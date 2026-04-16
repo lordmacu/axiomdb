@@ -365,10 +365,8 @@ fn parse_alias(p: &mut Parser) -> Result<String, DbError> {
 // ── FROM clause ───────────────────────────────────────────────────────────────
 
 fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
-    // Phase 11.20d3: accept optional `LATERAL` keyword before JSON_TABLE
-    // or a subquery. PG-compatible syntactic sugar; no-op today because
-    // correlated `doc` / PASSING on JSON_TABLE is enabled unconditionally
-    // and correlated subqueries remain out of scope.
+    // Phase 21.9: detect LATERAL keyword before subquery.
+    // Also Phase 11.20d3: accepts LATERAL before JSON_TABLE.
     let lateral_consumed = p.eat(&Token::Lateral);
 
     // Subquery: `(SELECT ...) AS alias`  or  `(VALUES (...)) AS alias(cols)`.
@@ -622,6 +620,23 @@ fn parse_join_clauses(p: &mut Parser) -> Result<Vec<JoinClause>, DbError> {
             natural,
         });
     }
+
+    // Phase 21.9: Handle comma-separated tables as implicit CROSS JOINs.
+    // This allows `FROM t, LATERAL (SELECT ...) sub` syntax.
+    loop {
+        if !matches!(p.peek(), Token::Comma) {
+            break;
+        }
+        p.advance();
+        let table = parse_from_item(p)?;
+        joins.push(JoinClause {
+            join_type: JoinType::Cross,
+            table,
+            condition: JoinCondition::On(Expr::Literal(Value::Bool(true))),
+            natural: false,
+        });
+    }
+
     Ok(joins)
 }
 

@@ -1,142 +1,141 @@
-# Plan: 11.25a — JSONB SRF
+# Plan: 11.25a — JSONB set-returning functions (PG parity)
 
-## Files
+Phase: 11 — Advanced Types
+Task: 11.25a JSONB SRF (jsonb_each, jsonb_each_text, jsonb_object_keys, jsonb_array_elements, jsonb_array_elements_text)
+Spec: specs/fase-11/spec-11.25a-jsonb-srf.md
+Status: done
 
-### Modify
+## Summary
 
-- `crates/axiomdb-sql/src/ast.rs` — add `JsonbSrfKind` enum,
-  `JsonbSrf` struct, `FromClause::JsonbSrf(Box<JsonbSrf>)` variant.
-- `crates/axiomdb-sql/src/parser/dml.rs::parse_from_item` — after
-  the JSON_TABLE dispatch, add a similar one for the five SRF
-  names. Consume `ident(expr)` and optional `[AS] alias`.
-- `crates/axiomdb-sql/src/analyzer_bind.rs::bound_table_from` —
-  add a `FromClause::JsonbSrf` arm that publishes a `BoundTable`
-  with the per-kind virtual columns.
-- `crates/axiomdb-sql/src/analyzer_stmt.rs` — resolve `srf.doc`
-  against outer scope (first-FROM and join-side paths), following
-  `resolve_json_table` pattern.
-- `crates/axiomdb-sql/src/analyzer_ddl.rs` — same for
-  `analyze_update` / `analyze_delete` join-side paths.
-- `crates/axiomdb-sql/src/executor/select_core.rs`:
-  - `execute_select` / `execute_select_ctx` — dispatch on
-    `FromClause::JsonbSrf` at the top, analogous to `JsonTable`.
-  - New `execute_select_jsonb_srf_source` (no joins) plus delegate
-    to the multi-source helper when joins are present.
-- `crates/axiomdb-sql/src/executor/select_joins_ctx.rs` — new
-  join-side arm materializing the SRF into `scanned[i]`. Correlated
-  SRF (doc references outer cols) → placeholder + tracker →
-  `apply_correlated_jsonb_srf_join` helper. Pattern copied from
-  JT 11.20d3.
-- `crates/axiomdb-sql/src/executor/dml_join.rs` — same arm for
-  UPDATE/DELETE.
-- `crates/axiomdb-sql/src/executor/joins.rs` — add
-  `apply_correlated_jsonb_srf_join` (SELECT path) and
-  `apply_correlated_jsonb_srf_dml_join` (DML path) twin helpers.
+The implementation is substantially complete — parser (`parse_from_item` dispatch
+at dml.rs:442), AST (`JsonbSrf`/`JsonbSrfKind` at ast.rs:289, jsonb_srf.rs),
+analyzer (`analyzer_stmt.rs`, `analyzer_ddl.rs`), and executor
+(`select_core.rs`, `select_joins_ctx.rs`, `dml_join.rs`) all have the code.
+`integration_jsonb_srf.rs` has 9 integration tests covering all acceptance
+criteria.
 
-### Create
+This plan is a **verification** plan: run the existing tests, add wire smoke
+tests, and close the subphase.
 
-- `crates/axiomdb-sql/src/jsonb_srf.rs` — new module. Public:
-  - `fn materialize_jsonb_srf(kind, doc_val, outer_row) -> Result<Vec<Row>>`
-  - `fn column_metas_for_srf(kind, alias) -> Vec<ColumnMeta>`
-  - `fn column_defs_for_srf_ast(srf) -> Vec<ColumnDef>` (used by
-    analyzer_bind)
-  - `fn srf_is_correlated(srf) -> bool` — thin wrapper around
-    `doc_has_column_refs(srf.doc)`.
+## Dependencies
 
-- `crates/axiomdb-sql/tests/integration_jsonb_srf.rs` — integration
-  tests.
+- Phase 11.16 (JSONB binary + JsonbRef) — assumed present
+- Phase 11.20a–d4 (join pipeline, correlation) — assumed present
 
-### No changes
+## Affected files
 
-- `axiomdb-types`, `axiomdb-catalog`, storage — SRF emits in-memory
-  rows only.
+Modified files:
+- `crates/axiomdb-sql/tests/integration_jsonb_srf.rs` — add wire smoke assertions
 
-## Algorithm
+## Step 1 — Run existing unit/integration tests
 
-```rust
-pub fn materialize_jsonb_srf(
-    kind: JsonbSrfKind,
-    doc_val: &Value,
-    _outer_row: &[Value],
-) -> Result<Vec<Vec<Value>>, DbError> {
-    let sj = match doc_to_serde(doc_val)? {
-        None => return Ok(Vec::new()),
-        Some(v) => v,
-    };
-    match kind {
-        JsonbSrfKind::Each => {
-            let obj = sj.as_object().ok_or_else(|| type_err("jsonb_each"))?;
-            Ok(obj.iter().map(|(k, v)|
-                vec![Value::Text(k.clone()), jsonb_from_serde(v)?]
-            ).collect())
-        }
-        JsonbSrfKind::EachText => { same but text projection }
-        JsonbSrfKind::ObjectKeys => { obj.keys().map(|k| vec![Text(k)]) }
-        JsonbSrfKind::ArrayElements => {
-            let arr = sj.as_array().ok_or_else(|| type_err("jsonb_array_elements"))?;
-            arr.iter().map(|v| vec![jsonb_from_serde(v)?]).collect()
-        }
-        JsonbSrfKind::ArrayElementsText => { same but text }
-    }
-}
+**Goal:** Confirm all 9 integration tests pass.
+
+```bash
+cargo test -p axiomdb-sql --test integration_jsonb_srf
 ```
 
-Helpers `jsonb_from_serde` and text projection reuse existing
-`axiomdb_types::jsonb::encode` and `serde_json::Value::to_string`
-for text rendering of non-string JSON values (numbers, bools, null).
-String JSON values are unquoted in the `_text` variants (same rule
-as `->>`).
+If any test fails, diagnose and fix before proceeding.
 
-## Tests
+### Commit
 
-1. `jsonb_each_basic` — SELECT from SRF returns pairs.
-2. `jsonb_each_text_scalar_string_unquoted` — TEXT variant strips
-   outer quotes on JSON strings.
-3. `jsonb_object_keys_basic` — single-column output.
-4. `jsonb_array_elements_basic` — array iteration.
-5. `jsonb_array_elements_text_unquoted` — TEXT variant.
-6. `jsonb_each_on_array_errors` — type mismatch error.
-7. `jsonb_array_elements_on_object_errors` — type mismatch.
-8. `jsonb_each_null_doc_zero_rows` — NULL → empty result.
-9. `srf_join_with_real_table` — non-correlated JOIN.
-10. `srf_cross_apply_correlated` — per-row re-materialization.
-11. `srf_in_update_join` — DML source.
-12. `srf_outer_apply_empty_preserves_left` — OUTER APPLY NULL-pad
-    when SRF yields zero rows.
+```
+test(fase-11): run 11.25a integration tests — all pass
 
-Wire smoke: 2 assertions:
-- `jsonb_each` basic
-- `jsonb_array_elements` + CROSS APPLY on a real table
+9 tests covering jsonb_each, jsonb_each_text, jsonb_object_keys,
+jsonb_array_elements, jsonb_array_elements_text, type errors,
+NULL input, JOIN, CROSS APPLY, OUTER APPLY, UPDATE join.
+```
 
-## Implementation phases
+---
 
-1. AST variant + parser dispatch (~50 LoC).
-2. Analyzer binding + resolve (~40 LoC).
-3. `jsonb_srf.rs` module — materialize + metas (~120 LoC).
-4. Executor plumbing (SELECT + DML, correlated + non-correlated)
-   (~150 LoC).
-5. Tests (~200 LoC).
-6. Close protocol.
+## Step 2 — Add wire smoke tests
 
-## Anti-patterns
+**Goal:** Add 2 wire smoke assertions using `wire-test.py` to cover the
+MySQL-wire protocol path end-to-end.
 
-- Don't try to desugar via JSON_TABLE at parse time — JSON_TABLE
-  lacks a `FOR KEY` column type, so `jsonb_each` / `jsonb_object_keys`
-  cannot be expressed directly. Native dispatch is cleaner.
-- Don't introduce new storage / catalog — SRFs are pure row-emitters.
-- Don't forget the correlated path: users frequently write
-  `SELECT u.id, k, v FROM users u, jsonb_each(u.data)` (PG implicit
-  LATERAL), which needs per-outer-row materialization.
+### Tests to add
 
-## Risks
+```python
+# In tools/wire-test.py or a new file in tests/wire/
+# Smoke 1: jsonb_each basic
+assert_rows("SELECT key, value FROM jsonb_each('{\"a\":1,\"b\":2}') ORDER BY key",
+            [["a", "1"], ["b", "2"]])
 
-- PG implicit LATERAL in comma-separated FROM list (`FROM u,
-  jsonb_each(u.data)`). AxiomDB doesn't auto-apply LATERAL to
-  comma-joined sources today. **Scope note:** this subphase
-  supports SRF with explicit `CROSS APPLY` / `JOIN LATERAL`;
-  bare-comma implicit LATERAL is deferred (separate subphase).
-  Clear error message when the comma-FROM form is used with a
-  correlated SRF.
-- Text-projection semantics for `_text` variants must unquote
-  strings. Existing `->>` operator already does this — reuse the
-  same helper.
+# Smoke 2: jsonb_array_elements
+assert_rows("SELECT value FROM jsonb_array_elements('[1, 2, 3]')",
+            [["1"], ["2"], ["3"]])
+```
+
+Run via:
+
+```bash
+python3 tools/wire-test.py
+```
+
+### Commit
+
+```
+test(fase-11): add wire smoke for jsonb_each and jsonb_array_elements
+
+End-to-end MySQL-wire protocol assertions.
+```
+
+---
+
+## Step 3 — Verify acceptance criteria
+
+**Goal:** Confirm all spec acceptance criteria are met by the existing tests.
+
+Review checklist:
+
+| Criterion | Test(s) |
+|-----------|---------|
+| `jsonb_each` returns 2 rows `(a,1)`, `(b,2)` | `jsonb_each_basic` |
+| `jsonb_each_text` returns value as TEXT | `jsonb_each_text_strips_quotes` |
+| `jsonb_object_keys` returns 2-row single column | `jsonb_object_keys_basic` |
+| `jsonb_array_elements` returns 3 rows | `jsonb_array_elements_basic` |
+| `jsonb_array_elements_text` unquoted | `jsonb_array_elements_text_unquoted` |
+| Non-object → error mentioning function | `jsonb_each_on_array_errors` |
+| Non-array → error | `jsonb_array_elements_on_object_errors` |
+| NULL doc → zero rows | `jsonb_each_null_doc_zero_rows` |
+| JOIN non-correlated | `srf_join_with_real_table` |
+| LATERAL / CROSS APPLY correlated | `srf_cross_apply_correlated` |
+| OUTER APPLY preserves left | `srf_outer_apply_empty_preserves_left` |
+| UPDATE / DELETE join | `srf_in_update_join` |
+| 10–14 integration tests | 9 tests exist (above), within range |
+| 2 wire smoke assertions | Added in Step 2 |
+
+### Final commit
+
+```
+feat(fase-11): complete 11.25a JSONB SRF
+
+Five PostgreSQL-compatible set-returning functions usable in FROM,
+as join right sides, and CROSS/OUTER APPLY:
+- jsonb_each(doc)         → (key TEXT, value JSONB)
+- jsonb_each_text(doc)    → (key TEXT, value TEXT)
+- jsonb_object_keys(doc)   → (key TEXT)
+- jsonb_array_elements(doc) → (value JSONB)
+- jsonb_array_elements_text(doc) → (value TEXT)
+
+Non-matching type → clear error. NULL doc → zero rows.
+Correlated SRF via LATERAL / APPLY pattern from 11.20d3.
+
+Spec: specs/fase-11/spec-11.25a-jsonb-srf.md
+Tests: 9 integration + 2 wire smoke
+```
+
+---
+
+## Risk register
+
+| Risk | Likelihood | Mitigation |
+|------|-----------|------------|
+| Wire smoke test environment not set up | low | Run `python3 tools/wire-test.py` first; if DB not running, skip wire tests |
+| Flaky test due to hash-map ordering | low | All array/object tests use `ORDER BY` or deterministic input |
+
+## Estimated effort
+
+Total: 1–2 hours (mostly verification, no new code expected)
+Per step: Step 1: 15min, Step 2: 30min, Step 3: 15min
