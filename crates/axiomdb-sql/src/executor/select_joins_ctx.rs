@@ -72,9 +72,13 @@ fn execute_select_with_joins_first_materialized(
         running_offset += first_source.columns.len();
         all_sources.push(first_source);
         scanned.push(first_rows);
-        correlated_sub.push(None);
+        // NOTE: do NOT push to correlated_sub here. The correlated_sub/jt/srf
+        // vectors are indexed by join index (1..=joins.len()), not by source index.
+        // They are initialized with vec![None] covering index 0 (unused sentinel),
+        // then each join pushes exactly one entry. Pushing here would cause an
+        // off-by-one where correlated_sub[right_idx] always points one slot too early.
 
-        for (_join_idx, join) in stmt.joins.iter().enumerate() {
+        for join in stmt.joins.iter() {
             match &join.table {
                 FromClause::Table(tref) => {
                     let jt = resolve_table_cached(storage, txn, ctx, conn_txn, tref)?;
@@ -116,15 +120,39 @@ fn execute_select_with_joins_first_materialized(
                     let effective_left_cols = base_left_cols + lateral_accum_cols;
                     let is_correlated = *lateral
                         && crate::json_table::subquery_is_correlated(query, effective_left_cols);
-                    eprintln!("DEBUG: Subquery {} lateral={} base_left={} lateral_accum={} effective_left={} is_correlated={}",
-                        alias, lateral, base_left_cols, lateral_accum_cols, effective_left_cols, is_correlated);
 
                     let (columns, rows) = if is_correlated {
-                        // Deferred: store the subquery for combine loop, use empty schema.
-                        // But track our output column count so subsequent LATERALs can
-                        // reference our columns for their correlation checks.
+                        // Deferred: store the subquery for the combine loop.
+                        // Build placeholder ColumnMeta from the SELECT list so that:
+                        //   1. running_offset advances by the correct column count
+                        //   2. right_col_count is correct for LEFT JOIN null padding
+                        //   3. project_join_row can look up columns by name
+                        // Actual typed values come from execute_select_ctx per outer row.
                         lateral_accum_cols += query.columns.len();
-                        (vec![], Vec::new())
+                        let placeholder_cols: Vec<crate::result::ColumnMeta> = query
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, item)| {
+                                let name = match item {
+                                    crate::ast::SelectItem::Expr { alias: Some(a), .. } => {
+                                        a.clone()
+                                    }
+                                    crate::ast::SelectItem::Expr { expr, alias: None } => {
+                                        format!("col{i}_{expr:?}")
+                                            .chars()
+                                            .take(64)
+                                            .collect()
+                                    }
+                                    _ => format!("col{i}"),
+                                };
+                                crate::result::ColumnMeta::computed(
+                                    name,
+                                    axiomdb_types::DataType::Text,
+                                )
+                            })
+                            .collect();
+                        (placeholder_cols, Vec::new())
                     } else {
                         let inner_result =
                             execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
@@ -146,11 +174,6 @@ fn execute_select_with_joins_first_materialized(
                     } else {
                         None
                     });
-                    eprintln!(
-                        "DEBUG: After Subquery push correlated_sub.len()={}, is_correlated={}",
-                        correlated_sub.len(),
-                        is_correlated
-                    );
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                 }
@@ -168,6 +191,7 @@ fn execute_select_with_joins_first_materialized(
                         scanned.push(Vec::new());
                         correlated_jt.push(Some(spec));
                         correlated_srf.push(None);
+                        correlated_sub.push(None);
                     } else {
                         let doc_val = crate::eval::eval(&jt.doc, &[])?;
                         let rows = match crate::json_table::doc_to_serde(&doc_val)? {
@@ -185,6 +209,7 @@ fn execute_select_with_joins_first_materialized(
                         scanned.push(rows);
                         correlated_jt.push(None);
                         correlated_srf.push(None);
+                        correlated_sub.push(None);
                     }
                 }
                 // Phase 11.25a — JSONB SRF (jsonb_each, etc.) on the right side.
@@ -198,12 +223,14 @@ fn execute_select_with_joins_first_materialized(
                         scanned.push(Vec::new());
                         correlated_jt.push(None);
                         correlated_srf.push(Some(srf.kind));
+                        correlated_sub.push(None);
                     } else {
                         let doc_val = crate::eval::eval(&srf.doc, &[])?;
                         let rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
                         scanned.push(rows);
                         correlated_jt.push(None);
                         correlated_srf.push(None);
+                        correlated_sub.push(None);
                     }
                 }
                 // Phase 21.22 — inline VALUES on the right side.
@@ -216,6 +243,7 @@ fn execute_select_with_joins_first_materialized(
                     scanned.push(rows);
                     correlated_jt.push(None);
                     correlated_srf.push(None);
+                    correlated_sub.push(None);
                 }
                 // Phase 21.3 — recursive CTE as join right side is deferred;
                 // MVP only supports recursive CTE as first-FROM source.
@@ -280,8 +308,6 @@ fn execute_select_with_joins_first_materialized(
                 right_col_offset,
             )?
         } else if let Some(subquery) = correlated_sub[right_idx].as_ref() {
-            eprintln!("DEBUG combine: i={} right_idx={} correlated_sub.len()={} - calling apply_correlated_subquery_join", 
-                i, right_idx, correlated_sub.len());
             // Phase 21.9 — correlated LATERAL subquery right side.
             apply_correlated_subquery_join(
                 combined_rows,
@@ -297,25 +323,6 @@ fn execute_select_with_joins_first_materialized(
                 ctx,
             )?
         } else {
-            let sub_in_vec = correlated_sub.get(right_idx);
-            eprintln!(
-                "DEBUG combine: i={} right_idx={} correlated_sub.len()={} sub_at_right_idx={:?} calling apply_join (non-correlated)",
-                i, right_idx, correlated_sub.len(), sub_in_vec
-            );
-            eprintln!(
-                "DEBUG combine: ALL correlated_sub entries: {:?}", correlated_sub
-            );
-            eprintln!(
-                "DEBUG combine: ALL scanned entries: {:?}", scanned.iter().map(|s| s.len()).collect::<Vec<_>>()
-            );
-            eprintln!(
-                "DEBUG combine: ALL all_sources columns len: {:?}",
-                all_sources.iter().map(|s| s.columns.len()).collect::<Vec<_>>()
-            );
-            eprintln!(
-                "DEBUG combine: ALL all_sources match_names: {:?}",
-                all_sources.iter().map(|s| &s.match_names).collect::<Vec<_>>()
-            );
             apply_join(
                 combined_rows,
                 &scanned[right_idx],

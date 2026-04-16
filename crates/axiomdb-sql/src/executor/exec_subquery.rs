@@ -372,6 +372,7 @@ fn extract_outer_col_indices(stmt: &SelectStmt) -> Vec<usize> {
     fn walk_expr(expr: &Expr, indices: &mut Vec<usize>) {
         match expr {
             Expr::OuterColumn { col_idx, .. } => {
+                #[allow(clippy::collapsible_match)]
                 if !indices.contains(col_idx) {
                     indices.push(*col_idx);
                 }

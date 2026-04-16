@@ -190,7 +190,7 @@ impl ClusteredFieldPatchEntry {
 
         let mut field_deltas = Vec::with_capacity(old_fields.len());
         for ((old_offset, old_size, old_arr), (new_offset, new_size, new_arr)) in
-            old_fields.into_iter().zip(new_fields.into_iter())
+            old_fields.into_iter().zip(new_fields)
         {
             if old_offset != new_offset || old_size != new_size {
                 return Err(DbError::InvalidValue {

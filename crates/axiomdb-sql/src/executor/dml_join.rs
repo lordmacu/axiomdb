@@ -340,22 +340,38 @@ fn collect_dml_join_candidates_ctx(
                 lateral,
             } => {
                 col_offsets.push(running_offset);
-                if *lateral {
-                    // Phase 21.9 — LATERAL subquery: defer materialization to per-outer-row
-                    // combine loop. The query carries OuterColumn references that need
-                    // values from the left side of the JOIN.
-                    let inner_result =
-                        execute_select_ctx((**query).clone(), exec_ctx, conn_txn, ctx)?;
-                    let columns = match inner_result {
-                        QueryResult::Rows { columns, .. } => columns,
-                        _ => {
-                            return Err(DbError::Internal {
-                                message: "join-side subquery did not return rows".into(),
-                            });
-                        }
-                    };
-                    running_offset += columns.len();
-                    all_sources.push(join_source_schema_from_derived(alias, columns));
+                // Phase 21.9: detect whether LATERAL subquery is correlated.
+                let base_left_cols: usize =
+                    all_sources.iter().map(|s| s.columns.len()).sum();
+                let is_correlated = *lateral
+                    && crate::json_table::subquery_is_correlated(query, base_left_cols);
+                if is_correlated {
+                    // Phase 21.9 — Correlated LATERAL subquery: infer output schema from
+                    // the AST SELECT list (same strategy as select_joins_ctx.rs). Running
+                    // the subquery with an empty scope is wrong for correlated queries —
+                    // OuterColumn references have no values to substitute yet.
+                    let placeholder_cols: Vec<crate::result::ColumnMeta> = query
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let name = match item {
+                                crate::ast::SelectItem::Expr { alias: Some(a), .. } => {
+                                    a.clone()
+                                }
+                                crate::ast::SelectItem::Expr { expr, alias: None } => {
+                                    format!("col{i}_{expr:?}").chars().take(64).collect()
+                                }
+                                _ => format!("col{i}"),
+                            };
+                            crate::result::ColumnMeta::computed(
+                                name,
+                                axiomdb_types::DataType::Text,
+                            )
+                        })
+                        .collect();
+                    running_offset += placeholder_cols.len();
+                    all_sources.push(join_source_schema_from_derived(alias, placeholder_cols));
                     scanned.push(Vec::new());
                     correlated_jt.push(None);
                     correlated_srf.push(None);
@@ -949,8 +965,11 @@ fn apply_correlated_subquery_dml_join(
     let mut out: Vec<DmlJoinRow> = Vec::with_capacity(left_rows.len());
 
     for outer in &left_rows {
-        // Execute the LATERAL subquery with outer values in scope.
-        let inner_result = execute_select_ctx(subquery.clone(), exec_ctx, conn_txn, ctx)?;
+        // Substitute OuterColumn references with values from the outer row,
+        // then execute the subquery in the context of this specific outer row.
+        use crate::executor::substitute_outer;
+        let subquery_resolved = substitute_outer(subquery.clone(), &outer.values);
+        let inner_result = execute_select_ctx(subquery_resolved, exec_ctx, conn_txn, ctx)?;
         let rows = match inner_result {
             QueryResult::Rows { rows, .. } => rows,
             _ => {

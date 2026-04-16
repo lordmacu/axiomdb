@@ -107,6 +107,28 @@ fn analyze_update(
 
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
+        // Phase 21.9: resolve LATERAL subquery using the combined DML context
+        // as an outer scope so that inner references (e.g. t.id) become
+        // OuterColumn nodes, enabling per-outer-row substitution at execute time.
+        if let FromClause::Subquery { query, alias, lateral } = join.table {
+            if lateral {
+                let analyzed_inner = analyze_select_with_outer(
+                    *query,
+                    storage,
+                    snapshot.clone(),
+                    default_database,
+                    default_schema,
+                    &[&ctx],
+                )?;
+                join.table = FromClause::Subquery {
+                    query: Box::new(analyzed_inner),
+                    alias,
+                    lateral,
+                };
+            } else {
+                join.table = FromClause::Subquery { query, alias, lateral };
+            }
+        }
         // Phase 11.20d4: resolve JSON_TABLE doc + PASSING against the combined
         // UPDATE scope so correlated doc / PASSING bind to the target table's
         // columns.
@@ -226,6 +248,26 @@ fn analyze_delete(
 
     let mut resolved_joins = Vec::with_capacity(s.joins.len());
     for mut join in s.joins {
+        // Phase 21.9: resolve LATERAL subquery for DELETE joins — same as UPDATE.
+        if let FromClause::Subquery { query, alias, lateral } = join.table {
+            if lateral {
+                let analyzed_inner = analyze_select_with_outer(
+                    *query,
+                    storage,
+                    snapshot.clone(),
+                    default_database,
+                    default_schema,
+                    &[&ctx],
+                )?;
+                join.table = FromClause::Subquery {
+                    query: Box::new(analyzed_inner),
+                    alias,
+                    lateral,
+                };
+            } else {
+                join.table = FromClause::Subquery { query, alias, lateral };
+            }
+        }
         // Phase 11.20d4: resolve JSON_TABLE doc + PASSING for DELETE joins.
         if let FromClause::JsonTable(jt) = &mut join.table {
             let taken_doc =

@@ -213,6 +213,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         limit,
         offset,
         lock_mode,
+        set_op_rest: vec![],
     })
 }
 
@@ -418,7 +419,26 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
             })));
         }
         p.expect(&Token::Select)?;
-        let sub = parse_select(p)?;
+        let mut sub = parse_select(p)?;
+        // Phase 21.9b: handle `(SELECT ... UNION [ALL] SELECT ...)` inside FROM/JOIN.
+        // Fold the tails into `set_op_rest` so the executor runs them as a set operation.
+        while matches!(p.peek(), Token::Union | Token::Intersect | Token::Except) {
+            let kind = match p.peek() {
+                Token::Union => crate::ast::SetOpKind::Union,
+                Token::Intersect => crate::ast::SetOpKind::Intersect,
+                Token::Except => crate::ast::SetOpKind::Except,
+                _ => unreachable!(),
+            };
+            p.advance();
+            let all = p.eat(&Token::All);
+            p.expect(&Token::Select)?;
+            let tail_select = parse_select(p)?;
+            sub.set_op_rest.push(crate::ast::SetOpTail {
+                kind,
+                all,
+                select: tail_select,
+            });
+        }
         p.expect(&Token::RParen)?;
         p.eat(&Token::As);
         let alias = p.parse_identifier()?;

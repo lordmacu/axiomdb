@@ -17,7 +17,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              11.16 (binary JSONB + JSONPath: -> operator, JSON_MERGE_PATCH, JSON_CONTAINS, JSON_PATH_EXISTS, TO_JSONB),
              11.25b (JSON aggregates: jsonb_agg, json_agg, JSON_ARRAYAGG, jsonb_object_agg,
                       json_object_agg, JSON_OBJECTAGG; constructors: JSON_ARRAY, JSON_OBJECT,
-                      jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH)
+                      jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH),
+             21.9 (LATERAL joins: inner comma-join, LEFT JOIN null-pad)
 """
 import os
 import signal
@@ -3532,6 +3533,40 @@ ok("21.4 DELETE RETURNING captures pre-delete row",
 # smoke skipped: earlier fragments of wire-test.py create fixtures that
 # collide when re-run, and rewriting those for idempotence is out of
 # scope here.
+
+# ── Phase 21.9 — LATERAL joins ───────────────────────────────────────────────
+
+print("\n[21.9 LATERAL joins]")
+
+cur.execute("CREATE TABLE lat_t (id INT)")
+cur.execute("INSERT INTO lat_t VALUES (1), (2), (3)")
+cur.execute("CREATE TABLE lat_other (t_id INT, val INT)")
+cur.execute("INSERT INTO lat_other VALUES (1, 10), (2, 20)")
+
+# INNER (comma = CROSS JOIN LATERAL + INNER filter via WHERE in subquery)
+cur.execute("""SELECT lat_t.id, sub.val
+               FROM lat_t,
+                    LATERAL (SELECT lat_t.id + 10 AS val
+                              FROM lat_other o
+                              WHERE o.t_id = lat_t.id) sub
+               ORDER BY lat_t.id""")
+rows = cur.fetchall()
+ok("[21.9 LATERAL] inner join drops unmatched outer rows",
+   len(rows) == 2 and int(rows[0][0]) == 1 and int(rows[0][1]) == 11
+   and int(rows[1][0]) == 2 and int(rows[1][1]) == 12,
+   f"got {rows}")
+
+# LEFT JOIN LATERAL — id=3 has no match, sub.val must be NULL
+cur.execute("""SELECT lat_t.id, sub.val
+               FROM lat_t
+               LEFT JOIN LATERAL (SELECT lat_t.id + 10 AS val
+                                   FROM lat_other o
+                                   WHERE o.t_id = lat_t.id) sub ON true
+               ORDER BY lat_t.id""")
+rows = cur.fetchall()
+ok("[21.9 LATERAL] left join null-pads unmatched outer row",
+   len(rows) == 3 and rows[2][1] is None,
+   f"got {rows}")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

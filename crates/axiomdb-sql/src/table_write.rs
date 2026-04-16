@@ -500,7 +500,7 @@ fn toast_row_if_needed(
             _ => None,
         })
         .collect();
-    cands.sort_by(|a, b| b.1.cmp(&a.1));
+    cands.sort_by_key(|&(_, sz)| std::cmp::Reverse(sz));
 
     for &(ci, sz) in &cands {
         if encoded.len().saturating_sub(saved) <= TOAST_THRESHOLD {

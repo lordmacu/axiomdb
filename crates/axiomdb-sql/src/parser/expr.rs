@@ -1049,7 +1049,9 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
     }
 
     // Optional RETURNING <type> — not valid for JSON_EXISTS.
-    if p.eat_ident_ci("RETURNING") {
+    // NOTE: RETURNING is a reserved keyword → Token::Returning, not Token::Ident,
+    // so eat_ident_ci("RETURNING") never fires; use eat(&Token::Returning).
+    if p.eat(&Token::Returning) {
         if matches!(kind, SqlJsonQueryKind::Exists) {
             return Err(DbError::ParseError {
                 message: "RETURNING is not allowed on JSON_EXISTS".into(),

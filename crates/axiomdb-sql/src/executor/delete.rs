@@ -693,6 +693,7 @@ fn collect_clustered_delete_candidates(
 fn collect_where_columns(e: &Expr, mask: &mut [bool]) {
     match e {
         Expr::Column { col_idx, .. } => {
+            #[allow(clippy::collapsible_match)]
             if *col_idx < mask.len() {
                 mask[*col_idx] = true;
             }
