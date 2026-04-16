@@ -450,6 +450,12 @@ pub struct SelectStmt {
     pub offset: Option<Expr>,
     /// Row-level lock mode: `FOR UPDATE` or `LOCK IN SHARE MODE` (ignored until Phase 13.7).
     pub lock_mode: Option<LockMode>,
+    /// Phase 21.9b — UNION/INTERSECT/EXCEPT tails when this SelectStmt is the
+    /// first branch of a set operation embedded inside a subquery or FROM clause.
+    /// Empty for plain SELECT statements (the common case).
+    /// Top-level set operations still use `Stmt::SetOp`; this field handles
+    /// `(SELECT ... UNION ALL SELECT ...) AS alias` inside FROM/JOIN.
+    pub set_op_rest: Vec<SetOpTail>,
 }
 
 // ── DML statements ────────────────────────────────────────────────────────────
@@ -941,6 +947,7 @@ mod tests {
             limit: Some(Expr::int(10)),
             offset: Some(Expr::int(0)),
             lock_mode: None,
+            set_op_rest: vec![],
         });
         assert!(matches!(stmt, Stmt::Select(_)));
     }
@@ -966,6 +973,7 @@ mod tests {
             limit: None,
             offset: None,
             lock_mode: None,
+            set_op_rest: vec![],
         });
         if let Stmt::Select(s) = stmt {
             assert!(s.from.is_none());
@@ -1162,6 +1170,7 @@ mod tests {
             limit: None,
             offset: None,
             lock_mode: None,
+            set_op_rest: vec![],
         };
         let from = FromClause::Subquery {
             query: Box::new(subquery),

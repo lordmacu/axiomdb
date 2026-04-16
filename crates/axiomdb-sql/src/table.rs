@@ -641,7 +641,7 @@ fn apply_prepared_updates_preserve_rid(
     let mut new_rids = Vec::with_capacity(prepared.len());
     let mut stable_images: Vec<StableImage> = Vec::new();
 
-    for ((rid, new_encoded), rewrite_result) in prepared.iter().zip(rewrite_results.into_iter()) {
+    for ((rid, new_encoded), rewrite_result) in prepared.iter().zip(rewrite_results) {
         match rewrite_result {
             Some(old_tuple_image) => {
                 let key = encode_rid(rid.page_id, rid.slot_id);

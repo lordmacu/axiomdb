@@ -338,6 +338,130 @@ fn lateral_full_rejected() {
     );
 }
 
+// ── lateral_update_join ─────────────────────────────────────────────────────
+
+#[test]
+fn lateral_update_join() {
+    let (mut s, mut t, mut b, mut c) = setup_ctx();
+
+    // target(id, val): rows to update
+    run_ctx(
+        "CREATE TABLE target (id INT, val INT)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    run_ctx(
+        "INSERT INTO target VALUES (1, 0), (2, 0), (3, 0)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+
+    // multiplier(tid, factor): only id=1 and id=2 have a factor
+    run_ctx(
+        "CREATE TABLE multiplier (tid INT, factor INT)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    run_ctx(
+        "INSERT INTO multiplier VALUES (1, 10), (2, 20)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+
+    // UPDATE target t JOIN LATERAL (...) sub ON true SET t.val = sub.computed
+    // sub computes target.id * factor for matching rows
+    run_ctx(
+        "UPDATE target t JOIN LATERAL (SELECT m.factor * t.id AS computed FROM multiplier m WHERE m.tid = t.id) sub ON true SET t.val = sub.computed",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    )
+    .expect("UPDATE with LATERAL JOIN should succeed");
+
+    // Verify: id=1 → val=10, id=2 → val=40, id=3 → val=0 (no match, not updated)
+    let result = run_ctx(
+        "SELECT id, val FROM target ORDER BY id",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    )
+    .expect("SELECT after UPDATE");
+    let r = rows(result);
+    assert_eq!(r.len(), 3, "expected 3 rows, got {r:?}");
+    assert_eq!(as_i64(&r[0][0]), 1);
+    assert_eq!(as_i64(&r[0][1]), 10); // 1 * 10
+    assert_eq!(as_i64(&r[1][0]), 2);
+    assert_eq!(as_i64(&r[1][1]), 40); // 2 * 20
+    assert_eq!(as_i64(&r[2][0]), 3);
+    assert_eq!(as_i64(&r[2][1]), 0); // no match in multiplier → not updated
+}
+
+// ── lateral_delete_join ─────────────────────────────────────────────────────
+
+#[test]
+fn lateral_delete_join() {
+    let (mut s, mut t, mut b, mut c) = setup_ctx();
+
+    run_ctx(
+        "CREATE TABLE target (id INT, val INT)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    run_ctx(
+        "INSERT INTO target VALUES (1, 100), (2, 200), (3, 300)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+
+    // sentinel: only ids 1 and 2 should be deleted
+    run_ctx(
+        "CREATE TABLE to_delete (tid INT)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    run_ctx(
+        "INSERT INTO to_delete VALUES (1), (2)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+
+    // DELETE t FROM target t JOIN LATERAL (...) sub ON true
+    run_ctx(
+        "DELETE t FROM target t JOIN LATERAL (SELECT d.tid AS match_id FROM to_delete d WHERE d.tid = t.id) sub ON true",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    )
+    .expect("DELETE with LATERAL JOIN should succeed");
+
+    // Only id=3 should remain
+    let result = run_ctx("SELECT id, val FROM target", &mut s, &mut t, &mut b, &mut c)
+        .expect("SELECT after DELETE");
+    let r = rows(result);
+    assert_eq!(r.len(), 1, "expected 1 row remaining, got {r:?}");
+    assert_eq!(as_i64(&r[0][0]), 3);
+    assert_eq!(as_i64(&r[0][1]), 300);
+}
+
 // ── regression_non_lateral_subquery ─────────────────────────────────────────
 
 #[test]
@@ -353,11 +477,11 @@ fn regression_non_lateral_subquery() {
         &mut c,
     );
 
-    // Existing subquery JOIN without LATERAL still works
-    // SELECT t.id, sub.x FROM t JOIN (SELECT id + 10 AS x FROM t) sub ON t.id = sub.id - 10
-    // t.id=1 matches sub.id=1 (x=11), t.id=2 matches sub.id=2 (x=12), t.id=3 matches sub.id=3 (x=13)
+    // Existing subquery JOIN without LATERAL still works.
+    // sub only exposes column x (= id + 10); use sub.x - 10 in the ON condition.
+    // t.id=1 → sub.x=11, t.id=2 → sub.x=12, t.id=3 → sub.x=13.
     let result = run_ctx(
-        "SELECT t.id, sub.x FROM t JOIN (SELECT id + 10 AS x FROM t) sub ON t.id = sub.id - 10",
+        "SELECT t.id, sub.x FROM t JOIN (SELECT id + 10 AS x FROM t) sub ON t.id = sub.x - 10",
         &mut s,
         &mut t,
         &mut b,

@@ -455,6 +455,61 @@ AxiomDB implements the same three-valued logic for <code>IN (subquery)</code> as
 </div>
 </div>
 
+### LATERAL Joins (Phase 21.9)
+
+A `LATERAL` subquery in the `FROM` or `JOIN` clause can reference columns from
+tables to its left. It is re-evaluated once per outer row, enabling per-row
+correlated sub-selects that are not possible with regular derived tables.
+
+```sql
+-- Comma = implicit CROSS JOIN LATERAL
+-- Each row in t drives the inner query; id=3 has no match and is excluded (INNER)
+SELECT t.id, sub.val
+FROM t,
+     LATERAL (
+         SELECT t.id + 10 AS val
+         FROM other o
+         WHERE o.t_id = t.id
+     ) sub;
+
+-- LEFT JOIN LATERAL: rows with no match get NULL on the right side
+SELECT t.id, sub.val
+FROM t
+LEFT JOIN LATERAL (
+    SELECT t.id + 10 AS val
+    FROM other o
+    WHERE o.t_id = t.id
+) sub ON true;
+
+-- CROSS JOIN LATERAL: each outer row joined with all rows from a constant subquery
+SELECT t.id, sub.x
+FROM t
+CROSS JOIN LATERAL (SELECT 1 AS x UNION ALL SELECT 2) sub;
+
+-- Chained LATERAL: second subquery references output of the first
+SELECT *
+FROM (VALUES (1)) t(v),
+     LATERAL (SELECT t.v + 10 AS a) s1,
+     LATERAL (SELECT s1.a * 2 AS b) s2;
+
+-- LATERAL as first FROM (no outer context, non-correlated)
+SELECT * FROM LATERAL (SELECT 1 AS x, 2 AS y) AS init;
+```
+
+**JOIN type semantics:**
+
+| Join type | No subquery rows | One+ subquery rows |
+|-----------|------------------|--------------------|
+| INNER / CROSS | outer row dropped | joined rows emitted |
+| LEFT | outer row with NULL right | joined rows emitted |
+| RIGHT | error (not supported) | — |
+| FULL | error (not supported) | — |
+
+`RIGHT JOIN LATERAL` and `FULL JOIN LATERAL` are rejected at execute time
+(PostgreSQL-compatible — outer re-scan semantics are ill-defined for LATERAL).
+
+LATERAL subqueries also work as the right side of UPDATE and DELETE JOIN clauses.
+
 ---
 
 ## GROUP BY and HAVING

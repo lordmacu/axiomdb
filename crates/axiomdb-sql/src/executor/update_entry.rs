@@ -210,6 +210,7 @@ fn statement_might_affect_indexes(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_update_index_maintenance(
     current_indexes: &mut [IndexDef],
     compiled_preds: &[Option<Expr>],

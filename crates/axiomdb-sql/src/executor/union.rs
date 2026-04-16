@@ -14,6 +14,17 @@
 ///
 /// Column metadata comes from the first SELECT. Every tail must produce
 /// the same arity.
+/// Public entry point for set operations embedded inside subqueries (Phase 21.9b).
+pub(crate) fn execute_set_op_ctx(
+    first: SelectStmt,
+    rest: Vec<SetOpTail>,
+    exec_ctx: &ExecutionContext,
+    conn_txn: Option<&ConnectionTxn>,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    execute_set_op(first, rest, exec_ctx, conn_txn, ctx)
+}
+
 fn execute_set_op(
     first: SelectStmt,
     rest: Vec<SetOpTail>,

@@ -57,7 +57,7 @@ fn persist_batch_insert_indexes(
         storage,
         bloom,
         plan.compiled_preds,
-        &plan.compiled_index_exprs,
+        plan.compiled_index_exprs,
         plan.skip_unique_check,
         plan.committed_empty,
         snap,

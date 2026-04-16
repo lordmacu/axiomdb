@@ -11,6 +11,13 @@ fn execute_select_ctx(
     // Cleared automatically when _coll_guard is dropped at function exit.
     let _coll_guard = CollationGuard::new(ctx.effective_collation());
 
+    // Phase 21.9b: subquery with embedded set operation (UNION/INTERSECT/EXCEPT).
+    // The parser folds tails into `set_op_rest` when inside a FROM/JOIN subquery.
+    if !stmt.set_op_rest.is_empty() {
+        let rest = std::mem::take(&mut stmt.set_op_rest);
+        return execute_set_op_ctx(stmt, rest, exec_ctx, conn_txn, ctx);
+    }
+
     // SELECT without FROM: no table resolution needed.
     if stmt.from.is_none() {
         return execute_select(stmt, storage, txn, conn_txn);

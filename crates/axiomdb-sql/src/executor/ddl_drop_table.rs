@@ -56,7 +56,7 @@ fn drop_table_fully(
 
     let mut seen_fk_ids = HashSet::new();
     let noop_bloom = crate::bloom::BloomRegistry::new();
-    for fk in child_fks.into_iter().chain(parent_fks.into_iter()) {
+    for fk in child_fks.into_iter().chain(parent_fks) {
         if !seen_fk_ids.insert(fk.fk_id) {
             continue;
         }

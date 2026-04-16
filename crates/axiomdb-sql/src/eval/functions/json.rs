@@ -3552,7 +3552,9 @@ fn json_search_walk(
         return;
     }
     match node {
-        serde_json::Value::String(s) => {
+        serde_json::Value::String(s) =>
+        {
+            #[allow(clippy::collapsible_match)]
             if like_match(pattern, s) {
                 hits.push(path.to_string());
             }

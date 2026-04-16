@@ -951,21 +951,49 @@ limitation rather than a regression.
 
 ### LATERAL keyword
 
-`Token::Lateral` is consumed optionally at the top of
-`parse_from_item`, covering:
+`Token::Lateral` is consumed optionally at the top of `parse_from_item`,
+covering all LATERAL forms:
 
 ```
-FROM LATERAL JSON_TABLE(...)            -- first-FROM sugar (no-op)
+FROM LATERAL JSON_TABLE(...)            -- first-FROM sugar (no-op on JT)
 FROM t JOIN LATERAL JSON_TABLE(...) ...  -- PG form
-FROM LATERAL (SELECT ...) AS q          -- subquery prefix (no-op)
+FROM LATERAL (SELECT ...) AS q          -- subquery, no outer context
+FROM t, LATERAL (SELECT t.id + 1 AS x) sub  -- comma = CROSS JOIN LATERAL
+FROM t JOIN LATERAL (...) sub ON true    -- explicit INNER
+FROM t LEFT JOIN LATERAL (...) sub ON true  -- LEFT, null-pads when empty
 ```
 
-LATERAL semantics on bare subqueries (allowing the inner SELECT /
-WHERE to reference outer columns) is a separate subphase — it
-requires exposing `outer_scopes` to derived-table analysis. LATERAL
-here is purely syntactic: for JSON_TABLE the correlation machinery
-is always active; for subqueries AxiomDB's analyzer does not yet
-feed outer scope into derived SELECTs.
+When `lateral=true` is set on a `FromClause::Subquery`, the semantic analyzer
+(`analyzer_stmt.rs` for SELECT, `analyzer_ddl.rs` for UPDATE/DELETE) passes the
+accumulated `BindContext` as an outer scope to `analyze_select_with_outer`. This
+causes column references inside the subquery (e.g. `t.id`) to be resolved as
+`Expr::OuterColumn { col_idx, .. }` nodes instead of raising "column not found".
+
+At execution time (`select_joins_ctx.rs`), each join is classified as correlated
+or non-correlated:
+
+```rust
+let is_correlated = lateral
+    && subquery_is_correlated(&query, effective_left_cols);
+```
+
+where `effective_left_cols` accumulates columns from all materialized sources
+including earlier LATERAL subqueries in the same FROM (`lateral_accum_cols`).
+This enables chains like `FROM t, LATERAL (...) s1, LATERAL (... s1.a ...) s2`.
+
+**Correlated path**: the AST is stored in `correlated_sub[right_idx]`; schema
+is inferred from the SELECT list (aliases → fallback `colN`). In the combine
+loop, `apply_correlated_subquery_join` runs `substitute_outer(subquery, outer_row)`
++ `execute_select_ctx` once per outer row. LEFT JOIN null-pads when the subquery
+returns no rows. RIGHT/FULL LATERAL → `NotImplemented` (PG-compatible — re-scan
+semantics ill-defined).
+
+**Non-correlated LATERAL**: materialized once with empty scope, then used
+identically to a regular derived table — zero overhead vs a plain subquery.
+
+The same `apply_correlated_subquery_dml_join` function handles UPDATE/DELETE JOINs.
+`analyze_update`/`analyze_delete` were extended with the same outer-scope injection
+so that LATERAL subqueries in DML joins work identically to SELECT.
 
 ## Phase 11.20d2 — JSON_TABLE first FROM + CROSS/OUTER APPLY
 
