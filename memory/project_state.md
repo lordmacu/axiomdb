@@ -3,7 +3,7 @@
 ## Current (2026-04-13)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** 21.3b WITH RECURSIVE closed — parser absorbs `UNION [ALL] SELECT step` inside CTE paren; expand_ctes routes recursive CTEs through `recursive_dict` producing `FromClause::RecursiveCte`; executor `execute_select_recursive_cte_ctx` runs PG-style loop with per-iter step re-analysis (self-ref → Values substitution); MAX_RECURSION=1000 caps infinite loops; 7 tests pass. Next: 21.5 MERGE + PG ON CONFLICT, 21.5f GENERATED columns, 21.9 LATERAL joins.
+**Active subphase:** Phase 11.25 COMPLETE — 4/4 JSON SRF + aggregates closed (11.25a JSONB SRF, 11.25b JSON aggregates + constructors, 11.25c `jsonb_to_record`/`jsonb_to_recordset`, 11.25d construction helpers). Commit `63bf05b`. Next: 11.18c pending `TEXT[]`, then Phase 21.5 MERGE.
 
 ### Phase 11 subphase status
 
@@ -29,7 +29,7 @@
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
 | 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |
 | 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed — 11.24c dot-notation pending |
-| **11.25** JSON SRF + aggregates + construction helpers (PG streaming parity) | ⬜ scoped — 4 subfases 11.25a-d |
+| **11.25** JSON SRF + aggregates + construction helpers (PG streaming parity) | ✅ complete — 11.25a ✅ 11.25b ✅ 11.25c ✅ 11.25d ✅ |
 
 ### 11.20 follow-ups
 
