@@ -63,6 +63,8 @@ fn contains_aggregate(expr: &Expr) -> bool {
         // inside its clauses in this MVP (PG allows in DEFAULT but it is
         // pathological); treat as a leaf for aggregation analysis.
         Expr::SqlJsonQuery { .. } => false,
+        // GROUPING() is not an aggregate function — it reads a hidden mask column.
+        Expr::Grouping { .. } => false,
     }
 }
 
@@ -333,6 +335,10 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
+        // GROUPING() is not an aggregate; recurse into its args.
+        Expr::Grouping { args, .. } => {
+            for a in args { collect_agg_exprs_from(a, result); }
+        }
     }
 }
 

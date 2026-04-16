@@ -160,6 +160,12 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 collect_column_refs(e, mask);
             }
         }
+        // GROUPING() args may reference columns — recurse.
+        Expr::Grouping { args, .. } => {
+            for a in args {
+                collect_column_refs(a, mask);
+            }
+        }
     }
 }
 

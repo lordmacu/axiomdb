@@ -202,6 +202,10 @@ fn execute_select_ctx(
                         collect_expr_columns(el, mask);
                     }
                 }
+                // GROUPING() args may reference columns — recurse.
+                crate::expr::Expr::Grouping { args, .. } => {
+                    for a in args { collect_expr_columns(a, mask); }
+                }
                 // Subquery internals are not scanned — they run as separate queries.
                 crate::expr::Expr::Literal(_)
                 | crate::expr::Expr::Default

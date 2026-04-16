@@ -3568,6 +3568,68 @@ ok("[21.9 LATERAL] left join null-pads unmatched outer row",
    len(rows) == 3 and rows[2][1] is None,
    f"got {rows}")
 
+# ── Phase 21.21 — ROLLUP / CUBE / GROUPING SETS / GROUPING() ─────────────────
+
+print("\n[21.21 GROUPING SETS]")
+
+cur.execute("CREATE TABLE gs_wire (region VARCHAR(10), yr INT, amount INT)")
+cur.execute("INSERT INTO gs_wire VALUES ('N',2022,10),('N',2022,20),('N',2023,15),"
+            "('S',2022,5),('S',2023,25),('S',2023,10)")
+
+# ROLLUP(region): 2 region groups + 1 grand total = 3 rows
+cur.execute("SELECT region, SUM(amount) FROM gs_wire GROUP BY ROLLUP(region)")
+rows = cur.fetchall()
+ok("[21.21 ROLLUP single col] 3 rows",
+   len(rows) == 3,
+   f"got {rows}")
+grand = [r for r in rows if r[0] is None]
+ok("[21.21 ROLLUP single col] grand total = 85",
+   len(grand) == 1 and int(grand[0][1]) == 85,
+   f"grand row: {grand}")
+
+# ROLLUP(region, yr): 7 rows
+cur.execute("SELECT region, yr, SUM(amount) FROM gs_wire GROUP BY ROLLUP(region, yr)")
+rows = cur.fetchall()
+ok("[21.21 ROLLUP two cols] 7 rows",
+   len(rows) == 7,
+   f"got {len(rows)} rows: {rows}")
+
+# CUBE(region, yr): 9 rows
+cur.execute("SELECT region, yr, SUM(amount) FROM gs_wire GROUP BY CUBE(region, yr)")
+rows = cur.fetchall()
+ok("[21.21 CUBE two cols] 9 rows",
+   len(rows) == 9,
+   f"got {len(rows)} rows: {rows}")
+
+# GROUPING SETS explicit
+cur.execute("SELECT region, yr, SUM(amount) FROM gs_wire "
+            "GROUP BY GROUPING SETS((region, yr), (region), ())")
+rows = cur.fetchall()
+ok("[21.21 GROUPING SETS explicit] 7 rows",
+   len(rows) == 7,
+   f"got {rows}")
+
+# GROUPING() function: grand total = 1, detail rows = 0
+cur.execute("SELECT region, SUM(amount), GROUPING(region) FROM gs_wire "
+            "GROUP BY ROLLUP(region)")
+rows = cur.fetchall()
+grand = [r for r in rows if r[0] is None]
+detail = [r for r in rows if r[0] is not None]
+ok("[21.21 GROUPING() grand total = 1]",
+   len(grand) == 1 and int(grand[0][2]) == 1,
+   f"grand: {grand}")
+ok("[21.21 GROUPING() detail rows = 0]",
+   all(int(r[2]) == 0 for r in detail),
+   f"detail: {detail}")
+
+# HAVING GROUPING(region) = 1 -> only grand total
+cur.execute("SELECT region, SUM(amount) FROM gs_wire "
+            "GROUP BY ROLLUP(region) HAVING GROUPING(region) = 1")
+rows = cur.fetchall()
+ok("[21.21 HAVING GROUPING=1] 1 row (grand total only)",
+   len(rows) == 1 and rows[0][0] is None,
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

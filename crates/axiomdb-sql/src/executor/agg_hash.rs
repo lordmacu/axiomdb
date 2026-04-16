@@ -279,20 +279,12 @@ fn execute_select_grouped_rollup(
 
 /// Executes `GROUP BY ROLLUP(...) / CUBE(...) / GROUPING SETS(...)`.
 ///
-/// Algorithm:
-/// 1. For each grouping set `s` in `sets`:
-///    a. Build a sub-`SelectStmt` with `group_by = Simple(exprs_in_s)`.
-///    b. Run `execute_select_grouped_hash` (HAVING applied per-pass, SQL standard).
-///    c. Null-out SELECT positions for universe exprs **not** in `s`.
-///    d. Append a hidden `__grouping_mask__: Value::BigInt(mask)` to each row.
-///       Bit `i` is set when universe[i] is absent from this set.
-/// 2. Union all per-set rows.
-/// 3. Apply DISTINCT / ORDER BY (ORDER BY may reference GROUPING() which reads the mask).
-/// 4. Strip the hidden mask column.
-/// 5. Apply LIMIT / OFFSET.
-///
-/// The `__grouping_mask__` hidden column is always the **last** value in each row
-/// during steps 1–3. It is stripped before returning `QueryResult::Rows`.
+/// For each grouping set: builds a simple `SELECT … GROUP BY <set_exprs>`,
+/// runs the hash aggregator (HAVING applied per-pass per SQL standard), nulls
+/// out SELECT positions for universe exprs absent from the set, then appends
+/// a hidden `Value::BigInt(mask)` where bit `i` = 1 iff `universe[i]` is absent.
+/// All per-set rows are unioned, ORDER BY runs (GROUPING() can read the mask),
+/// the mask is stripped, then LIMIT / OFFSET are applied.
 fn execute_select_grouped_sets(
     stmt: SelectStmt,
     combined_rows: Vec<Row>,
@@ -346,6 +338,31 @@ fn execute_select_grouped_sets(
         other => return Ok(other),
     };
 
+    // If HAVING contains GROUPING() calls, the mask must be present when HAVING
+    // is evaluated. The mask is appended AFTER the hash executor runs, so we
+    // cannot pass such HAVING to the per-pass hash executor. Instead we strip
+    // HAVING from the per-pass stmt and apply it post-mask in the post-union step.
+    let having_has_grouping = stmt
+        .having
+        .as_ref()
+        .map(expr_contains_grouping)
+        .unwrap_or(false);
+
+    // Precompute: which SELECT output positions hold a GROUPING() expression?
+    // These positions are filled with 0 by the hash executor (no mask yet).
+    // After mask injection we re-evaluate them with the real mask.
+    let grouping_select_slots: Vec<(usize, Expr)> = stmt
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, item)| match item {
+            SelectItem::Expr { expr, .. } if expr_contains_grouping(expr) => {
+                Some((pos, expr.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
     // Run one pass per grouping set.
     let mut all_rows: Vec<Row> = Vec::new();
 
@@ -363,6 +380,10 @@ fn execute_select_grouped_sets(
         pass_stmt.distinct = false;
         pass_stmt.calc_found_rows = false;
         // HAVING intentionally kept — applied per-pass (SQL standard semantics).
+        // Exception: if HAVING references GROUPING(), defer it to post-mask step.
+        if having_has_grouping {
+            pass_stmt.having = None;
+        }
 
         let pass_rows = match execute_select_grouped_hash(pass_stmt, combined_rows.clone())? {
             QueryResult::Rows { rows, .. } => rows,
@@ -391,8 +412,34 @@ fn execute_select_grouped_sets(
                 }
             }
             row.push(Value::BigInt(mask as i64));
+            // Re-evaluate GROUPING() SELECT slots now that the mask is present.
+            for (pos, grouping_expr) in &grouping_select_slots {
+                if *pos < row.len() - 1 {
+                    // row.last() is the mask; eval reads it directly.
+                    if let Ok(v) = crate::eval::eval(grouping_expr, row) {
+                        row[*pos] = v;
+                    }
+                    // on error: leave as 0
+                }
+            }
         }
         all_rows.extend(pass_rows);
+    }
+
+    // Post-mask HAVING filter: apply when HAVING contains GROUPING() and was
+    // deferred from per-pass execution.  The hidden mask is still in row.last().
+    if having_has_grouping {
+        if let Some(ref having_expr) = stmt.having {
+            let mut filtered = Vec::with_capacity(all_rows.len());
+            for row in all_rows {
+                match crate::eval::eval(having_expr, &row) {
+                    Ok(v) if crate::eval::is_truthy(&v) => filtered.push(row),
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            all_rows = filtered;
+        }
     }
 
     // Post-union operations: DISTINCT, ORDER BY (may reference GROUPING()), LIMIT/OFFSET.
@@ -619,4 +666,43 @@ fn build_virtual_row(
         }
     }
     vrow
+}
+
+/// Returns `true` if `expr` or any sub-expression is `Expr::Grouping`.
+///
+/// Used to detect whether a HAVING clause references GROUPING(), in which case
+/// evaluation must be deferred until after the hidden mask column is appended.
+fn expr_contains_grouping(expr: &Expr) -> bool {
+    match expr {
+        Expr::Grouping { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_grouping(left) || expr_contains_grouping(right)
+        }
+        Expr::UnaryOp { operand, .. } => expr_contains_grouping(operand),
+        Expr::IsNull { expr, .. } | Expr::IsBoolean { expr, .. } => expr_contains_grouping(expr),
+        Expr::Between { expr, low, high, .. } => {
+            expr_contains_grouping(expr)
+                || expr_contains_grouping(low)
+                || expr_contains_grouping(high)
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            expr_contains_grouping(expr)
+                || expr_contains_grouping(pattern)
+                || escape.as_ref().map(|e| expr_contains_grouping(e)).unwrap_or(false)
+        }
+        Expr::In { expr, list, .. } => {
+            expr_contains_grouping(expr) || list.iter().any(expr_contains_grouping)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_grouping),
+        Expr::Case { operand, when_thens, else_result } => {
+            operand.as_ref().map(|e| expr_contains_grouping(e)).unwrap_or(false)
+                || when_thens.iter().any(|(w, t)| expr_contains_grouping(w) || expr_contains_grouping(t))
+                || else_result.as_ref().map(|e| expr_contains_grouping(e)).unwrap_or(false)
+        }
+        Expr::Cast { expr, .. } => expr_contains_grouping(expr),
+        Expr::GroupConcat { expr, order_by, .. } => {
+            expr_contains_grouping(expr) || order_by.iter().any(|(e, _)| expr_contains_grouping(e))
+        }
+        _ => false,
+    }
 }

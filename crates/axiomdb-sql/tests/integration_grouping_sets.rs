@@ -63,7 +63,10 @@ fn test_parse_rollup_accepted() {
     // Just check it parses without error (executor returns NotImplemented for now)
     let res = run_ctx(
         "SELECT region, yr, SUM(amount) FROM gs_sales GROUP BY ROLLUP(region, yr)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     // NotImplemented is acceptable in Step 2; what matters is no ParseError
     match res {
@@ -83,7 +86,10 @@ fn test_parse_cube_accepted() {
     let (mut s, mut t, mut b, mut c) = setup();
     let res = run_ctx(
         "SELECT region, yr, SUM(amount) FROM gs_sales GROUP BY CUBE(region, yr)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     match res {
         Err(e) => {
@@ -100,7 +106,10 @@ fn test_parse_grouping_sets_accepted() {
     let res = run_ctx(
         "SELECT region, yr, SUM(amount) FROM gs_sales \
          GROUP BY GROUPING SETS((region, yr), (region), ())",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     match res {
         Err(e) => {
@@ -117,7 +126,10 @@ fn test_parse_mixed_plain_and_rollup() {
     // GROUP BY a, ROLLUP(b) — cross-product → 2 sets: {a,b} and {a}
     let res = run_ctx(
         "SELECT region, yr, SUM(amount) FROM gs_sales GROUP BY region, ROLLUP(yr)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     match res {
         Err(e) => {
@@ -134,16 +146,32 @@ fn test_mysql_with_rollup_still_works_regression() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales GROUP BY region WITH ROLLUP",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // 2 region groups + 1 grand total = 3 rows
-    assert_eq!(r.len(), 3, "expected 3 rows (2 groups + grand total), got {:?}", r);
+    assert_eq!(
+        r.len(),
+        3,
+        "expected 3 rows (2 groups + grand total), got {:?}",
+        r
+    );
     // Grand total row has NULL region
     let grand_total = r.iter().find(|row| row[0] == Value::Null);
-    assert!(grand_total.is_some(), "missing grand total row with NULL region");
+    assert!(
+        grand_total.is_some(),
+        "missing grand total row with NULL region"
+    );
     let total_sum = grand_total.unwrap()[1].clone();
-    assert_eq!(total_sum, Value::Int(85), "grand total SUM should be 85, got {:?}", total_sum);
+    assert_eq!(
+        total_sum,
+        Value::Int(85),
+        "grand total SUM should be 85, got {:?}",
+        total_sum
+    );
 }
 
 // ── Step 3 tests: executor results ──────────────────────────────────────────
@@ -162,9 +190,16 @@ fn test_rollup_two_columns() {
     // ('N', 2022, 30), ('N', 2023, 15), ('N', NULL, 45),   -- N subtotals
     // ('S', 2022, 5),  ('S', 2023, 35), ('S', NULL, 40),   -- S subtotals
     // (NULL, NULL, 85)                                       -- grand total
-    assert_eq!(r.len(), 7, "ROLLUP(region, yr) should produce 7 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        7,
+        "ROLLUP(region, yr) should produce 7 rows, got {:?}",
+        r
+    );
     // Verify grand total
-    let grand = r.iter().find(|row| row[0] == Value::Null && row[1] == Value::Null);
+    let grand = r
+        .iter()
+        .find(|row| row[0] == Value::Null && row[1] == Value::Null);
     assert!(grand.is_some(), "missing grand total row");
     assert_eq!(grand.unwrap()[2], Value::Int(85));
 }
@@ -174,11 +209,19 @@ fn test_rollup_single_column() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales GROUP BY ROLLUP(region)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // {N: 45}, {S: 40}, grand-total {NULL: 85} = 3 rows
-    assert_eq!(r.len(), 3, "ROLLUP(region) should produce 3 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        3,
+        "ROLLUP(region) should produce 3 rows, got {:?}",
+        r
+    );
     let grand = r.iter().find(|row| row[0] == Value::Null);
     assert!(grand.is_some());
     assert_eq!(grand.unwrap()[1], Value::Int(85));
@@ -189,7 +232,10 @@ fn test_cube_two_columns() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, yr, SUM(amount) FROM gs_sales GROUP BY CUBE(region, yr)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // CUBE(region, yr): 4 sets: {region,yr}, {region}, {yr}, {}
@@ -198,7 +244,12 @@ fn test_cube_two_columns() {
     // {yr}: 2 rows (2022, 2023)
     // {}: 1 row (grand total)
     // Total: 4+2+2+1 = 9 rows
-    assert_eq!(r.len(), 9, "CUBE(region, yr) should produce 9 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        9,
+        "CUBE(region, yr) should produce 9 rows, got {:?}",
+        r
+    );
 }
 
 #[test]
@@ -207,11 +258,19 @@ fn test_grouping_sets_explicit() {
     let result = run(
         "SELECT region, yr, SUM(amount) FROM gs_sales \
          GROUP BY GROUPING SETS((region, yr), (region), ())",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // (region,yr): 4 rows; (region): 2 rows; (): 1 row = 7 total
-    assert_eq!(r.len(), 7, "GROUPING SETS((region,yr),(region),()) should give 7 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        7,
+        "GROUPING SETS((region,yr),(region),()) should give 7 rows, got {:?}",
+        r
+    );
 }
 
 #[test]
@@ -219,13 +278,20 @@ fn test_grand_total_row_nulls() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales GROUP BY ROLLUP(region)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // Grand total row has NULL in all group keys
     let grand = r.iter().find(|row| row[0] == Value::Null);
     assert!(grand.is_some(), "no grand total row");
-    assert_eq!(grand.unwrap()[1], Value::Int(85), "grand total should be 85");
+    assert_eq!(
+        grand.unwrap()[1],
+        Value::Int(85),
+        "grand total should be 85"
+    );
 }
 
 #[test]
@@ -235,11 +301,19 @@ fn test_having_per_pass() {
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales \
          GROUP BY ROLLUP(region) HAVING SUM(amount) > 40",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // N: 45 (passes), S: 40 (fails), grand: 85 (passes) → 2 rows
-    assert_eq!(r.len(), 2, "HAVING SUM > 40 should give 2 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        2,
+        "HAVING SUM > 40 should give 2 rows, got {:?}",
+        r
+    );
 }
 
 #[test]
@@ -249,11 +323,19 @@ fn test_mixed_plain_and_rollup_cross_product() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, yr, SUM(amount) FROM gs_sales GROUP BY region, ROLLUP(yr)",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // {region,yr}: 4 rows; {region}: 2 rows = 6 total (no grand total — region is always present)
-    assert_eq!(r.len(), 6, "GROUP BY region, ROLLUP(yr) should give 6 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        6,
+        "GROUP BY region, ROLLUP(yr) should give 6 rows, got {:?}",
+        r
+    );
 }
 
 #[test]
@@ -261,17 +343,27 @@ fn test_order_by_post_union() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales GROUP BY ROLLUP(region) ORDER BY SUM(amount) ASC",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     assert_eq!(r.len(), 3);
     // S=40, N=45, grand=85 — in ascending order of SUM
-    let sums: Vec<i64> = r.iter().map(|row| match &row[1] {
-        Value::Int(n) => *n as i64,
-        Value::BigInt(n) => *n,
-        other => panic!("unexpected value: {:?}", other),
-    }).collect();
-    assert!(sums.windows(2).all(|w| w[0] <= w[1]), "should be sorted ASC: {:?}", sums);
+    let sums: Vec<i64> = r
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Int(n) => *n as i64,
+            Value::BigInt(n) => *n,
+            other => panic!("unexpected value: {:?}", other),
+        })
+        .collect();
+    assert!(
+        sums.windows(2).all(|w| w[0] <= w[1]),
+        "should be sorted ASC: {:?}",
+        sums
+    );
 }
 
 #[test]
@@ -279,7 +371,10 @@ fn test_limit_post_union() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales GROUP BY ROLLUP(region) LIMIT 2",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     assert_eq!(r.len(), 2, "LIMIT 2 should give 2 rows, got {:?}", r);
@@ -291,11 +386,19 @@ fn test_grouping_sets_duplicate_sets() {
     let (mut s, mut t, mut b, mut c) = setup();
     let result = run(
         "SELECT region, SUM(amount) FROM gs_sales GROUP BY GROUPING SETS((region),(region))",
-        &mut s, &mut t, &mut b, &mut c,
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
     );
     let r = rows(result);
     // 2 region groups × 2 sets = 4 rows (SQL standard: duplicate sets produce duplicate rows)
-    assert_eq!(r.len(), 4, "duplicate sets should produce 4 rows, got {:?}", r);
+    assert_eq!(
+        r.len(),
+        4,
+        "duplicate sets should produce 4 rows, got {:?}",
+        r
+    );
 }
 
 #[test]
@@ -305,19 +408,175 @@ fn test_real_null_not_confused() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
     run_ctx(
         "CREATE TABLE t_null_grp (a INT, v INT)",
-        &mut storage, &mut txn, &mut bloom, &mut ctx,
-    ).unwrap();
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
     run_ctx(
         "INSERT INTO t_null_grp VALUES (NULL, 5), (NULL, 10), (1, 20)",
-        &mut storage, &mut txn, &mut bloom, &mut ctx,
-    ).unwrap();
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
     let result = run(
         "SELECT a, SUM(v) FROM t_null_grp GROUP BY ROLLUP(a)",
-        &mut storage, &mut txn, &mut bloom, &mut ctx,
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
     );
     let r = rows(result);
     // {a}: NULL group (15) + group 1 (20) = 2 rows
     // grand total: 35
     // Total: 3 rows
     assert_eq!(r.len(), 3, "should have 3 rows, got {:?}", r);
+}
+
+// ── Step 4 tests: GROUPING() function ────────────────────────────────────────
+
+#[test]
+fn test_grouping_single_arg() {
+    // GROUPING(region) = 1 for grand total row, 0 for detail rows.
+    let (mut s, mut t, mut b, mut c) = setup();
+    let result = run(
+        "SELECT region, SUM(amount), GROUPING(region) FROM gs_sales GROUP BY ROLLUP(region)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let r = rows(result);
+    // 3 rows: N, S, grand total
+    assert_eq!(r.len(), 3, "expected 3 rows, got {:?}", r);
+    // Grand total row: region=NULL, GROUPING(region)=1
+    let grand = r
+        .iter()
+        .find(|row| row[0] == Value::Null)
+        .expect("no grand total");
+    assert_eq!(
+        grand[2],
+        Value::Int(1),
+        "GROUPING(region) should be 1 for grand total, got {:?}",
+        grand[2]
+    );
+    // Detail rows: GROUPING(region) = 0
+    for row in r.iter().filter(|row| row[0] != Value::Null) {
+        assert_eq!(
+            row[2],
+            Value::Int(0),
+            "GROUPING(region) should be 0 for detail row, got {:?}",
+            row[2]
+        );
+    }
+}
+
+#[test]
+fn test_grouping_two_args_bitmask() {
+    // GROUPING(region, yr): MSB=region, LSB=yr.
+    // Grand total ({}) → GROUPING=3 (both rolled up).
+    // Region subtotal ({region}) → yr rolled up → GROUPING=1.
+    // Detail ({region,yr}) → GROUPING=0.
+    let (mut s, mut t, mut b, mut c) = setup();
+    let result = run(
+        "SELECT region, yr, SUM(amount), GROUPING(region, yr) \
+         FROM gs_sales GROUP BY ROLLUP(region, yr)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let r = rows(result);
+    assert_eq!(r.len(), 7, "expected 7 rows, got {:?}", r);
+    // Grand total: both NULL → GROUPING = 3
+    let grand = r
+        .iter()
+        .find(|row| row[0] == Value::Null && row[1] == Value::Null)
+        .expect("no grand total row");
+    assert_eq!(
+        grand[3],
+        Value::Int(3),
+        "grand total GROUPING(region,yr) should be 3, got {:?}",
+        grand[3]
+    );
+    // Region subtotals: region present, yr NULL → GROUPING = 1
+    let region_subtotals: Vec<_> = r
+        .iter()
+        .filter(|row| row[0] != Value::Null && row[1] == Value::Null)
+        .collect();
+    assert_eq!(region_subtotals.len(), 2, "expected 2 region subtotals");
+    for row in &region_subtotals {
+        assert_eq!(
+            row[3],
+            Value::Int(1),
+            "region subtotal GROUPING should be 1, got {:?}",
+            row[3]
+        );
+    }
+    // Detail rows: both present → GROUPING = 0
+    let details: Vec<_> = r
+        .iter()
+        .filter(|row| row[0] != Value::Null && row[1] != Value::Null)
+        .collect();
+    assert_eq!(details.len(), 4, "expected 4 detail rows");
+    for row in &details {
+        assert_eq!(
+            row[3],
+            Value::Int(0),
+            "detail GROUPING should be 0, got {:?}",
+            row[3]
+        );
+    }
+}
+
+#[test]
+fn test_order_by_grouping() {
+    // ORDER BY GROUPING(region) DESC puts grand total last.
+    let (mut s, mut t, mut b, mut c) = setup();
+    let result = run(
+        "SELECT region, SUM(amount), GROUPING(region) FROM gs_sales \
+         GROUP BY ROLLUP(region) ORDER BY GROUPING(region) ASC",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let r = rows(result);
+    assert_eq!(r.len(), 3);
+    // With ASC, grand total (GROUPING=1) should be last.
+    assert_eq!(
+        r.last().unwrap()[2],
+        Value::Int(1),
+        "last row should have GROUPING=1 (grand total), got {:?}",
+        r.last().unwrap()[2]
+    );
+    // First two rows should have GROUPING=0.
+    assert_eq!(r[0][2], Value::Int(0));
+    assert_eq!(r[1][2], Value::Int(0));
+}
+
+#[test]
+fn test_having_grouping_filter() {
+    // HAVING GROUPING(region) = 1 → only grand total row.
+    let (mut s, mut t, mut b, mut c) = setup();
+    let result = run(
+        "SELECT region, SUM(amount) FROM gs_sales \
+         GROUP BY ROLLUP(region) HAVING GROUPING(region) = 1",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut c,
+    );
+    let r = rows(result);
+    assert_eq!(
+        r.len(),
+        1,
+        "HAVING GROUPING=1 should give 1 row (grand total), got {:?}",
+        r
+    );
+    assert_eq!(r[0][0], Value::Null, "grand total region should be NULL");
+    assert_eq!(r[0][1], Value::Int(85), "grand total sum should be 85");
 }

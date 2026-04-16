@@ -466,6 +466,23 @@ fn analyze_select_with_outer(
     }
     s.columns = resolved_cols;
 
+    // Post-pass: populate universe_indices on every GROUPING() call in HAVING,
+    // SELECT list, and ORDER BY — all resolved now.
+    if let GroupByClause::Sets { ref universe, .. } = s.group_by {
+        let universe_snapshot: Vec<Expr> = universe.clone();
+        if let Some(ref mut having_expr) = s.having {
+            populate_grouping_indices(having_expr, &universe_snapshot);
+        }
+        for item in s.columns.iter_mut() {
+            if let SelectItem::Expr { ref mut expr, .. } = item {
+                populate_grouping_indices(expr, &universe_snapshot);
+            }
+        }
+        for ob in s.order_by.iter_mut() {
+            populate_grouping_indices(&mut ob.expr, &universe_snapshot);
+        }
+    }
+
     // 4.12c: DISTINCT + non-selected ORDER BY → MySQL error 3065.
     // `SELECT DISTINCT a FROM t ORDER BY b` is invalid when b is not derived
     // from any expression in the SELECT list, because DISTINCT deduplications
@@ -517,6 +534,77 @@ fn expr_column_idx(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Column { col_idx, .. } => Some(*col_idx),
         _ => None,
+    }
+}
+
+/// Recursively walks `expr` and fills in `universe_indices` on every
+/// `Expr::Grouping` node by matching each argument against the `universe`
+/// list from `GroupByClause::Sets`.
+///
+/// An argument that is not found in the universe gets index `usize::MAX`
+/// (will be treated as never-rolled-up = returns 0 for that bit).
+fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
+    match expr {
+        Expr::Grouping { args, universe_indices } => {
+            let indices: Vec<usize> = args
+                .iter()
+                .map(|arg| universe.iter().position(|u| u == arg).unwrap_or(usize::MAX))
+                .collect();
+            *universe_indices = Some(indices);
+            // Recurse into args (GROUPING inside GROUPING is unusual but valid).
+            for a in args.iter_mut() {
+                populate_grouping_indices(a, universe);
+            }
+        }
+        // Recurse into all compound variants.
+        Expr::BinaryOp { left, right, .. } => {
+            populate_grouping_indices(left, universe);
+            populate_grouping_indices(right, universe);
+        }
+        Expr::UnaryOp { operand, .. } => populate_grouping_indices(operand, universe),
+        Expr::IsNull { expr, .. } => populate_grouping_indices(expr, universe),
+        Expr::IsBoolean { expr, .. } => populate_grouping_indices(expr, universe),
+        Expr::Between { expr, low, high, .. } => {
+            populate_grouping_indices(expr, universe);
+            populate_grouping_indices(low, universe);
+            populate_grouping_indices(high, universe);
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            populate_grouping_indices(expr, universe);
+            populate_grouping_indices(pattern, universe);
+            if let Some(e) = escape { populate_grouping_indices(e, universe); }
+        }
+        Expr::In { expr, list, .. } => {
+            populate_grouping_indices(expr, universe);
+            for e in list { populate_grouping_indices(e, universe); }
+        }
+        Expr::Function { args, .. } => {
+            for a in args { populate_grouping_indices(a, universe); }
+        }
+        Expr::Case { operand, when_thens, else_result } => {
+            if let Some(op) = operand { populate_grouping_indices(op, universe); }
+            for (w, t) in when_thens {
+                populate_grouping_indices(w, universe);
+                populate_grouping_indices(t, universe);
+            }
+            if let Some(e) = else_result { populate_grouping_indices(e, universe); }
+        }
+        Expr::Cast { expr, .. } => populate_grouping_indices(expr, universe),
+        Expr::GroupConcat { expr, order_by, .. } => {
+            populate_grouping_indices(expr, universe);
+            for (e, _) in order_by { populate_grouping_indices(e, universe); }
+        }
+        // Leaf nodes — nothing to recurse into.
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::Default
+        | Expr::Param { .. }
+        | Expr::SqlJsonQuery { .. }
+        | Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. } => {}
     }
 }
 

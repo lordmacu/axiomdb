@@ -258,6 +258,41 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         Expr::GroupConcat { .. } => Err(DbError::InvalidValue {
             reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
         }),
+
+        // GROUPING(expr, ...) — returns a bitmask.
+        // The hidden `__grouping_mask__` column is appended as the last element
+        // of the row by `execute_select_grouped_sets`. Bit i of the mask is set
+        // when universe[i] is absent from the current grouping set.
+        // We compute the result as: for each arg j, check if universe_indices[j]
+        // is set in the mask; if so, set bit (n-1-j) in the result (MSB = leftmost).
+        Expr::Grouping {
+            universe_indices, ..
+        } => {
+            let mask = match row.last() {
+                Some(Value::BigInt(m)) => *m as u64,
+                // Outside a GROUPING SETS pass (no hidden mask) → return 0.
+                _ => 0u64,
+            };
+            let result = match universe_indices {
+                None => 0i32,
+                Some(indices) => {
+                    let n = indices.len();
+                    let mut bits = 0i32;
+                    for (j, &ui) in indices.iter().enumerate() {
+                        if ui == usize::MAX {
+                            // Arg not in universe → never rolled up → bit stays 0.
+                            continue;
+                        }
+                        if ui < 64 && (mask >> ui) & 1 == 1 {
+                            // Bit n-1-j (MSB = leftmost arg). Max 31 args → fits i32.
+                            bits |= 1i32 << (n - 1 - j);
+                        }
+                    }
+                    bits
+                }
+            };
+            Ok(Value::Int(result))
+        }
     }
 }
 
@@ -636,6 +671,33 @@ pub fn eval_with<R: SubqueryRunner>(
         Expr::GroupConcat { .. } => Err(DbError::InvalidValue {
             reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
         }),
+
+        // GROUPING — same as scalar eval path; sq is unused here.
+        Expr::Grouping {
+            universe_indices, ..
+        } => {
+            let mask = match row.last() {
+                Some(Value::BigInt(m)) => *m as u64,
+                _ => 0u64,
+            };
+            let result = match universe_indices {
+                None => 0i32,
+                Some(indices) => {
+                    let n = indices.len();
+                    let mut bits = 0i32;
+                    for (j, &ui) in indices.iter().enumerate() {
+                        if ui == usize::MAX {
+                            continue;
+                        }
+                        if ui < 64 && (mask >> ui) & 1 == 1 {
+                            bits |= 1i32 << (n - 1 - j);
+                        }
+                    }
+                    bits
+                }
+            };
+            Ok(Value::Int(result))
+        }
     }
 }
 

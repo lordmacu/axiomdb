@@ -268,6 +268,27 @@ pub enum Expr {
         /// String placed between consecutive values. Default: `","`.
         separator: String,
     },
+
+    // ── GROUPING SETS function (Phase 21.21) ──────────────────────────────────
+    /// SQL standard `GROUPING(expr, ...)`.
+    ///
+    /// Returns a bitmask indicating which arguments are "rolled up" (NULLed by the
+    /// current grouping set). Bit `n-1-i` corresponds to `args[i]` (leftmost = MSB,
+    /// PostgreSQL-compatible).
+    ///
+    /// - `args`: raw argument expressions (set by the parser).
+    /// - `universe_indices`: resolved by the analyzer from the current query's
+    ///   `GroupByClause::Sets.universe`. `None` if outside a
+    ///   GROUPING SETS context (evaluates to 0).
+    ///
+    /// At eval time, the last element of the current row is the hidden
+    /// `__grouping_mask__` (a `Value::BigInt`). The evaluator reads it and
+    /// computes the bitmask over `universe_indices`.
+    Grouping {
+        args: Vec<Expr>,
+        /// Populated by the analyzer. `None` = pre-analysis or outside Sets context.
+        universe_indices: Option<Vec<usize>>,
+    },
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────

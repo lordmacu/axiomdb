@@ -177,7 +177,8 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::Param { .. }
         | Expr::Case { .. }
         | Expr::Cast { .. }
-        | Expr::GroupConcat { .. } => Err(DbError::NotImplemented {
+        | Expr::GroupConcat { .. }
+        | Expr::Grouping { .. } => Err(DbError::NotImplemented {
             feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate)"
                 .into(),
         }),

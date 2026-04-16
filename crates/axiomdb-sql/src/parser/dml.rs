@@ -758,14 +758,6 @@ fn parse_limit_offset(p: &mut Parser) -> Result<(Option<Expr>, Option<Expr>), Db
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-fn parse_expr_list(p: &mut Parser) -> Result<Vec<Expr>, DbError> {
-    let mut exprs = vec![parse_expr(p)?];
-    while p.eat(&Token::Comma) {
-        exprs.push(parse_expr(p)?);
-    }
-    Ok(exprs)
-}
-
 /// Parse a single argument to `CALL proc(arg1, arg2, ...)`.
 /// Exposed as `pub(crate)` for use by the top-level parser dispatch.
 pub(crate) fn parse_call_arg(p: &mut Parser) -> Result<Expr, DbError> {
@@ -811,11 +803,13 @@ fn parse_grouping_arg_list(
     loop {
         if p.peek() == &Token::LParen {
             p.advance(); // consume '('
-            // Tuple of exprs — add each as a separate universe slot.
+                         // Tuple of exprs — add each as a separate universe slot.
             loop {
                 let e = parse_expr(p)?;
                 items.push(grouping_intern(universe, e));
-                if p.peek() == &Token::RParen { break; }
+                if p.peek() == &Token::RParen {
+                    break;
+                }
                 p.expect(&Token::Comma)?;
             }
             p.expect(&Token::RParen)?;
@@ -823,10 +817,14 @@ fn parse_grouping_arg_list(
             let e = parse_expr(p)?;
             items.push(grouping_intern(universe, e));
         }
-        if p.peek() != &Token::Comma { break; }
+        if p.peek() != &Token::Comma {
+            break;
+        }
         p.advance(); // consume ','
-        // Stop if we see the closing ')' of the outer ROLLUP/CUBE call.
-        if p.peek() == &Token::RParen { break; }
+                     // Stop if we see the closing ')' of the outer ROLLUP/CUBE call.
+        if p.peek() == &Token::RParen {
+            break;
+        }
     }
     Ok(items)
 }
@@ -868,18 +866,25 @@ fn parse_grouping_sets_content(
                 return Err(DbError::ParseError {
                     message: format!(
                         "CUBE with {} dimensions would produce {} sets (maximum is 65536)",
-                        n, 1usize << n
+                        n,
+                        1usize << n
                     ),
                     position: Some(p.current_pos()),
                 });
             }
             let total = 1usize << n;
             let mut cube_sets: Vec<Vec<usize>> = (0..total)
-                .map(|mask| (0..n).filter(|&i| (mask >> i) & 1 == 1).map(|i| items[i]).collect())
+                .map(|mask| {
+                    (0..n)
+                        .filter(|&i| (mask >> i) & 1 == 1)
+                        .map(|i| items[i])
+                        .collect()
+                })
                 .collect();
             cube_sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
             sets.extend(cube_sets);
-        } else if peek_ident_ci_at(p, 0, "GROUPING") && peek_ident_ci_at(p, 1, "SETS")
+        } else if peek_ident_ci_at(p, 0, "GROUPING")
+            && peek_ident_ci_at(p, 1, "SETS")
             && p.peek_at(2) == &Token::LParen
         {
             // Nested GROUPING SETS — flatten by appending its sets directly.
@@ -901,7 +906,9 @@ fn parse_grouping_sets_content(
                 loop {
                     let e = parse_expr(p)?;
                     set_items.push(grouping_intern(universe, e));
-                    if p.peek() == &Token::RParen { break; }
+                    if p.peek() == &Token::RParen {
+                        break;
+                    }
                     p.expect(&Token::Comma)?;
                 }
                 p.expect(&Token::RParen)?;
@@ -914,10 +921,14 @@ fn parse_grouping_sets_content(
             sets.push(vec![idx]);
         }
 
-        if p.peek() != &Token::Comma { break; }
+        if p.peek() != &Token::Comma {
+            break;
+        }
         p.advance(); // consume ','
-        // Stop if we've hit the closing ')' of the outer GROUPING SETS call
-        if p.peek() == &Token::RParen { break; }
+                     // Stop if we've hit the closing ')' of the outer GROUPING SETS call
+        if p.peek() == &Token::RParen {
+            break;
+        }
     }
     Ok(sets)
 }
@@ -975,14 +986,20 @@ fn parse_group_by_items(p: &mut Parser) -> Result<GroupByClause, DbError> {
                 return Err(DbError::ParseError {
                     message: format!(
                         "CUBE with {} dimensions would produce {} sets (maximum is 65536)",
-                        n, 1usize << n
+                        n,
+                        1usize << n
                     ),
                     position: Some(p.current_pos()),
                 });
             }
             let total = 1usize << n;
             let mut cube_sets: Vec<Vec<usize>> = (0..total)
-                .map(|mask| (0..n).filter(|&i| (mask >> i) & 1 == 1).map(|i| items[i]).collect())
+                .map(|mask| {
+                    (0..n)
+                        .filter(|&i| (mask >> i) & 1 == 1)
+                        .map(|i| items[i])
+                        .collect()
+                })
                 .collect();
             cube_sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
             item_sets.push(cube_sets);
@@ -1019,9 +1036,7 @@ fn parse_group_by_items(p: &mut Parser) -> Result<GroupByClause, DbError> {
 
     if !has_special {
         // Check for MySQL-style WITH ROLLUP.
-        if matches!(p.peek(), Token::With)
-            && peek_ident_ci_at(p, 1, "rollup")
-        {
+        if matches!(p.peek(), Token::With) && peek_ident_ci_at(p, 1, "rollup") {
             p.advance(); // WITH
             p.advance(); // ROLLUP
             return Ok(GroupByClause::WithRollup(universe));
@@ -1051,15 +1066,15 @@ fn parse_group_by_items(p: &mut Parser) -> Result<GroupByClause, DbError> {
     let total_sets = result.len();
     if total_sets > 65535 {
         return Err(DbError::ParseError {
-            message: format!(
-                "Grouping set count {} exceeds maximum 65535",
-                total_sets
-            ),
+            message: format!("Grouping set count {} exceeds maximum 65535", total_sets),
             position: Some(p.current_pos()),
         });
     }
 
-    Ok(GroupByClause::Sets { universe, sets: result })
+    Ok(GroupByClause::Sets {
+        universe,
+        sets: result,
+    })
 }
 
 /// Parse the expression after `DO`.
