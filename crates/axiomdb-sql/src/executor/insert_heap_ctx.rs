@@ -124,6 +124,8 @@ fn execute_insert_ctx(
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
+    let compiled_index_exprs =
+        crate::partial_index::compile_index_exprs(&secondary_indexes, schema_cols)?;
     let ignore = stmt.ignore;
     let replace_mode = stmt.replace;
     // Pre-resolve the ODKU assignment list once so the per-row loop only
@@ -311,6 +313,7 @@ fn execute_insert_ctx(
                             storage,
                             bloom,
                             &compiled_preds,
+                            &compiled_index_exprs,
                             snap,
                             Some(txn),
                             Some(conn_txn),
@@ -364,6 +367,7 @@ fn execute_insert_ctx(
                         indexes: &mut secondary_indexes,
                         rows: &full_batch,
                         compiled_preds: &compiled_preds,
+                        compiled_index_exprs: &compiled_index_exprs,
                         skip_unique_check: false,
                         committed_empty: &committed_empty,
                     },
@@ -476,8 +480,14 @@ fn execute_insert_ctx(
                             }
                         }
                         let rid = match TableEngine::insert_row_with_ctx(
-                            storage, txn, &resolved.def, schema_cols, ctx, conn_txn,
-                            full_values.clone(), row_idx + 1,
+                            storage,
+                            txn,
+                            &resolved.def,
+                            schema_cols,
+                            ctx,
+                            conn_txn,
+                            full_values.clone(),
+                            row_idx + 1,
                         ) {
                             Ok(rid) => rid,
                             Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
@@ -486,20 +496,37 @@ fn execute_insert_ctx(
                         if !secondary_indexes.is_empty() {
                             let snap = txn.active_snapshot(&*conn_txn);
                             match crate::index_maintenance::insert_into_indexes_with_undo(
-                                &secondary_indexes, &full_values, rid, storage, bloom,
-                                &compiled_preds, snap, Some(txn), Some(conn_txn),
+                                &secondary_indexes,
+                                &full_values,
+                                rid,
+                                storage,
+                                bloom,
+                                &compiled_preds,
+                                &compiled_index_exprs,
+                                snap,
+                                Some(txn),
+                                Some(conn_txn),
                             ) {
                                 Ok(updated) => {
                                     for (index_id, new_root) in updated {
                                         CatalogWriter::new(storage, txn, conn_txn)?
                                             .update_index_root(index_id, new_root)?;
-                                        if let Some(idx) = secondary_indexes.iter_mut().find(|i| i.index_id == index_id) {
+                                        if let Some(idx) = secondary_indexes
+                                            .iter_mut()
+                                            .find(|i| i.index_id == index_id)
+                                        {
                                             idx.root_page_id = new_root;
                                         }
                                     }
                                 }
                                 Err(e) if ignore && is_ignorable_insert_error(&e) => {
-                                    TableEngine::delete_row(storage, txn, conn_txn, &resolved.def, rid)?;
+                                    TableEngine::delete_row(
+                                        storage,
+                                        txn,
+                                        conn_txn,
+                                        &resolved.def,
+                                        rid,
+                                    )?;
                                     continue;
                                 }
                                 Err(e) => return Err(e),
@@ -518,13 +545,18 @@ fn execute_insert_ctx(
                     let committed_empty = std::collections::HashSet::new();
                     let n = full_batch.len() as u64;
                     apply_insert_batch_with_ctx(
-                        storage, txn, bloom, ctx, conn_txn,
+                        storage,
+                        txn,
+                        bloom,
+                        ctx,
+                        conn_txn,
                         InsertBatchApply {
                             table_def: &resolved.def,
                             columns: schema_cols,
                             indexes: &mut secondary_indexes,
                             rows: &full_batch,
                             compiled_preds: &compiled_preds,
+                            compiled_index_exprs: &compiled_index_exprs,
                             skip_unique_check: false,
                             committed_empty: &committed_empty,
                         },
@@ -638,6 +670,7 @@ fn execute_insert_ctx(
                     storage,
                     bloom,
                     &compiled_preds,
+                    &compiled_index_exprs,
                     snap,
                     Some(txn),
                     Some(conn_txn),

@@ -65,11 +65,8 @@ fn execute_update(
     }
 
     let candidate_rows_raw: Vec<(RecordId, Vec<Value>)> = if let Some(ref wc) = stmt.where_clause {
-        let update_access = crate::planner::plan_update_candidates(
-            wc,
-            &secondary_indexes,
-            &schema_cols,
-        );
+        let update_access =
+            crate::planner::plan_update_candidates(wc, &secondary_indexes, &schema_cols);
         collect_delete_candidates(
             wc,
             &secondary_indexes,
@@ -93,6 +90,8 @@ fn execute_update(
 
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, &schema_cols)?;
+    let compiled_index_exprs =
+        crate::partial_index::compile_index_exprs(&secondary_indexes, &schema_cols)?;
 
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     let mut matched_count: u64 = 0;
@@ -168,6 +167,7 @@ fn execute_update(
             apply_update_index_maintenance(
                 &mut secondary_indexes,
                 &compiled_preds,
+                &compiled_index_exprs,
                 &update_pairs,
                 storage,
                 txn,
@@ -213,6 +213,7 @@ fn statement_might_affect_indexes(
 fn apply_update_index_maintenance(
     current_indexes: &mut [IndexDef],
     compiled_preds: &[Option<Expr>],
+    compiled_index_exprs: &[Vec<Option<Expr>>],
     update_pairs: &[(RecordId, Vec<Value>, RecordId, Vec<Value>)],
     storage: &dyn StorageEngine,
     txn: &TxnManager,
@@ -225,17 +226,13 @@ fn apply_update_index_maintenance(
             continue;
         }
         let pred = compiled_preds.get(idx_pos).and_then(|p| p.as_ref());
+        let idx_exprs = compiled_index_exprs.get(idx_pos).map(|v| v.as_slice());
 
         if idx.index_type == 4 {
             let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
             for (old_rid, old_values, new_rid, new_values) in update_pairs {
                 if crate::index_maintenance::update_affects_index(
-                    idx,
-                    pred,
-                    old_values,
-                    *old_rid,
-                    new_values,
-                    *new_rid,
+                    idx, pred, old_values, *old_rid, new_values, *new_rid, idx_exprs,
                 )? {
                     insert_rows.push((*new_rid, new_values));
                 }
@@ -279,22 +276,15 @@ fn apply_update_index_maintenance(
         let mut insert_rows: Vec<(RecordId, &Vec<Value>)> = Vec::new();
         for (old_rid, old_values, new_rid, new_values) in update_pairs {
             if crate::index_maintenance::update_affects_index(
-                idx,
-                pred,
-                old_values,
-                *old_rid,
-                new_values,
-                *new_rid,
+                idx, pred, old_values, *old_rid, new_values, *new_rid, idx_exprs,
             )? {
                 // For UPDATE: delete old key for unique/PK indexes to avoid
                 // stale entries that would confuse index lookups returning
                 // the wrong row values. Non-unique indexes use lazy deletion.
                 if idx.is_unique || idx.is_fk_index {
-                    if let Some(key_vals) =
-                        crate::index_maintenance::index_key_values_if_indexed(
-                            idx, old_values, pred,
-                        )?
-                    {
+                    if let Some(key_vals) = crate::index_maintenance::index_key_values_if_indexed(
+                        idx, old_values, pred,
+                    )? {
                         let old_key = crate::index_maintenance::encode_index_entry_key(
                             idx, &key_vals, *old_rid,
                         )?;
@@ -352,7 +342,8 @@ fn apply_update_index_maintenance(
                 bloom,
                 snap.clone(),
             )? {
-                CatalogWriter::new(storage, txn, conn_txn)?.update_index_root(idx.index_id, new_root)?;
+                CatalogWriter::new(storage, txn, conn_txn)?
+                    .update_index_root(idx.index_id, new_root)?;
                 idx.root_page_id = new_root;
             }
         }

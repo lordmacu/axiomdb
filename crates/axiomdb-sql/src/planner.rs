@@ -25,7 +25,7 @@ use axiomdb_types::Value;
 use axiomdb_catalog::ColumnType;
 
 use crate::{
-    expr::{BinaryOp, Expr},
+    expr::{BinaryOp, Expr, UnaryOp},
     session::{SessionCollation, StaleStatsTracker},
 };
 
@@ -83,6 +83,7 @@ mod tests {
             columns: vec![IndexColumnDef {
                 col_idx,
                 order: SortOrder::Asc,
+                expr: None,
             }],
             predicate: None,
             fillfactor: 90,

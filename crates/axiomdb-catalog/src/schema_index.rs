@@ -104,6 +104,13 @@ impl IndexDef {
         let pred_bytes = self.predicate.as_deref().map(str::as_bytes);
         let pred_len = pred_bytes.map(|b| b.len()).unwrap_or(0);
 
+        // Calculate expression bytes for capacity
+        let expr_total_len: usize = self
+            .columns
+            .iter()
+            .map(|c| c.expr.as_deref().map(str::len).unwrap_or(0))
+            .sum();
+
         let mut buf = Vec::with_capacity(
             4 + 4
                 + 8
@@ -111,7 +118,8 @@ impl IndexDef {
                 + 1
                 + name.len()
                 + 1
-                + self.columns.len() * 3
+                + self.columns.len() * 5 // 5 = 2 (col_idx) + 1 (order) + 2 (expr_len)
+                + expr_total_len
                 + if pred_len > 0 { 2 + pred_len } else { 0 },
         );
         buf.extend_from_slice(&self.index_id.to_le_bytes());
@@ -125,6 +133,13 @@ impl IndexDef {
         for col in &self.columns {
             buf.extend_from_slice(&col.col_idx.to_le_bytes());
             buf.push(col.order as u8);
+            // Expression section (Phase 21.8) — backward-compatible: expr_len=0 means no expression
+            let expr_bytes = col.expr.as_deref().map(str::as_bytes);
+            let expr_len = expr_bytes.map(|b| b.len()).unwrap_or(0) as u16;
+            buf.extend_from_slice(&expr_len.to_le_bytes());
+            if let Some(expr) = expr_bytes {
+                buf.extend_from_slice(expr);
+            }
         }
         // Predicate section (Phase 6.7) — always write pred_len u16 (0 if no predicate).
         // Pre-6.7 rows have no pred_len bytes; from_bytes skips when < 2 bytes remain.
@@ -197,7 +212,38 @@ impl IndexDef {
                 let col_idx = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]);
                 let order = SortOrder::try_from(bytes[consumed + 2])?;
                 consumed += 3;
-                cols.push(IndexColumnDef { col_idx, order });
+                // Expression section (Phase 21.8) — backward-compatible:
+                // old format ends after order byte; expr_len = 0 when no expression
+                let expr = if bytes.len() >= consumed + 2 {
+                    let expr_len =
+                        u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+                    consumed += 2;
+                    if expr_len > 0 {
+                        if bytes.len() < consumed + expr_len {
+                            return Err(DbError::ParseError {
+                                message: "IndexDef column expression truncated".into(),
+                                position: None,
+                            });
+                        }
+                        let sql = std::str::from_utf8(&bytes[consumed..consumed + expr_len])
+                            .map_err(|_| DbError::ParseError {
+                                message: "IndexDef column expression not valid UTF-8".into(),
+                                position: None,
+                            })?
+                            .to_string();
+                        consumed += expr_len;
+                        Some(sql)
+                    } else {
+                        None
+                    }
+                } else {
+                    None // old format with no expression bytes
+                };
+                cols.push(IndexColumnDef {
+                    col_idx,
+                    order,
+                    expr,
+                });
             }
             cols
         } else {

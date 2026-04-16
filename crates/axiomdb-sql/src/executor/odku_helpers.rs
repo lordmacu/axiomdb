@@ -28,20 +28,24 @@ fn eval_odku_assignment_rhs(
     proposed_row: &[Value],
 ) -> Result<Value, DbError> {
     match expr {
-        Expr::Column { col_idx, .. } => existing_row
-            .get(*col_idx)
-            .cloned()
-            .ok_or(DbError::ColumnIndexOutOfBounds {
-                idx: *col_idx,
-                len: existing_row.len(),
-            }),
-        Expr::InsertValue { col_idx, .. } => proposed_row
-            .get(*col_idx)
-            .cloned()
-            .ok_or(DbError::ColumnIndexOutOfBounds {
-                idx: *col_idx,
-                len: proposed_row.len(),
-            }),
+        Expr::Column { col_idx, .. } => {
+            existing_row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: existing_row.len(),
+                })
+        }
+        Expr::InsertValue { col_idx, .. } => {
+            proposed_row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: proposed_row.len(),
+                })
+        }
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Default => Ok(Value::Null),
         Expr::UnaryOp { op, operand } => {
@@ -205,7 +209,12 @@ fn apply_odku_heap(
 
     // Same constraint + FK pipeline as a plain UPDATE.
     enforce_text_constraints(schema_cols, &mut new_row)?;
-    check_row_constraints_with_cols(&resolved.constraints, &new_row, &resolved.def.table_name, &resolved.columns)?;
+    check_row_constraints_with_cols(
+        &resolved.constraints,
+        &new_row,
+        &resolved.def.table_name,
+        &resolved.columns,
+    )?;
     if !resolved.foreign_keys.is_empty() {
         crate::fk_enforcement::check_fk_child_update(
             &existing_row,
@@ -223,8 +232,7 @@ fn apply_odku_heap(
         let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap.clone())?;
         let parent_fks = reader.list_fk_constraints_referencing(resolved.def.id)?;
         parent_fks.iter().any(|fk| {
-            existing_row.get(fk.parent_col_idx as usize)
-                != new_row.get(fk.parent_col_idx as usize)
+            existing_row.get(fk.parent_col_idx as usize) != new_row.get(fk.parent_col_idx as usize)
         })
     };
     if parent_key_changed {
@@ -259,11 +267,14 @@ fn apply_odku_heap(
     // Secondary-index maintenance — reuse the UPDATE executor's helper so
     // every edge case (partial indexes, FK auto-indexes, GIN, unique
     // re-check) is covered identically.
+    let compiled_index_exprs =
+        crate::partial_index::compile_index_exprs(secondary_indexes, schema_cols)?;
     if !secondary_indexes.is_empty() {
         let update_pairs = vec![(old_rid, existing_row.clone(), new_rid, coerced_new.clone())];
         apply_update_index_maintenance(
             secondary_indexes,
             compiled_preds,
+            &compiled_index_exprs,
             &update_pairs,
             storage,
             txn,

@@ -1,3 +1,8 @@
+---
+name: fase-completa
+description: Full phase close protocol — tests, clippy, fmt, benchmarks, docs, memory update, commit, push
+---
+
 # /fase-completa — Phase close protocol
 
 Run this COMPLETE protocol when finishing each phase. No exceptions.

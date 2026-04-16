@@ -273,6 +273,7 @@ mod tests {
             columns: vec![IndexColumnDef {
                 col_idx: 0,
                 order: SortOrder::Asc,
+                expr: None,
             }],
             predicate: None,
             fillfactor: 90,
@@ -299,6 +300,7 @@ mod tests {
             columns: vec![IndexColumnDef {
                 col_idx: 2,
                 order: SortOrder::Asc,
+                expr: None,
             }],
             predicate: None,
             fillfactor: 90,
@@ -350,10 +352,12 @@ mod tests {
                 IndexColumnDef {
                     col_idx: 1,
                     order: SortOrder::Asc,
+                    expr: None,
                 },
                 IndexColumnDef {
                     col_idx: 3,
                     order: SortOrder::Desc,
+                    expr: None,
                 },
             ],
             predicate: None,

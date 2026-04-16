@@ -561,6 +561,7 @@ mod tests {
                 columns: vec![IndexColumnDef {
                     col_idx: 0,
                     order: SortOrder::Asc,
+                    expr: None,
                 }],
                 predicate: None,
                 fillfactor: 90,

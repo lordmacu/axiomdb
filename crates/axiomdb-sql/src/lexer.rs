@@ -774,8 +774,13 @@ fn strip_hash_comments(input: &str) -> String {
                 i += 1;
             }
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            // Decode a full UTF-8 code point starting at bytes[i] so that
+            // multi-byte sequences (e.g. `é` = 0xC3 0xA9) are not split into
+            // two surrogate chars.
+            let rest = &input[i..];
+            let c = rest.chars().next().unwrap_or('\0');
+            result.push(c);
+            i += c.len_utf8();
         }
     }
     result

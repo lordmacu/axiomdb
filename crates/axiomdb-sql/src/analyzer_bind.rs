@@ -230,6 +230,7 @@ fn build_context(
     snapshot: TransactionSnapshot,
     default_database: &str,
     default_schema: &str,
+    outer_scopes: &[&BindContext],
 ) -> Result<BindContext, DbError> {
     let mut ctx = BindContext::empty();
     let mut col_offset = 0usize;
@@ -242,11 +243,18 @@ fn build_context(
             default_database,
             default_schema,
             &mut col_offset,
+            outer_scopes,
         )?;
         ctx.tables.extend(bound);
     }
 
+    // For each join, pass the accumulated context as an additional outer scope so that
+    // LATERAL subqueries can reference tables from the left side of the join.
     for join in joins {
+        // Construct extended outer scopes: current accumulated ctx becomes an additional
+        // outer scope (depth increases by 1 for all previous tables).
+        let mut extended_scopes: Vec<&BindContext> = outer_scopes.to_vec();
+        extended_scopes.push(&ctx);
         let bound = bound_from_clause(
             &join.table,
             storage,
@@ -254,6 +262,7 @@ fn build_context(
             default_database,
             default_schema,
             &mut col_offset,
+            &extended_scopes,
         )?;
         ctx.tables.extend(bound);
     }
@@ -268,6 +277,7 @@ fn bound_from_clause(
     default_database: &str,
     default_schema: &str,
     col_offset: &mut usize,
+    outer_scopes: &[&BindContext],
 ) -> Result<Vec<BoundTable>, DbError> {
     match from {
         FromClause::Table(table_ref) => {
@@ -281,16 +291,33 @@ fn bound_from_clause(
             )?;
             Ok(vec![bound])
         }
-        FromClause::Subquery { query, alias, .. } => {
-            // Analyze the inner SELECT recursively.
-            // The virtual table's columns = the SELECT list items.
-            let analyzed_query = analyze_select(
-                *query.clone(),
-                storage,
-                snapshot,
-                default_database,
-                default_schema,
-            )?;
+        FromClause::Subquery {
+            query,
+            alias,
+            lateral,
+        } => {
+            // Phase 21.9: For LATERAL subqueries, analyze with outer scopes so that
+            // correlated references (e.g., `t.id` in `FROM t, LATERAL (SELECT t.id ...)`)
+            // are resolved as OuterColumn. For non-LATERAL, use analyze_select since
+            // outer correlation is not allowed.
+            let analyzed_query = if *lateral {
+                analyze_select_with_outer(
+                    *query.clone(),
+                    storage,
+                    snapshot,
+                    default_database,
+                    default_schema,
+                    outer_scopes,
+                )?
+            } else {
+                analyze_select(
+                    *query.clone(),
+                    storage,
+                    snapshot,
+                    default_database,
+                    default_schema,
+                )?
+            };
             let virtual_cols = virtual_columns_from_select(&analyzed_query);
             let n = virtual_cols.len();
             let bound = BoundTable {

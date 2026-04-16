@@ -357,6 +357,7 @@ fn test_index_def_roundtrip_with_predicate() {
         columns: vec![IndexColumnDef {
             col_idx: 1,
             order: SortOrder::Asc,
+            expr: None,
         }],
         predicate: Some("deleted_at IS NULL".to_string()),
         fillfactor: 90,
@@ -387,6 +388,7 @@ fn test_index_def_roundtrip_no_predicate_backward_compat() {
         columns: vec![IndexColumnDef {
             col_idx: 0,
             order: SortOrder::Asc,
+            expr: None,
         }],
         predicate: None,
         fillfactor: 90,
@@ -419,6 +421,7 @@ fn test_pre_67_index_row_reads_predicate_as_none() {
         columns: vec![IndexColumnDef {
             col_idx: 0,
             order: SortOrder::Asc,
+            expr: None,
         }],
         predicate: None,
         fillfactor: 90,

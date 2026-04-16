@@ -21,8 +21,7 @@ fn execute_create_table(
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
-        let mut resolver =
-            make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
         if resolver.table_exists(Some(schema), &stmt.table.name)? {
             if stmt.if_not_exists {
                 return Ok(QueryResult::Empty);
@@ -78,24 +77,14 @@ fn execute_create_table(
             inline_fk_specs.push((i as u16, col_def.name.clone(), refs));
         }
 
-        let default_expr = col_def
-            .constraints
-            .iter()
-            .find_map(|c| match c {
-                ColumnConstraint::Default(expr) => {
-                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
-                }
-                _ => None,
-            });
-        let on_update_expr = col_def
-            .constraints
-            .iter()
-            .find_map(|c| match c {
-                ColumnConstraint::OnUpdate(expr) => {
-                    Some(crate::expr_to_sql::expr_to_sql_string(expr))
-                }
-                _ => None,
-            });
+        let default_expr = col_def.constraints.iter().find_map(|c| match c {
+            ColumnConstraint::Default(expr) => Some(crate::expr_to_sql::expr_to_sql_string(expr)),
+            _ => None,
+        });
+        let on_update_expr = col_def.constraints.iter().find_map(|c| match c {
+            ColumnConstraint::OnUpdate(expr) => Some(crate::expr_to_sql::expr_to_sql_string(expr)),
+            _ => None,
+        });
 
         writer.create_column(CatalogColumnDef {
             table_id,
@@ -115,12 +104,12 @@ fn execute_create_table(
         use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
 
         let mut create_empty_index = |index_name: String,
-                                  columns: Vec<IndexColumnDef>,
-                                  is_unique: bool,
-                                  is_primary: bool,
-                                  root_override: Option<u64>,
-                                  storage: &dyn StorageEngine,
-                                  txn: &TxnManager|
+                                      columns: Vec<IndexColumnDef>,
+                                      is_unique: bool,
+                                      is_primary: bool,
+                                      root_override: Option<u64>,
+                                      storage: &dyn StorageEngine,
+                                      txn: &TxnManager|
          -> Result<u32, DbError> {
             let root_page_id = match root_override {
                 Some(root_page_id) => root_page_id,
@@ -222,13 +211,9 @@ fn execute_create_table(
     for col_def in &stmt.columns {
         for cc in &col_def.constraints {
             if let crate::ast::ColumnConstraint::Check(expr) = cc {
-                let check_name = format!(
-                    "axiom_check_{}_{}",
-                    col_def.name, check_ordinal
-                );
+                let check_name = format!("axiom_check_{}_{}", col_def.name, check_ordinal);
                 check_ordinal += 1;
-                let check_expr_str =
-                    expr_to_sql_string(expr);
+                let check_expr_str = expr_to_sql_string(expr);
                 CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(
                     axiomdb_catalog::schema::ConstraintDef {
                         constraint_id: 0,
@@ -357,6 +342,7 @@ fn resolve_create_table_index_columns(
             Ok(IndexColumnDef {
                 col_idx: col_idx as u16,
                 order: CatalogSortOrder::Asc,
+                expr: None,
             })
         })
         .collect()
@@ -398,8 +384,9 @@ fn collect_create_table_primary_key(
     if !inline_pk_cols.is_empty() {
         if inline_pk_cols.len() > 1 {
             return Err(DbError::InvalidValue {
-                reason: "multiple inline PRIMARY KEY columns are not allowed; use PRIMARY KEY (...)"
-                    .into(),
+                reason:
+                    "multiple inline PRIMARY KEY columns are not allowed; use PRIMARY KEY (...)"
+                        .into(),
             });
         }
         return Ok(Some(CreateTableIndexSpec {
@@ -407,6 +394,7 @@ fn collect_create_table_primary_key(
             columns: vec![IndexColumnDef {
                 col_idx: inline_pk_cols[0].0,
                 order: CatalogSortOrder::Asc,
+                expr: None,
             }],
         }));
     }
@@ -430,6 +418,7 @@ fn collect_create_table_unique_indexes(
                 columns: vec![IndexColumnDef {
                     col_idx: idx as u16,
                     order: CatalogSortOrder::Asc,
+                    expr: None,
                 }],
             });
         }
@@ -658,7 +647,13 @@ fn persist_fk_constraint(
                 };
 
                 // Insert composite key entry for every existing child row.
-                let rows = TableEngine::scan_table(storage, &child_table_def_for_fk, &child_cols, snap, None)?;
+                let rows = TableEngine::scan_table(
+                    storage,
+                    &child_table_def_for_fk,
+                    &child_cols,
+                    snap,
+                    None,
+                )?;
                 for (rid, row_vals) in rows {
                     let fk_val = row_vals.get(child_col_idx as usize).unwrap_or(&Value::Null);
                     if matches!(fk_val, Value::Null) {
@@ -670,24 +665,26 @@ fn persist_fk_constraint(
                 }
 
                 let final_root = root_pid.load(Ordering::Acquire);
-                let new_idx_id = CatalogWriter::new(storage, txn, conn_txn)?.create_index(IndexDef {
-                    index_id: 0,
-                    table_id: child_table_id,
-                    name: format!("_fk_{constraint_name}"),
-                    root_page_id: final_root,
-                    is_unique: false,
-                    is_primary: false,
-                    is_fk_index: true, // marks composite-key FK auto-index
-                    columns: vec![CatIndexColumnDef {
-                        col_idx: child_col_idx,
-                        order: CatSortOrder::Asc,
-                    }],
-                    predicate: None,
-                    fillfactor: 90,
-                    include_columns: vec![],
-                    index_type: 0,
-                    pages_per_range: 128,
-                })?;
+                let new_idx_id =
+                    CatalogWriter::new(storage, txn, conn_txn)?.create_index(IndexDef {
+                        index_id: 0,
+                        table_id: child_table_id,
+                        name: format!("_fk_{constraint_name}"),
+                        root_page_id: final_root,
+                        is_unique: false,
+                        is_primary: false,
+                        is_fk_index: true, // marks composite-key FK auto-index
+                        columns: vec![CatIndexColumnDef {
+                            col_idx: child_col_idx,
+                            order: CatSortOrder::Asc,
+                            expr: None,
+                        }],
+                        predicate: None,
+                        fillfactor: 90,
+                        include_columns: vec![],
+                        index_type: 0,
+                        pages_per_range: 128,
+                    })?;
                 new_idx_id
             }
         }
@@ -896,8 +893,7 @@ fn execute_create_table_as_select(
     // 3. Check destination table does not already exist.
     {
         let conn_txn = ctx.conn_txn.as_ref().expect("conn_txn set for DDL");
-        let mut resolver =
-            make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
         if resolver.table_exists(Some(&new_schema), &new_name)? {
             return Err(DbError::TableAlreadyExists {
                 schema: new_schema.clone(),
@@ -910,8 +906,11 @@ fn execute_create_table_as_select(
     let new_def = {
         let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
         let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
-        let def = writer
-            .create_table_with_layout(&new_schema, &new_name, axiomdb_catalog::schema::TableStorageLayout::Heap)?;
+        let def = writer.create_table_with_layout(
+            &new_schema,
+            &new_name,
+            axiomdb_catalog::schema::TableStorageLayout::Heap,
+        )?;
         if database != DEFAULT_DATABASE_NAME {
             writer.bind_table_to_database(def.id, &database)?;
         }
@@ -1136,4 +1135,3 @@ fn persist_composite_fk_constraint(
 
     Ok(())
 }
-

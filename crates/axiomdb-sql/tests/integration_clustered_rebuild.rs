@@ -317,6 +317,7 @@ fn install_primary_index(
             IndexColumnDef {
                 col_idx: col.col_idx,
                 order: CatalogSortOrder::Asc,
+                expr: None,
             }
         })
         .collect();

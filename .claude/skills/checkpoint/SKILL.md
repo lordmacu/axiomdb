@@ -1,3 +1,8 @@
+---
+name: checkpoint
+description: Save session context to a checkpoint file so the next session can resume without losing state
+---
+
 # /checkpoint — Save context when pausing
 
 When a task must be paused mid-way, save the exact state
@@ -7,7 +12,7 @@ so the next session can continue without questions.
 
 ```bash
 DATE=$(date +%Y%m%d-%H%M)
-cat > /Users/cristian/nexusdb/docs/checkpoint-$DATE.md << 'CHECKPOINT'
+cat > /home/familia/axiomdb/docs/checkpoint-$DATE.md << 'CHECKPOINT'
 # Checkpoint [DATE]
 
 ## Phase state

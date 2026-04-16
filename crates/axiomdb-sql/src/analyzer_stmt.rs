@@ -220,6 +220,8 @@ fn analyze_select_with_outer(
     }
 
     // Build resolution context from FROM and JOINs.
+    // Phase 21.9: Pass outer_scopes so LATERAL subqueries in JOINs can reference
+    // outer tables (they become OuterColumn during analysis).
     let ctx = build_context(
         &s.from,
         &s.joins,
@@ -227,6 +229,7 @@ fn analyze_select_with_outer(
         snapshot.clone(),
         default_database,
         default_schema,
+        outer_scopes,
     )?;
 
     // If FROM is a derived table (subquery in FROM), `build_context` analyzed
@@ -239,6 +242,8 @@ fn analyze_select_with_outer(
         lateral,
     }) = s.from
     {
+        // For LATERAL subqueries in first-FROM position, there are no left-side
+        // tables yet, so effective_scopes = outer_scopes (same as non-LATERAL).
         let analyzed_inner = analyze_select_with_outer(
             *query,
             storage,
@@ -300,13 +305,23 @@ fn analyze_select_with_outer(
                 alias,
                 lateral,
             } => {
+                // For LATERAL subqueries, pass the accumulated context (ctx) as an
+                // additional outer scope so that references to left-side tables (like t.id)
+                // are resolved as OuterColumn. For non-LATERAL, use the original outer_scopes.
+                let effective_scopes = if lateral {
+                    let mut scopes = outer_scopes.to_vec();
+                    scopes.push(&ctx);
+                    scopes
+                } else {
+                    outer_scopes.to_vec()
+                };
                 let analyzed_inner = analyze_select_with_outer(
                     *query,
                     storage,
                     state.snapshot.clone(),
                     state.default_database,
                     state.default_schema,
-                    outer_scopes,
+                    &effective_scopes,
                 )?;
                 join.table = FromClause::Subquery {
                     query: Box::new(analyzed_inner),

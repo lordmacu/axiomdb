@@ -1,3 +1,8 @@
+---
+name: scan-gaps
+description: Discover undocumented gaps by comparing AxiomDB against MySQL/PostgreSQL — build inventory, run tests, classify, hand off to hunt-gap
+---
+
 # /scan-gaps — Discover undocumented gaps by comparing with real databases
 
 Proactively find gaps, bugs, and missing features that are NOT yet documented

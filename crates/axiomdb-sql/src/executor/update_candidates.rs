@@ -167,9 +167,8 @@ fn execute_update_with_candidates(
     // The sparse path (to_update_sparse) avoids cloning unchanged columns,
     // eliminating String allocations for non-assigned fields.
 
-    let use_sparse_fast_path = field_patch_eligible
-        && !to_update_sparse.is_empty()
-        && resolved.foreign_keys.is_empty();
+    let use_sparse_fast_path =
+        field_patch_eligible && !to_update_sparse.is_empty() && resolved.foreign_keys.is_empty();
     let use_full_fast_path = !use_sparse_fast_path
         && !to_update.is_empty()
         && field_patch_eligible
@@ -236,8 +235,7 @@ fn execute_update_with_candidates(
                 // snapshots that already see it.
                 {
                     let hdr_bytes = &page.as_bytes()[off..off + hdr_size];
-                    let old_hdr: &axiomdb_storage::RowHeader =
-                        bytemuck::from_bytes(hdr_bytes);
+                    let old_hdr: &axiomdb_storage::RowHeader = bytemuck::from_bytes(hdr_bytes);
                     let new_hdr = axiomdb_storage::RowHeader {
                         txn_id_created: old_hdr.txn_id_created,
                         txn_id_deleted: 0,
@@ -245,8 +243,7 @@ fn execute_update_with_candidates(
                         _flags: old_hdr._flags,
                     };
                     let raw = page.as_bytes_mut();
-                    raw[off..off + hdr_size]
-                        .copy_from_slice(bytemuck::bytes_of(&new_hdr));
+                    raw[off..off + hdr_size].copy_from_slice(bytemuck::bytes_of(&new_hdr));
                 }
 
                 // Patch each changed field directly.
@@ -254,8 +251,7 @@ fn execute_update_with_candidates(
                 match slot_data {
                     SlotData::Sparse(sparse_vals) => {
                         for (col_pos, new_val) in *sparse_vals {
-                            let row_data_slice =
-                                &page.as_bytes()[row_start..row_start + row_len];
+                            let row_data_slice = &page.as_bytes()[row_start..row_start + row_len];
                             if let Some(loc) =
                                 axiomdb_types::field_patch::compute_field_location_runtime(
                                     col_types,
@@ -267,15 +263,16 @@ fn execute_update_with_candidates(
                                 let row_data_mut =
                                     &mut page.as_bytes_mut()[row_start..row_start + row_len];
                                 let _ = axiomdb_types::field_patch::write_field(
-                                    row_data_mut, &loc, new_val,
+                                    row_data_mut,
+                                    &loc,
+                                    new_val,
                                 );
                             }
                         }
                     }
                     SlotData::Full(new_vals) => {
                         for &(col_pos, _) in &assignments {
-                            let row_data_slice =
-                                &page.as_bytes()[row_start..row_start + row_len];
+                            let row_data_slice = &page.as_bytes()[row_start..row_start + row_len];
                             if let Some(loc) =
                                 axiomdb_types::field_patch::compute_field_location_runtime(
                                     col_types,
@@ -287,7 +284,9 @@ fn execute_update_with_candidates(
                                 let row_data_mut =
                                     &mut page.as_bytes_mut()[row_start..row_start + row_len];
                                 let _ = axiomdb_types::field_patch::write_field(
-                                    row_data_mut, &loc, &new_vals[col_pos],
+                                    row_data_mut,
+                                    &loc,
+                                    &new_vals[col_pos],
                                 );
                             }
                         }
@@ -326,6 +325,8 @@ fn execute_update_with_candidates(
 
         // Index maintenance (same as normal path).
         if !secondary_indexes.is_empty() {
+            let compiled_index_exprs =
+                crate::partial_index::compile_index_exprs(secondary_indexes, schema_cols)?;
             let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
                 .iter()
                 .map(|(rid, old, new)| (*rid, old.clone(), *rid, new.clone()))
@@ -333,6 +334,7 @@ fn execute_update_with_candidates(
             apply_update_index_maintenance(
                 &mut secondary_indexes.to_vec(),
                 &compiled_preds,
+                &compiled_index_exprs,
                 &update_pairs,
                 storage,
                 txn,
@@ -386,6 +388,8 @@ fn execute_update_with_candidates(
 
         if any_index_affected || !all_rids_stable {
             let mut current_indexes = secondary_indexes.to_vec();
+            let compiled_index_exprs =
+                crate::partial_index::compile_index_exprs(secondary_indexes, schema_cols)?;
             let update_pairs: Vec<(RecordId, Vec<Value>, RecordId, Vec<Value>)> = to_update
                 .into_iter()
                 .zip(new_rids)
@@ -396,6 +400,7 @@ fn execute_update_with_candidates(
             apply_update_index_maintenance(
                 &mut current_indexes,
                 &compiled_preds,
+                &compiled_index_exprs,
                 &update_pairs,
                 storage,
                 txn,
@@ -416,5 +421,3 @@ fn execute_update_with_candidates(
         last_insert_id: None,
     })
 }
-
-

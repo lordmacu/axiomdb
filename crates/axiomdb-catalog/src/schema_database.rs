@@ -32,14 +32,20 @@ impl TryFrom<u8> for SortOrder {
 /// Records which column position (`col_idx`) is part of the index key
 /// and in which sort direction.
 ///
-/// ## On-disk format (3 bytes per entry)
-/// `[col_idx:2 LE][order:1]`
+/// ## On-disk format (backward-compatible)
+/// - Without expression: `[col_idx:2 LE][order:1]` (3 bytes — old format)
+/// - With expression:    `[col_idx:2 LE][order:1][expr_len:2 LE][expr_sql]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexColumnDef {
     /// Position of this column in the table (matches `ColumnDef.col_idx`).
     pub col_idx: u16,
     /// Sort direction for this column in the index key.
     pub order: SortOrder,
+    /// Optional SQL expression for expression indexes.
+    ///
+    /// Example: `Some("LOWER(email)")` for `CREATE INDEX ON t(LOWER(email))`.
+    /// `None` = ordinary column index.
+    pub expr: Option<String>,
 }
 
 // ── Public type aliases ───────────────────────────────────────────────────────

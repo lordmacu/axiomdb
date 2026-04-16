@@ -1,3 +1,8 @@
+---
+name: subfase-completa
+description: Mark a subphase as completed — run tests, update progreso.md, update memory, commit and push
+---
+
 # /subfase-completa — Mark a subphase as completed
 
 Run this skill when finishing each individual subphase.

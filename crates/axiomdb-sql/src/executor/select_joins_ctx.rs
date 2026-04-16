@@ -297,12 +297,24 @@ fn execute_select_with_joins_first_materialized(
                 ctx,
             )?
         } else {
-            eprintln!("DEBUG combine: i={} right_idx={} correlated_sub.len()={} - calling apply_join (non-correlated)", 
-                i, right_idx, correlated_sub.len());
+            let sub_in_vec = correlated_sub.get(right_idx);
             eprintln!(
-                "DEBUG combine: scanned[{}].len()={}",
-                right_idx,
-                scanned[right_idx].len()
+                "DEBUG combine: i={} right_idx={} correlated_sub.len()={} sub_at_right_idx={:?} calling apply_join (non-correlated)",
+                i, right_idx, correlated_sub.len(), sub_in_vec
+            );
+            eprintln!(
+                "DEBUG combine: ALL correlated_sub entries: {:?}", correlated_sub
+            );
+            eprintln!(
+                "DEBUG combine: ALL scanned entries: {:?}", scanned.iter().map(|s| s.len()).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "DEBUG combine: ALL all_sources columns len: {:?}",
+                all_sources.iter().map(|s| s.columns.len()).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "DEBUG combine: ALL all_sources match_names: {:?}",
+                all_sources.iter().map(|s| &s.match_names).collect::<Vec<_>>()
             );
             apply_join(
                 combined_rows,
