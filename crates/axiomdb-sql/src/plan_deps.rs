@@ -426,6 +426,12 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            Expr::Grouping { args, .. } => {
+                for a in args {
+                    self.visit_expr(a)?;
+                }
+                Ok(())
+            }
             // Leaf nodes — no sub-structure to traverse.
             Expr::Column { .. }
             | Expr::OuterColumn { .. }

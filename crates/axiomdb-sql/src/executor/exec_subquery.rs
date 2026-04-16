@@ -531,6 +531,7 @@ fn expr_has_outer_ref(expr: &Expr) -> bool {
         Expr::GroupConcat { expr, order_by, .. } => {
             expr_has_outer_ref(expr) || order_by.iter().any(|(e, _)| expr_has_outer_ref(e))
         }
+        Expr::Grouping { args, .. } => args.iter().any(expr_has_outer_ref),
         // Leaves: Literal, Column, Default, Param — no outer refs.
         _ => false,
     }
@@ -789,6 +790,10 @@ fn subst_expr(expr: Expr, outer_row: &[Value], binding_depth: u16) -> Expr {
                 .map(|(e, dir)| (subst_expr(e, outer_row, binding_depth), dir))
                 .collect(),
             separator,
+        },
+        Expr::Grouping { args, universe_indices } => Expr::Grouping {
+            args: args.into_iter().map(|a| subst_expr(a, outer_row, binding_depth)).collect(),
+            universe_indices,
         },
         other => other,
     }

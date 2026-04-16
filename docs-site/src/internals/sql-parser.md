@@ -793,6 +793,67 @@ keeps parsing and execution logic clean and makes semantic analysis and partial-
 
 ---
 
+## GROUPING SETS / ROLLUP / CUBE (Phase 21.21)
+
+### AST Representation — `GroupByClause`
+
+The `group_by` field on `SelectStmt` was migrated from `Vec<Expr>` to a typed enum:
+
+```rust
+pub enum GroupByClause {
+    None,
+    Simple(Vec<Expr>),
+    WithRollup(Vec<Expr>),   // MySQL-style GROUP BY ... WITH ROLLUP
+    Sets {
+        universe: Vec<Expr>, // deduplicated list of all referenced expressions
+        sets: Vec<Vec<usize>>, // each set is indices into universe
+    },
+}
+```
+
+The `Sets` variant uses the **universe + index** pattern from DuckDB/PostgreSQL:
+all GROUP BY expressions are deduplicated into a single `universe` list;
+each grouping set is then a subset of indices into that list.
+
+### Parser — ROLLUP/CUBE/GROUPING SETS Expansion
+
+```
+ROLLUP(a, b, c)  →  {a,b,c}, {a,b}, {a}, {}           (N+1 sets)
+CUBE(a, b)       →  {a,b}, {a}, {b}, {}                 (2^N subsets, ≤ 16 dims)
+GROUPING SETS((a,b),(a),())  →  explicit list of sets
+GROUP BY a, ROLLUP(b)        →  cross-product of {a} × ({b},{}) = {a,b},{a}
+```
+
+### `Expr::Grouping` and the Hidden Mask
+
+```rust
+Expr::Grouping {
+    args: Vec<Expr>,
+    /// Populated by the analyzer post-pass.
+    universe_indices: Option<Vec<usize>>,
+}
+```
+
+The executor appends a hidden `Value::BigInt(mask)` as the **last column** of every
+output row during a GROUPING SETS pass. Bit `i` of `mask` is 1 when `universe[i]` is
+absent from the current grouping set. The `eval` function reads `row.last()` to compute
+the GROUPING() bitmask; the mask is stripped before `QueryResult::Rows` is returned.
+
+### Analyzer Post-Pass for GROUPING()
+
+After GROUP BY and all expressions are resolved, `analyzer_stmt.rs` walks HAVING,
+SELECT list, and ORDER BY to find `Expr::Grouping` nodes and populate `universe_indices`
+by matching each arg against `GroupByClause::Sets.universe` via structural equality.
+
+### Executor — Multi-Pass Strategy
+
+`execute_select_grouped_sets` runs one `execute_select_grouped_hash` pass per grouping
+set. If HAVING contains `GROUPING()`, it is deferred to a post-mask filter (mask not yet
+present during per-pass aggregation). SELECT slots containing `GROUPING()` are
+re-evaluated after mask injection.
+
+---
+
 ## Error Reporting
 
 ### ParseError — structured position field

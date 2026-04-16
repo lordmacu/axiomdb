@@ -257,6 +257,7 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
                     .iter()
                     .any(|(e, _)| expr_mentions_column_name(e, target_name))
         }
+        Expr::Grouping { args, .. } => args.iter().any(|a| expr_mentions_column_name(a, target_name)),
     }
 }
 

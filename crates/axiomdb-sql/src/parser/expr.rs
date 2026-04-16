@@ -829,6 +829,28 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             });
         }
 
+        // ── GROUPING(...) — SQL standard Phase 21.21 ─────────────────────────
+        // GROUPING(expr [, expr, ...])
+        // Returns a bitmask indicating which expressions are "rolled up" in the
+        // current grouping set. `universe_indices` is left `None` here and
+        // populated by the analyzer.
+        if name.eq_ignore_ascii_case("grouping") {
+            let mut args = Vec::new();
+            if !matches!(p.peek(), Token::RParen) {
+                loop {
+                    args.push(parse_expr(p)?);
+                    if !p.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+            }
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::Grouping {
+                args,
+                universe_indices: None,
+            });
+        }
+
         // CAST(expr AS type) — special syntax, not a regular function call.
         if name.eq_ignore_ascii_case("cast") {
             let expr = parse_expr(p)?;

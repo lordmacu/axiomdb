@@ -363,6 +363,10 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
                 collect_col_idxs_non_agg(e, out);
             }
         }
+        // GROUPING() args may reference non-aggregate columns.
+        Expr::Grouping { args, .. } => {
+            for a in args { collect_col_idxs_non_agg(a, out); }
+        }
         Expr::Literal(_)
         | Expr::Default
         | Expr::OuterColumn { .. }
@@ -426,6 +430,10 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
             if let Some(e) = else_result {
                 collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
             }
+        }
+        // GROUPING() args may reference non-aggregate columns.
+        Expr::Grouping { args, .. } => {
+            for a in args { collect_non_agg_col_idxs_in_expr(a, inside_agg, out); }
         }
         Expr::Column { .. }
         | Expr::Literal(_)

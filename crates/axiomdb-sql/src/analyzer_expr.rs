@@ -331,6 +331,19 @@ fn resolve_expr_full(
                 negated,
             })
         }
+
+        // GROUPING(expr, ...) — resolve each arg; universe_indices are populated
+        // later by a post-pass in analyzer_stmt once the GROUP BY universe is known.
+        Expr::Grouping { args, .. } => {
+            let resolved_args = args
+                .into_iter()
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::Grouping {
+                args: resolved_args,
+                universe_indices: None,
+            })
+        }
     }
 }
 

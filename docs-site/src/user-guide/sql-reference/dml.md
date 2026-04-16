@@ -562,6 +562,82 @@ GROUP BY category_id
 HAVING AVG(price) > 50;
 ```
 
+### ROLLUP, CUBE, and GROUPING SETS (Phase 21.21)
+
+Multi-level GROUP BY produces subtotals and grand totals in a single query.
+NULL in a grouping column means "this column was rolled up / aggregated away".
+
+**ROLLUP** — hierarchical subtotals from most-detailed to grand total:
+
+```sql
+-- Per (region, year), per region, and grand total — 7 rows for 2 regions × 2 years
+SELECT region, yr, SUM(amount)
+FROM sales
+GROUP BY ROLLUP(region, yr);
+```
+
+**CUBE** — all 2^N combinations of grouping columns:
+
+```sql
+-- All four combinations: {region,yr}, {region}, {yr}, {} — 9 rows for the example above
+SELECT region, yr, SUM(amount)
+FROM sales
+GROUP BY CUBE(region, yr);
+```
+
+**GROUPING SETS** — explicit list of grouping combinations:
+
+```sql
+SELECT region, yr, SUM(amount)
+FROM sales
+GROUP BY GROUPING SETS((region, yr), (region), ());
+```
+
+**Mixed plain + ROLLUP** — cross-product semantics:
+
+```sql
+-- GROUP BY region, ROLLUP(yr) → sets {region,yr} and {region} (no grand total)
+SELECT region, yr, SUM(amount)
+FROM sales
+GROUP BY region, ROLLUP(yr);
+```
+
+**MySQL-style WITH ROLLUP** — still supported:
+
+```sql
+SELECT region, SUM(amount)
+FROM sales
+GROUP BY region WITH ROLLUP;
+```
+
+**GROUPING() function** — returns a bitmask identifying rolled-up columns.
+Bit `n-1-i` is 1 when `args[i]` is absent from the current grouping set (MSB = leftmost arg).
+Use it to distinguish a real NULL from a rollup NULL, or to filter to specific aggregation levels:
+
+```sql
+-- Show region label or 'TOTAL' for the grand total row
+SELECT
+    CASE WHEN GROUPING(region) = 1 THEN 'TOTAL' ELSE region END AS region,
+    SUM(amount)
+FROM sales
+GROUP BY ROLLUP(region);
+
+-- HAVING: show only the grand total
+SELECT region, SUM(amount)
+FROM sales
+GROUP BY ROLLUP(region)
+HAVING GROUPING(region) = 1;
+
+-- ORDER BY: detail rows first, grand total last
+SELECT region, yr, SUM(amount), GROUPING(region, yr) AS g
+FROM sales
+GROUP BY ROLLUP(region, yr)
+ORDER BY GROUPING(region, yr) ASC;
+```
+
+GROUPING() returns 0 for real NULL values in the source data — it only returns 1 for
+NULLs introduced by the ROLLUP/CUBE/GROUPING SETS mechanism.
+
 ---
 
 ## ORDER BY

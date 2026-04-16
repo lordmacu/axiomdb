@@ -8,7 +8,7 @@
 
 use axiomdb_core::error::DbError;
 use axiomdb_sql::{
-    ast::{SelectItem, SelectStmt, Stmt},
+    ast::{GroupByClause, SelectItem, SelectStmt, Stmt},
     expr::Expr,
     result::ColumnMeta,
 };
@@ -613,11 +613,24 @@ fn subst_select(mut s: SelectStmt, params: &[Value]) -> Result<SelectStmt, DbErr
             other => other,
         })
         .collect();
-    s.group_by = s
-        .group_by
-        .into_iter()
-        .map(|e| subst_expr_param(e, params))
-        .collect();
+    {
+        let resolved: Vec<Expr> = s
+            .group_by
+            .exprs()
+            .to_owned()
+            .into_iter()
+            .map(|e| subst_expr_param(e, params))
+            .collect();
+        s.group_by = match s.group_by {
+            GroupByClause::Simple(_) => GroupByClause::Simple(resolved),
+            GroupByClause::WithRollup(_) => GroupByClause::WithRollup(resolved),
+            GroupByClause::Sets { sets, .. } => GroupByClause::Sets {
+                universe: resolved,
+                sets,
+            },
+            GroupByClause::None => GroupByClause::None,
+        };
+    }
     s.order_by = s
         .order_by
         .into_iter()
