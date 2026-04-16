@@ -2,7 +2,7 @@
 
 Phase: 21 — Advanced SQL
 Task: 21.21 — SQL standard multi-dimensional aggregation
-Status: approved
+Status: implemented
 
 ## Context
 
