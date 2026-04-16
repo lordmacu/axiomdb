@@ -262,7 +262,7 @@ fn execute_select_ctx(
                     }
                     // ORDER BY, GROUP BY, HAVING
                     for ob in &stmt.order_by { collect_expr_columns(&ob.expr, &mut mask); }
-                    for gb in &stmt.group_by { collect_expr_columns(gb, &mut mask); }
+                    for gb in stmt.group_by.exprs() { collect_expr_columns(gb, &mut mask); }
                     if let Some(ref having) = stmt.having {
                         collect_expr_columns(having, &mut mask);
                     }
@@ -347,7 +347,7 @@ fn execute_select_ctx(
                             collect_expr_columns(&ob.expr, &mut mask);
                         }
                         // GROUP BY columns
-                        for gb in &stmt.group_by {
+                        for gb in stmt.group_by.exprs() {
                             collect_expr_columns(gb, &mut mask);
                         }
                         // HAVING columns
@@ -414,7 +414,7 @@ fn execute_select_ctx(
                         for ob in &stmt.order_by {
                             collect_expr_columns(&ob.expr, &mut mask);
                         }
-                        for gb in &stmt.group_by {
+                        for gb in stmt.group_by.exprs() {
                             collect_expr_columns(gb, &mut mask);
                         }
                         if let Some(ref having) = stmt.having {
@@ -669,7 +669,7 @@ fn execute_select_ctx(
             // Single-table path: choose sorted strategy when the access method
             // already delivers rows in group-key order (Phase 4.9b).
             let strategy = choose_group_by_strategy_ctx_with_collation(
-                &stmt.group_by,
+                stmt.group_by.exprs(),
                 &access_method,
                 effective_coll,
                 &resolved.columns,

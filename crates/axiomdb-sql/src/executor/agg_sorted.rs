@@ -29,6 +29,7 @@ fn execute_select_grouped_sorted(
         .map(|row| {
             let key_values: Vec<Value> = stmt
                 .group_by
+                .exprs()
                 .iter()
                 .map(|e| eval(e, &row))
                 .collect::<Result<_, _>>()?;

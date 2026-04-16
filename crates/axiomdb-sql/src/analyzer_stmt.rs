@@ -418,11 +418,18 @@ fn analyze_select_with_outer(
 
     // Resolve WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
     s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&state))?;
-    s.group_by = s
-        .group_by
-        .into_iter()
-        .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
-        .collect::<Result<_, _>>()?;
+    {
+        let resolved_exprs = s.group_by.exprs().to_owned()
+            .into_iter()
+            .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
+            .collect::<Result<Vec<_>, _>>()?;
+        s.group_by = match s.group_by {
+            GroupByClause::Simple(_) => GroupByClause::Simple(resolved_exprs),
+            GroupByClause::WithRollup(_) => GroupByClause::WithRollup(resolved_exprs),
+            GroupByClause::Sets { sets, .. } => GroupByClause::Sets { universe: resolved_exprs, sets },
+            GroupByClause::None => GroupByClause::None,
+        };
+    }
     s.having = resolve_opt_expr_full(s.having, &ctx, outer_scopes, Some(&state))?;
 
     // Resolve ORDER BY.

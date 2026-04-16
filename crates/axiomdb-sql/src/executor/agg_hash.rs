@@ -116,20 +116,34 @@ fn execute_select_grouped(
     combined_rows: Vec<Row>,
     strategy: GroupByStrategy,
 ) -> Result<QueryResult, DbError> {
+    use crate::ast::GroupByClause;
+
     // Resolve positional GROUP BY (e.g. GROUP BY 1) to SELECT expressions (G8).
-    stmt.group_by = resolve_positional_group_by(&stmt.group_by, &stmt.columns);
+    {
+        let resolved = resolve_positional_group_by(stmt.group_by.exprs(), &stmt.columns);
+        stmt.group_by = match stmt.group_by {
+            GroupByClause::Simple(_) => GroupByClause::Simple(resolved),
+            GroupByClause::WithRollup(_) => GroupByClause::WithRollup(resolved),
+            GroupByClause::Sets { sets, .. } => GroupByClause::Sets { universe: resolved, sets },
+            GroupByClause::None => GroupByClause::None,
+        };
+    }
     // Resolve positional ORDER BY (e.g. ORDER BY 2) to SELECT expressions (G8).
     stmt.order_by = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
 
-    if stmt.with_rollup {
-        return execute_select_grouped_rollup(stmt, combined_rows, strategy);
-    }
-
-    match strategy {
-        GroupByStrategy::Hash => execute_select_grouped_hash(stmt, combined_rows),
-        GroupByStrategy::Sorted { presorted } => {
-            execute_select_grouped_sorted(stmt, combined_rows, presorted)
+    match &stmt.group_by {
+        GroupByClause::WithRollup(_) => {
+            execute_select_grouped_rollup(stmt, combined_rows, strategy)
         }
+        GroupByClause::Sets { .. } => {
+            execute_select_grouped_sets(stmt, combined_rows)
+        }
+        _ => match strategy {
+            GroupByStrategy::Hash => execute_select_grouped_hash(stmt, combined_rows),
+            GroupByStrategy::Sorted { presorted } => {
+                execute_select_grouped_sorted(stmt, combined_rows, presorted)
+            }
+        },
     }
 }
 
@@ -153,18 +167,24 @@ fn execute_select_grouped_rollup(
     combined_rows: Vec<Row>,
     strategy: GroupByStrategy,
 ) -> Result<QueryResult, DbError> {
-    let n = stmt.group_by.len();
+    use crate::ast::GroupByClause;
+
+    // Extract the expression list from the WithRollup variant.
+    let exprs = match &stmt.group_by {
+        GroupByClause::WithRollup(v) => v.clone(),
+        _ => unreachable!("execute_select_grouped_rollup called without WithRollup"),
+    };
+    let n = exprs.len();
     if n == 0 {
         // `GROUP BY () WITH ROLLUP` degenerates to a single grand-total row.
         let mut stripped = stmt.clone();
-        stripped.with_rollup = false;
+        stripped.group_by = GroupByClause::None;
         return execute_select_grouped_hash(stripped, combined_rows);
     }
 
     // Precompute which SELECT item positions correspond to each group_by expr.
     // Used to null-out rolled-up keys at each level.
-    let select_slot_for_gb: Vec<Option<usize>> = stmt
-        .group_by
+    let select_slot_for_gb: Vec<Option<usize>> = exprs
         .iter()
         .map(|gb| {
             stmt.columns.iter().position(|item| match item {
@@ -178,7 +198,7 @@ fn execute_select_grouped_rollup(
         // Borrow the column meta from a single-level run (shape is identical
         // across all levels — only values change).
         let mut probe = stmt.clone();
-        probe.with_rollup = false;
+        probe.group_by = GroupByClause::Simple(exprs.clone());
         probe.order_by.clear();
         probe.limit = None;
         probe.offset = None;
@@ -200,8 +220,12 @@ fn execute_select_grouped_rollup(
     let mut all_rows: Vec<Row> = Vec::new();
     for k in (0..=n).rev() {
         let mut level_stmt = stmt.clone();
-        level_stmt.with_rollup = false;
-        level_stmt.group_by.truncate(k);
+        let level_exprs = exprs[..k].to_vec();
+        level_stmt.group_by = if level_exprs.is_empty() {
+            GroupByClause::None
+        } else {
+            GroupByClause::Simple(level_exprs)
+        };
         level_stmt.order_by.clear();
         level_stmt.limit = None;
         level_stmt.offset = None;
@@ -251,6 +275,21 @@ fn execute_select_grouped_rollup(
     })
 }
 
+// ── GROUPING SETS executor (Step 3 — placeholder until Step 3 is implemented) ──
+
+/// Executes `GROUP BY ROLLUP(...) / CUBE(...) / GROUPING SETS(...)`.
+///
+/// Full implementation in Step 3. This stub returns `NotImplemented` so Step 1/2
+/// compile and all existing tests stay green.
+fn execute_select_grouped_sets(
+    _stmt: SelectStmt,
+    _combined_rows: Vec<Row>,
+) -> Result<QueryResult, DbError> {
+    Err(DbError::NotImplemented {
+        feature: "GROUP BY GROUPING SETS / ROLLUP / CUBE — executor coming in Step 3".into(),
+    })
+}
+
 // ── Hash aggregation ─────────────────────────────────────────────────────────
 
 fn execute_select_grouped_hash(
@@ -264,6 +303,7 @@ fn execute_select_grouped_hash(
     // Fast-path: detect when all GROUP BY exprs are simple column refs.
     let group_by_col_idxs: Option<Vec<usize>> = stmt
         .group_by
+        .exprs()
         .iter()
         .map(|e| match e {
             Expr::Column { col_idx, .. } => Some(*col_idx),
@@ -308,7 +348,7 @@ fn execute_select_grouped_hash(
 
     // Reused buffers — cleared each iteration, cloned only on new group.
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
-    let mut key_values_buf: Vec<Value> = Vec::with_capacity(stmt.group_by.len().max(1));
+    let mut key_values_buf: Vec<Value> = Vec::with_capacity(stmt.group_by.exprs().len().max(1));
 
     // ── One-pass scan ─────────────────────────────────────────────────────────
 
@@ -320,7 +360,7 @@ fn execute_select_grouped_hash(
                 key_values_buf.push(row.get(i).cloned().unwrap_or(Value::Null));
             }
         } else {
-            for e in &stmt.group_by {
+            for e in stmt.group_by.exprs() {
                 key_values_buf.push(eval(e, row)?);
             }
         }

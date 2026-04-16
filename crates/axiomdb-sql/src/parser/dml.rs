@@ -6,9 +6,9 @@ use axiomdb_types::Value;
 
 use crate::{
     ast::{
-        Assignment, DeleteStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition,
-        JoinType, LockMode, NullsOrder, OrderByItem, SelectItem, SelectStmt, SetOpKind, SetOpTail,
-        SortOrder, Stmt, UpdateStmt,
+        Assignment, DeleteStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinClause,
+        JoinCondition, JoinType, LockMode, NullsOrder, OrderByItem, SelectItem, SelectStmt,
+        SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -151,22 +151,21 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         None
     };
 
-    let (group_by, with_rollup) = if p.eat(&Token::Group) {
+    let group_by = if p.eat(&Token::Group) {
         p.expect(&Token::By)?;
         let exprs = parse_expr_list(p)?;
-        // Optional `WITH ROLLUP` modifier (MySQL + SQL std).
-        let rollup = if matches!(p.peek(), Token::With)
+        // Optional `WITH ROLLUP` modifier (MySQL-style).
+        if matches!(p.peek(), Token::With)
             && matches!(p.peek_at(1), Token::Ident(s) if s.eq_ignore_ascii_case("rollup"))
         {
             p.advance(); // WITH
             p.advance(); // ROLLUP
-            true
+            GroupByClause::WithRollup(exprs)
         } else {
-            false
-        };
-        (exprs, rollup)
+            GroupByClause::Simple(exprs)
+        }
     } else {
-        (vec![], false)
+        GroupByClause::None
     };
 
     let having = if p.eat(&Token::Having) {
@@ -207,7 +206,6 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         joins,
         where_clause,
         group_by,
-        with_rollup,
         having,
         order_by,
         limit,

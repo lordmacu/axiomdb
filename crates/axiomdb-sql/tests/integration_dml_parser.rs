@@ -384,13 +384,13 @@ fn test_select_where_or() {
 #[test]
 fn test_select_group_by() {
     let s = select("SELECT country FROM users GROUP BY country");
-    assert_eq!(s.group_by.len(), 1);
+    assert_eq!(s.group_by.exprs().len(), 1);
 }
 
 #[test]
 fn test_select_group_by_multiple() {
     let s = select("SELECT a, b FROM t GROUP BY a, b");
-    assert_eq!(s.group_by.len(), 2);
+    assert_eq!(s.group_by.exprs().len(), 2);
 }
 
 #[test]
@@ -475,7 +475,7 @@ fn test_select_full_query() {
     assert_eq!(s.joins.len(), 1);
     assert_eq!(s.joins[0].join_type, JoinType::Left);
     assert!(s.where_clause.is_some());
-    assert_eq!(s.group_by.len(), 2);
+    assert_eq!(s.group_by.exprs().len(), 2);
     assert!(s.having.is_some());
     assert_eq!(s.order_by.len(), 1);
     assert_eq!(s.order_by[0].order, SortOrder::Desc);

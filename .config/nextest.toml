@@ -1,0 +1,14 @@
+[profile.default]
+test-threads = "num-cpus"
+failure-output = "immediate"
+success-output = "never"
+status-level = "pass"   # show each passing test name as it runs
+retries = 0
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+[profile.ci]
+test-threads = "num-cpus"
+failure-output = "immediate"
+success-output = "never"
+status-level = "pass"
+retries = 1

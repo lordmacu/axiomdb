@@ -32,8 +32,8 @@ use axiomdb_storage::StorageEngine;
 use crate::{
     ast::{
         AlterTableStmt, Assignment, ColumnConstraint, CreateIndexStmt, CreateTableStmt, DeleteStmt,
-        DropTableStmt, FromClause, InsertSource, InsertStmt, JoinCondition, SelectItem, SelectStmt,
-        Stmt, TableRef, UpdateStmt,
+        DropTableStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinCondition,
+        SelectItem, SelectStmt, Stmt, TableRef, UpdateStmt,
     },
     expr::Expr,
     schema_cache::SchemaCache,

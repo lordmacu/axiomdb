@@ -867,7 +867,7 @@ pub fn subquery_is_correlated(subquery: &crate::ast::SelectStmt, left_col_count:
         }
     }
     // Check GROUP BY
-    for expr in &subquery.group_by {
+    for expr in subquery.group_by.exprs() {
         if expr_has_outer_column_refs(expr) {
             if let Some(idx) = outer_column_idx(expr) {
                 if idx < left_col_count {
