@@ -3,7 +3,7 @@
 Phase: 21 — Advanced SQL
 Task: 21.21 — SQL standard multi-dimensional aggregation
 Spec: specs/fase-21/spec-21.21-grouping-sets.md
-Status: in-progress
+Status: done
 
 ## Summary
 
