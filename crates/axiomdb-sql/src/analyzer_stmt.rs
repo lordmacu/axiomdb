@@ -443,6 +443,16 @@ fn analyze_select_with_outer(
     s.limit = resolve_opt_expr_full(s.limit, &ctx, outer_scopes, Some(&state))?;
     s.offset = resolve_opt_expr_full(s.offset, &ctx, outer_scopes, Some(&state))?;
 
+    // Phase 21.12 — Resolve DISTINCT ON expressions (evaluated against pre-projection rows,
+    // same scope as ORDER BY, so source columns not in the SELECT list are accessible).
+    if !s.distinct_on.is_empty() {
+        let mut resolved_distinct_on = Vec::with_capacity(s.distinct_on.len());
+        for e in s.distinct_on {
+            resolved_distinct_on.push(resolve_expr_full(e, &ctx, outer_scopes, Some(&state))?);
+        }
+        s.distinct_on = resolved_distinct_on;
+    }
+
     // Resolve SELECT list.
     let mut resolved_cols = Vec::with_capacity(s.columns.len());
     for item in s.columns {

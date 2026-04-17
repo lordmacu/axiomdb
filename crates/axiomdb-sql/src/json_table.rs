@@ -897,6 +897,16 @@ pub fn subquery_is_correlated(subquery: &crate::ast::SelectStmt, left_col_count:
             }
         }
     }
+    // Check DISTINCT ON
+    for e in &subquery.distinct_on {
+        if expr_has_outer_column_refs(e) {
+            if let Some(idx) = outer_column_idx(e) {
+                if idx < left_col_count {
+                    return true;
+                }
+            }
+        }
+    }
     // Check JOIN conditions in the subquery itself
     for join in &subquery.joins {
         if let crate::ast::JoinCondition::On(ref expr) = join.condition {

@@ -350,6 +350,9 @@ impl<'r, 'db> DepCollector<'r, 'db> {
         for gb in s.group_by.exprs() {
             self.visit_expr(gb)?;
         }
+        for e in &s.distinct_on {
+            self.visit_expr(e)?;
+        }
         if let Some(lim) = &s.limit {
             self.visit_expr(lim)?;
         }
