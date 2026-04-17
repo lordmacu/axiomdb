@@ -18,7 +18,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              11.25b (JSON aggregates: jsonb_agg, json_agg, JSON_ARRAYAGG, jsonb_object_agg,
                       json_object_agg, JSON_OBJECTAGG; constructors: JSON_ARRAY, JSON_OBJECT,
                       jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH),
-             21.9 (LATERAL joins: inner comma-join, LEFT JOIN null-pad)
+             21.9 (LATERAL joins: inner comma-join, LEFT JOIN null-pad),
+             21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression)
 """
 import os
 import signal
@@ -3628,6 +3629,51 @@ cur.execute("SELECT region, SUM(amount) FROM gs_wire "
 rows = cur.fetchall()
 ok("[21.21 HAVING GROUPING=1] 1 row (grand total only)",
    len(rows) == 1 and rows[0][0] is None,
+   f"got {rows}")
+
+# ── Phase 21.12 — DISTINCT ON ────────────────────────────────────────────────
+
+print("\n[21.12 DISTINCT ON]")
+
+cur.execute("CREATE TABLE do_orders (cid INT, oid INT, odate INT, amt INT)")
+cur.execute("INSERT INTO do_orders VALUES "
+            "(1,10,20230101,100),(1,11,20230201,200),"
+            "(2,20,20230301,50),"
+            "(3,30,20230101,10),(3,31,20230201,15),(3,32,20230301,20)")
+
+# Latest order per customer: ORDER BY cid, odate DESC → first = most-recent
+cur.execute("SELECT DISTINCT ON (cid) cid, oid, amt "
+            "FROM do_orders ORDER BY cid ASC, odate DESC")
+rows = cur.fetchall()
+ok("[21.12 DISTINCT ON] 3 rows (one per customer)",
+   len(rows) == 3,
+   f"got {rows}")
+ok("[21.12 DISTINCT ON] customer 1 → most-recent order (amt=200)",
+   rows[0][0] == 1 and int(rows[0][2]) == 200,
+   f"row[0]={rows[0]}")
+ok("[21.12 DISTINCT ON] customer 3 → most-recent order (amt=20)",
+   rows[2][0] == 3 and int(rows[2][2]) == 20,
+   f"row[2]={rows[2]}")
+
+# DISTINCT ON with LIMIT
+cur.execute("SELECT DISTINCT ON (cid) cid FROM do_orders ORDER BY cid LIMIT 2")
+rows = cur.fetchall()
+ok("[21.12 DISTINCT ON + LIMIT] 2 rows",
+   len(rows) == 2,
+   f"got {rows}")
+
+# DISTINCT ON expr not in SELECT: group by odate, return first cid per date
+cur.execute("SELECT DISTINCT ON (odate) cid FROM do_orders ORDER BY odate")
+rows = cur.fetchall()
+ok("[21.12 DISTINCT ON expr not in SELECT] 3 distinct dates",
+   len(rows) == 3,
+   f"got {rows}")
+
+# Plain DISTINCT regression (must still work)
+cur.execute("SELECT DISTINCT cid FROM do_orders ORDER BY cid")
+rows = cur.fetchall()
+ok("[21.12 regression plain DISTINCT] 3 unique customers",
+   len(rows) == 3 and [r[0] for r in rows] == [1, 2, 3],
    f"got {rows}")
 
 # ── Result ────────────────────────────────────────────────────────────────────

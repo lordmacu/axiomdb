@@ -110,6 +110,99 @@ fn apply_distinct_with_session(rows: Vec<Row>) -> Vec<Row> {
         .collect()
 }
 
+/// Phase 21.12 — Resolve positional integers in DISTINCT ON exprs
+/// (e.g. `DISTINCT ON (1)` → first SELECT item), mirroring ORDER BY positional resolution.
+fn resolve_positional_distinct_on(
+    distinct_on: &[crate::expr::Expr],
+    select_items: &[SelectItem],
+) -> Vec<crate::expr::Expr> {
+    distinct_on
+        .iter()
+        .map(|e| match e {
+            crate::expr::Expr::Literal(Value::Int(n)) if *n >= 1 => {
+                let idx = (*n as usize) - 1;
+                if let Some(SelectItem::Expr { expr, .. }) = select_items.get(idx) {
+                    expr.clone()
+                } else {
+                    e.clone()
+                }
+            }
+            crate::expr::Expr::Literal(Value::BigInt(n)) if *n >= 1 => {
+                let idx = (*n as usize) - 1;
+                if let Some(SelectItem::Expr { expr, .. }) = select_items.get(idx) {
+                    expr.clone()
+                } else {
+                    e.clone()
+                }
+            }
+            _ => e.clone(),
+        })
+        .collect()
+}
+
+/// Phase 21.12 — DISTINCT ON deduplication.
+///
+/// Keeps the first row per distinct combination of the DISTINCT ON key expressions
+/// (`distinct_on`). "First" is defined by the combined sort:
+/// (all `distinct_on` exprs ASC NULLS LAST, then the full `order_by` clause).
+///
+/// The algorithm:
+/// 1. Build a combined `OrderByItem` list: `distinct_on` exprs all ASC NULLS LAST,
+///    followed by the caller's `order_by` items.
+/// 2. Sort `rows` by that combined key (one sort pass, same as a plain ORDER BY).
+/// 3. Walk sorted rows; serialize only the `distinct_on` portion as a dedup key,
+///    and emit each row only on the first occurrence of that key.
+///
+/// The result is already in the correct final ORDER BY sequence — no second sort
+/// is needed by the caller.
+fn apply_distinct_on(
+    rows: Vec<Row>,
+    distinct_on: &[crate::expr::Expr],
+    order_by: &[OrderByItem],
+    select_items: &[SelectItem],
+) -> Result<Vec<Row>, DbError> {
+    use crate::ast::{NullsOrder, SortOrder};
+    use crate::eval::eval as eval_expr;
+
+    if distinct_on.is_empty() {
+        return Ok(rows);
+    }
+
+    // Resolve any positional integer references in DISTINCT ON (e.g. DISTINCT ON (1)).
+    let resolved = resolve_positional_distinct_on(distinct_on, select_items);
+
+    // Build combined ORDER BY: DISTINCT ON exprs first (all ASC NULLS LAST),
+    // then the user's ORDER BY.
+    let mut combined: Vec<OrderByItem> = resolved
+        .iter()
+        .map(|e| OrderByItem {
+            expr: e.clone(),
+            order: SortOrder::Asc,
+            nulls: Some(NullsOrder::Last),
+        })
+        .collect();
+    combined.extend_from_slice(order_by);
+
+    let sorted = apply_order_by(rows, &combined)?;
+
+    // Walk sorted rows, keeping the first occurrence of each DISTINCT ON key.
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut result: Vec<Row> = Vec::new();
+    for row in sorted {
+        let key: Vec<u8> = resolved
+            .iter()
+            .flat_map(|e| {
+                let v = eval_expr(e, &row).unwrap_or(Value::Null);
+                value_to_session_key_bytes(&v)
+            })
+            .collect();
+        if seen.insert(key) {
+            result.push(row);
+        }
+    }
+    Ok(result)
+}
+
 // ── GroupState ────────────────────────────────────────────────────────────────
 
 /// State for one GROUP BY group.

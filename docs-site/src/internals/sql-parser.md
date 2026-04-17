@@ -793,6 +793,91 @@ keeps parsing and execution logic clean and makes semantic analysis and partial-
 
 ---
 
+## DISTINCT ON (Phase 21.12)
+
+`SELECT DISTINCT ON (e1, e2, …)` is a PostgreSQL extension that returns the **first row per
+distinct combination** of key expressions. It differs from plain `DISTINCT` (full-row dedup)
+by operating on a *subset* of expressions and giving access to a representative row from each
+group.
+
+### AST
+
+```rust
+pub struct SelectStmt {
+    pub distinct: bool,          // plain SELECT DISTINCT
+    pub distinct_on: Vec<Expr>,  // DISTINCT ON (e1, e2, …) — non-empty ⟹ distinct==false
+    // ... other fields ...
+}
+```
+
+`distinct_on` is non-empty only when `DISTINCT ON (…)` is used. Both cannot be true simultaneously.
+
+### Parser
+
+```
+parse_select:
+  saw_distinct = eat(Token::Distinct)
+  if saw_distinct && peek == Token::On:
+    advance()  // consume ON
+    expect '('
+    if peek == ')': ParseError "DISTINCT ON requires at least one expression"
+    loop: parse_expr() → distinct_on.push(e)
+    expect ')'
+    distinct = false   // DISTINCT ON ≠ plain DISTINCT
+  else:
+    distinct = saw_distinct
+```
+
+### Analyzer
+
+`distinct_on` expressions are resolved in the analyzer against the *source-row scope*
+(same `BindContext` as `ORDER BY`), so columns not in the `SELECT` list are accessible:
+
+```rust
+// analyzer_stmt.rs — after ORDER BY resolution, before SELECT list
+if !s.distinct_on.is_empty() {
+    // Guard: DISTINCT ON + GROUP BY not supported (use subquery instead)
+    if !s.group_by.is_empty() { return Err(NotImplemented) }
+    for e in s.distinct_on { ... resolve_expr_full(e, &ctx) ... }
+}
+```
+
+Positional references (`DISTINCT ON (1)`) are resolved in the executor by
+`resolve_positional_distinct_on`, mirroring `resolve_positional_order_by`.
+
+### Executor — `apply_distinct_on`
+
+```
+apply_distinct_on(rows, distinct_on, order_by, select_items):
+  1. resolve_positional_distinct_on(distinct_on, select_items) → resolved
+  2. combined_ob = [resolved.each as (ASC NULLS LAST)] ++ order_by
+  3. sorted = apply_order_by(rows, combined_ob)      // one sort pass
+  4. seen = HashSet<Vec<u8>>
+  5. for row in sorted:
+       key = concat(value_to_session_key_bytes(eval(e, row)) for e in resolved)
+       if seen.insert(key): emit row
+  6. return result
+```
+
+The combined sort ensures that within each DISTINCT ON group, the "first" row is
+exactly the row that sorts first according to ORDER BY — identical to PostgreSQL's semantics.
+The result is already in correct ORDER BY sequence; no second sort is needed.
+
+`apply_distinct_on` is wired into all five SELECT executor paths
+(`execute_select_derived`, `execute_select_json_table_source`,
+`execute_select_jsonb_srf_source`, `execute_select_values_source`,
+the main table-scan path, and `execute_select_with_joins`). When `distinct_on` is
+non-empty, it replaces both `apply_order_by` and `apply_distinct_with_session`.
+
+<div class="callout-advantage">
+<strong>AxiomDB advantage</strong>: DISTINCT ON is not available in MySQL 8 or MariaDB.
+AxiomDB implements it with a single O(n log n) sort + O(n) hash walk — same algorithmic
+complexity as PostgreSQL's sort-unique plan node (nodeUnique.c), without a separate planning
+phase.
+</div>
+
+---
+
 ## GROUPING SETS / ROLLUP / CUBE (Phase 21.21)
 
 ### AST Representation — `GroupByClause`

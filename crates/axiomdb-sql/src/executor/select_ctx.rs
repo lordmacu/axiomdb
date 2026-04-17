@@ -682,17 +682,23 @@ fn execute_select_ctx(
         }
 
         let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
-        // Top-N optimization: partial sort when ORDER BY + LIMIT present.
-        if !resolved_ob.is_empty()
-            && stmt.limit.is_some()
-            && !stmt.distinct
-            && !stmt.calc_found_rows
-        {
-            let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
-            let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
-            combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+        if !stmt.distinct_on.is_empty() {
+            // Phase 21.12 — DISTINCT ON: sort by (distinct_on ASC, then ORDER BY),
+            // keep first pre-projection row per DISTINCT ON key group.
+            combined_rows = apply_distinct_on(combined_rows, &stmt.distinct_on, &resolved_ob, &stmt.columns)?;
         } else {
-            combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+            // Top-N optimization: partial sort when ORDER BY + LIMIT present.
+            if !resolved_ob.is_empty()
+                && stmt.limit.is_some()
+                && !stmt.distinct
+                && !stmt.calc_found_rows
+            {
+                let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+                let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+                combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+            } else {
+                combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+            }
         }
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
