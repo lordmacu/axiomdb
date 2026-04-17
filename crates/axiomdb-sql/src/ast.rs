@@ -510,6 +510,10 @@ pub struct SelectStmt {
     /// and clears the list, so executors never see non-empty entries.
     pub with_ctes: Vec<CteBinding>,
     pub distinct: bool,
+    /// Phase 21.12 — `SELECT DISTINCT ON (e1, e2, …) …` key expressions.
+    /// Non-empty implies `distinct == false`. Evaluated against pre-projection rows
+    /// (same scope as ORDER BY), so source columns not in the SELECT list are accessible.
+    pub distinct_on: Vec<Expr>,
     /// `SQL_CALC_FOUND_ROWS` modifier: stash pre-LIMIT count for `FOUND_ROWS()` (4.5e).
     pub calc_found_rows: bool,
     pub columns: Vec<SelectItem>,
@@ -1005,6 +1009,7 @@ mod tests {
         let stmt = Stmt::Select(SelectStmt {
             with_ctes: Vec::new(),
             distinct: false,
+            distinct_on: vec![],
             calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
             from: Some(FromClause::Table(TableRef::simple("users"))),
@@ -1031,6 +1036,7 @@ mod tests {
         let stmt = Stmt::Select(SelectStmt {
             with_ctes: Vec::new(),
             distinct: false,
+            distinct_on: vec![],
             calc_found_rows: false,
             columns: vec![SelectItem::Expr {
                 expr: Expr::int(1),
@@ -1230,6 +1236,7 @@ mod tests {
         let subquery = SelectStmt {
             with_ctes: Vec::new(),
             distinct: false,
+            distinct_on: vec![],
             calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
             from: Some(FromClause::Table(TableRef::simple("users"))),
