@@ -111,7 +111,32 @@ fn eat_ident_ci(p: &mut Parser, keyword: &str) -> bool {
 
 /// Parses everything after `SELECT` has been consumed.
 pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
-    let distinct = p.eat(&Token::Distinct);
+    let saw_distinct = p.eat(&Token::Distinct);
+
+    // Phase 21.12 — DISTINCT ON (expr, …): key-based first-row-per-group.
+    // Syntax: SELECT DISTINCT ON (e1, e2, …) …
+    // Mutually exclusive with plain DISTINCT.
+    let mut distinct_on: Vec<Expr> = vec![];
+    let distinct = if saw_distinct && matches!(p.peek(), Token::On) {
+        p.advance(); // consume ON
+        p.expect(&Token::LParen)?;
+        if matches!(p.peek(), Token::RParen) {
+            return Err(DbError::ParseError {
+                message: "DISTINCT ON requires at least one expression".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        loop {
+            distinct_on.push(parse_expr(p)?);
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+        p.expect(&Token::RParen)?;
+        false // DISTINCT ON ≠ plain DISTINCT
+    } else {
+        saw_distinct
+    };
 
     // MySQL optimizer hint modifiers (4.4i): consume and discard.
     // SQL_CALC_FOUND_ROWS is stored for FOUND_ROWS() support (4.5e).
@@ -190,6 +215,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
     Ok(SelectStmt {
         with_ctes: Vec::new(),
         distinct,
+        distinct_on,
         calc_found_rows,
         columns,
         from,
