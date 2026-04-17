@@ -230,7 +230,8 @@ fn detect_materializable_pattern(stmt: &SelectStmt) -> Option<MaterializableInfo
         }
     }) || stmt.having.as_ref().is_some_and(expr_has_outer_ref)
         || stmt.group_by.exprs().iter().any(expr_has_outer_ref)
-        || stmt.order_by.iter().any(|o| expr_has_outer_ref(&o.expr));
+        || stmt.order_by.iter().any(|o| expr_has_outer_ref(&o.expr))
+        || stmt.distinct_on.iter().any(expr_has_outer_ref);
 
     if has_outer_elsewhere {
         return None;
@@ -634,6 +635,11 @@ fn substitute_outer_at(
             item.expr = subst_expr(item.expr, outer_row, binding_depth);
             item
         })
+        .collect();
+    stmt.distinct_on = stmt
+        .distinct_on
+        .into_iter()
+        .map(|e| subst_expr(e, outer_row, binding_depth))
         .collect();
     stmt.joins = stmt
         .joins
