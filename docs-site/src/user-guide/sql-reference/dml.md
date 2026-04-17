@@ -52,6 +52,48 @@ SELECT DISTINCT status FROM orders;
 SELECT DISTINCT category_id, status FROM products ORDER BY category_id;
 ```
 
+### DISTINCT ON (Phase 21.12)
+
+`DISTINCT ON (expr_list)` keeps the **first row per distinct combination** of the
+key expressions. "First" is defined by the `ORDER BY` clause — which should begin
+with the same expressions as `DISTINCT ON`.
+
+```sql
+-- Classic "latest order per customer":
+-- ORDER BY customer_id, order_date DESC → for each customer, first row = most-recent
+SELECT DISTINCT ON (customer_id)
+    customer_id, order_id, order_date, amount
+FROM orders
+ORDER BY customer_id ASC, order_date DESC;
+
+-- First product per category by lowest price
+SELECT DISTINCT ON (category_id)
+    category_id, name, price
+FROM products
+ORDER BY category_id, price ASC;
+
+-- DISTINCT ON expr not in SELECT — works, evaluated against source rows
+SELECT DISTINCT ON (LOWER(email))
+    id, name
+FROM users
+ORDER BY LOWER(email), created_at ASC;
+```
+
+**Rules:**
+
+- `DISTINCT ON` and plain `DISTINCT` are mutually exclusive.
+- `DISTINCT ON (e1, e2)` deduplicates on the *combination* of `e1` and `e2`.
+- Two `NULL` key values are treated as equal (same group).
+- `LIMIT` and `OFFSET` apply *after* deduplication.
+- Combining `DISTINCT ON` with `GROUP BY` is not supported (use a subquery instead).
+- Positional notation works: `DISTINCT ON (1)` refers to the first SELECT column.
+
+<div class="callout-advantage">
+<strong>AxiomDB advantage</strong>: DISTINCT ON is a PostgreSQL extension not available in MySQL
+or MariaDB. AxiomDB implements it with a single sort pass — O(n log n) — identical to PostgreSQL's
+approach, with no extra planning overhead.
+</div>
+
 ---
 
 ## FROM and JOIN

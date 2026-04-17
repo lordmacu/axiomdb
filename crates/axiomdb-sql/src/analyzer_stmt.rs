@@ -446,6 +446,11 @@ fn analyze_select_with_outer(
     // Phase 21.12 — Resolve DISTINCT ON expressions (evaluated against pre-projection rows,
     // same scope as ORDER BY, so source columns not in the SELECT list are accessible).
     if !s.distinct_on.is_empty() {
+        if !s.group_by.is_empty() {
+            return Err(DbError::NotImplemented {
+                feature: "DISTINCT ON combined with GROUP BY".into(),
+            });
+        }
         let mut resolved_distinct_on = Vec::with_capacity(s.distinct_on.len());
         for e in s.distinct_on {
             resolved_distinct_on.push(resolve_expr_full(e, &ctx, outer_scopes, Some(&state))?);
