@@ -41,6 +41,12 @@ fn dispatch_ctx(
             ctx.conn_txn = Some(conn);
             r
         }
+        Stmt::Merge(s) => {
+            let mut conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_merge_ctx(s, exec_ctx, &mut conn, ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
         Stmt::Update(s) => {
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_update_ctx(s, exec_ctx, &mut conn, ctx);

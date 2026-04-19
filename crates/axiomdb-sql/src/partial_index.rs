@@ -173,6 +173,7 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::Exists { .. }
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
         | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. }
         | Expr::Case { .. }

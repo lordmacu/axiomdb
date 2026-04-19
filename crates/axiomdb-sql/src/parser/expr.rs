@@ -622,6 +622,7 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         // Reserved DML keywords that double as MySQL built-in function names.
         | Token::Truncate  // TRUNCATE(x, d) — numeric rounding function
         | Token::Insert    // INSERT(str, pos, len, newstr) — string replacement
+        | Token::Merge
         => parse_ident_or_call(p),
 
         // ── CASE WHEN ... END ─────────────────────────────────────────────────
@@ -683,6 +684,12 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
     // Check for table.column: `name.field`
     if p.eat(&Token::Dot) {
         let field = p.parse_identifier()?;
+        if p.in_on_conflict_expr && name.eq_ignore_ascii_case("excluded") {
+            return Ok(Expr::ExcludedValue {
+                col_idx: 0,
+                name: field,
+            });
+        }
         let qualified = format!("{name}.{field}");
         // No function call after table.col in Phase 4.4
         return Ok(Expr::Column {

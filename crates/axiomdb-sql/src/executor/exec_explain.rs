@@ -14,6 +14,9 @@ fn dispatch(
             feature: "UNION/INTERSECT/EXCEPT in legacy dispatch — use session-aware path".into(),
         }),
         Stmt::Insert(s) => execute_insert(s, storage, txn, conn_txn),
+        Stmt::Merge(_) => Err(DbError::NotImplemented {
+            feature: "MERGE execution".into(),
+        }),
         Stmt::Update(s) => execute_update(s, storage, txn, conn_txn),
         Stmt::Delete(s) => execute_delete(s, storage, txn, conn_txn),
         Stmt::CreateTable(s) => {
@@ -163,6 +166,7 @@ fn execute_explain(
             // For non-SELECT, just show the statement type.
             let type_name = match &other {
                 Stmt::Insert(_) => "INSERT",
+                Stmt::Merge(_) => "MERGE",
                 Stmt::Update(_) => "UPDATE",
                 Stmt::Delete(_) => "DELETE",
                 _ => "OTHER",

@@ -733,7 +733,8 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
         | Expr::Literal(_)
         | Expr::Default
         | Expr::Param { .. }
-        | Expr::InsertValue { .. } => false,
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. } => false,
         Expr::UnaryOp { operand, .. } => expr_has_outer_column_refs(operand),
         Expr::BinaryOp { left, right, .. } => {
             expr_has_outer_column_refs(left) || expr_has_outer_column_refs(right)
@@ -925,7 +926,10 @@ pub fn subquery_is_correlated(subquery: &crate::ast::SelectStmt, left_col_count:
 pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
     use crate::expr::Expr;
     match expr {
-        Expr::Column { .. } | Expr::OuterColumn { .. } | Expr::InsertValue { .. } => true,
+        Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. } => true,
         Expr::Literal(_) | Expr::Default | Expr::Param { .. } => false,
         Expr::UnaryOp { operand, .. } => doc_has_column_refs(operand),
         Expr::BinaryOp { left, right, .. } => {

@@ -107,6 +107,10 @@ pub(crate) struct Parser<'src> {
     /// to recognize `VALUES(col)` as the MySQL pseudo-function referring to
     /// the proposed row; outside ODKU it stays a normal identifier / call.
     pub(crate) in_odku_assignment: bool,
+    /// `true` while parsing PostgreSQL `ON CONFLICT DO UPDATE` expressions.
+    /// The expression parser uses this to recognize `EXCLUDED.col` as the
+    /// proposed-row value rather than a normal qualified column reference.
+    pub(crate) in_on_conflict_expr: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -116,6 +120,7 @@ impl<'src> Parser<'src> {
             pos: 0,
             param_count: 0,
             in_odku_assignment: false,
+            in_on_conflict_expr: false,
         }
     }
 
@@ -261,6 +266,7 @@ impl<'src> Parser<'src> {
             // DML keywords that double as MySQL built-in function names.
             | Token::Truncate  // TRUNCATE(x, d) — numeric rounding function
             | Token::Insert    // INSERT(str, pos, len, newstr) — string replacement
+            | Token::Merge
             => {
                 let tok = self.advance();
                 keyword_as_identifier(&tok.token)
@@ -322,7 +328,12 @@ impl<'src> Parser<'src> {
                 self.advance();
                 self.parse_drop()
             }
-            Token::Select | Token::Insert | Token::Update | Token::Delete | Token::With => {
+            Token::Select
+            | Token::Insert
+            | Token::Merge
+            | Token::Update
+            | Token::Delete
+            | Token::With => {
                 dml::parse_dml(self)
             }
             // MySQL `REPLACE INTO` — distinct statement verb, not a function
@@ -1057,6 +1068,7 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         // DML keywords that double as MySQL built-in function names.
         Token::Truncate => "truncate".into(),
         Token::Insert => "insert".into(),
+        Token::Merge => "merge".into(),
         _ => unreachable!("only called for known unreserved keywords"),
     }
 }

@@ -55,6 +55,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
         | Expr::Column { .. }
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
         | Expr::Param { .. } => false,
         // Subquery internals are analyzed independently; aggregates inside them
         // do not count as aggregates of the outer query.
@@ -331,6 +332,7 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         | Expr::Column { .. }
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
         | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. } => {}
         // Aggregates inside a subquery belong to the inner query, not the outer.
@@ -355,4 +357,3 @@ fn collect_agg_exprs(items: &[SelectItem], having: &Option<Expr>) -> Vec<AggExpr
     }
     result
 }
-

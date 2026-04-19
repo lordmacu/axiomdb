@@ -20,6 +20,9 @@ fn analyze_stmt(
         Stmt::Delete(s) => {
             analyze_delete(s, storage, snapshot, default_database, default_schema).map(Stmt::Delete)
         }
+        Stmt::Merge(s) => {
+            analyze_merge(s, storage, snapshot, default_database, default_schema).map(Stmt::Merge)
+        }
         Stmt::CreateTable(s) => {
             analyze_create_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::CreateTable)
@@ -125,6 +128,10 @@ fn analyze_insert_cached(
     default_schema: &str,
     cache: &mut SchemaCache,
 ) -> Result<InsertStmt, DbError> {
+    if s.on_conflict.is_some() || !s.returning.is_empty() {
+        return analyze_insert(s, storage, snapshot, default_database, default_schema);
+    }
+
     let database = s.table.database.as_deref().unwrap_or(default_database);
     let schema = s.table.schema.as_deref().unwrap_or(default_schema);
 
@@ -614,6 +621,7 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         | Expr::Column { .. }
         | Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
         | Expr::Default
         | Expr::Param { .. }
         | Expr::SqlJsonQuery { .. }

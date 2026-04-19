@@ -211,6 +211,14 @@ pub enum Expr {
     /// target table's schema; the parser emits `col_idx = 0`.
     InsertValue { col_idx: usize, name: String },
 
+    /// `EXCLUDED.col` inside PostgreSQL `INSERT ... ON CONFLICT DO UPDATE`.
+    ///
+    /// References the proposed row's value for `col`, after INSERT defaults
+    /// and coercions have been materialized. Like `InsertValue`, this is only
+    /// valid in a conflict-resolution context and must be resolved by the
+    /// analyzer before execution.
+    ExcludedValue { col_idx: usize, name: String },
+
     /// SQL:2016 `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS` (Phase 11.19a).
     /// Special-form grammar with typed clause fields.
     SqlJsonQuery {

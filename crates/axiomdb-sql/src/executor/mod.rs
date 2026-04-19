@@ -57,9 +57,11 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, CreateDatabaseStmt,
         CreateIndexStmt, CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
-        DropTableStmt, FromClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
-        NullsOrder, OrderByItem, SelectItem, SelectStmt, SetOpKind, SetOpTail, SetStmt, SetValue,
-        ShowDatabasesStmt, SortOrder, Stmt, TableRef, UpdateStmt, UseDatabaseStmt,
+        DropTableStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinClause,
+        JoinCondition, JoinType, LockMode, MergeActionCondition, MergeActionKind, MergeStmt,
+        NullsOrder, OnConflictAction, OrderByItem, SelectItem, SelectStmt, SetOpKind, SetOpTail,
+        SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, TableRef, UpdateStmt,
+        UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, InSubquerySet, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -99,7 +101,9 @@ include!("aggregate.rs");
 include!("select.rs");
 include!("insert.rs");
 include!("replace_helpers.rs");
+include!("on_conflict_helpers.rs");
 include!("odku_helpers.rs");
+include!("merge.rs");
 include!("update_ctx.rs");
 include!("update_fused_range.rs");
 include!("update_clustered_helpers.rs");

@@ -1,9 +1,26 @@
 # Project State
 
-## Current (2026-04-13)
+## Current (2026-04-19)
 
-**Active phase:** Phase 11 — Advanced Types
-**Active subphase:** Phase 11.25 COMPLETE — 4/4 JSON SRF + aggregates closed (11.25a JSONB SRF, 11.25b JSON aggregates + constructors, 11.25c `jsonb_to_record`/`jsonb_to_recordset`, 11.25d construction helpers). Commit `63bf05b`. Next: 11.18c pending `TEXT[]`, then Phase 21.5 MERGE.
+**Active phase:** Phase 21 — Advanced SQL
+**Active subphase:** Phase 21.5 COMPLETE — MERGE / UPSERT closed.
+PostgreSQL `INSERT ... ON CONFLICT` now supports `DO NOTHING`, `(cols) DO UPDATE SET ... [WHERE ...]`, `EXCLUDED.col`, and `RETURNING` on heap targets. SQL-standard heap `MERGE` now supports matched UPDATE/DELETE/DO NOTHING and not-matched INSERT/DO NOTHING, with table/subquery/VALUES/JSON_TABLE/JSONB SRF sources and a unique-key equality fast path. Clustered `ON CONFLICT` / `MERGE` and `WHEN NOT MATCHED BY SOURCE` are explicit follow-ups.
+
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql`; `cargo clippy -p axiomdb-sql -- -D warnings`; `python3 tools/wire-test.py` (417/417); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+
+**Next:** Phase 21.5f GENERATED ALWAYS AS columns, unless we pivot back to deferred JSONB operator work.
+
+### Phase 21 subphase status
+
+| Subphase | Status |
+|---|---|
+| 21.2 Non-recursive CTEs | ✅ closed |
+| 21.3 / 21.3b Recursive CTEs | ✅ closed |
+| 21.4 / 21.4b RETURNING | ✅ closed |
+| **21.5 MERGE / UPSERT** | ✅ closed |
+| 21.5b-e MySQL DML variants and multi-table DML | ✅ closed |
+| 21.5f GENERATED ALWAYS AS columns | ⏳ next |
+| 21.6 CHECK constraints | ✅ closed |
 
 ### Phase 11 subphase status
 

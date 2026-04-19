@@ -40,26 +40,90 @@ fn analyze_insert(
         s.source = InsertSource::Select(Box::new(analyzed));
     }
 
-    // Phase 21.4 — resolve RETURNING projection against the target table's scope.
-    if !s.returning.is_empty() {
-        let mut reader = CatalogReader::new(storage, snapshot.clone())?;
-        let table_def = resolve_dml_table(&mut reader, &s.table, default_database, default_schema)?;
-        let columns = reader.list_columns(table_def.id)?;
-        let bound = BoundTable {
+    let target_ctx = BindContext {
+        tables: vec![BoundTable {
             alias: s.table.alias.clone(),
             name: s.table.name.clone(),
-            columns,
+            columns: columns.clone(),
             col_offset: 0,
-        };
-        let ctx = BindContext {
-            tables: vec![bound],
-        };
+        }],
+    };
+
+    if let Some(mut clause) = s.on_conflict.take() {
+        let mut target_col_idxs = Vec::with_capacity(clause.target_columns.len());
+        for col_name in &clause.target_columns {
+            let Some(col) = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col_name))
+            else {
+                return Err(DbError::ColumnNotFound {
+                    name: col_name.clone(),
+                    table: s.table.name.clone(),
+                });
+            };
+            target_col_idxs.push(col.col_idx);
+        }
+
+        if !target_col_idxs.is_empty() {
+            let indexes = reader.list_indexes(table_def.id)?;
+            let has_match = indexes.iter().any(|idx| {
+                (idx.is_primary || idx.is_unique)
+                    && idx.columns.len() == target_col_idxs.len()
+                    && idx.columns.iter().all(|ic| {
+                        ic.expr.is_none() && target_col_idxs.contains(&ic.col_idx)
+                    })
+            });
+            if !has_match {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "ON CONFLICT target ({}) has no matching unique constraint or index",
+                        clause.target_columns.join(", ")
+                    ),
+                });
+            }
+        }
+
+        if let OnConflictAction::DoUpdate {
+            assignments,
+            where_clause,
+        } = clause.action
+        {
+            let mut resolved_assignments = Vec::with_capacity(assignments.len());
+            for assignment in assignments {
+                if !columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&assignment.column))
+                {
+                    return Err(DbError::ColumnNotFound {
+                        name: assignment.column,
+                        table: s.table.name.clone(),
+                    });
+                }
+                resolved_assignments.push(Assignment {
+                    column: assignment.column,
+                    value: resolve_expr(assignment.value, &target_ctx)?,
+                });
+            }
+            let where_clause = where_clause
+                .map(|expr| resolve_expr(expr, &target_ctx))
+                .transpose()?;
+            clause.action = OnConflictAction::DoUpdate {
+                assignments: resolved_assignments,
+                where_clause,
+            };
+        }
+
+        s.on_conflict = Some(clause);
+    }
+
+    // Phase 21.4 — resolve RETURNING projection against the target table's scope.
+    if !s.returning.is_empty() {
         let mut resolved = Vec::with_capacity(s.returning.len());
         for item in std::mem::take(&mut s.returning) {
             resolved.push(match item {
                 SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => item,
                 SelectItem::Expr { expr, alias } => SelectItem::Expr {
-                    expr: resolve_expr(expr, &ctx)?,
+                    expr: resolve_expr(expr, &target_ctx)?,
                     alias,
                 },
             });
@@ -328,6 +392,183 @@ fn analyze_delete(
     Ok(s)
 }
 
+// ── MERGE ────────────────────────────────────────────────────────────────────
+
+fn analyze_merge(
+    mut s: MergeStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<MergeStmt, DbError> {
+    let mut reader = CatalogReader::new(storage, snapshot.clone())?;
+    let table_def = resolve_dml_table(&mut reader, &s.target, default_database, default_schema)?;
+    let target_columns = reader.list_columns(table_def.id)?;
+
+    s.source = analyze_merge_source(
+        s.source,
+        storage,
+        snapshot.clone(),
+        default_database,
+        default_schema,
+    )?;
+
+    let mut col_offset = target_columns.len();
+    let mut tables = vec![BoundTable {
+        alias: s.target.alias.clone(),
+        name: s.target.name.clone(),
+        columns: target_columns.clone(),
+        col_offset: 0,
+    }];
+    tables.extend(bound_from_clause(
+        &s.source,
+        storage,
+        snapshot.clone(),
+        default_database,
+        default_schema,
+        &mut col_offset,
+        &[],
+    )?);
+    let ctx = BindContext { tables };
+
+    let state = AnalyzeState {
+        storage,
+        snapshot,
+        default_database,
+        default_schema,
+    };
+
+    s.on = resolve_expr_full(s.on, &ctx, &[], Some(&state))?;
+
+    let mut resolved_actions = Vec::with_capacity(s.actions.len());
+    for mut action in s.actions {
+        action.guard = resolve_opt_expr_full(action.guard, &ctx, &[], Some(&state))?;
+        action.kind = match action.kind {
+            MergeActionKind::Update(assignments) => {
+                let mut resolved = Vec::with_capacity(assignments.len());
+                for Assignment { column, value } in assignments {
+                    if !target_columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&column))
+                    {
+                        let available = target_columns
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(DbError::ColumnNotFound {
+                            name: column.clone(),
+                            table: format!("\"{}\" (available: {})", s.target.name, available),
+                        });
+                    }
+                    resolved.push(Assignment {
+                        column,
+                        value: resolve_expr_full(value, &ctx, &[], Some(&state))?,
+                    });
+                }
+                MergeActionKind::Update(resolved)
+            }
+            MergeActionKind::Insert { columns, values } => {
+                let expected_len = if let Some(ref cols) = columns {
+                    for col_name in cols {
+                        if !target_columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(col_name))
+                        {
+                            let available = target_columns
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(DbError::ColumnNotFound {
+                                name: col_name.clone(),
+                                table: format!(
+                                    "\"{}\" (available: {})",
+                                    s.target.name, available
+                                ),
+                            });
+                        }
+                    }
+                    cols.len()
+                } else {
+                    target_columns.len()
+                };
+                if values.len() != expected_len {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "MERGE INSERT has {} value(s) for {} target column(s)",
+                            values.len(),
+                            expected_len
+                        ),
+                    });
+                }
+                let values = values
+                    .into_iter()
+                    .map(|value| resolve_expr_full(value, &ctx, &[], Some(&state)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                MergeActionKind::Insert { columns, values }
+            }
+            MergeActionKind::Delete => MergeActionKind::Delete,
+            MergeActionKind::DoNothing => MergeActionKind::DoNothing,
+        };
+        resolved_actions.push(action);
+    }
+    s.actions = resolved_actions;
+
+    Ok(s)
+}
+
+fn analyze_merge_source(
+    source: FromClause,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<FromClause, DbError> {
+    let state = AnalyzeState {
+        storage,
+        snapshot: snapshot.clone(),
+        default_database,
+        default_schema,
+    };
+    let empty_ctx = BindContext::empty();
+
+    match source {
+        FromClause::Subquery {
+            query,
+            alias,
+            lateral,
+        } => {
+            let analyzed =
+                analyze_select(*query, storage, snapshot, default_database, default_schema)?;
+            Ok(FromClause::Subquery {
+                query: Box::new(analyzed),
+                alias,
+                lateral,
+            })
+        }
+        FromClause::JsonTable(jt) => {
+            let resolved = resolve_json_table(*jt, &empty_ctx, &[], &state)?;
+            Ok(FromClause::JsonTable(Box::new(resolved)))
+        }
+        FromClause::JsonbSrf(mut srf) => {
+            let taken = std::mem::replace(&mut srf.doc, Expr::Literal(axiomdb_types::Value::Null));
+            srf.doc = resolve_expr_full(taken, &empty_ctx, &[], Some(&state))?;
+            Ok(FromClause::JsonbSrf(srf))
+        }
+        FromClause::Values(mut vc) => {
+            for row in &mut vc.rows {
+                for expr in row {
+                    let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                    *expr = resolve_expr_full(taken, &empty_ctx, &[], Some(&state))?;
+                }
+            }
+            Ok(FromClause::Values(vc))
+        }
+        other @ FromClause::Table(_) | other @ FromClause::RecursiveCte(_) => Ok(other),
+    }
+}
+
 // ── CREATE TABLE ──────────────────────────────────────────────────────────────
 
 fn analyze_create_table(
@@ -500,7 +741,7 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
         Expr::Param { .. } => Err(DbError::NotImplemented {
             feature: "prepared parameter is not allowed in index expression".into(),
         }),
-        Expr::OuterColumn { .. } | Expr::InsertValue { .. } => Err(DbError::NotImplemented {
+        Expr::OuterColumn { .. } | Expr::InsertValue { .. } | Expr::ExcludedValue { .. } => Err(DbError::NotImplemented {
             feature: "outer/insert reference is not allowed in index expression".into(),
         }),
         Expr::BinaryOp { left, right, .. } => {

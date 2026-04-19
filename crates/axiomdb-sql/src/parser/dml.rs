@@ -7,8 +7,9 @@ use axiomdb_types::Value;
 use crate::{
     ast::{
         Assignment, DeleteStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, LockMode, NullsOrder, OrderByItem, SelectItem, SelectStmt,
-        SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
+        JoinCondition, JoinType, LockMode, MergeAction, MergeActionCondition, MergeActionKind,
+        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, SelectItem,
+        SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -51,6 +52,10 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
             p.advance();
             parse_insert(p)
         }
+        Token::Merge => {
+            p.advance();
+            parse_merge(p)
+        }
         Token::Update => {
             p.advance();
             parse_update(p)
@@ -61,7 +66,7 @@ pub(crate) fn parse_dml(p: &mut Parser) -> Result<Stmt, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected SELECT, INSERT, UPDATE, or DELETE, found {:?}",
+                "expected SELECT, INSERT, MERGE, UPDATE, or DELETE, found {:?}",
                 other,
             ),
             position: Some(p.current_pos()),
@@ -1167,6 +1172,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
             }
         }
         let on_duplicate_update = parse_on_duplicate_update_tail(p, is_replace)?;
+        let on_conflict = parse_on_conflict_tail(p, is_replace)?;
         let returning = parse_returning_clause(p)?;
         return Ok(Stmt::Insert(InsertStmt {
             table,
@@ -1175,6 +1181,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
             ignore,
             replace: is_replace,
             on_duplicate_update,
+            on_conflict,
             returning,
         }));
     }
@@ -1219,6 +1226,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
     };
 
     let on_duplicate_update = parse_on_duplicate_update_tail(p, is_replace)?;
+    let on_conflict = parse_on_conflict_tail(p, is_replace)?;
     let returning = parse_returning_clause(p)?;
     Ok(Stmt::Insert(InsertStmt {
         table,
@@ -1227,6 +1235,7 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
         ignore,
         replace: is_replace,
         on_duplicate_update,
+        on_conflict,
         returning,
     }))
 }
@@ -1298,6 +1307,84 @@ fn parse_on_duplicate_update_tail(
     Ok(Some(assignments))
 }
 
+/// Parses PostgreSQL `ON CONFLICT ...` after an INSERT source.
+fn parse_on_conflict_tail(
+    p: &mut Parser,
+    is_replace: bool,
+) -> Result<Option<OnConflictClause>, DbError> {
+    if !matches!(p.peek(), Token::On) {
+        return Ok(None);
+    }
+    if !matches!(p.peek_at(1), Token::Ident(s) if s.eq_ignore_ascii_case("conflict")) {
+        return Ok(None);
+    }
+    p.advance(); // ON
+    p.advance(); // CONFLICT
+
+    if is_replace {
+        return Err(DbError::ParseError {
+            message: "REPLACE INTO ... ON CONFLICT is not a valid combination \
+                      (REPLACE and ON CONFLICT are mutually exclusive upserts)"
+                .into(),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    let target_columns = if p.eat(&Token::LParen) {
+        let mut cols = vec![p.parse_identifier()?];
+        while p.eat(&Token::Comma) {
+            cols.push(p.parse_identifier()?);
+        }
+        p.expect(&Token::RParen)?;
+        cols
+    } else {
+        Vec::new()
+    };
+
+    p.expect(&Token::Do)?;
+    let action = if eat_ident_ci(p, "nothing") {
+        OnConflictAction::DoNothing
+    } else if p.eat(&Token::Update) {
+        if target_columns.is_empty() {
+            return Err(DbError::ParseError {
+                message: "ON CONFLICT DO UPDATE requires a conflict target".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        p.expect(&Token::Set)?;
+
+        let old_flag = p.in_on_conflict_expr;
+        p.in_on_conflict_expr = true;
+        let parsed = (|| -> Result<OnConflictAction, DbError> {
+            let mut assignments = vec![parse_assignment(p)?];
+            while p.eat(&Token::Comma) {
+                assignments.push(parse_assignment(p)?);
+            }
+            let where_clause = if p.eat(&Token::Where) {
+                Some(parse_expr(p)?)
+            } else {
+                None
+            };
+            Ok(OnConflictAction::DoUpdate {
+                assignments,
+                where_clause,
+            })
+        })();
+        p.in_on_conflict_expr = old_flag;
+        parsed?
+    } else {
+        return Err(DbError::ParseError {
+            message: "expected NOTHING or UPDATE after ON CONFLICT DO".into(),
+            position: Some(p.current_pos()),
+        });
+    };
+
+    Ok(Some(OnConflictClause {
+        target_columns,
+        action,
+    }))
+}
+
 // ── UPDATE ────────────────────────────────────────────────────────────────────
 
 fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
@@ -1362,6 +1449,153 @@ fn parse_assignment(p: &mut Parser) -> Result<Assignment, DbError> {
     p.expect(&Token::Eq)?;
     let value = parse_expr(p)?;
     Ok(Assignment { column, value })
+}
+
+// ── MERGE ────────────────────────────────────────────────────────────────────
+
+fn parse_merge(p: &mut Parser) -> Result<Stmt, DbError> {
+    p.expect(&Token::Into)?;
+    let mut target = p.parse_table_ref()?;
+    if p.eat(&Token::As) || is_implicit_alias_token(p.peek()) {
+        target.alias = Some(p.parse_identifier()?);
+    }
+
+    p.expect(&Token::Using)?;
+    let source = parse_from_item(p)?;
+
+    p.expect(&Token::On)?;
+    let on = parse_expr(p)?;
+
+    let mut actions = Vec::new();
+    while p.eat(&Token::When) {
+        actions.push(parse_merge_action(p)?);
+    }
+    if actions.is_empty() {
+        return Err(DbError::ParseError {
+            message: "MERGE requires at least one WHEN branch".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    Ok(Stmt::Merge(MergeStmt {
+        target,
+        source,
+        on,
+        actions,
+    }))
+}
+
+fn parse_merge_action(p: &mut Parser) -> Result<MergeAction, DbError> {
+    let condition = if p.eat(&Token::Not) {
+        expect_ident_ci(p, "MATCHED")?;
+        if p.eat(&Token::By) {
+            if p.eat_ident_ci("SOURCE") {
+                return Err(DbError::NotImplemented {
+                    feature: "MERGE WHEN NOT MATCHED BY SOURCE".into(),
+                });
+            }
+            expect_ident_ci(p, "TARGET")?;
+        }
+        MergeActionCondition::NotMatched
+    } else {
+        expect_ident_ci(p, "MATCHED")?;
+        MergeActionCondition::Matched
+    };
+
+    let guard = if p.eat(&Token::And) {
+        Some(parse_expr(p)?)
+    } else {
+        None
+    };
+
+    p.expect(&Token::Then)?;
+    let kind = parse_merge_action_kind(p, condition)?;
+    Ok(MergeAction {
+        condition,
+        guard,
+        kind,
+    })
+}
+
+fn parse_merge_action_kind(
+    p: &mut Parser,
+    condition: MergeActionCondition,
+) -> Result<MergeActionKind, DbError> {
+    if p.eat(&Token::Update) {
+        if condition != MergeActionCondition::Matched {
+            return Err(DbError::ParseError {
+                message: "MERGE UPDATE action requires WHEN MATCHED".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        p.expect(&Token::Set)?;
+        let mut assignments = vec![parse_assignment(p)?];
+        while p.eat(&Token::Comma) {
+            assignments.push(parse_assignment(p)?);
+        }
+        return Ok(MergeActionKind::Update(assignments));
+    }
+
+    if p.eat(&Token::Delete) {
+        if condition != MergeActionCondition::Matched {
+            return Err(DbError::ParseError {
+                message: "MERGE DELETE action requires WHEN MATCHED".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        return Ok(MergeActionKind::Delete);
+    }
+
+    if p.eat(&Token::Do) {
+        expect_ident_ci(p, "NOTHING")?;
+        return Ok(MergeActionKind::DoNothing);
+    }
+
+    if p.eat(&Token::Insert) {
+        if condition != MergeActionCondition::NotMatched {
+            return Err(DbError::ParseError {
+                message: "MERGE INSERT action requires WHEN NOT MATCHED".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        let columns = if p.eat(&Token::LParen) {
+            let mut cols = vec![p.parse_identifier()?];
+            while p.eat(&Token::Comma) {
+                cols.push(p.parse_identifier()?);
+            }
+            p.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        p.expect(&Token::Values)?;
+        p.expect(&Token::LParen)?;
+        let mut values = vec![parse_expr(p)?];
+        while p.eat(&Token::Comma) {
+            values.push(parse_expr(p)?);
+        }
+        p.expect(&Token::RParen)?;
+        return Ok(MergeActionKind::Insert { columns, values });
+    }
+
+    Err(DbError::ParseError {
+        message: format!(
+            "expected UPDATE, DELETE, INSERT, or DO NOTHING after MERGE THEN, found {:?}",
+            p.peek(),
+        ),
+        position: Some(p.current_pos()),
+    })
+}
+
+fn expect_ident_ci(p: &mut Parser, keyword: &str) -> Result<(), DbError> {
+    if p.eat_ident_ci(keyword) {
+        Ok(())
+    } else {
+        Err(DbError::ParseError {
+            message: format!("expected {keyword}, found {:?}", p.peek()),
+            position: Some(p.current_pos()),
+        })
+    }
 }
 
 // ── DELETE ────────────────────────────────────────────────────────────────────
