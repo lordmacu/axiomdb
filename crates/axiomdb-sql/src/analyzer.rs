@@ -33,7 +33,8 @@ use crate::{
     ast::{
         AlterTableStmt, Assignment, ColumnConstraint, CreateIndexStmt, CreateTableStmt, DeleteStmt,
         DropTableStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinCondition,
-        SelectItem, SelectStmt, Stmt, TableRef, UpdateStmt,
+        MergeActionKind, MergeStmt, OnConflictAction, SelectItem, SelectStmt, Stmt, TableRef,
+        UpdateStmt,
     },
     expr::Expr,
     schema_cache::SchemaCache,

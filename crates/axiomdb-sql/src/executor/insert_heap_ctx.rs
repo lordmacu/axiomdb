@@ -139,6 +139,10 @@ fn execute_insert_ctx(
         None => None,
     };
     let odku_mode = odku_assignments.is_some();
+    let on_conflict_clause = stmt.on_conflict.clone();
+    let on_conflict_mode = on_conflict_clause.is_some();
+    let mut on_conflict_touched: std::collections::HashSet<RecordId> =
+        std::collections::HashSet::new();
 
     match stmt.source {
         // ── INSERT ... VALUES — immediate path ────────────────────────────────
@@ -243,7 +247,7 @@ fn execute_insert_ctx(
                 )?);
             }
 
-            if full_batch.len() == 1 || ignore || replace_mode || odku_mode {
+            if full_batch.len() == 1 || ignore || replace_mode || odku_mode || on_conflict_mode {
                 for (row_idx, full_values) in full_batch.into_iter().enumerate() {
                     // REPLACE: delete every row that would violate a PK / UNIQUE
                     // before attempting the INSERT. Each displaced row counts
@@ -287,6 +291,32 @@ fn execute_insert_ctx(
                             }
                             OdkuOutcome::Inserted => {
                                 // Fall through to the normal INSERT path below.
+                            }
+                        }
+                    }
+                    if let Some(ref clause) = on_conflict_clause {
+                        match apply_on_conflict_heap(
+                            storage,
+                            txn,
+                            conn_txn,
+                            bloom,
+                            ctx,
+                            &resolved,
+                            schema_cols,
+                            &mut secondary_indexes,
+                            &compiled_preds,
+                            clause,
+                            &full_values,
+                            &mut on_conflict_touched,
+                        )? {
+                            OnConflictOutcome::Insert => {}
+                            OnConflictOutcome::Skip => continue,
+                            OnConflictOutcome::Updated { row, .. } => {
+                                if want_returning {
+                                    returning_rows.push(row);
+                                }
+                                count += 1;
+                                continue;
                             }
                         }
                     }
@@ -438,7 +468,7 @@ fn execute_insert_ctx(
 
             // Batch insert: one heap pass + one WAL record per page + batch index maintenance.
             if !full_batch.is_empty() {
-                if ignore || replace_mode || odku_mode {
+                if ignore || replace_mode || odku_mode || on_conflict_mode {
                     // IGNORE / REPLACE / ODKU mode: fall back to per-row for
                     // error handling / conflict displacement / conflict-update.
                     for (row_idx, full_values) in full_batch.into_iter().enumerate() {
@@ -477,6 +507,32 @@ fn execute_insert_ctx(
                                     continue;
                                 }
                                 OdkuOutcome::Inserted => {}
+                            }
+                        }
+                        if let Some(ref clause) = on_conflict_clause {
+                            match apply_on_conflict_heap(
+                                storage,
+                                txn,
+                                conn_txn,
+                                bloom,
+                                ctx,
+                                &resolved,
+                                schema_cols,
+                                &mut secondary_indexes,
+                                &compiled_preds,
+                                clause,
+                                &full_values,
+                                &mut on_conflict_touched,
+                            )? {
+                                OnConflictOutcome::Insert => {}
+                                OnConflictOutcome::Skip => continue,
+                                OnConflictOutcome::Updated { row, .. } => {
+                                    if want_returning {
+                                        returning_rows.push(row);
+                                    }
+                                    count += 1;
+                                    continue;
+                                }
                             }
                         }
                         let rid = match TableEngine::insert_row_with_ctx(
@@ -650,6 +706,54 @@ fn execute_insert_ctx(
                     });
                 }
                 Some(OdkuOutcome::Inserted) | None => {}
+            }
+            if let Some(ref clause) = on_conflict_clause {
+                match apply_on_conflict_heap(
+                    storage,
+                    txn,
+                    conn_txn,
+                    bloom,
+                    ctx,
+                    &resolved,
+                    schema_cols,
+                    &mut secondary_indexes,
+                    &compiled_preds,
+                    clause,
+                    &full_values,
+                    &mut on_conflict_touched,
+                )? {
+                    OnConflictOutcome::Insert => {}
+                    OnConflictOutcome::Skip => {
+                        if want_returning {
+                            return project_returning(
+                                &stmt.returning,
+                                &returning_rows,
+                                &resolved.def,
+                                &resolved.columns,
+                            );
+                        }
+                        return Ok(QueryResult::Affected {
+                            count,
+                            last_insert_id: first_generated,
+                        });
+                    }
+                    OnConflictOutcome::Updated { row, .. } => {
+                        count += 1;
+                        if want_returning {
+                            returning_rows.push(row);
+                            return project_returning(
+                                &stmt.returning,
+                                &returning_rows,
+                                &resolved.def,
+                                &resolved.columns,
+                            );
+                        }
+                        return Ok(QueryResult::Affected {
+                            count,
+                            last_insert_id: first_generated,
+                        });
+                    }
+                }
             }
             let rid = TableEngine::insert_row_with_ctx(
                 storage,

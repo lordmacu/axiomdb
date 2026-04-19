@@ -46,6 +46,15 @@ fn eval_odku_assignment_rhs(
                     len: proposed_row.len(),
                 })
         }
+        Expr::ExcludedValue { col_idx, .. } => {
+            proposed_row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: proposed_row.len(),
+                })
+        }
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Default => Ok(Value::Null),
         Expr::UnaryOp { op, operand } => {
@@ -339,6 +348,16 @@ fn resolve_odku_expr(
                     table: format!("VALUES() in {table_name}"),
                 })?;
             Ok(Expr::InsertValue { col_idx: idx, name })
+        }
+        Expr::ExcludedValue { col_idx: _, name } => {
+            let idx = schema_cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    name: name.clone(),
+                    table: format!("EXCLUDED in {table_name}"),
+                })?;
+            Ok(Expr::ExcludedValue { col_idx: idx, name })
         }
         Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
             op,

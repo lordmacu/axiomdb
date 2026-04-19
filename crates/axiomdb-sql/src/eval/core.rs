@@ -58,6 +58,12 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                  eval_with_proposed must be called inside an ODKU assignment"
             ),
         }),
+        Expr::ExcludedValue { col_idx, name } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted EXCLUDED.{name} (col_idx={col_idx}) — \
+                 ON CONFLICT evaluation must substitute the proposed row"
+            ),
+        }),
 
         Expr::UnaryOp { op, operand } => {
             let v = eval(operand, row)?;
@@ -445,6 +451,12 @@ pub fn eval_with<R: SubqueryRunner>(
             message: format!(
                 "unsubstituted VALUES('{name}') (col_idx={col_idx}) — \
                  eval_with_proposed must be called inside an ODKU assignment"
+            ),
+        }),
+        Expr::ExcludedValue { col_idx, name } => Err(DbError::Internal {
+            message: format!(
+                "unsubstituted EXCLUDED.{name} (col_idx={col_idx}) — \
+                 ON CONFLICT evaluation must substitute the proposed row"
             ),
         }),
 

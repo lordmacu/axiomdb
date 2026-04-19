@@ -77,6 +77,8 @@ pub enum Token<'src> {
     Where,
     #[token("INSERT", ignore(ascii_case))]
     Insert,
+    #[token("MERGE", ignore(ascii_case))]
+    Merge,
     #[token("INTO", ignore(ascii_case))]
     Into,
     #[token("VALUES", ignore(ascii_case))]

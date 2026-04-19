@@ -184,6 +184,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::Insert(s) => self.visit_insert(s),
             Stmt::Update(s) => self.visit_update(s),
             Stmt::Delete(s) => self.visit_delete(s),
+            Stmt::Merge(s) => self.visit_merge(s),
             // DDL — never cached; return empty deps.
             Stmt::CreateTable(_)
             | Stmt::CreateDatabase(_)
@@ -279,6 +280,31 @@ impl<'r, 'db> DepCollector<'r, 'db> {
         self.visit_joins(&s.joins)?;
         if let Some(w) = &s.where_clause {
             self.visit_expr(w)?;
+        }
+        Ok(())
+    }
+
+    fn visit_merge(&mut self, s: &crate::ast::MergeStmt) -> Result<(), DbError> {
+        self.visit_tableref(&s.target)?;
+        self.visit_from_clause(&s.source)?;
+        self.visit_expr(&s.on)?;
+        for action in &s.actions {
+            if let Some(guard) = &action.guard {
+                self.visit_expr(guard)?;
+            }
+            match &action.kind {
+                crate::ast::MergeActionKind::Update(assignments) => {
+                    for assignment in assignments {
+                        self.visit_expr(&assignment.value)?;
+                    }
+                }
+                crate::ast::MergeActionKind::Insert { values, .. } => {
+                    for value in values {
+                        self.visit_expr(value)?;
+                    }
+                }
+                crate::ast::MergeActionKind::Delete | crate::ast::MergeActionKind::DoNothing => {}
+            }
         }
         Ok(())
     }
@@ -439,6 +465,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Expr::Column { .. }
             | Expr::OuterColumn { .. }
             | Expr::InsertValue { .. }
+            | Expr::ExcludedValue { .. }
             | Expr::SqlJsonQuery { .. }
             | Expr::Literal(_)
             | Expr::Default

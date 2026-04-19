@@ -93,6 +93,17 @@ fn resolve_expr_full(
                 table: "VALUES()".into(),
             })
         }
+        Expr::ExcludedValue { col_idx: _, name } => {
+            if !ctx.tables.is_empty() {
+                if let Ok(idx) = ctx.resolve_column(&name) {
+                    return Ok(Expr::ExcludedValue { col_idx: idx, name });
+                }
+            }
+            Err(DbError::ColumnNotFound {
+                name: name.clone(),
+                table: "EXCLUDED".into(),
+            })
+        }
         Expr::Column { col_idx: _, name } => {
             // 1. Try the inner (current) scope first.
             if !ctx.tables.is_empty() {
@@ -380,4 +391,3 @@ fn resolve_sql_json_behavior(
         other => Ok(other),
     }
 }
-

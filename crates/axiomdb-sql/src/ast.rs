@@ -549,6 +549,26 @@ pub enum InsertSource {
     DefaultValues,
 }
 
+/// PostgreSQL `INSERT ... ON CONFLICT` action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictAction {
+    /// `DO NOTHING`
+    DoNothing,
+    /// `DO UPDATE SET ... [WHERE ...]`
+    DoUpdate {
+        assignments: Vec<Assignment>,
+        where_clause: Option<Expr>,
+    },
+}
+
+/// PostgreSQL `INSERT ... ON CONFLICT` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflictClause {
+    /// Column-list conflict target. Empty only for target-less `DO NOTHING`.
+    pub target_columns: Vec<String>,
+    pub action: OnConflictAction,
+}
+
 /// An `INSERT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStmt {
@@ -571,6 +591,8 @@ pub struct InsertStmt {
     /// of erroring. `VALUES(col)` in the RHS refers to the proposed
     /// (would-have-been-inserted) row via `Expr::InsertValue`.
     pub on_duplicate_update: Option<Vec<Assignment>>,
+    /// PostgreSQL `INSERT ... ON CONFLICT ...`.
+    pub on_conflict: Option<OnConflictClause>,
 }
 
 /// An `UPDATE` statement.
@@ -606,6 +628,49 @@ pub struct DeleteStmt {
     /// Phase 21.4 — `RETURNING ...` projection. Empty = no RETURNING.
     #[allow(dead_code)]
     pub returning: Vec<SelectItem>,
+}
+
+/// SQL-standard MERGE match class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeActionCondition {
+    /// `WHEN MATCHED`
+    Matched,
+    /// `WHEN NOT MATCHED [BY TARGET]`
+    NotMatched,
+}
+
+/// SQL-standard MERGE action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeActionKind {
+    /// `UPDATE SET col = expr, ...`
+    Update(Vec<Assignment>),
+    /// `DELETE`
+    Delete,
+    /// `INSERT [(col, ...)] VALUES (expr, ...)`
+    Insert {
+        columns: Option<Vec<String>>,
+        values: Vec<Expr>,
+    },
+    /// `DO NOTHING`
+    DoNothing,
+}
+
+/// One `WHEN ... THEN ...` branch in a MERGE statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeAction {
+    pub condition: MergeActionCondition,
+    /// Optional `AND <expr>` guard after MATCHED / NOT MATCHED.
+    pub guard: Option<Expr>,
+    pub kind: MergeActionKind,
+}
+
+/// SQL-standard `MERGE INTO target USING source ON expr WHEN ... THEN ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeStmt {
+    pub target: TableRef,
+    pub source: FromClause,
+    pub on: Expr,
+    pub actions: Vec<MergeAction>,
 }
 
 /// Row-level lock mode for `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE`.
@@ -908,6 +973,7 @@ pub enum Stmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    Merge(MergeStmt),
     /// `CALL proc(args)` — MySQL stored procedure call; executes as Noop (Phase 17+).
     Call {
         name: String,
@@ -1158,6 +1224,7 @@ mod tests {
             ignore: false,
             replace: false,
             on_duplicate_update: None,
+            on_conflict: None,
             returning: Vec::new(),
         });
         if let Stmt::Insert(ins) = stmt {

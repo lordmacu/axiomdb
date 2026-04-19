@@ -19,7 +19,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
                       json_object_agg, JSON_OBJECTAGG; constructors: JSON_ARRAY, JSON_OBJECT,
                       jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH),
              21.9 (LATERAL joins: inner comma-join, LEFT JOIN null-pad),
-             21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression)
+             21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression),
+             21.5 (INSERT ON CONFLICT + MERGE smoke)
 """
 import os
 import signal
@@ -3674,6 +3675,42 @@ cur.execute("SELECT DISTINCT cid FROM do_orders ORDER BY cid")
 rows = cur.fetchall()
 ok("[21.12 regression plain DISTINCT] 3 unique customers",
    len(rows) == 3 and [r[0] for r in rows] == [1, 2, 3],
+   f"got {rows}")
+
+# ── Phase 21.5 — PostgreSQL UPSERT + SQL MERGE ───────────────────────────────
+
+print("\n[21.5 ON CONFLICT + MERGE]")
+
+cur.execute("CREATE TABLE up_wire (id INT, v INT)")
+cur.execute("CREATE UNIQUE INDEX uq_up_wire_id ON up_wire(id)")
+cur.execute("INSERT INTO up_wire VALUES (1, 10)")
+cur.execute("INSERT INTO up_wire VALUES (1, 20) ON CONFLICT DO NOTHING")
+ok("[21.5 ON CONFLICT DO NOTHING] duplicate skipped",
+   conn.affected_rows() == 0,
+   f"affected={conn.affected_rows()}")
+
+cur.execute("""INSERT INTO up_wire VALUES (1, 30)
+               ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+               RETURNING id, v""")
+rows = cur.fetchall()
+ok("[21.5 ON CONFLICT DO UPDATE RETURNING] returns updated row",
+   len(rows) == 1 and int(rows[0][0]) == 1 and int(rows[0][1]) == 30,
+   f"got {rows}")
+
+cur.execute("CREATE TABLE merge_wire (id INT, name TEXT)")
+cur.execute("INSERT INTO merge_wire VALUES (1, 'old')")
+cur.execute("""MERGE INTO merge_wire AS d
+               USING (VALUES (1, 'updated'), (2, 'inserted')) AS s(id, name)
+               ON d.id = s.id
+               WHEN MATCHED THEN UPDATE SET name = s.name
+               WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)""")
+ok("[21.5 MERGE] update + insert affected=2",
+   conn.affected_rows() == 2,
+   f"affected={conn.affected_rows()}")
+cur.execute("SELECT id, name FROM merge_wire ORDER BY id")
+rows = cur.fetchall()
+ok("[21.5 MERGE] final rows",
+   rows == ((1, 'updated'), (2, 'inserted')),
    f"got {rows}")
 
 # ── Result ────────────────────────────────────────────────────────────────────

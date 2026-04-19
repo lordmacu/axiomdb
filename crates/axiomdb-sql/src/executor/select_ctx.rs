@@ -212,6 +212,7 @@ fn execute_select_ctx(
                 | crate::expr::Expr::Param { .. }
                 | crate::expr::Expr::OuterColumn { .. }
                 | crate::expr::Expr::InsertValue { .. }
+                | crate::expr::Expr::ExcludedValue { .. }
                 | crate::expr::Expr::SqlJsonQuery { .. }
                 | crate::expr::Expr::Subquery(_)
                 | crate::expr::Expr::InSubquery { .. }
