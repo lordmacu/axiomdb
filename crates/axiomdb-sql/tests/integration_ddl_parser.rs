@@ -3,7 +3,10 @@
 use axiomdb_core::DbError;
 use axiomdb_sql::expr::{BinaryOp, Expr, UnaryOp};
 use axiomdb_sql::{
-    ast::{AlterTableOp, ColumnConstraint, ForeignKeyAction, SortOrder, Stmt, TableConstraint},
+    ast::{
+        AlterTableOp, ColumnConstraint, ExclusionElement, ExclusionElementTarget,
+        ExclusionOperator, ForeignKeyAction, SortOrder, Stmt, TableConstraint,
+    },
     parse,
 };
 use axiomdb_types::{DataType, Value};
@@ -667,5 +670,46 @@ fn test_alter_table_add_primary_key_without_constraint_keyword() {
         &at.operations[0],
         AlterTableOp::AddConstraint(TableConstraint::PrimaryKey { name: None, columns })
             if columns == &["id", "tenant_id"]
+    ));
+}
+
+#[test]
+fn test_create_table_exclude_btree_eq() {
+    let ct = create_table("CREATE TABLE t (id INT, slug TEXT, EXCLUDE USING btree (slug WITH =))");
+    assert_eq!(ct.table_constraints.len(), 1);
+    assert!(matches!(
+        &ct.table_constraints[0],
+        TableConstraint::Exclude {
+            name: None,
+            using,
+            elements,
+            predicate: None,
+        } if using.eq_ignore_ascii_case("btree")
+            && elements == &vec![ExclusionElement {
+                target: ExclusionElementTarget::Column("slug".into()),
+                operator: ExclusionOperator::Eq,
+            }]
+    ));
+}
+
+#[test]
+fn test_alter_table_add_named_exclude_btree_eq() {
+    let at = alter_table(
+        "ALTER TABLE users ADD CONSTRAINT users_slug_excl EXCLUDE USING btree (slug WITH =)",
+    );
+    assert_eq!(at.operations.len(), 1);
+    assert!(matches!(
+        &at.operations[0],
+        AlterTableOp::AddConstraint(TableConstraint::Exclude {
+            name: Some(name),
+            using,
+            elements,
+            predicate: None,
+        }) if name == "users_slug_excl"
+            && using.eq_ignore_ascii_case("btree")
+            && elements == &vec![ExclusionElement {
+                target: ExclusionElementTarget::Column("slug".into()),
+                operator: ExclusionOperator::Eq,
+            }]
     ));
 }

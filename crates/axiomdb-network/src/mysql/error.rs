@@ -124,6 +124,11 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
             b"HY000",
             format!("Check constraint '{constraint}' is violated for table '{table}'"),
         ),
+        DbError::ExclusionViolation { table, constraint } => (
+            1062,
+            b"23000",
+            format!("Exclusion constraint '{constraint}' is violated for table '{table}'"),
+        ),
         DbError::CardinalityViolation { count } => (
             1242,
             b"21000",

@@ -36,22 +36,25 @@ fn dispatch_ctx(
             r
         }
         Stmt::Insert(s) => {
+            let table_ref = s.table.clone();
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_insert_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r
+            r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))
         }
         Stmt::Merge(s) => {
+            let table_ref = s.target.clone();
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_merge_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r
+            r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))
         }
         Stmt::Update(s) => {
+            let table_ref = s.table.clone();
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_update_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r
+            r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))
         }
         Stmt::Delete(s) => {
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");

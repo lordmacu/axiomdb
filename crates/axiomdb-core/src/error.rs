@@ -105,6 +105,9 @@ pub enum DbError {
     #[error("CHECK constraint violation on {table}.{constraint}")]
     CheckViolation { table: String, constraint: String },
 
+    #[error("EXCLUDE constraint violation on {table}.{constraint}")]
+    ExclusionViolation { table: String, constraint: String },
+
     #[error("column count doesn't match value count at row {row}: expected {expected}, got {got}")]
     ColumnCountMismatch {
         expected: usize,
@@ -353,6 +356,7 @@ impl DbError {
             DbError::ForeignKeyNoParentIndex { .. } => "42830",
             DbError::NotNullViolation { .. } => "23502",
             DbError::CheckViolation { .. } => "23514",
+            DbError::ExclusionViolation { .. } => "23P01",
             DbError::ColumnCountMismatch { .. } => "21S01",
             DbError::DuplicateKey => "23505",
             // ── Transaction ───────────────────────────────────────────────

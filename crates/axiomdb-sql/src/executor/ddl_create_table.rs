@@ -321,6 +321,7 @@ fn execute_create_table(
     let primary_key = collect_create_table_primary_key(&stmt)?;
     let unique_indexes = collect_create_table_unique_indexes(&stmt)?;
     let non_unique_indexes = collect_create_table_non_unique_indexes(&stmt)?;
+    let exclusion_constraints = collect_create_table_exclusion_constraints(&stmt)?;
     let primary_key_cols: std::collections::HashSet<u16> = primary_key
         .as_ref()
         .map(|pk| pk.columns.iter().map(|c| c.col_idx).collect())
@@ -423,13 +424,14 @@ fn execute_create_table(
     {
         use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
 
-        let mut create_empty_index = |index_name: String,
-                                      columns: Vec<IndexColumnDef>,
-                                      is_unique: bool,
-                                      is_primary: bool,
-                                      root_override: Option<u64>,
-                                      storage: &dyn StorageEngine,
-                                      txn: &TxnManager|
+        let create_empty_index = |index_name: String,
+                                  columns: Vec<IndexColumnDef>,
+                                  is_unique: bool,
+                                  is_primary: bool,
+                                  root_override: Option<u64>,
+                                  storage: &dyn StorageEngine,
+                                  txn: &TxnManager,
+                                  conn_txn: &mut axiomdb_wal::ConnectionTxn|
          -> Result<u32, DbError> {
             let root_page_id = match root_override {
                 Some(root_page_id) => root_page_id,
@@ -472,6 +474,7 @@ fn execute_create_table(
                 Some(table_def.root_page_id),
                 storage,
                 txn,
+                conn_txn,
             )?;
             let _ = idx_id;
         }
@@ -485,6 +488,7 @@ fn execute_create_table(
                 None,
                 storage,
                 txn,
+                conn_txn,
             )?;
             let _ = idx_id;
         }
@@ -499,8 +503,33 @@ fn execute_create_table(
                 None,
                 storage,
                 txn,
+                conn_txn,
             )?;
             let _ = idx_id;
+        }
+
+        for exclusion_spec in exclusion_constraints {
+            let idx_id = create_empty_index(
+                exclusion_spec.helper_index_name,
+                exclusion_spec.index_columns,
+                true,
+                false,
+                None,
+                storage,
+                txn,
+                conn_txn,
+            )?;
+            CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(
+                axiomdb_catalog::schema::ConstraintDef {
+                    constraint_id: 0,
+                    table_id,
+                    name: exclusion_spec.constraint_name,
+                    check_expr: String::new(),
+                    kind: axiomdb_catalog::schema::ConstraintKind::Exclusion,
+                    owned_index_id: idx_id,
+                    exclude_elements: exclusion_spec.exclude_elements,
+                },
+            )?;
         }
     }
 
@@ -540,6 +569,9 @@ fn execute_create_table(
                         table_id,
                         name: check_name,
                         check_expr: check_expr_str,
+                        kind: axiomdb_catalog::schema::ConstraintKind::Check,
+                        owned_index_id: 0,
+                        exclude_elements: vec![],
                     },
                 )?;
             }
@@ -559,6 +591,9 @@ fn execute_create_table(
                     table_id,
                     name: check_name,
                     check_expr: check_expr_str,
+                    kind: axiomdb_catalog::schema::ConstraintKind::Check,
+                    owned_index_id: 0,
+                    exclude_elements: vec![],
                 },
             )?;
         }
@@ -635,6 +670,220 @@ fn execute_create_table(
 struct CreateTableIndexSpec {
     name: String,
     columns: Vec<IndexColumnDef>,
+}
+
+#[derive(Debug, Clone)]
+struct CreateTableExclusionSpec {
+    constraint_name: String,
+    helper_index_name: String,
+    index_columns: Vec<IndexColumnDef>,
+    exclude_elements: Vec<axiomdb_catalog::ExclusionElementDef>,
+}
+
+type CreateTableExclusionResolution = (
+    Vec<String>,
+    Vec<IndexColumnDef>,
+    Vec<axiomdb_catalog::ExclusionElementDef>,
+);
+
+type ExistingTableExclusionResolution = (
+    Vec<String>,
+    Vec<crate::ast::IndexColumn>,
+    Vec<axiomdb_catalog::ExclusionElementDef>,
+);
+
+fn exclusion_operator_to_feature(operator: crate::ast::ExclusionOperator) -> &'static str {
+    match operator {
+        crate::ast::ExclusionOperator::Eq => "=",
+        crate::ast::ExclusionOperator::NotEq => "<>",
+        crate::ast::ExclusionOperator::Lt => "<",
+        crate::ast::ExclusionOperator::LtEq => "<=",
+        crate::ast::ExclusionOperator::Gt => ">",
+        crate::ast::ExclusionOperator::GtEq => ">=",
+        crate::ast::ExclusionOperator::Overlaps => "&&",
+    }
+}
+
+fn ast_exclusion_operator_to_catalog(
+    operator: crate::ast::ExclusionOperator,
+) -> axiomdb_catalog::ConstraintOperator {
+    match operator {
+        crate::ast::ExclusionOperator::Eq => axiomdb_catalog::ConstraintOperator::Eq,
+        crate::ast::ExclusionOperator::NotEq => axiomdb_catalog::ConstraintOperator::NotEq,
+        crate::ast::ExclusionOperator::Lt => axiomdb_catalog::ConstraintOperator::Lt,
+        crate::ast::ExclusionOperator::LtEq => axiomdb_catalog::ConstraintOperator::LtEq,
+        crate::ast::ExclusionOperator::Gt => axiomdb_catalog::ConstraintOperator::Gt,
+        crate::ast::ExclusionOperator::GtEq => axiomdb_catalog::ConstraintOperator::GtEq,
+        crate::ast::ExclusionOperator::Overlaps => axiomdb_catalog::ConstraintOperator::Overlaps,
+    }
+}
+
+fn default_exclusion_constraint_name(table_name: &str, columns: &[String]) -> String {
+    format!("{}_{}_excl", table_name, columns.join("_"))
+}
+
+fn exclusion_helper_index_name(constraint_name: &str) -> String {
+    format!("__axiom_excl_idx_{constraint_name}")
+}
+
+fn validate_exclusion_access_method(using: &str) -> Result<(), DbError> {
+    if using.eq_ignore_ascii_case("btree") {
+        Ok(())
+    } else {
+        Err(DbError::NotImplemented {
+            feature: format!("EXCLUDE USING {using} exclusion constraints"),
+        })
+    }
+}
+
+fn validate_exclusion_predicate(predicate: &Option<Expr>) -> Result<(), DbError> {
+    if predicate.is_some() {
+        return Err(DbError::NotImplemented {
+            feature: "exclusion constraint predicates".into(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_exclusion_elements_create_table(
+    stmt: &CreateTableStmt,
+    elements: &[crate::ast::ExclusionElement],
+) -> Result<CreateTableExclusionResolution, DbError> {
+    if elements.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: "EXCLUDE constraint requires at least one element".into(),
+        });
+    }
+
+    let mut column_names = Vec::with_capacity(elements.len());
+    let mut index_columns = Vec::with_capacity(elements.len());
+    let mut exclude_elements = Vec::with_capacity(elements.len());
+
+    for element in elements {
+        let col_name = match &element.target {
+            crate::ast::ExclusionElementTarget::Column(name) => name.clone(),
+            crate::ast::ExclusionElementTarget::Expr(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "expression exclusion elements".into(),
+                })
+            }
+        };
+        if !matches!(element.operator, crate::ast::ExclusionOperator::Eq) {
+            return Err(DbError::NotImplemented {
+                feature: format!(
+                    "EXCLUDE ... WITH {} operators",
+                    exclusion_operator_to_feature(element.operator)
+                ),
+            });
+        }
+        let (col_idx, _) = stmt
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == col_name)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                name: col_name.clone(),
+                table: stmt.table.name.clone(),
+            })?;
+        column_names.push(col_name);
+        index_columns.push(IndexColumnDef {
+            col_idx: col_idx as u16,
+            order: CatalogSortOrder::Asc,
+            expr: None,
+        });
+        exclude_elements.push(axiomdb_catalog::ExclusionElementDef {
+            col_idx: col_idx as u16,
+            operator: ast_exclusion_operator_to_catalog(element.operator),
+        });
+    }
+
+    Ok((column_names, index_columns, exclude_elements))
+}
+
+fn resolve_exclusion_elements_existing(
+    table_name: &str,
+    columns_arg: &[axiomdb_catalog::schema::ColumnDef],
+    elements: &[crate::ast::ExclusionElement],
+) -> Result<ExistingTableExclusionResolution, DbError> {
+    if elements.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: "EXCLUDE constraint requires at least one element".into(),
+        });
+    }
+
+    let mut column_names = Vec::with_capacity(elements.len());
+    let mut ast_columns = Vec::with_capacity(elements.len());
+    let mut exclude_elements = Vec::with_capacity(elements.len());
+
+    for element in elements {
+        let col_name = match &element.target {
+            crate::ast::ExclusionElementTarget::Column(name) => name.clone(),
+            crate::ast::ExclusionElementTarget::Expr(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "expression exclusion elements".into(),
+                })
+            }
+        };
+        if !matches!(element.operator, crate::ast::ExclusionOperator::Eq) {
+            return Err(DbError::NotImplemented {
+                feature: format!(
+                    "EXCLUDE ... WITH {} operators",
+                    exclusion_operator_to_feature(element.operator)
+                ),
+            });
+        }
+        let col = columns_arg
+            .iter()
+            .find(|c| c.name == col_name)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                name: col_name.clone(),
+                table: table_name.to_string(),
+            })?;
+        column_names.push(col_name.clone());
+        ast_columns.push(crate::ast::IndexColumn {
+            name: col_name,
+            order: crate::ast::SortOrder::Asc,
+            expr: None,
+        });
+        exclude_elements.push(axiomdb_catalog::ExclusionElementDef {
+            col_idx: col.col_idx,
+            operator: ast_exclusion_operator_to_catalog(element.operator),
+        });
+    }
+
+    Ok((column_names, ast_columns, exclude_elements))
+}
+
+fn collect_create_table_exclusion_constraints(
+    stmt: &CreateTableStmt,
+) -> Result<Vec<CreateTableExclusionSpec>, DbError> {
+    let mut exclusions = Vec::new();
+
+    for tc in &stmt.table_constraints {
+        if let crate::ast::TableConstraint::Exclude {
+            name,
+            using,
+            elements,
+            predicate,
+        } = tc
+        {
+            validate_exclusion_access_method(using)?;
+            validate_exclusion_predicate(predicate)?;
+            let (column_names, index_columns, exclude_elements) =
+                resolve_exclusion_elements_create_table(stmt, elements)?;
+            let constraint_name = name.clone().unwrap_or_else(|| {
+                default_exclusion_constraint_name(&stmt.table.name, &column_names)
+            });
+            exclusions.push(CreateTableExclusionSpec {
+                helper_index_name: exclusion_helper_index_name(&constraint_name),
+                constraint_name,
+                index_columns,
+                exclude_elements,
+            });
+        }
+    }
+
+    Ok(exclusions)
 }
 
 fn resolve_create_table_index_columns(
@@ -1104,6 +1353,7 @@ fn execute_create_table_like(
 
     // 5. Copy indexes with fresh empty B-tree roots.
     //    For clustered tables the primary index root IS the table root page.
+    let mut copied_index_ids = std::collections::HashMap::new();
     for idx in &source.indexes {
         let root_page_id = if idx.is_primary && source.def.is_clustered() {
             new_def.root_page_id
@@ -1119,7 +1369,7 @@ fn execute_create_table_like(
             pid
         };
 
-        CatalogWriter::new(storage, txn, conn_txn)?.create_index(IndexDef {
+        let new_index_id = CatalogWriter::new(storage, txn, conn_txn)?.create_index(IndexDef {
             index_id: 0,
             table_id: new_table_id,
             name: idx.name.clone(),
@@ -1135,6 +1385,36 @@ fn execute_create_table_like(
             index_type: idx.index_type,
             pages_per_range: idx.pages_per_range,
         })?;
+        copied_index_ids.insert(idx.index_id, new_index_id);
+    }
+
+    // 6. Copy CHECK / EXCLUDE constraints. FK constraints are intentionally
+    // not copied (MySQL-compatible CREATE TABLE LIKE behavior).
+    for constraint in &source.constraints {
+        let owned_index_id = if constraint.kind == axiomdb_catalog::ConstraintKind::Exclusion {
+            copied_index_ids.get(&constraint.owned_index_id).copied().ok_or_else(|| {
+                DbError::Internal {
+                    message: format!(
+                        "missing copied helper index {} for exclusion constraint '{}'",
+                        constraint.owned_index_id, constraint.name
+                    ),
+                }
+            })?
+        } else {
+            0
+        };
+
+        CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(
+            axiomdb_catalog::schema::ConstraintDef {
+                constraint_id: 0,
+                table_id: new_table_id,
+                name: constraint.name.clone(),
+                check_expr: constraint.check_expr.clone(),
+                kind: constraint.kind,
+                owned_index_id,
+                exclude_elements: constraint.exclude_elements.clone(),
+            },
+        )?;
     }
 
     Ok(QueryResult::Empty)

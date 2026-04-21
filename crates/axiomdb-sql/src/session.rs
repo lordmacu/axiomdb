@@ -198,6 +198,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::ForeignKeyNoParentIndex { .. }
         | DbError::NotNullViolation { .. }
         | DbError::CheckViolation { .. }
+        | DbError::ExclusionViolation { .. }
         | DbError::ColumnCountMismatch { .. }
         | DbError::TypeMismatch { .. }
         | DbError::InvalidValue { .. }

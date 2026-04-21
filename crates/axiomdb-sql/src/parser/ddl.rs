@@ -7,8 +7,8 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CreateIndexStmt,
         CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, DropIndexStmt,
-        DropTableStmt, ForeignKeyAction, GeneratedColumnKind, IndexColumn, SortOrder, Stmt,
-        TableConstraint,
+        DropTableStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
+        ForeignKeyAction, GeneratedColumnKind, IndexColumn, SortOrder, Stmt, TableConstraint,
     },
     expr::Expr,
     lexer::Token,
@@ -229,6 +229,7 @@ fn is_table_constraint_start(p: &Parser) -> bool {
             | Token::Unique
             | Token::Foreign
             | Token::Check
+            | Token::Exclude
             | Token::Constraint
             | Token::Index  // inline INDEX idx (col) — MySQL extension
             | Token::Key // inline KEY idx (col) — MySQL extension
@@ -424,6 +425,7 @@ fn parse_table_constraint(p: &mut Parser) -> Result<TableConstraint, DbError> {
             p.expect(&Token::RParen)?;
             Ok(TableConstraint::Check { name, expr })
         }
+        Token::Exclude => parse_exclusion_constraint(p, name),
         // ── MySQL inline INDEX / KEY ──────────────────────────────────────────
         // `INDEX idx_name (col1, col2)` and `KEY idx_name (col1, col2)` inside
         // the column list are MySQL extensions for non-unique indexes.
@@ -446,12 +448,98 @@ fn parse_table_constraint(p: &mut Parser) -> Result<TableConstraint, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!(
-                "expected PRIMARY, UNIQUE, FOREIGN, CHECK, INDEX, or KEY in table constraint, found {:?}",
+                "expected PRIMARY, UNIQUE, FOREIGN, CHECK, EXCLUDE, INDEX, or KEY in table constraint, found {:?}",
                 other,
             ),
             position: Some(p.current_pos()),
         }),
     }
+}
+
+fn parse_exclusion_constraint(
+    p: &mut Parser,
+    name: Option<String>,
+) -> Result<TableConstraint, DbError> {
+    p.expect(&Token::Exclude)?;
+    p.expect(&Token::Using)?;
+    let using = p.parse_identifier()?;
+    p.expect(&Token::LParen)?;
+    let mut elements = Vec::new();
+    loop {
+        elements.push(parse_exclusion_element(p)?);
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+    let predicate = if p.eat(&Token::Where) {
+        p.expect(&Token::LParen)?;
+        let expr = parse_expr(p)?;
+        p.expect(&Token::RParen)?;
+        Some(expr)
+    } else {
+        None
+    };
+    Ok(TableConstraint::Exclude {
+        name,
+        using,
+        elements,
+        predicate,
+    })
+}
+
+fn parse_exclusion_element(p: &mut Parser) -> Result<ExclusionElement, DbError> {
+    let target = if p.eat(&Token::LParen) {
+        let expr = parse_expr(p)?;
+        p.expect(&Token::RParen)?;
+        ExclusionElementTarget::Expr(expr)
+    } else {
+        ExclusionElementTarget::Column(p.parse_identifier()?)
+    };
+    p.expect(&Token::With)?;
+    let operator = parse_exclusion_operator(p)?;
+    Ok(ExclusionElement { target, operator })
+}
+
+fn parse_exclusion_operator(p: &mut Parser) -> Result<ExclusionOperator, DbError> {
+    let op = match p.peek() {
+        Token::Eq => {
+            p.advance();
+            ExclusionOperator::Eq
+        }
+        Token::NotEq => {
+            p.advance();
+            ExclusionOperator::NotEq
+        }
+        Token::Lt => {
+            p.advance();
+            ExclusionOperator::Lt
+        }
+        Token::LtEq => {
+            p.advance();
+            ExclusionOperator::LtEq
+        }
+        Token::Gt => {
+            p.advance();
+            ExclusionOperator::Gt
+        }
+        Token::GtEq => {
+            p.advance();
+            ExclusionOperator::GtEq
+        }
+        Token::Amp if matches!(p.peek_at(1), Token::Amp) => {
+            p.advance();
+            p.advance();
+            ExclusionOperator::Overlaps
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected exclusion operator after WITH, found {:?}", other),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+    Ok(op)
 }
 
 // ── REFERENCES (column-level) ─────────────────────────────────────────────────
@@ -1072,7 +1160,11 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
                 // ADD CHECK (...)
                 if matches!(
                     p.peek(),
-                    Token::Constraint | Token::Primary | Token::Foreign | Token::Check
+                    Token::Constraint
+                        | Token::Primary
+                        | Token::Foreign
+                        | Token::Check
+                        | Token::Exclude
                 ) {
                     let constraint = parse_table_constraint(p)?;
                     AlterTableOp::AddConstraint(constraint)
