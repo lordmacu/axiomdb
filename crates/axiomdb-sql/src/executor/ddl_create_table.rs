@@ -1,3 +1,315 @@
+fn generated_column_constraint(
+    col_def: &crate::ast::ColumnDef,
+) -> Result<Option<(&Expr, GeneratedColumnKind)>, DbError> {
+    let mut generated = None;
+    for constraint in &col_def.constraints {
+        if let ColumnConstraint::Generated { expr, kind } = constraint {
+            if generated.is_some() {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "column '{}' has more than one generated column clause",
+                        col_def.name
+                    ),
+                });
+            }
+            generated = Some((expr, *kind));
+        }
+    }
+    Ok(generated)
+}
+
+fn validate_create_table_generated_columns(stmt: &CreateTableStmt) -> Result<(), DbError> {
+    let mut generated_cols = std::collections::HashSet::new();
+    let mut base_cols = std::collections::HashSet::new();
+    for col in &stmt.columns {
+        if generated_column_constraint(col)?.is_some() {
+            generated_cols.insert(col.name.to_ascii_lowercase());
+        } else {
+            base_cols.insert(col.name.to_ascii_lowercase());
+        }
+    }
+
+    for col in &stmt.columns {
+        let Some((expr, kind)) = generated_column_constraint(col)? else {
+            continue;
+        };
+        if matches!(kind, GeneratedColumnKind::Virtual) {
+            return Err(DbError::NotImplemented {
+                feature: "virtual generated columns".into(),
+            });
+        }
+        if col
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Default(_)))
+        {
+            return Err(DbError::InvalidValue {
+                reason: format!("generated column '{}' cannot declare DEFAULT", col.name),
+            });
+        }
+        if col
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::OnUpdate(_)))
+        {
+            return Err(DbError::InvalidValue {
+                reason: format!("generated column '{}' cannot declare ON UPDATE", col.name),
+            });
+        }
+        if col
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::AutoIncrement))
+        {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "generated column '{}' cannot declare AUTO_INCREMENT",
+                    col.name
+                ),
+            });
+        }
+        validate_generated_expr_refs(
+            expr,
+            &stmt.table.name,
+            &col.name,
+            &base_cols,
+            &generated_cols,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_generated_expr_refs(
+    expr: &Expr,
+    table_name: &str,
+    generated_name: &str,
+    base_cols: &std::collections::HashSet<String>,
+    generated_cols: &std::collections::HashSet<String>,
+) -> Result<(), DbError> {
+    match expr {
+        Expr::Literal(_) => Ok(()),
+        Expr::Column { name, .. } => {
+            let key = name.to_ascii_lowercase();
+            if key == generated_name.to_ascii_lowercase() {
+                return Err(DbError::InvalidValue {
+                    reason: format!("generated column '{generated_name}' cannot reference itself"),
+                });
+            }
+            if generated_cols.contains(&key) {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "generated column '{generated_name}' cannot reference another generated column '{name}'"
+                    ),
+                });
+            }
+            if !base_cols.contains(&key) {
+                return Err(DbError::ColumnNotFound {
+                    name: name.clone(),
+                    table: table_name.to_string(),
+                });
+            }
+            Ok(())
+        }
+        Expr::UnaryOp { operand, .. } => validate_generated_expr_refs(
+            operand,
+            table_name,
+            generated_name,
+            base_cols,
+            generated_cols,
+        ),
+        Expr::BinaryOp { left, right, .. } => {
+            validate_generated_expr_refs(
+                left,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            validate_generated_expr_refs(
+                right,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )
+        }
+        Expr::IsNull { expr, .. } | Expr::IsBoolean { expr, .. } | Expr::Cast { expr, .. } => {
+            validate_generated_expr_refs(
+                expr,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_generated_expr_refs(
+                expr,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            validate_generated_expr_refs(
+                low,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            validate_generated_expr_refs(
+                high,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_generated_expr_refs(
+                expr,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            validate_generated_expr_refs(
+                pattern,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            if let Some(escape) = escape {
+                validate_generated_expr_refs(
+                    escape,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::In { expr, list, .. } => {
+            validate_generated_expr_refs(
+                expr,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            for item in list {
+                validate_generated_expr_refs(
+                    item,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                validate_generated_expr_refs(
+                    arg,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                validate_generated_expr_refs(
+                    operand,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            for (when, then) in when_thens {
+                validate_generated_expr_refs(
+                    when,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+                validate_generated_expr_refs(
+                    then,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            if let Some(else_result) = else_result {
+                validate_generated_expr_refs(
+                    else_result,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::SqlJsonQuery { doc, passing, .. } => {
+            validate_generated_expr_refs(
+                doc,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            for (arg, _) in passing {
+                validate_generated_expr_refs(
+                    arg,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            Err(DbError::NotImplemented {
+                feature: "subqueries in generated columns".into(),
+            })
+        }
+        Expr::GroupConcat { .. } | Expr::Grouping { .. } => Err(DbError::NotImplemented {
+            feature: "aggregate expressions in generated columns".into(),
+        }),
+        Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
+        | Expr::Param { .. }
+        | Expr::Default => Err(DbError::InvalidValue {
+            reason: format!(
+                "unsupported expression in generated column '{generated_name}'"
+            ),
+        }),
+    }
+}
+
 fn execute_create_table(
     stmt: CreateTableStmt,
     storage: &dyn StorageEngine,
@@ -18,6 +330,7 @@ fn execute_create_table(
     } else {
         axiomdb_catalog::schema::TableStorageLayout::Heap
     };
+    validate_create_table_generated_columns(&stmt)?;
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
@@ -85,6 +398,11 @@ fn execute_create_table(
             ColumnConstraint::OnUpdate(expr) => Some(crate::expr_to_sql::expr_to_sql_string(expr)),
             _ => None,
         });
+        let generated = generated_column_constraint(col_def)?;
+        let generated_expr = generated.map(|(expr, _)| crate::expr_to_sql::expr_to_sql_string(expr));
+        let generated_stored = generated
+            .map(|(_, kind)| matches!(kind, GeneratedColumnKind::Stored))
+            .unwrap_or(false);
 
         writer.create_column(CatalogColumnDef {
             table_id,
@@ -97,6 +415,8 @@ fn execute_create_table(
             is_fixed_len: col_def.is_char,
             default_expr,
             on_update_expr,
+            generated_expr,
+            generated_stored,
         })?;
     }
 
@@ -777,6 +1097,8 @@ fn execute_create_table_like(
             is_fixed_len: col.is_fixed_len,
             default_expr: col.default_expr.clone(),
             on_update_expr: col.on_update_expr.clone(),
+            generated_expr: col.generated_expr.clone(),
+            generated_stored: col.generated_stored,
         })?;
     }
 
@@ -931,6 +1253,8 @@ fn execute_create_table_as_select(
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })?;
     }
 
@@ -950,6 +1274,8 @@ fn execute_create_table_as_select(
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })
         .collect();
 

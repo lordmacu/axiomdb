@@ -121,6 +121,12 @@ fn execute_clustered_insert_ctx(
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
+                validate_generated_insert_exprs(
+                    &col_positions,
+                    &value_exprs,
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
                 let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
                 assign_auto_increment(
@@ -132,6 +138,7 @@ fn execute_clustered_insert_ctx(
                     full_values.as_mut_slice(),
                     &mut first_generated,
                 )?;
+                materialize_generated_columns(schema_cols, &mut full_values)?;
                 prepare_one_row_ctx!(full_values, row_idx + 1);
             }
         }
@@ -146,6 +153,12 @@ fn execute_clustered_insert_ctx(
             };
 
             for (row_idx, row_values) in select_rows.into_iter().enumerate() {
+                validate_generated_insert_source_values(
+                    &col_positions,
+                    row_values.len(),
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
                 assign_auto_increment(
                     storage,
@@ -156,6 +169,7 @@ fn execute_clustered_insert_ctx(
                     full_values.as_mut_slice(),
                     &mut first_generated,
                 )?;
+                materialize_generated_columns(schema_cols, &mut full_values)?;
                 prepare_one_row_ctx!(full_values, row_idx + 1);
             }
         }
@@ -170,6 +184,7 @@ fn execute_clustered_insert_ctx(
                 full_values.as_mut_slice(),
                 &mut first_generated,
             )?;
+            materialize_generated_columns(schema_cols, &mut full_values)?;
             prepare_one_row_ctx!(full_values, 1);
         }
     }
@@ -370,6 +385,12 @@ fn enqueue_clustered_insert_ctx(
             .iter()
             .map(|e| eval(e, &[]))
             .collect::<Result<_, _>>()?;
+        validate_generated_insert_exprs(
+            &col_positions,
+            &value_exprs,
+            schema_cols,
+            &resolved.def.table_name,
+        )?;
         resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
         let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
         assign_auto_increment(
@@ -381,6 +402,7 @@ fn enqueue_clustered_insert_ctx(
             full_values.as_mut_slice(),
             &mut first_generated,
         )?;
+        materialize_generated_columns(schema_cols, &mut full_values)?;
         match enforce_text_constraints(&resolved.columns, &mut full_values)
             .and_then(|()| check_row_constraints_with_cols(&resolved.constraints, &full_values, &resolved.def.table_name, &resolved.columns))
         {

@@ -830,6 +830,8 @@ mod tests {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         }
     }
 
@@ -897,6 +899,8 @@ mod tests {
                 is_fixed_len: false,
                 default_expr: None,
                 on_update_expr: None,
+                generated_expr: None,
+                generated_stored: false,
             },
             ColumnDef {
                 table_id: 1,
@@ -909,6 +913,8 @@ mod tests {
                 is_fixed_len: false,
                 default_expr: None,
                 on_update_expr: None,
+                generated_expr: None,
+                generated_stored: false,
             },
         ];
 
@@ -963,6 +969,8 @@ mod tests {
                 is_fixed_len: false,
                 default_expr: None,
                 on_update_expr: None,
+                generated_expr: None,
+                generated_stored: false,
             },
             ColumnDef {
                 table_id: 1,
@@ -975,6 +983,8 @@ mod tests {
                 is_fixed_len: false,
                 default_expr: None,
                 on_update_expr: None,
+                generated_expr: None,
+                generated_stored: false,
             },
         ];
 

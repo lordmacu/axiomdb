@@ -104,6 +104,15 @@ impl Default for ForeignKeyAction {
 
 // ── Column and constraint types ───────────────────────────────────────────────
 
+/// Storage kind for a generated column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedColumnKind {
+    /// `GENERATED ALWAYS AS (expr) STORED` — computed on write and persisted.
+    Stored,
+    /// `GENERATED ALWAYS AS (expr) VIRTUAL` — computed on read.
+    Virtual,
+}
+
 /// Column definition as it appears in `CREATE TABLE` or `ALTER TABLE ADD COLUMN`.
 ///
 /// Different from `axiomdb_catalog::schema::ColumnDef` (the disk-stored form
@@ -149,6 +158,11 @@ pub enum ColumnConstraint {
     /// was not explicitly assigned. Classic MySQL pattern:
     /// `updated_at TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`.
     OnUpdate(Expr),
+    /// `GENERATED ALWAYS AS (expr) STORED|VIRTUAL`.
+    Generated {
+        expr: Expr,
+        kind: GeneratedColumnKind,
+    },
 }
 
 /// Table-level constraint declared after the column list.

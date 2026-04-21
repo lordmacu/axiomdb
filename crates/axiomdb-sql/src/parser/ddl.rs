@@ -7,7 +7,8 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CreateIndexStmt,
         CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, DropIndexStmt,
-        DropTableStmt, ForeignKeyAction, IndexColumn, SortOrder, Stmt, TableConstraint,
+        DropTableStmt, ForeignKeyAction, GeneratedColumnKind, IndexColumn, SortOrder, Stmt,
+        TableConstraint,
     },
     expr::Expr,
     lexer::Token,
@@ -285,6 +286,9 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
                 // 4.3b
                 constraints.push(parse_check_column_constraint(p)?);
             }
+            Token::Ident(s) if s.eq_ignore_ascii_case("generated") => {
+                constraints.push(parse_generated_column_constraint(p)?);
+            }
             // ── MySQL column attributes (4.1c) ────────────────────────────────
             // UNSIGNED / ZEROFILL / SIGNED — modifiers on numeric types.
             // Parsed and discarded; AxiomDB stores all integers as signed.
@@ -348,6 +352,27 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         type_len,
         is_char,
     })
+}
+
+fn parse_generated_column_constraint(p: &mut Parser) -> Result<ColumnConstraint, DbError> {
+    p.advance(); // GENERATED
+    if !p.eat_ident_ci("always") {
+        return Err(DbError::ParseError {
+            message: "expected ALWAYS after GENERATED".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    p.expect(&Token::As)?;
+    p.expect(&Token::LParen)?;
+    let expr = parse_expr(p)?;
+    p.expect(&Token::RParen)?;
+    let kind = if p.eat_ident_ci("stored") {
+        GeneratedColumnKind::Stored
+    } else {
+        let _ = p.eat_ident_ci("virtual");
+        GeneratedColumnKind::Virtual
+    };
+    Ok(ColumnConstraint::Generated { expr, kind })
 }
 
 // ── Table-level constraint ────────────────────────────────────────────────────

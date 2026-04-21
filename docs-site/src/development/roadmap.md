@@ -14,11 +14,11 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 11.20c `JSON_TABLE` multi-sibling + multi-level `NESTED PATH` — any number of NESTED siblings in the same `COLUMNS(...)` list produce UNION rows (each sibling's row set emitted with the other siblings' columns NULL-padded); NESTED can recurse arbitrarily (bounded to depth 32); per-level `FOR ORDINALITY` resets cleanly at each iteration entry. `materialize_json_table` collapsed into a single `emit_rows_rec` recursion covering flat, single-NESTED, multi-sibling, multi-level, and mixed cases. 10 new integration tests + 2 wire-smoke assertions.
+**Last completed subphase:** 21.5f `GENERATED ALWAYS AS (... ) STORED` columns — parser/AST now capture generated-column metadata, `axiom_columns` persists `generated_expr` + `generated_stored`, and all write paths recompute stored generated values before CHECK/FK/UNIQUE/index maintenance and `RETURNING`. Direct non-`DEFAULT` writes are rejected; `VIRTUAL` and `ALTER TABLE ... GENERATED` stay explicit `NotImplemented`. 19 integration tests + 2 wire-smoke assertions.
 
-**Active development:** Phase 11 — Advanced types. 11.16 → 11.19c + 11.20a/b/c + 11.21a–g + 11.22a/b + 11.23a/b/d/e/f + 11.24a/b/d closed. Remaining gaps: 11.18c (needs `TEXT[]`), 11.20d (WRAPPER/QUOTES/PASSING + LATERAL-correlated doc + UPDATE/DELETE/MERGE sources + first-FROM JSON_TABLE combined with JOIN), 11.21h (planner JSONPath pushdown + `jsonb_path_ops` GIN), 11.23c (catalog-stored named JSON schemas), 11.24c (dot-notation `t.doc.a.b`).
+**Active development:** Phase 21 — Advanced SQL. Closed: 21.2, 21.3/21.3b, 21.4/21.4b, 21.5, 21.5b-e, 21.5f, 21.6, 21.9, 21.12, 21.17, 21.18, 21.19, 21.21, 21.22. Near-term remaining gaps: 21.6b exclusion constraints, 21.7 TEMP/UNLOGGED tables, 21.8 expression indexes, 21.10 cursors, 21.11 hints, 21.16 DEFERRABLE constraints.
 
-**Next milestone:** 11.20d — `WRAPPER` / `QUOTES` on JSON_TABLE columns, `PASSING name AS var` on the row path, LATERAL-correlated `doc` expression, and JSON_TABLE as first FROM entry combined with JOINs / as UPDATE / DELETE / MERGE source.
+**Next milestone:** 21.6b exclusion constraints — btree-backed equality exclusions first, with GiST/range overlap deferred to the later range-types/indexing phases.
 
 **Concurrency note:** the current server already supports concurrent read-only
 queries, but mutating statements are still serialized through a database-wide

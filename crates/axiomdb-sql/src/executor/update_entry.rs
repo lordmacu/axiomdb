@@ -32,6 +32,11 @@ fn execute_update(
             Ok((pos, a.value))
         })
         .collect::<Result<_, DbError>>()?;
+    validate_generated_update_assignments(
+        &assignments,
+        &schema_cols,
+        &resolved.def.table_name,
+    )?;
 
     // Use the already-loaded indexes from the resolved table (cached by SchemaCache).
     let mut secondary_indexes: Vec<IndexDef> = resolved
@@ -99,19 +104,17 @@ fn execute_update(
         // Evaluate assigned columns without cloning the full row.
         // Build new_values by iterating columns once, cloning only non-assigned
         // values and evaluating expressions for assigned ones.
-        let mut changed = false;
         let mut new_values = Vec::with_capacity(current_values.len());
         for (ci, cv) in current_values.iter().enumerate() {
             if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
                 let nv = eval(val_expr, &current_values)?;
-                if nv != *cv {
-                    changed = true;
-                }
                 new_values.push(nv);
             } else {
                 new_values.push(cv.clone());
             }
         }
+        materialize_generated_columns(&resolved.columns, &mut new_values)?;
+        let changed = new_values != current_values;
         matched_count += 1;
         if !changed {
             continue; // no-op: skip heap/index work

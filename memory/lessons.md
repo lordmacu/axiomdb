@@ -1,5 +1,21 @@
 # Lessons Learned
 
+## 2026-04-21 - Phase 21.5f
+
+- **Generated-column semantics must live in one helper, not in each DML arm.**
+  Heap INSERT, clustered INSERT, UPDATE, `ON CONFLICT`, ODKU, `MERGE`, and
+  UPDATE JOIN all need the same recomputation order. Centralizing it in
+  `materialize_generated_columns()` prevented subtle divergence between
+  "normal" and conflict-update paths.
+- **Persist the expression as SQL text first; optimize later.** Storing
+  `generated_expr` in the catalog and re-parsing it at write time keeps the
+  on-disk format simple and backward-compatible while still letting every path
+  reuse the normal expression evaluator.
+- **Treat explicit writes as DEFAULT-or-error centrally.** Once INSERT/UPDATE
+  use one "generated columns cannot be assigned explicitly" guard, positional
+  INSERT arity, `DEFAULT`, and update-like paths become predictable instead of
+  each path inventing its own rule.
+
 ## 2026-04-13 — Phase 11.20b
 
 - **Slot layout up front is easier than deferred row assembly.** First

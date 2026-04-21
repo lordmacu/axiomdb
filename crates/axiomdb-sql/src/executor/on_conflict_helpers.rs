@@ -63,9 +63,20 @@ fn apply_on_conflict_heap(
                         name: assignment.column.clone(),
                         table: resolved.def.table_name.clone(),
                     })?;
+                if schema_cols[target_idx].generated_expr.is_some()
+                    && !matches!(assignment.value, Expr::Default)
+                {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "generated column '{}.{}' cannot be assigned explicitly",
+                            resolved.def.table_name, schema_cols[target_idx].name
+                        ),
+                    });
+                }
                 new_row[target_idx] =
                     eval_odku_assignment_rhs(&assignment.value, &existing_row, proposed_row)?;
             }
+            materialize_generated_columns(schema_cols, &mut new_row)?;
 
             enforce_text_constraints(schema_cols, &mut new_row)?;
             check_row_constraints_with_cols(

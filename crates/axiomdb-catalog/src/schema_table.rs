@@ -233,6 +233,15 @@ pub struct ColumnDef {
     /// after `default_expr` when `flags bit5` is set — old rows read as
     /// `None`.
     pub on_update_expr: Option<String>,
+    /// SQL text of `GENERATED ALWAYS AS (expr)` for generated columns.
+    /// `None` means this is a normal base column. Stored after
+    /// `on_update_expr` when `flags bit6` is set — old rows read as `None`.
+    pub generated_expr: Option<String>,
+    /// `true` for STORED generated columns, `false` for VIRTUAL generated
+    /// columns. Only meaningful when `generated_expr` is `Some`.
+    /// Stored in `flags bit7` as inverted virtual marker: 0 = STORED,
+    /// 1 = VIRTUAL.
+    pub generated_stored: bool,
 }
 
 impl ColumnDef {
@@ -244,6 +253,9 @@ impl ColumnDef {
     /// - `flags bit2` = type_len extension present
     /// - `flags bit3` = is_fixed_len (CHAR vs VARCHAR)
     /// - `flags bit4` = default_expr extension present
+    /// - `flags bit5` = on_update_expr extension present
+    /// - `flags bit6` = generated_expr extension present
+    /// - `flags bit7` = generated kind: 0 STORED, 1 VIRTUAL
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
@@ -253,6 +265,8 @@ impl ColumnDef {
         let has_default = default_bytes.is_some();
         let on_update_bytes = self.on_update_expr.as_deref().map(|s| s.as_bytes());
         let has_on_update = on_update_bytes.is_some();
+        let generated_bytes = self.generated_expr.as_deref().map(|s| s.as_bytes());
+        let has_generated = generated_bytes.is_some();
 
         let mut flags: u8 = 0;
         if self.nullable {
@@ -273,10 +287,17 @@ impl ColumnDef {
         if has_on_update {
             flags |= 0x20; // bit5: on_update_expr present
         }
+        if has_generated {
+            flags |= 0x40; // bit6: generated_expr present
+            if !self.generated_stored {
+                flags |= 0x80; // bit7: virtual generated column
+            }
+        }
 
         let extra = if has_type_len { 2 } else { 0 }
             + default_bytes.map_or(0, |b| 2 + b.len())
-            + on_update_bytes.map_or(0, |b| 2 + b.len());
+            + on_update_bytes.map_or(0, |b| 2 + b.len())
+            + generated_bytes.map_or(0, |b| 2 + b.len());
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + extra);
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
@@ -294,6 +315,10 @@ impl ColumnDef {
         if let Some(ob) = on_update_bytes {
             buf.extend_from_slice(&(ob.len() as u16).to_le_bytes());
             buf.extend_from_slice(ob);
+        }
+        if let Some(gb) = generated_bytes {
+            buf.extend_from_slice(&(gb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(gb);
         }
         buf
     }
@@ -322,6 +347,8 @@ impl ColumnDef {
         let is_fixed_len = flags & 0x08 != 0;
         let has_default = flags & 0x10 != 0;
         let has_on_update = flags & 0x20 != 0;
+        let has_generated = flags & 0x40 != 0;
+        let generated_stored = has_generated && flags & 0x80 == 0;
         let name_len = bytes[8] as usize;
 
         if bytes.len() < 9 + name_len {
@@ -391,6 +418,28 @@ impl ColumnDef {
             None
         };
 
+        // generated_expr present only when bit6 set (old rows read as None).
+        let generated_expr = if has_generated {
+            if bytes.len() < consumed + 2 {
+                return Err(err());
+            }
+            let glen = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+            consumed += 2;
+            if bytes.len() < consumed + glen {
+                return Err(err());
+            }
+            let s = std::str::from_utf8(&bytes[consumed..consumed + glen])
+                .map_err(|_| DbError::ParseError {
+                    message: "invalid UTF-8 in generated_expr".into(),
+                    position: None,
+                })?
+                .to_string();
+            consumed += glen;
+            Some(s)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 table_id,
@@ -403,6 +452,8 @@ impl ColumnDef {
                 is_fixed_len,
                 default_expr,
                 on_update_expr,
+                generated_expr,
+                generated_stored,
             },
             consumed,
         ))

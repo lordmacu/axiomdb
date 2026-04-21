@@ -88,6 +88,12 @@ fn execute_clustered_insert(
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
+                validate_generated_insert_exprs(
+                    &col_positions,
+                    &value_exprs,
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
                 let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
                 assign_auto_increment(
@@ -99,6 +105,7 @@ fn execute_clustered_insert(
                     full_values.as_mut_slice(),
                     &mut first_generated,
                 )?;
+                materialize_generated_columns(schema_cols, &mut full_values)?;
                 prepare_one_row!(full_values);
             }
         }
@@ -113,6 +120,12 @@ fn execute_clustered_insert(
             };
 
             for row_values in select_rows {
+                validate_generated_insert_source_values(
+                    &col_positions,
+                    row_values.len(),
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
                 assign_auto_increment(
                     storage,
@@ -123,6 +136,7 @@ fn execute_clustered_insert(
                     full_values.as_mut_slice(),
                     &mut first_generated,
                 )?;
+                materialize_generated_columns(schema_cols, &mut full_values)?;
                 prepare_one_row!(full_values);
             }
         }
@@ -137,6 +151,7 @@ fn execute_clustered_insert(
                 full_values.as_mut_slice(),
                 &mut first_generated,
             )?;
+            materialize_generated_columns(schema_cols, &mut full_values)?;
             prepare_one_row!(full_values);
         }
     }

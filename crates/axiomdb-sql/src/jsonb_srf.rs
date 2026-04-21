@@ -89,6 +89,8 @@ pub fn column_defs_for_srf(kind: JsonbSrfKind) -> Vec<ColumnDef> {
                 is_fixed_len: false,
                 default_expr: None,
                 on_update_expr: None,
+                generated_expr: None,
+                generated_stored: false,
             }
         })
         .collect()

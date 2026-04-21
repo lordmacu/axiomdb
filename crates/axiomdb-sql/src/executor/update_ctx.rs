@@ -60,6 +60,11 @@ fn execute_update_ctx(
             Ok((pos, a.value))
         })
         .collect::<Result<_, DbError>>()?;
+    validate_generated_update_assignments(
+        &assignments,
+        &schema_cols,
+        &resolved.def.table_name,
+    )?;
 
     // MySQL `ON UPDATE` auto-refresh: every column with a persisted
     // `on_update_expr` that the statement did NOT explicitly assign is
@@ -145,6 +150,7 @@ fn execute_update_ctx(
     }
 
     let field_patch_eligible = ctx.strict_mode
+        && !schema_cols.iter().any(|c| c.generated_expr.is_some())
         && resolved.foreign_keys.is_empty()
         && assignments.iter().all(|(col_pos, _)| {
             axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()

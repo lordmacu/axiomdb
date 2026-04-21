@@ -829,6 +829,31 @@ INSERT INTO users (id, name) VALUES (100, 'Eve');
 -- id=100; sequence not advanced; next LAST_INSERT_ID() still returns 2
 ```
 
+### Generated columns on INSERT and UPDATE
+
+`GENERATED ALWAYS AS (... ) STORED` columns are computed during write-time
+materialization. You normally omit them from the column list, or spell them as
+`DEFAULT` when you want "compute the generated value here".
+
+```sql
+CREATE TABLE line_items (
+    price INT NOT NULL,
+    qty   INT NOT NULL,
+    total INT GENERATED ALWAYS AS (price * qty) STORED
+);
+
+INSERT INTO line_items (price, qty) VALUES (10, 3);                  -- total = 30
+INSERT INTO line_items (price, qty, total) VALUES (10, 3, DEFAULT); -- total = 30
+UPDATE line_items SET qty = 4 WHERE price = 10;                     -- total = 40
+```
+
+Rules:
+
+- Literal or computed assignments to a generated column are rejected.
+- `DEFAULT` means "recompute the stored generated value".
+- `CHECK`, `UNIQUE`, foreign keys, and `RETURNING` see the recomputed value.
+- `VIRTUAL` generated columns are not implemented yet.
+
 The same `AUTO_INCREMENT` contract now applies to clustered explicit-PK tables:
 AxiomDB bootstraps the next value by scanning the clustered rows for the
 current maximum instead of falling back to heap metadata.
@@ -962,6 +987,10 @@ WHERE status = 'pending'
 > An UPDATE without a WHERE clause updates **every row** in the table. This is
 > rarely what you want. Always double-check before running unbounded updates in
 > production.
+
+On tables with `GENERATED ALWAYS AS (... ) STORED`, `UPDATE` recomputes stored
+generated columns after the `SET` list and any `ON UPDATE` expressions are
+applied. Direct non-`DEFAULT` assignments to a generated column are rejected.
 
 ### UPDATE ORDER BY + LIMIT
 

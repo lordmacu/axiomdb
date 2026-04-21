@@ -121,6 +121,34 @@ INSERT INTO orders (status) VALUES ('shipped');
 -- Row: id=<auto>, status='shipped', created_at=<now>, priority=0
 ```
 
+#### GENERATED ALWAYS AS (... ) STORED
+
+Stored generated columns compute their value from other columns in the same row
+on every `INSERT` and `UPDATE`, then persist that value like any other physical
+column.
+
+```sql
+CREATE TABLE line_items (
+    price INT NOT NULL,
+    qty   INT NOT NULL,
+    total INT GENERATED ALWAYS AS (price * qty) STORED
+);
+
+INSERT INTO line_items (price, qty) VALUES (10, 3);
+SELECT price, qty, total FROM line_items;
+-- 10 | 3 | 30
+```
+
+Rules:
+
+- The expression may reference only existing non-generated columns from the
+  same table.
+- `DEFAULT`, `ON UPDATE`, and `AUTO_INCREMENT` are not allowed on a generated
+  column.
+- `STORED` is implemented now. `VIRTUAL` is parsed but returns
+  `NotImplemented`.
+- `ALTER TABLE ... GENERATED` is deferred to a later rewrite/backfill subphase.
+
 #### PRIMARY KEY
 
 Declares a column (or set of columns) as the primary key. A primary key:
@@ -367,7 +395,7 @@ The new table is independent of the source. Changes to the source schema (via
 `ALTER TABLE`) do not affect the copy, and vice versa.
 
 **What is copied:**
-- All columns (name, type, nullability, default, auto_increment)
+- All columns (name, type, nullability, default, auto_increment, generated metadata)
 - All constraints (PRIMARY KEY, UNIQUE, CHECK, FOREIGN KEY)
 - All secondary indexes (with fresh empty B-tree roots)
 

@@ -300,6 +300,8 @@ fn flatten_defs_recursive(
                     is_fixed_len: false,
                     default_expr: None,
                     on_update_expr: None,
+                    generated_expr: None,
+                    generated_stored: false,
                 });
             }
             JsonTableColumn::Ordinality { name } => {
@@ -316,6 +318,8 @@ fn flatten_defs_recursive(
                     is_fixed_len: false,
                     default_expr: None,
                     on_update_expr: None,
+                    generated_expr: None,
+                    generated_stored: false,
                 });
             }
             JsonTableColumn::Exists { name, ty, .. } => {
@@ -330,6 +334,8 @@ fn flatten_defs_recursive(
                     is_fixed_len: false,
                     default_expr: None,
                     on_update_expr: None,
+                    generated_expr: None,
+                    generated_stored: false,
                 });
             }
             JsonTableColumn::Nested { columns, .. } => {

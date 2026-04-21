@@ -214,6 +214,8 @@ mod tests {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -234,6 +236,8 @@ mod tests {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -254,9 +258,33 @@ mod tests {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());
+    }
+
+    #[test]
+    fn test_column_def_roundtrip_generated_stored() {
+        let def = ColumnDef {
+            table_id: 1,
+            col_idx: 2,
+            name: "total".into(),
+            col_type: ColumnType::Int,
+            nullable: true,
+            auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
+            on_update_expr: None,
+            generated_expr: Some("price * qty".into()),
+            generated_stored: true,
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
     }
 
     // ── IndexDef ──────────────────────────────────────────────────────────────
