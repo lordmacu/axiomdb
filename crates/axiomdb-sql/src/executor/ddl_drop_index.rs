@@ -57,7 +57,13 @@ fn execute_drop_index(
     let schema = table_ref.schema.as_deref().unwrap_or("public");
 
     // Capture index_id, root_page_id, clustered flag, and table_id for bump.
-    let (index_id, root_page_id, clustered_primary, table_id_for_bump) = {
+    let (
+        index_id,
+        root_page_id,
+        clustered_primary,
+        table_id_for_bump,
+        owned_exclusion_constraint,
+    ) = {
         let mut reader = CatalogReader::new(storage, snap)?;
         let table_def = match reader.get_table_in_database(database, schema, &table_ref.name)? {
             Some(d) => d,
@@ -70,19 +76,38 @@ fn execute_drop_index(
         };
         let indexes = reader.list_indexes(table_def.id)?;
         match indexes.into_iter().find(|i| i.name == stmt.name) {
-            Some(i) => (
-                Some(i.index_id),
-                Some(i.root_page_id),
-                table_def.is_clustered() && i.is_primary,
-                table_def.id,
-            ),
-            None => (None, None, false, table_def.id),
+            Some(i) => {
+                let owned_exclusion_constraint = reader
+                    .list_constraints(table_def.id)?
+                    .into_iter()
+                    .find(|c| {
+                        c.kind == axiomdb_catalog::ConstraintKind::Exclusion
+                            && c.owned_index_id == i.index_id
+                    })
+                    .map(|c| c.name);
+                (
+                    Some(i.index_id),
+                    Some(i.root_page_id),
+                    table_def.is_clustered() && i.is_primary,
+                    table_def.id,
+                    owned_exclusion_constraint,
+                )
+            }
+            None => (None, None, false, table_def.id, None),
         }
     }; // reader dropped
 
     if clustered_primary {
         return Err(DbError::NotImplemented {
             feature: "DROP PRIMARY KEY on clustered table — Phase 39.19".into(),
+        });
+    }
+    if let Some(constraint_name) = owned_exclusion_constraint {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "index '{}' is owned by exclusion constraint '{}'; drop the constraint instead",
+                stmt.name, constraint_name
+            ),
         });
     }
 
@@ -152,4 +177,3 @@ fn execute_drop_index_by_id(
     }
     Ok(())
 }
-

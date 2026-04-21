@@ -251,7 +251,20 @@ fn generate_is_key_column_usage_rows(
         for t in tables {
             let columns = reader.list_columns(t.id)?;
             let indexes = reader.list_indexes(t.id)?;
+            let constraints = reader.list_constraints(t.id)?;
+            let exclusion_by_index: std::collections::HashMap<u32, &axiomdb_catalog::ConstraintDef> =
+                constraints
+                    .iter()
+                    .filter(|c| {
+                        c.kind == axiomdb_catalog::ConstraintKind::Exclusion
+                            && c.owned_index_id != 0
+                    })
+                    .map(|c| (c.owned_index_id, c))
+                    .collect();
             for idx in &indexes {
+                if exclusion_by_index.contains_key(&idx.index_id) {
+                    continue;
+                }
                 if !idx.is_primary && !idx.is_unique {
                     continue;
                 }
@@ -282,6 +295,32 @@ fn generate_is_key_column_usage_rows(
                     ]);
                 }
             }
+            for constraint in constraints
+                .iter()
+                .filter(|c| c.kind == axiomdb_catalog::ConstraintKind::Exclusion)
+            {
+                for (seq, elem) in constraint.exclude_elements.iter().enumerate() {
+                    let col_name = columns
+                        .iter()
+                        .find(|c| c.col_idx == elem.col_idx)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    rows.push(vec![
+                        Value::Text("def".into()),              // CONSTRAINT_CATALOG
+                        Value::Text(db.name.clone()),           // CONSTRAINT_SCHEMA
+                        Value::Text(constraint.name.clone()),   // CONSTRAINT_NAME
+                        Value::Text("def".into()),              // TABLE_CATALOG
+                        Value::Text(db.name.clone()),           // TABLE_SCHEMA
+                        Value::Text(t.table_name.clone()),      // TABLE_NAME
+                        Value::Text(col_name),                  // COLUMN_NAME
+                        Value::BigInt((seq + 1) as i64),        // ORDINAL_POSITION
+                        Value::Null,                            // POSITION_IN_UNIQUE_CONSTRAINT
+                        Value::Null,                            // REFERENCED_TABLE_SCHEMA
+                        Value::Null,                            // REFERENCED_TABLE_NAME
+                        Value::Null,                            // REFERENCED_COLUMN_NAME
+                    ]);
+                }
+            }
         }
     }
 
@@ -302,7 +341,19 @@ fn generate_is_table_constraints_rows(
         let tables = reader.list_tables_in_database(&db.name, "public")?;
         for t in tables {
             let indexes = reader.list_indexes(t.id)?;
+            let constraints = reader.list_constraints(t.id)?;
+            let owned_exclusion_index_ids: std::collections::HashSet<u32> = constraints
+                .iter()
+                .filter(|c| {
+                    c.kind == axiomdb_catalog::ConstraintKind::Exclusion
+                        && c.owned_index_id != 0
+                })
+                .map(|c| c.owned_index_id)
+                .collect();
             for idx in &indexes {
+                if owned_exclusion_index_ids.contains(&idx.index_id) {
+                    continue;
+                }
                 let (constraint_name, constraint_type) = if idx.is_primary {
                     ("PRIMARY".to_string(), "PRIMARY KEY")
                 } else if idx.is_unique {
@@ -318,6 +369,20 @@ fn generate_is_table_constraints_rows(
                     Value::Text(t.table_name.clone()),   // TABLE_NAME
                     Value::Text(constraint_type.into()), // CONSTRAINT_TYPE
                     Value::Text("YES".into()),           // ENFORCED
+                ]);
+            }
+            for constraint in constraints
+                .iter()
+                .filter(|c| c.kind == axiomdb_catalog::ConstraintKind::Exclusion)
+            {
+                rows.push(vec![
+                    Value::Text("def".into()),                 // CONSTRAINT_CATALOG
+                    Value::Text(db.name.clone()),              // CONSTRAINT_SCHEMA
+                    Value::Text(constraint.name.clone()),      // CONSTRAINT_NAME
+                    Value::Text(db.name.clone()),              // TABLE_SCHEMA
+                    Value::Text(t.table_name.clone()),         // TABLE_NAME
+                    Value::Text("EXCLUSION".into()),           // CONSTRAINT_TYPE
+                    Value::Text("YES".into()),                 // ENFORCED
                 ]);
             }
         }

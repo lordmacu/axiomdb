@@ -45,11 +45,12 @@ pub mod values_clause;
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, ColumnDef, CreateDatabaseStmt,
     CreateIndexStmt, CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt,
-    ForeignKeyAction, FromClause, IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition,
-    JoinType, MergeAction, MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder,
-    OnConflictAction, OnConflictClause, OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue,
-    ShowColumnsStmt, ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt,
-    TableConstraint, TableRef, TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
+    ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction, FromClause,
+    IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, MergeAction,
+    MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder, OnConflictAction,
+    OnConflictClause, OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt,
+    ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt, TableConstraint, TableRef,
+    TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
 };
 pub use bloom::BloomRegistry;
 pub use eval::{

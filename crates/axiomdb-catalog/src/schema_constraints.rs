@@ -1,9 +1,72 @@
 // ── ConstraintDef ─────────────────────────────────────────────────────────────
 
+/// Kind of persisted catalog constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConstraintKind {
+    Check = 0,
+    Exclusion = 1,
+}
+
+impl TryFrom<u8> for ConstraintKind {
+    type Error = DbError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Check),
+            1 => Ok(Self::Exclusion),
+            _ => Err(DbError::ParseError {
+                message: format!("unknown ConstraintKind byte: {value}"),
+                position: None,
+            }),
+        }
+    }
+}
+
+/// Operator used by one persisted exclusion-constraint element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConstraintOperator {
+    Eq = 0,
+    NotEq = 1,
+    Lt = 2,
+    LtEq = 3,
+    Gt = 4,
+    GtEq = 5,
+    Overlaps = 6,
+}
+
+impl TryFrom<u8> for ConstraintOperator {
+    type Error = DbError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Eq),
+            1 => Ok(Self::NotEq),
+            2 => Ok(Self::Lt),
+            3 => Ok(Self::LtEq),
+            4 => Ok(Self::Gt),
+            5 => Ok(Self::GtEq),
+            6 => Ok(Self::Overlaps),
+            _ => Err(DbError::ParseError {
+                message: format!("unknown ConstraintOperator byte: {value}"),
+                position: None,
+            }),
+        }
+    }
+}
+
+/// One `(col_idx, operator)` pair owned by an exclusion constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExclusionElementDef {
+    pub col_idx: u16,
+    pub operator: ConstraintOperator,
+}
+
 /// A row in `axiom_constraints` — a named constraint persisted in the catalog.
 ///
-/// Currently used for CHECK constraints added via `ALTER TABLE ADD CONSTRAINT`.
-/// UNIQUE constraints are stored as indexes in `axiom_indexes` instead.
+/// CHECK constraints keep the legacy base layout. Exclusion constraints append a
+/// trailer with the owned helper-index id and constrained column tuple.
 ///
 /// ## Binary row format
 ///
@@ -11,6 +74,14 @@
 /// [constraint_id: u32 LE][table_id: u32 LE]
 /// [name_len: u32 LE][name: utf-8 bytes]
 /// [expr_len: u32 LE][check_expr: utf-8 bytes]
+/// [optional trailer]
+///
+/// trailer for exclusion constraints:
+/// [kind: u8 = 1]
+/// [owned_index_id: u32 LE]
+/// [num_elements: u8]
+/// repeated num_elements times:
+///   [col_idx: u16 LE][operator: u8]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstraintDef {
@@ -20,8 +91,15 @@ pub struct ConstraintDef {
     pub table_id: u32,
     /// Constraint name (required — anonymous constraints not supported in ALTER TABLE).
     pub name: String,
-    /// SQL expression string for CHECK constraints. Empty for future types.
+    /// SQL expression string for CHECK constraints. Empty for exclusion rows.
     pub check_expr: String,
+    /// Kind of constraint stored in this row.
+    pub kind: ConstraintKind,
+    /// `index_id` of the helper UNIQUE index owned by an exclusion constraint.
+    /// `0` for CHECK constraints.
+    pub owned_index_id: u32,
+    /// Ordered exclusion tuple elements. Empty for CHECK constraints.
+    pub exclude_elements: Vec<ExclusionElementDef>,
 }
 
 impl ConstraintDef {
@@ -36,6 +114,15 @@ impl ConstraintDef {
         buf.extend_from_slice(name_bytes);
         buf.extend_from_slice(&(expr_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(expr_bytes);
+        if self.kind == ConstraintKind::Exclusion {
+            buf.push(self.kind as u8);
+            buf.extend_from_slice(&self.owned_index_id.to_le_bytes());
+            buf.push(self.exclude_elements.len() as u8);
+            for elem in &self.exclude_elements {
+                buf.extend_from_slice(&elem.col_idx.to_le_bytes());
+                buf.push(elem.operator as u8);
+            }
+        }
         buf
     }
 
@@ -53,9 +140,20 @@ impl ConstraintDef {
         let table_id = u32::from_le_bytes(data[4..8].try_into().unwrap_or_default());
 
         let mut pos = 8usize;
-
+        if data.len() < pos + 4 {
+            return Err(DbError::ParseError {
+                message: "ConstraintDef row truncated before name length".into(),
+                position: None,
+            });
+        }
         let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
         pos += 4;
+        if data.len() < pos + name_len {
+            return Err(DbError::ParseError {
+                message: "ConstraintDef row truncated in name".into(),
+                position: None,
+            });
+        }
         let name = String::from_utf8(data[pos..pos + name_len].to_vec()).map_err(|e| {
             DbError::ParseError {
                 message: format!("ConstraintDef name not valid UTF-8: {e}"),
@@ -64,8 +162,20 @@ impl ConstraintDef {
         })?;
         pos += name_len;
 
+        if data.len() < pos + 4 {
+            return Err(DbError::ParseError {
+                message: "ConstraintDef row truncated before check_expr length".into(),
+                position: None,
+            });
+        }
         let expr_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default()) as usize;
         pos += 4;
+        if data.len() < pos + expr_len {
+            return Err(DbError::ParseError {
+                message: "ConstraintDef row truncated in check_expr".into(),
+                position: None,
+            });
+        }
         let check_expr = String::from_utf8(data[pos..pos + expr_len].to_vec()).map_err(|e| {
             DbError::ParseError {
                 message: format!("ConstraintDef check_expr not valid UTF-8: {e}"),
@@ -74,15 +184,139 @@ impl ConstraintDef {
         })?;
         pos += expr_len;
 
-        Ok((
-            Self {
-                constraint_id,
-                table_id,
-                name,
-                check_expr,
-            },
-            pos,
-        ))
+        if pos == data.len() {
+            return Ok((
+                Self {
+                    constraint_id,
+                    table_id,
+                    name,
+                    check_expr,
+                    kind: ConstraintKind::Check,
+                    owned_index_id: 0,
+                    exclude_elements: Vec::new(),
+                },
+                pos,
+            ));
+        }
+
+        let kind = ConstraintKind::try_from(data[pos])?;
+        pos += 1;
+        match kind {
+            ConstraintKind::Check => {
+                if pos != data.len() {
+                    return Err(DbError::ParseError {
+                        message: "unexpected trailing bytes in CHECK constraint row".into(),
+                        position: None,
+                    });
+                }
+                Ok((
+                    Self {
+                        constraint_id,
+                        table_id,
+                        name,
+                        check_expr,
+                        kind,
+                        owned_index_id: 0,
+                        exclude_elements: Vec::new(),
+                    },
+                    pos,
+                ))
+            }
+            ConstraintKind::Exclusion => {
+                if data.len() < pos + 5 {
+                    return Err(DbError::ParseError {
+                        message: "ConstraintDef exclusion trailer truncated".into(),
+                        position: None,
+                    });
+                }
+                let owned_index_id =
+                    u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or_default());
+                pos += 4;
+                let num_elements = data[pos] as usize;
+                pos += 1;
+                let mut exclude_elements = Vec::with_capacity(num_elements);
+                for _ in 0..num_elements {
+                    if data.len() < pos + 3 {
+                        return Err(DbError::ParseError {
+                            message: "ConstraintDef exclusion element truncated".into(),
+                            position: None,
+                        });
+                    }
+                    let col_idx =
+                        u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or_default());
+                    pos += 2;
+                    let operator = ConstraintOperator::try_from(data[pos])?;
+                    pos += 1;
+                    exclude_elements.push(ExclusionElementDef { col_idx, operator });
+                }
+                if pos != data.len() {
+                    return Err(DbError::ParseError {
+                        message: "unexpected trailing bytes in exclusion constraint row".into(),
+                        position: None,
+                    });
+                }
+                Ok((
+                    Self {
+                        constraint_id,
+                        table_id,
+                        name,
+                        check_expr,
+                        kind,
+                        owned_index_id,
+                        exclude_elements,
+                    },
+                    pos,
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod constraint_tests {
+    use super::*;
+
+    #[test]
+    fn test_constraint_def_check_roundtrip_legacy_shape() {
+        let def = ConstraintDef {
+            constraint_id: 7,
+            table_id: 9,
+            name: "ck_positive".into(),
+            check_expr: "v > 0".into(),
+            kind: ConstraintKind::Check,
+            owned_index_id: 0,
+            exclude_elements: vec![],
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = ConstraintDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_constraint_def_exclusion_roundtrip() {
+        let def = ConstraintDef {
+            constraint_id: 11,
+            table_id: 3,
+            name: "users_slug_excl".into(),
+            check_expr: String::new(),
+            kind: ConstraintKind::Exclusion,
+            owned_index_id: 42,
+            exclude_elements: vec![
+                ExclusionElementDef {
+                    col_idx: 1,
+                    operator: ConstraintOperator::Eq,
+                },
+                ExclusionElementDef {
+                    col_idx: 3,
+                    operator: ConstraintOperator::Eq,
+                },
+            ],
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = ConstraintDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
     }
 }
 

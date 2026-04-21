@@ -242,6 +242,14 @@ fn derive_detail_hint(err: &DbError) -> (Option<String>, Option<String>) {
             )),
         ),
 
+        DbError::ExclusionViolation { table, constraint } => (
+            None,
+            Some(format!(
+                "The row conflicts with EXCLUDE constraint {constraint} on table {table}. \
+                 Adjust the constrained values or remove the conflicting row."
+            )),
+        ),
+
         DbError::DuplicateKey => (
             None,
             Some(

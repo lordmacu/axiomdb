@@ -113,6 +113,41 @@ pub enum GeneratedColumnKind {
     Virtual,
 }
 
+/// Operator used by an exclusion-constraint element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionOperator {
+    /// `WITH =`
+    Eq,
+    /// `WITH <>` / `WITH !=`
+    NotEq,
+    /// `WITH <`
+    Lt,
+    /// `WITH <=`
+    LtEq,
+    /// `WITH >`
+    Gt,
+    /// `WITH >=`
+    GtEq,
+    /// `WITH &&`
+    Overlaps,
+}
+
+/// Target expression of one exclusion-constraint element.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExclusionElementTarget {
+    /// Plain column reference: `slug WITH =`
+    Column(String),
+    /// Parenthesized expression target: `((lower(email))) WITH =`
+    Expr(Expr),
+}
+
+/// One `EXCLUDE USING ... (target WITH op)` element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExclusionElement {
+    pub target: ExclusionElementTarget,
+    pub operator: ExclusionOperator,
+}
+
 /// Column definition as it appears in `CREATE TABLE` or `ALTER TABLE ADD COLUMN`.
 ///
 /// Different from `axiomdb_catalog::schema::ColumnDef` (the disk-stored form
@@ -187,6 +222,13 @@ pub enum TableConstraint {
     Check {
         name: Option<String>,
         expr: Expr,
+    },
+    /// `EXCLUDE USING btree (col WITH =, ...) [WHERE (...)]`
+    Exclude {
+        name: Option<String>,
+        using: String,
+        elements: Vec<ExclusionElement>,
+        predicate: Option<Expr>,
     },
     /// Non-unique index defined inline in a CREATE TABLE column list.
     ///

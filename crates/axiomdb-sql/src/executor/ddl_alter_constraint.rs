@@ -99,6 +99,105 @@ fn alter_add_constraint(
                 table_id: table_def.def.id,
                 name: cname,
                 check_expr,
+                kind: axiomdb_catalog::schema::ConstraintKind::Check,
+                owned_index_id: 0,
+                exclude_elements: vec![],
+            })?;
+            Ok(None)
+        }
+
+        TableConstraint::Exclude {
+            name,
+            using,
+            elements,
+            predicate,
+        } => {
+            let cname = name.ok_or_else(|| DbError::ParseError {
+                message: "ADD CONSTRAINT EXCLUDE requires an explicit constraint name".into(),
+                position: None,
+            })?;
+            validate_exclusion_access_method(&using)?;
+            validate_exclusion_predicate(&predicate)?;
+            let helper_index_name = exclusion_helper_index_name(&cname);
+
+            let snap = txn.active_snapshot(conn_txn);
+            {
+                let mut reader = CatalogReader::new(storage, snap.clone())?;
+                if reader
+                    .get_constraint_by_name(table_def.def.id, &cname)?
+                    .is_some()
+                {
+                    return Err(DbError::Other(format!(
+                        "constraint '{cname}' already exists on table '{}'",
+                        table_def.def.table_name
+                    )));
+                }
+                if reader
+                    .list_indexes(table_def.def.id)?
+                    .iter()
+                    .any(|idx| idx.name == cname || idx.name == helper_index_name)
+                {
+                    return Err(DbError::Other(format!(
+                        "constraint '{cname}' already exists on table '{}'",
+                        table_def.def.table_name
+                    )));
+                }
+            }
+
+            let (_column_names, index_columns, exclude_elements) =
+                resolve_exclusion_elements_existing(&table_def.def.table_name, columns_arg, &elements)?;
+            let stmt = crate::ast::CreateIndexStmt {
+                name: helper_index_name.clone(),
+                table: crate::ast::TableRef {
+                    database: None,
+                    schema: Some(schema.to_string()),
+                    name: table_def.def.table_name.clone(),
+                    alias: None,
+                },
+                columns: index_columns,
+                unique: true,
+                if_not_exists: false,
+                predicate: None,
+                fillfactor: None,
+                include_columns: vec![],
+                index_type: crate::ast::IndexType::BTree,
+                pages_per_range: None,
+            };
+            let noop_bloom = crate::bloom::BloomRegistry::new();
+            match execute_create_index(stmt, storage, txn, conn_txn, &noop_bloom, database) {
+                Ok(_) => {}
+                Err(DbError::UniqueViolation { .. } | DbError::DuplicateKey) => {
+                    return Err(DbError::ExclusionViolation {
+                        table: table_def.def.table_name.clone(),
+                        constraint: cname,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+
+            let owned_index_id = {
+                let mut reader = CatalogReader::new(storage, txn.active_snapshot(conn_txn))?;
+                reader
+                    .list_indexes(table_def.def.id)?
+                    .into_iter()
+                    .find(|idx| idx.name == helper_index_name)
+                    .map(|idx| idx.index_id)
+                    .ok_or_else(|| DbError::Internal {
+                        message: format!(
+                            "exclusion helper index '{}' not found after creation",
+                            helper_index_name
+                        ),
+                    })?
+            };
+
+            CatalogWriter::new(storage, txn, conn_txn)?.create_constraint(ConstraintDef {
+                constraint_id: 0,
+                table_id: table_def.def.id,
+                name: cname,
+                check_expr: String::new(),
+                kind: axiomdb_catalog::schema::ConstraintKind::Exclusion,
+                owned_index_id,
+                exclude_elements,
             })?;
             Ok(None)
         }
@@ -454,7 +553,7 @@ fn alter_drop_constraint(
         return Ok(());
     }
 
-    // 2. Search in axiom_constraints (CHECK constraints).
+    // 2. Search in axiom_constraints (CHECK / EXCLUDE constraints).
     let constraint = {
         let mut reader = CatalogReader::new(storage, snap.clone())?;
         reader.get_constraint_by_name(table_id, name)?
@@ -462,6 +561,10 @@ fn alter_drop_constraint(
 
     if let Some(c) = constraint {
         CatalogWriter::new(storage, txn, conn_txn)?.drop_constraint(c.constraint_id)?;
+        if c.kind == axiomdb_catalog::schema::ConstraintKind::Exclusion && c.owned_index_id != 0 {
+            let noop_bloom = crate::bloom::BloomRegistry::new();
+            execute_drop_index_by_id(c.owned_index_id, storage, txn, conn_txn, &noop_bloom)?;
+        }
         return Ok(());
     }
 

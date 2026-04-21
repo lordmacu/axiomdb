@@ -1,5 +1,27 @@
 # Architecture Notes
 
+## 2026-04-21 - Exclusion constraints (21.6b)
+
+- **Owned-helper model:** 21.6b does not add a new row-vs-row exclusion
+  engine. `EXCLUDE USING btree (... WITH =)` compiles to a real catalog
+  constraint plus an owned backing UNIQUE index, so heap and clustered write
+  paths reuse existing duplicate enforcement.
+- **Catalog trailer stays append-only:** `ConstraintDef` now distinguishes
+  `ConstraintKind::{Check, Exclusion}` and stores `owned_index_id` plus
+  `(col_idx, operator)` exclusion elements in an optional trailer. Legacy CHECK
+  rows with no trailer still decode as CHECK.
+- **Error translation sits at shared write boundaries:** helper-index
+  `UniqueViolation`s are translated back to `ExclusionViolation { table,
+  constraint }` in shared executor entrypoints so INSERT/UPDATE-like paths and
+  legacy execute flows all surface the same user-facing error.
+- **Owned helper indexes are metadata, not user indexes:** `DROP INDEX` rejects
+  direct removal of exclusion-owned helpers, `DROP CONSTRAINT` cleans both
+  catalog objects, and `information_schema` filters helper UNIQUE metadata out
+  of ordinary unique-constraint reporting.
+- **Schema cloning must remap ownership:** `CREATE TABLE ... LIKE` now copies
+  exclusion constraints together with their cloned helper indexes and rewrites
+  `owned_index_id` to the new table-local helper index ids.
+
 ## 2026-04-21 - Generated columns (21.5f)
 
 - **AST contract:** generated columns live as

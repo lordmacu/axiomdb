@@ -13,11 +13,35 @@ fn dispatch(
         Stmt::SetOp { .. } => Err(DbError::NotImplemented {
             feature: "UNION/INTERSECT/EXCEPT in legacy dispatch — use session-aware path".into(),
         }),
-        Stmt::Insert(s) => execute_insert(s, storage, txn, conn_txn),
+        Stmt::Insert(s) => {
+            let table_ref = s.table.clone();
+            execute_insert(s, storage, txn, conn_txn).map_err(|e| {
+                translate_exclusion_violation_legacy(
+                    e,
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_ref,
+                    DEFAULT_DATABASE_NAME,
+                )
+            })
+        }
         Stmt::Merge(_) => Err(DbError::NotImplemented {
             feature: "MERGE execution".into(),
         }),
-        Stmt::Update(s) => execute_update(s, storage, txn, conn_txn),
+        Stmt::Update(s) => {
+            let table_ref = s.table.clone();
+            execute_update(s, storage, txn, conn_txn).map_err(|e| {
+                translate_exclusion_violation_legacy(
+                    e,
+                    storage,
+                    txn,
+                    conn_txn,
+                    &table_ref,
+                    DEFAULT_DATABASE_NAME,
+                )
+            })
+        }
         Stmt::Delete(s) => execute_delete(s, storage, txn, conn_txn),
         Stmt::CreateTable(s) => {
             execute_create_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)

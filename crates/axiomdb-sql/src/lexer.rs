@@ -149,6 +149,8 @@ pub enum Token<'src> {
     References,
     #[token("CHECK", ignore(ascii_case))]
     Check,
+    #[token("EXCLUDE", ignore(ascii_case))]
+    Exclude,
     #[token("CONSTRAINT", ignore(ascii_case))]
     Constraint,
     #[token("DEFAULT", ignore(ascii_case))]

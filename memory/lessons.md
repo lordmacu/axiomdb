@@ -1,5 +1,21 @@
 # Lessons Learned
 
+## 2026-04-21 - Phase 21.6b
+
+- **Reuse owned UNIQUE enforcement before inventing a new exclusion engine.**
+  For equality-only `EXCLUDE USING btree`, the helper-index approach closed the
+  user-visible feature with far less risk than a bespoke row scan / operator
+  dispatcher, while still preserving proper constraint semantics at the SQL
+  surface.
+- **If an internal helper is catalog-owned, protect every lifecycle edge.**
+  The first implementation pass is not enough unless `DROP INDEX`, `DROP
+  CONSTRAINT`, `CREATE TABLE ... LIKE`, and metadata views all understand that
+  the helper index is internal state owned by the constraint.
+- **Translate internal storage errors at shared executor boundaries.** UNIQUE
+  enforcement already fires in multiple DML paths; the reliable fix is a shared
+  translation layer that maps owned-helper duplicates back to exclusion
+  violations before the error escapes to sessions or wire clients.
+
 ## 2026-04-21 - Phase 21.5f
 
 - **Generated-column semantics must live in one helper, not in each DML arm.**

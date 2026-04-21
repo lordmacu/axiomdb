@@ -3,17 +3,20 @@
 ## Current (2026-04-21)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.5f COMPLETE — GENERATED ALWAYS AS columns closed.
-`CREATE TABLE` now supports `GENERATED ALWAYS AS (expr) STORED`; generated
-metadata persists in `axiom_columns` (`generated_expr`, `generated_stored`);
-INSERT/UPDATE/ON CONFLICT/ODKU/MERGE recompute stored generated values through a
-shared helper; direct non-`DEFAULT` writes to generated columns are rejected.
-`VIRTUAL` and `ALTER TABLE ... GENERATED` remain explicit follow-ups via
-`NotImplemented`.
+**Active subphase:** Phase 21.6b COMPLETE — Exclusion constraints closed.
+`CREATE TABLE` and `ALTER TABLE ... ADD CONSTRAINT` now accept the equality-only
+subset of `EXCLUDE USING btree (... WITH =)`. Exclusion metadata persists in
+`axiom_constraints` with owned helper-index ids and constrained column order,
+runtime UNIQUE conflicts from helper indexes are translated back to
+table/constraint-scoped exclusion violations, `DROP CONSTRAINT` removes the
+owned helper index, and `information_schema` reports `EXCLUSION` without
+leaking the helper UNIQUE index as a normal unique constraint. GiST/range
+overlap, predicates, expressions, and non-`=` operators remain explicit
+follow-ups via `NotImplemented`.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-catalog`; `cargo test -p axiomdb-sql --test integration_generated_columns`; `cargo test -p axiomdb-sql --test integration_lateral_join`; `cargo test -p axiomdb-sql`; `cargo clippy -p axiomdb-sql -- -D warnings`; `python3 tools/wire-test.py` (419/419); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-catalog`; `cargo test -p axiomdb-sql --test integration_ddl_parser`; `cargo test -p axiomdb-sql --test integration_g11_information_schema`; `cargo test -p axiomdb-sql --test integration_exclusion_constraints`; `cargo test -p axiomdb-sql --test integration_errors`; `cargo test -p axiomdb-sql --test integration_g5_dml`; `cargo test -p axiomdb-sql`; `cargo clippy -p axiomdb-sql -- -D warnings`; `python3 tools/wire-test.py` (419/419); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.6b Exclusion constraints, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.7 TEMP and UNLOGGED tables, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -26,7 +29,8 @@ shared helper; direct non-`DEFAULT` writes to generated columns are rejected.
 | 21.5b-e MySQL DML variants and multi-table DML | ✅ closed |
 | 21.5f GENERATED ALWAYS AS columns | ✅ closed |
 | 21.6 CHECK constraints | ✅ closed |
-| 21.6b Exclusion constraints | ⏳ next |
+| 21.6b Exclusion constraints | ✅ closed |
+| 21.7 TEMP and UNLOGGED tables | ⏳ next |
 
 ### Phase 11 subphase status
 

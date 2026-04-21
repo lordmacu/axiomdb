@@ -71,6 +71,108 @@ fn effective_database_for_ref(tref: &crate::ast::TableRef, ctx: &SessionContext)
         .to_string()
 }
 
+fn owned_exclusion_constraint_name_by_index(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
+    table_id: u32,
+    index_name: &str,
+) -> Result<Option<String>, DbError> {
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let Some(index_id) = reader
+        .list_indexes(table_id)?
+        .into_iter()
+        .find(|idx| idx.name == index_name)
+        .map(|idx| idx.index_id)
+    else {
+        return Ok(None);
+    };
+
+    Ok(reader
+        .list_constraints(table_id)?
+        .into_iter()
+        .find(|constraint| {
+            constraint.kind == axiomdb_catalog::ConstraintKind::Exclusion
+                && constraint.owned_index_id == index_id
+        })
+        .map(|constraint| constraint.name))
+}
+
+fn translate_exclusion_violation_ctx(
+    err: DbError,
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+    table_ref: &crate::ast::TableRef,
+) -> DbError {
+    let DbError::UniqueViolation { index_name, .. } = &err else {
+        return err;
+    };
+    let Some(conn_txn) = ctx.conn_txn.take() else {
+        return err;
+    };
+    let translated = match resolve_table_cached(
+        exec_ctx.storage(),
+        exec_ctx.coord(),
+        ctx,
+        Some(&conn_txn),
+        table_ref,
+    ) {
+        Ok(resolved) => match owned_exclusion_constraint_name_by_index(
+            exec_ctx.storage(),
+            exec_ctx.coord(),
+            &conn_txn,
+            resolved.def.id,
+            index_name,
+        ) {
+            Ok(Some(constraint)) => DbError::ExclusionViolation {
+                table: resolved.def.table_name,
+                constraint,
+            },
+            _ => err,
+        },
+        Err(_) => err,
+    };
+    ctx.conn_txn = Some(conn_txn);
+    translated
+}
+
+fn translate_exclusion_violation_legacy(
+    err: DbError,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
+    table_ref: &crate::ast::TableRef,
+    default_database: &str,
+) -> DbError {
+    let DbError::UniqueViolation { index_name, .. } = &err else {
+        return err;
+    };
+    let schema = table_ref.schema.as_deref().unwrap_or("public");
+    let mut resolver = match make_resolver_with_database(storage, txn, Some(conn_txn), default_database)
+    {
+        Ok(resolver) => resolver,
+        Err(_) => return err,
+    };
+    let resolved = match resolver.resolve_table(Some(schema), &table_ref.name) {
+        Ok(resolved) => resolved,
+        Err(_) => return err,
+    };
+    match owned_exclusion_constraint_name_by_index(
+        storage,
+        txn,
+        conn_txn,
+        resolved.def.id,
+        index_name,
+    ) {
+        Ok(Some(constraint)) => DbError::ExclusionViolation {
+            table: resolved.def.table_name,
+            constraint,
+        },
+        _ => err,
+    }
+}
+
 // ── ctx-aware DML handlers ────────────────────────────────────────────────────
 
 
