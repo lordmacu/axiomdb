@@ -144,6 +144,8 @@ fn test_create_column_fires_no_event() {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })
         .unwrap();
         let count_after_column = events.lock().unwrap().len();

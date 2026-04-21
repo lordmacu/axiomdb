@@ -42,7 +42,9 @@ fn execute_clustered_update(
     //   2. No FK constraints
     //   3. No secondary indexes with changed key columns
     //   4. PK columns not changed
-    let field_patch_ok = resolved.foreign_keys.is_empty()
+    let has_generated_columns = schema_cols.iter().any(|c| c.generated_expr.is_some());
+    let field_patch_ok = !has_generated_columns
+        && resolved.foreign_keys.is_empty()
         && assignments.iter().all(|(col_pos, _)| {
             axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
         });
@@ -136,14 +138,12 @@ fn execute_clustered_update(
 
         for candidate in &candidates {
             let mut new_values = candidate.values.clone();
-            let mut changed = false;
             for &(col_pos, ref val_expr) in &assignments {
                 let nv = eval(val_expr, &candidate.values)?;
-                if nv != candidate.values[col_pos] {
-                    changed = true;
-                }
                 new_values[col_pos] = nv;
             }
+            materialize_generated_columns(schema_cols, &mut new_values)?;
+            let changed = new_values != candidate.values;
             if !changed {
                 continue;
             }
@@ -221,14 +221,12 @@ fn execute_clustered_update(
         matched_count += 1;
 
         let mut new_values = candidate.values.clone();
-        let mut changed = false;
         for &(col_pos, ref val_expr) in &assignments {
             let nv = eval(val_expr, &candidate.values)?;
-            if nv != candidate.values[col_pos] {
-                changed = true;
-            }
             new_values[col_pos] = nv;
         }
+        materialize_generated_columns(schema_cols, &mut new_values)?;
+        let changed = new_values != candidate.values;
         if !changed {
             continue;
         }
@@ -243,7 +241,8 @@ fn execute_clustered_update(
         // Field-patch optimization: when all changed columns are fixed-size
         // and PK is unchanged, patch bytes directly in the existing row_data
         // instead of full encode_row(). Saves ~16× per row.
-        let field_patch_ok = !pk_changed
+        let field_patch_ok = !has_generated_columns
+            && !pk_changed
             && assignments.iter().all(|(col_pos, _)| {
                 axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
             });

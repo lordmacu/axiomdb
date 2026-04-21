@@ -533,8 +533,19 @@ fn apply_merge_update_heap(
                 message: "MERGE target column index outside target row".into(),
             });
         }
+        if resolved.columns[target_idx].generated_expr.is_some()
+            && !matches!(assignment.value, Expr::Default)
+        {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "generated column '{}.{}' cannot be assigned explicitly",
+                    resolved.def.table_name, resolved.columns[target_idx].name
+                ),
+            });
+        }
         new_row[target_idx] = eval(&assignment.value, combined)?;
     }
+    materialize_generated_columns(&resolved.columns, &mut new_row)?;
 
     if new_row == old_row {
         return Ok(());
@@ -656,12 +667,19 @@ fn apply_merge_insert_heap(
     ctx: &mut SessionContext,
     first_generated: &mut Option<u64>,
 ) -> Result<(), DbError> {
-    let provided = values
+    let mut provided = values
         .iter()
         .map(|expr| eval(expr, combined))
         .collect::<Result<Vec<_>, _>>()?;
     let col_positions =
         build_insert_column_positions(&resolved.columns, columns, &resolved.def.table_name)?;
+    validate_generated_insert_exprs(
+        &col_positions,
+        values,
+        &resolved.columns,
+        &resolved.def.table_name,
+    )?;
+    resolve_expr_defaults(&col_positions, values, &mut provided, &resolved.columns);
     let mut full_values = materialize_insert_row(&col_positions, &provided, &resolved.columns);
 
     assign_auto_increment(
@@ -673,6 +691,7 @@ fn apply_merge_insert_heap(
         &mut full_values,
         first_generated,
     )?;
+    materialize_generated_columns(&resolved.columns, &mut full_values)?;
 
     enforce_text_constraints(&resolved.columns, &mut full_values)?;
     check_row_constraints_with_cols(

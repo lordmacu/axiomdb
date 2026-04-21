@@ -77,19 +77,17 @@ fn execute_update_join_ctx(
         };
 
         matched_count += 1;
-        let mut changed = false;
         let mut new_values = Vec::with_capacity(current_values.len());
         for (ci, cv) in current_values.iter().enumerate() {
             if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
                 let nv = eval(val_expr, &candidate.combined_values)?;
-                if nv != *cv {
-                    changed = true;
-                }
                 new_values.push(nv);
             } else {
                 new_values.push(cv.clone());
             }
         }
+        materialize_generated_columns(&resolved.columns, &mut new_values)?;
+        let changed = new_values != current_values;
         if changed {
             to_update.push((candidate.rid, current_values, new_values));
         }

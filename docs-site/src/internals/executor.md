@@ -153,6 +153,28 @@ When no transaction is active, `execute` wraps the statement in an implicit
 All reads use `txn.active_snapshot()?` — a snapshot fixed at `BEGIN` — so that
 writes made earlier in the same transaction are visible (read-your-own-writes).
 
+## Generated columns (Phase 21.5f)
+
+Stored generated columns are materialized by one shared helper:
+`executor/insert_helpers.rs::materialize_generated_columns()`.
+
+Write-time order:
+
+1. evaluate INSERT/UPDATE expressions and expand omitted columns
+2. apply `DEFAULT` / `AUTO_INCREMENT`
+3. apply explicit UPDATE assignments and `ON UPDATE` expressions
+4. recompute every `GENERATED ALWAYS AS (... ) STORED` column
+5. run CHECK/FK/UNIQUE/index maintenance and `RETURNING` on the final row
+
+Direct writes to generated columns are rejected unless the SQL expression is
+`DEFAULT`, which means "recompute". The same helper is called from heap INSERT,
+clustered INSERT, UPDATE, UPDATE JOIN, `ON CONFLICT`, MySQL ODKU, and `MERGE`,
+so proposed rows, stored rows, and `RETURNING` rows stay aligned across all
+write paths.
+
+`VIRTUAL` generated columns are rejected at DDL execution time, so the executor
+does not yet carry a read-time synthesized-column path.
+
 ## Transactional INSERT staging (Phase 5.21)
 
 `5.21` adds a statement-boundary staging path for consecutive

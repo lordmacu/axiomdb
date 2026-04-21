@@ -6,7 +6,8 @@
 
 mod common;
 
-use axiomdb_sql::QueryResult;
+use axiomdb_sql::{bloom::BloomRegistry, QueryResult, SessionContext};
+use axiomdb_storage::MemoryStorage;
 use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 
@@ -27,6 +28,17 @@ fn as_i64(v: &Value) -> i64 {
         Value::BigInt(i) => *i,
         other => panic!("expected int, got {other:?}"),
     }
+}
+
+fn exec_ok(
+    sql: &str,
+    storage: &mut MemoryStorage,
+    txn: &mut TxnManager,
+    bloom: &mut BloomRegistry,
+    ctx: &mut SessionContext,
+) {
+    run_ctx(sql, storage, txn, bloom, ctx)
+        .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"));
 }
 
 /// Insertion-sort rows by the i-th column (ascending) without requiring Ord on Value.
@@ -50,8 +62,8 @@ fn basic_lateral_inner() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
     // t(id): 1, 2, 3
-    run_ctx("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
-    run_ctx(
+    exec_ok("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok(
         "INSERT INTO t VALUES (1), (2), (3)",
         &mut s,
         &mut t,
@@ -60,14 +72,14 @@ fn basic_lateral_inner() {
     );
 
     // other(t_id, val): (1,10), (2,20)
-    run_ctx(
+    exec_ok(
         "CREATE TABLE other (t_id INT, val INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO other VALUES (1, 10), (2, 20)",
         &mut s,
         &mut t,
@@ -105,8 +117,8 @@ fn basic_lateral_inner() {
 fn lateral_left_join_null_pad() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
-    run_ctx(
+    exec_ok("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok(
         "INSERT INTO t VALUES (1), (2), (3)",
         &mut s,
         &mut t,
@@ -114,14 +126,14 @@ fn lateral_left_join_null_pad() {
         &mut c,
     );
 
-    run_ctx(
+    exec_ok(
         "CREATE TABLE other (t_id INT, val INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO other VALUES (1, 10), (2, 20)",
         &mut s,
         &mut t,
@@ -162,8 +174,8 @@ fn lateral_left_join_null_pad() {
 fn lateral_cross_join() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
-    run_ctx(
+    exec_ok("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok(
         "INSERT INTO t VALUES (1), (2), (3)",
         &mut s,
         &mut t,
@@ -252,14 +264,14 @@ fn lateral_chain() {
 fn lateral_outer_ref() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx(
+    exec_ok(
         "CREATE TABLE t (a INT, b INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO t VALUES (1, 2), (3, 4)",
         &mut s,
         &mut t,
@@ -292,8 +304,8 @@ fn lateral_outer_ref() {
 fn lateral_right_rejected() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
-    run_ctx("INSERT INTO t VALUES (1)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok("INSERT INTO t VALUES (1)", &mut s, &mut t, &mut b, &mut c);
 
     // RIGHT JOIN LATERAL → NotImplemented
     let err = run_ctx(
@@ -318,8 +330,8 @@ fn lateral_right_rejected() {
 fn lateral_full_rejected() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
-    run_ctx("INSERT INTO t VALUES (1)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok("INSERT INTO t VALUES (1)", &mut s, &mut t, &mut b, &mut c);
 
     // FULL JOIN LATERAL → NotImplemented
     let err = run_ctx(
@@ -345,14 +357,14 @@ fn lateral_update_join() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
     // target(id, val): rows to update
-    run_ctx(
+    exec_ok(
         "CREATE TABLE target (id INT, val INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO target VALUES (1, 0), (2, 0), (3, 0)",
         &mut s,
         &mut t,
@@ -361,14 +373,14 @@ fn lateral_update_join() {
     );
 
     // multiplier(tid, factor): only id=1 and id=2 have a factor
-    run_ctx(
+    exec_ok(
         "CREATE TABLE multiplier (tid INT, factor INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO multiplier VALUES (1, 10), (2, 20)",
         &mut s,
         &mut t,
@@ -412,14 +424,14 @@ fn lateral_update_join() {
 fn lateral_delete_join() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx(
+    exec_ok(
         "CREATE TABLE target (id INT, val INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO target VALUES (1, 100), (2, 200), (3, 300)",
         &mut s,
         &mut t,
@@ -428,14 +440,14 @@ fn lateral_delete_join() {
     );
 
     // sentinel: only ids 1 and 2 should be deleted
-    run_ctx(
+    exec_ok(
         "CREATE TABLE to_delete (tid INT)",
         &mut s,
         &mut t,
         &mut b,
         &mut c,
     );
-    run_ctx(
+    exec_ok(
         "INSERT INTO to_delete VALUES (1), (2)",
         &mut s,
         &mut t,
@@ -468,8 +480,8 @@ fn lateral_delete_join() {
 fn regression_non_lateral_subquery() {
     let (mut s, mut t, mut b, mut c) = setup_ctx();
 
-    run_ctx("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
-    run_ctx(
+    exec_ok("CREATE TABLE t (id INT)", &mut s, &mut t, &mut b, &mut c);
+    exec_ok(
         "INSERT INTO t VALUES (1), (2), (3)",
         &mut s,
         &mut t,

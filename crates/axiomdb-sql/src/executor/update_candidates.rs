@@ -33,7 +33,8 @@ fn execute_update_with_candidates(
     let needs_full_row = !field_patch_eligible
         || !secondary_indexes.is_empty()
         || !resolved.constraints.is_empty()
-        || !returning.is_empty();
+        || !returning.is_empty()
+        || schema_cols.iter().any(|c| c.generated_expr.is_some());
 
     let mut to_update: Vec<(RecordId, Vec<Value>, Vec<Value>)> = Vec::new();
     // Sparse path: (rid, [(col_pos, new_value)])
@@ -70,19 +71,17 @@ fn execute_update_with_candidates(
         matched_count += 1;
         if needs_full_row {
             // Full-row path: build complete new_values (normal path / FK / index maintenance).
-            let mut changed = false;
             let mut new_values = Vec::with_capacity(current_values.len());
             for (ci, cv) in current_values.iter().enumerate() {
                 if let Some((_, val_expr)) = assignments.iter().find(|(pos, _)| *pos == ci) {
                     let nv = eval(val_expr, &current_values)?;
-                    if nv != *cv {
-                        changed = true;
-                    }
                     new_values.push(nv);
                 } else {
                     new_values.push(cv.clone());
                 }
             }
+            materialize_generated_columns(schema_cols, &mut new_values)?;
+            let changed = new_values != current_values;
             if !changed {
                 continue;
             }

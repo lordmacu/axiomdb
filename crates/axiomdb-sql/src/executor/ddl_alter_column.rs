@@ -578,6 +578,11 @@ fn alter_add_column(
 ) -> Result<(), DbError> {
     // Check for duplicate column name.
     let table_name = &table_def.table_name;
+    if generated_column_constraint(&col_def)?.is_some() {
+        return Err(DbError::NotImplemented {
+            feature: "ALTER TABLE generated columns".into(),
+        });
+    }
     if columns.iter().any(|c| c.name == col_def.name) {
         return Err(DbError::ColumnAlreadyExists {
             name: col_def.name.clone(),
@@ -635,6 +640,8 @@ fn alter_add_column(
             }
             _ => None,
         }),
+        generated_expr: None,
+        generated_stored: false,
     };
 
     // 1. Add column to catalog.
@@ -901,6 +908,12 @@ fn alter_modify_column(
 ) -> Result<(), DbError> {
     use axiomdb_types::coerce::{coerce, CoercionMode};
 
+    if generated_column_constraint(&col_def)?.is_some() {
+        return Err(DbError::NotImplemented {
+            feature: "ALTER TABLE generated columns".into(),
+        });
+    }
+
     // Find the column to modify.
     let col_pos = columns
         .iter()
@@ -1018,6 +1031,8 @@ fn alter_modify_column(
                 _ => None,
             })
             .or_else(|| old_columns[col_pos].on_update_expr.clone()),
+        generated_expr: old_columns[col_pos].generated_expr.clone(),
+        generated_stored: old_columns[col_pos].generated_stored,
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 

@@ -165,6 +165,12 @@ fn execute_insert_ctx(
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
+                validate_generated_insert_exprs(
+                    &col_positions,
+                    &value_exprs,
+                    &resolved.columns,
+                    &resolved.def.table_name,
+                )?;
                 resolve_expr_defaults(
                     &col_positions,
                     &value_exprs,
@@ -210,6 +216,7 @@ fn execute_insert_ctx(
                         }
                     }
                 }
+                materialize_generated_columns(schema_cols, &mut full_values)?;
 
                 // CHAR(N) padding + VARCHAR(N) length check + CHECK constraints.
                 match enforce_text_constraints(&resolved.columns, &mut full_values).and_then(|()| {
@@ -422,6 +429,12 @@ fn execute_insert_ctx(
             // Batch: heap insert + WAL + index maintenance (single pass).
             let mut full_batch: Vec<Vec<Value>> = Vec::with_capacity(select_rows.len());
             for (row_idx, row_values) in select_rows.into_iter().enumerate() {
+                validate_generated_insert_source_values(
+                    &col_positions,
+                    row_values.len(),
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 let mut full_values =
                     materialize_insert_row(&col_positions, &row_values, &resolved.columns);
                 if let Some(ai_col) = auto_inc_col {
@@ -443,6 +456,7 @@ fn execute_insert_ctx(
                         }
                     }
                 }
+                materialize_generated_columns(schema_cols, &mut full_values)?;
                 // FK validation (still per-row — FK check reads catalog).
                 if !resolved.foreign_keys.is_empty() {
                     match crate::fk_enforcement::check_fk_child_insert(
@@ -641,6 +655,7 @@ fn execute_insert_ctx(
                     first_generated = Some(id);
                 }
             }
+            materialize_generated_columns(schema_cols, &mut full_values)?;
             enforce_text_constraints(&resolved.columns, &mut full_values)?;
             check_row_constraints_with_cols(
                 &resolved.constraints,

@@ -215,6 +215,7 @@ fn apply_odku_heap(
             new_row[*target_idx] = v;
         }
     }
+    materialize_generated_columns(schema_cols, &mut new_row)?;
 
     // Same constraint + FK pipeline as a plain UPDATE.
     enforce_text_constraints(schema_cols, &mut new_row)?;
@@ -317,6 +318,7 @@ fn resolve_odku_assignments(
         let rhs = resolve_odku_expr(a.value.clone(), schema_cols, table_name)?;
         out.push((target_idx, rhs));
     }
+    validate_generated_update_assignments(&out, schema_cols, table_name)?;
     Ok(out)
 }
 

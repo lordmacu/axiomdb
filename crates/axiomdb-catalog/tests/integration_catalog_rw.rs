@@ -156,6 +156,8 @@ fn test_create_columns_list_ordered_by_col_idx() {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -169,6 +171,8 @@ fn test_create_columns_list_ordered_by_col_idx() {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -182,6 +186,8 @@ fn test_create_columns_list_ordered_by_col_idx() {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })
         .unwrap();
         tid
@@ -373,6 +379,8 @@ fn test_delete_table_cascades_columns_and_indexes() {
             is_fixed_len: false,
             default_expr: None,
             on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
         })
         .unwrap();
         w.create_index(IndexDef {

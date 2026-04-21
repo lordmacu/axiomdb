@@ -277,12 +277,18 @@ pub enum TableStorageLayout {
 // lookup without scanning the entire plan cache (Phase 40.2 OID invalidation).
 
 pub struct ColumnDef {
-    pub table_id:      u64,
-    pub col_index:     usize,       // zero-based position within the table
-    pub col_name:      String,
-    pub data_type:     DataType,    // from axiomdb-core::types::DataType
-    pub not_null:      bool,
-    pub default_value: Option<String>,  // DEFAULT expression as source text
+    pub table_id:         u64,
+    pub col_idx:          usize,
+    pub name:             String,
+    pub col_type:         ColumnType,
+    pub nullable:         bool,
+    pub auto_increment:   bool,
+    pub type_len:         u16,
+    pub is_fixed_len:     bool,
+    pub default_expr:     Option<String>,
+    pub on_update_expr:   Option<String>,
+    pub generated_expr:   Option<String>,
+    pub generated_stored: bool,
 }
 
 pub struct IndexDef {
@@ -303,6 +309,24 @@ pub struct IndexDef {
 `TableDef` no longer hard-codes a heap root because Phase 39.13 makes explicit-`PRIMARY KEY` tables clustered from day one. This follows SQLite `WITHOUT ROWID` more closely than the easier InnoDB-style hidden-key shortcut, which would have preserved the old heap assumption at the cost of reopening the storage rewrite later.
 </div>
 </div>
+
+### Generated-column persistence (Phase 21.5f)
+
+`axiom_columns` gained two backward-compatible extensions:
+
+- `flags bit6` -> generated expression bytes are present after
+  `on_update_expr`
+- `flags bit7` -> generated kind (`0 = STORED`, `1 = VIRTUAL`)
+
+When bit6 is set, the row appends:
+
+```text
+[generated_expr_len: 2 bytes LE][generated_expr utf8 bytes]
+```
+
+Old rows keep bit6 clear and decode exactly as before. The executor reparses the
+stored SQL text at write time so heap INSERT, clustered INSERT, UPDATE, ODKU,
+`ON CONFLICT`, and `MERGE` all reuse one materialization rule.
 
 ---
 

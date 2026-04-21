@@ -1,5 +1,28 @@
 # Architecture Notes
 
+## 2026-04-21 - Generated columns (21.5f)
+
+- **AST contract:** generated columns live as
+  `ColumnConstraint::Generated { expr, kind }`; no separate `ColumnDef` field
+  was added on the SQL AST side, so parser/analyzer/executor match sites keep
+  using the existing constraint loop.
+- **Catalog persistence:** `axiom_columns` now stores `generated_expr` and
+  `generated_stored`; flag bit6 means expression bytes are present after
+  `on_update_expr`, and bit7 differentiates `STORED` vs `VIRTUAL` without
+  breaking older rows.
+- **Validation boundary:** `execute_create_table` owns semantic validation for
+  generated expressions. The parser only captures syntax; DDL rejects
+  self-reference, generated-to-generated dependencies, unknown columns,
+  subqueries, aggregates, and incompatible column attributes.
+- **Write-time contract:** `executor/insert_helpers.rs::materialize_generated_columns`
+  is the single recomputation point. INSERT paths call it after
+  defaults/auto_increment; UPDATE paths call it after `SET` + `ON UPDATE`
+  expressions; CHECK/FK/index maintenance/RETURNING all see the final
+  recomputed row.
+- **Out-of-scope forms are rejected early:** `VIRTUAL` generated columns and
+  `ALTER TABLE ... GENERATED` are surfaced as explicit `NotImplemented` so no
+  read-time synthesized column path leaks into the executor yet.
+
 ## 2026-04-13 — LATERAL-correlated JSON_TABLE (11.20d3)
 
 - **Correlation detector**: `jsontable_is_correlated(&jt)` returns true

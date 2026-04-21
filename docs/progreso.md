@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 135/442 subphases (30.5%) — Phase 11 active**
+> **MySQL+PG parity path: 136/442 subphases (30.8%) — Phase 21 active**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
@@ -11,8 +11,8 @@
 
 ## Ruta crítica (orden de ataque)
 
-1. **Fase 11 JSON** — 3 subfases restantes (`11.18c`, `11.21h`, `11.25d`). ~75% cerrada.
-2. **Fase 21 Advanced SQL** — CTE, MERGE, RETURNING, CHECK, LATERAL, cursors. ⭐ alto valor user-visible.
+1. **Fase 21 Advanced SQL** — CTE, MERGE, RETURNING, CHECK, generated columns, LATERAL y gaps de compat restantes. ⭐ alto valor user-visible.
+2. **Fase 11 JSON** — 4 follow-ups restantes (`11.18c`, `11.21h`, `11.23c`, `11.24c`).
 3. **Fase 13 Advanced PostgreSQL** — window funcs, generated cols, triggers BEFORE/AFTER, collation ICU.
 4. **Fase 20 Types + import/export** — views, sequences, ENUMs, arrays, COPY.
 5. **Fase 16 Server logic** — stored procs, triggers completos, pooler.
@@ -32,7 +32,7 @@
 |---|---|---|
 | A. Foundations | 1-7, 39, 40 | ✅ done |
 | B. Execution + Embedded | 8-10 | ✅ done |
-| C. Type System + SQL completeness | 11, 13, 20, 21, 24, 25, 26 | 🔄 fase 11 in progress |
+| C. Type System + SQL completeness | 11, 13, 20, 21, 24, 25, 26 | 🔄 fase 21 in progress |
 | D. Server Logic + Security + Observability | 16, 17, 19 | ⏳ pending |
 | E. High Availability | 18 | ⏳ pending |
 | F. Platform + Compat | 14, 22b, 23 | ⏳ pending |
@@ -242,7 +242,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [x] ✅ 21.5b `REPLACE INTO` (MySQL) — DELETE-then-INSERT semantics. `InsertStmt.replace: bool` flag in AST; parser branches on `REPLACE` keyword; executor deletes any conflicting row via PK/UNIQUE index lookup + FK cascade before inserting. AUTO_INCREMENT increments on replace. 16 integration tests in `tests/integration_replace_into.rs` (status fix — implemented in earlier sprint).
 - [x] ✅ 21.5c `INSERT IGNORE` (MySQL) — `InsertStmt.ignore: bool` silences unique/FK/NOT NULL violations per row; returns warning count instead of error. Tested in `tests/integration_insert_on_dup.rs` + coexistence with ODKU. Status fix.
 - [x] ✅ 21.5d Multi-table UPDATE/DELETE — `UPDATE orders o JOIN customers c ON ...` / `DELETE o FROM orders o JOIN customers c ON ...`. Implemented as part of 11.20d4 (JSON_TABLE as UPDATE/DELETE source generalized the join-side DML machinery). Tests in `tests/integration_json_table_dml.rs`. Status fix.
-- [ ] 21.5f ⏳ GENERATED ALWAYS AS (expr) STORED/VIRTUAL columns — computed columns not in parser or executor; `total DECIMAL(10,2) GENERATED ALWAYS AS (price * (1 + tax_rate)) STORED`; STORED: persisted on INSERT/UPDATE; VIRTUAL: computed at read time; requires parser extension in `ColumnDef` + executor materialization on INSERT/SELECT
+- [x] ✅ 21.5f GENERATED ALWAYS AS (expr) STORED/VIRTUAL columns — `CREATE TABLE` now persists generated metadata in `axiom_columns` (`generated_expr`, `generated_stored`); STORED values are materialized on INSERT/UPDATE/ON CONFLICT/ODKU/MERGE; direct writes are rejected except `DEFAULT`; `VIRTUAL` and `ALTER TABLE ... GENERATED` return explicit `NotImplemented`. Coverage: 19 integration tests + wire smoke 419/419.
 - [x] 4.1f ✅ Version-conditional MySQL comments `/*!NNNNN SQL*/` — `expand_version_comments()` in `lexer.rs` preprocesses input before tokenization; includes SQL if NNNNN ≤ 80000; no version number → always include; fast path (no allocation) when `/*!` not present; 5 unit tests
 - [x] ✅ 21.5e `INSERT ... ON DUPLICATE KEY UPDATE` (MySQL) — `InsertStmt.on_duplicate_update: Option<Vec<Assignment>>`; executor `apply_odku_heap` + `apply_odku_clustered` in `odku_helpers.rs` applies assignments on DuplicateKey catch. `VALUES(col)` RHS + arithmetic + CASE supported via `eval_odku_assignment_rhs`. 16 integration tests in `tests/integration_insert_on_dup.rs`. Status fix.
 - [x] ✅ 21.6 CHECK constraints — column-level `col INT CHECK (col >= 0)` + table-level `CHECK (lo <= hi)` persisted at CREATE TABLE; ALTER ADD CONSTRAINT validates existing rows; enforcement on INSERT (heap + clustered + ODKU) and UPDATE (heap + clustered + multi-table JOIN); SQL-standard NULL→pass semantics (only explicit FALSE violates); column-name resolution via `resolve_column_refs` walks re-parsed expr; 7 integration tests in `tests/integration_check_constraint.rs`. DOMAIN types deferred to 21.6c.

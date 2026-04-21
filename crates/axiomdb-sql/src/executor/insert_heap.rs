@@ -112,6 +112,12 @@ fn execute_insert(
                     .iter()
                     .map(|e| eval(e, &[]))
                     .collect::<Result<_, _>>()?;
+                validate_generated_insert_exprs(
+                    &col_positions,
+                    value_exprs,
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 resolve_expr_defaults(&col_positions, value_exprs, &mut provided, schema_cols);
 
                 let mut full_values =
@@ -137,6 +143,7 @@ fn execute_insert(
                         }
                     }
                 }
+                materialize_generated_columns(schema_cols, &mut full_values)?;
 
                 full_batch.push(crate::table::coerce_values(full_values, schema_cols)?);
             }
@@ -230,6 +237,12 @@ fn execute_insert(
             };
 
             for row_values in select_rows {
+                validate_generated_insert_source_values(
+                    &col_positions,
+                    row_values.len(),
+                    schema_cols,
+                    &resolved.def.table_name,
+                )?;
                 let mut full_values =
                     materialize_insert_row(&col_positions, &row_values, schema_cols);
 
@@ -252,6 +265,7 @@ fn execute_insert(
                         }
                     }
                 }
+                materialize_generated_columns(schema_cols, &mut full_values)?;
                 let full_values = crate::table::coerce_values(full_values, schema_cols)?;
 
                 let rid = match TableEngine::insert_row(
@@ -312,6 +326,7 @@ fn execute_insert(
                     }
                 }
             }
+            materialize_generated_columns(schema_cols, &mut full_values)?;
             let full_values = crate::table::coerce_values(full_values, schema_cols)?;
             let rid = TableEngine::insert_row(
                 storage,

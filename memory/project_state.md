@@ -1,14 +1,19 @@
 # Project State
 
-## Current (2026-04-19)
+## Current (2026-04-21)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.5 COMPLETE — MERGE / UPSERT closed.
-PostgreSQL `INSERT ... ON CONFLICT` now supports `DO NOTHING`, `(cols) DO UPDATE SET ... [WHERE ...]`, `EXCLUDED.col`, and `RETURNING` on heap targets. SQL-standard heap `MERGE` now supports matched UPDATE/DELETE/DO NOTHING and not-matched INSERT/DO NOTHING, with table/subquery/VALUES/JSON_TABLE/JSONB SRF sources and a unique-key equality fast path. Clustered `ON CONFLICT` / `MERGE` and `WHEN NOT MATCHED BY SOURCE` are explicit follow-ups.
+**Active subphase:** Phase 21.5f COMPLETE — GENERATED ALWAYS AS columns closed.
+`CREATE TABLE` now supports `GENERATED ALWAYS AS (expr) STORED`; generated
+metadata persists in `axiom_columns` (`generated_expr`, `generated_stored`);
+INSERT/UPDATE/ON CONFLICT/ODKU/MERGE recompute stored generated values through a
+shared helper; direct non-`DEFAULT` writes to generated columns are rejected.
+`VIRTUAL` and `ALTER TABLE ... GENERATED` remain explicit follow-ups via
+`NotImplemented`.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql`; `cargo clippy -p axiomdb-sql -- -D warnings`; `python3 tools/wire-test.py` (417/417); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-catalog`; `cargo test -p axiomdb-sql --test integration_generated_columns`; `cargo test -p axiomdb-sql --test integration_lateral_join`; `cargo test -p axiomdb-sql`; `cargo clippy -p axiomdb-sql -- -D warnings`; `python3 tools/wire-test.py` (419/419); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.5f GENERATED ALWAYS AS columns, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.6b Exclusion constraints, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -19,8 +24,9 @@ PostgreSQL `INSERT ... ON CONFLICT` now supports `DO NOTHING`, `(cols) DO UPDATE
 | 21.4 / 21.4b RETURNING | ✅ closed |
 | **21.5 MERGE / UPSERT** | ✅ closed |
 | 21.5b-e MySQL DML variants and multi-table DML | ✅ closed |
-| 21.5f GENERATED ALWAYS AS columns | ⏳ next |
+| 21.5f GENERATED ALWAYS AS columns | ✅ closed |
 | 21.6 CHECK constraints | ✅ closed |
+| 21.6b Exclusion constraints | ⏳ next |
 
 ### Phase 11 subphase status
 

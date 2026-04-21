@@ -269,6 +269,8 @@ column_constraint →
   | AUTO_INCREMENT | SERIAL | BIGSERIAL
   | REFERENCES ident LPAREN ident RPAREN [on_action] [on_action]
   | CHECK LPAREN expr RPAREN
+  | ON UPDATE expr
+  | GENERATED ALWAYS AS LPAREN expr RPAREN [STORED | VIRTUAL]
 
 table_constraint →
     PRIMARY KEY LPAREN ident_list RPAREN
@@ -303,6 +305,20 @@ deferred that grammar until the analyzer and executor can honor it end-to-end in
 of shipping a misleading parser-only approximation.
 </div>
 </div>
+
+### Generated column clauses (Phase 21.5f)
+
+`parse_column_def` keeps the normal constraint loop and special-cases the
+leading identifier `GENERATED` into
+`ColumnConstraint::Generated { expr, kind }`. That means generated columns are
+syntactically just another column constraint, which avoids widening the DDL AST
+surface.
+
+`VIRTUAL` survives parsing intentionally: the parser accepts the syntax, then
+`execute_create_table` returns a precise `NotImplemented` after semantic
+validation. The same DDL validation pass also rejects self-reference, generated
+dependencies, unknown columns, subqueries, and aggregates inside the generated
+expression.
 
 ### SHOW / DESCRIBE Parsing
 

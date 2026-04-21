@@ -20,7 +20,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
                       jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH),
              21.9 (LATERAL joins: inner comma-join, LEFT JOIN null-pad),
              21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression),
-             21.5 (INSERT ON CONFLICT + MERGE smoke)
+             21.5 (INSERT ON CONFLICT + MERGE smoke),
+             21.5f (GENERATED ALWAYS AS STORED insert/update smoke)
 """
 import os
 import signal
@@ -55,7 +56,7 @@ def _check_binary_freshness(binary):
     binary_mtime = os.path.getmtime(binary)
     stale = [
         f for f in glob.glob("crates/**/*.rs", recursive=True)
-        if os.path.getmtime(f) > binary_mtime
+        if "/tests/" not in f and os.path.getmtime(f) > binary_mtime
     ]
     if stale:
         print(f"\nERROR: binary '{binary}' is stale.")
@@ -3711,6 +3712,26 @@ cur.execute("SELECT id, name FROM merge_wire ORDER BY id")
 rows = cur.fetchall()
 ok("[21.5 MERGE] final rows",
    rows == ((1, 'updated'), (2, 'inserted')),
+   f"got {rows}")
+
+cur.execute("""
+    CREATE TABLE gen_wire (
+        id INT PRIMARY KEY,
+        base INT,
+        doubled INT GENERATED ALWAYS AS (base * 2) STORED
+    )
+""")
+cur.execute("INSERT INTO gen_wire (id, base) VALUES (1, 7)")
+cur.execute("SELECT id, base, doubled FROM gen_wire WHERE id = 1")
+rows = cur.fetchall()
+ok("[21.5f generated columns] insert materializes stored value",
+   rows == ((1, 7, 14),),
+   f"got {rows}")
+cur.execute("UPDATE gen_wire SET base = 9 WHERE id = 1")
+cur.execute("SELECT doubled FROM gen_wire WHERE id = 1")
+rows = cur.fetchall()
+ok("[21.5f generated columns] update recomputes stored value",
+   rows == ((18,),),
    f"got {rows}")
 
 # ── Result ────────────────────────────────────────────────────────────────────

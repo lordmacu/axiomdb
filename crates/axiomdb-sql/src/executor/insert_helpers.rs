@@ -184,6 +184,106 @@ pub(crate) fn resolve_expr_defaults(
     }
 }
 
+pub(crate) fn validate_generated_insert_exprs(
+    col_positions: &[usize],
+    exprs: &[Expr],
+    schema_cols: &[CatalogColumnDef],
+    table_name: &str,
+) -> Result<(), DbError> {
+    for (schema_idx, col) in schema_cols.iter().enumerate() {
+        if col.generated_expr.is_none() {
+            continue;
+        }
+        let Some(&val_idx) = col_positions.get(schema_idx) else {
+            continue;
+        };
+        if val_idx == usize::MAX || val_idx >= exprs.len() {
+            continue;
+        }
+        if !matches!(exprs[val_idx], Expr::Default) {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "generated column '{}.{}' cannot be assigned explicitly",
+                    table_name, col.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_generated_insert_source_values(
+    col_positions: &[usize],
+    provided_len: usize,
+    schema_cols: &[CatalogColumnDef],
+    table_name: &str,
+) -> Result<(), DbError> {
+    for (schema_idx, col) in schema_cols.iter().enumerate() {
+        if col.generated_expr.is_none() {
+            continue;
+        }
+        let Some(&val_idx) = col_positions.get(schema_idx) else {
+            continue;
+        };
+        if val_idx != usize::MAX && val_idx < provided_len {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "generated column '{}.{}' cannot be assigned explicitly",
+                    table_name, col.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn materialize_generated_columns(
+    schema_cols: &[CatalogColumnDef],
+    row_values: &mut [Value],
+) -> Result<(), DbError> {
+    for (idx, col) in schema_cols.iter().enumerate() {
+        let Some(expr_sql) = col.generated_expr.as_ref() else {
+            continue;
+        };
+        if !col.generated_stored {
+            return Err(DbError::NotImplemented {
+                feature: "virtual generated columns".into(),
+            });
+        }
+        let mut expr = crate::parser::parse_expr_only(expr_sql)?;
+        resolve_column_refs(&mut expr, schema_cols);
+        let value = eval(&expr, row_values)?;
+        if let Some(slot) = row_values.get_mut(idx) {
+            *slot = value;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_generated_update_assignments(
+    assignments: &[(usize, Expr)],
+    schema_cols: &[CatalogColumnDef],
+    table_name: &str,
+) -> Result<(), DbError> {
+    for (col_pos, expr) in assignments {
+        let Some(col) = schema_cols.get(*col_pos) else {
+            continue;
+        };
+        if col.generated_expr.is_none() {
+            continue;
+        }
+        if !matches!(expr, Expr::Default) {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "generated column '{}.{}' cannot be assigned explicitly",
+                    table_name, col.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn assign_auto_increment(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
