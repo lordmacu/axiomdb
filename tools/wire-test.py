@@ -25,7 +25,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.11 (query hints),
              21.10 (SQL cursors),
              21.20 (CHECKPOINT),
-             21.23 (advanced SQL acceptance smoke)
+             21.23 (advanced SQL acceptance smoke),
+             21.24 (ORM compatibility tier 2 smoke)
 """
 import os
 import signal
@@ -3864,6 +3865,44 @@ ok("[21.23 advanced sql] MERGE + SAVEPOINT workflow preserves pre-savepoint stat
    rows == ((1, 20), (2, 5)),
    rows)
 cur.execute("COMMIT")
+
+# ── Phase 21.24 — ORM compatibility tier 2 ──────────────────────────────────
+
+print("\n[21.24 orm compat]")
+
+cur.execute("SET foreign_key_checks = 0")
+cur.execute("SET unique_checks = 0")
+cur.execute("SET sql_notes = 0")
+cur.execute("CREATE TABLE orm24_users (id INT SERIAL, email TEXT NOT NULL)")
+cur.execute("INSERT INTO orm24_users (email) VALUES ('orm@example.com') RETURNING id")
+rows = cur.fetchall()
+ok("[21.24 orm compat] INSERT ... RETURNING works for migration-style flow",
+   rows == ((1,),),
+   rows)
+
+cur.execute("SHOW FULL FIELDS FROM orm24_users")
+rows = cur.fetchall()
+ok("[21.24 orm compat] SHOW FULL FIELDS exposes ORM-friendly metadata columns",
+   len(rows) == 2 and len(rows[0]) == 9 and rows[0][0] == "id" and rows[1][0] == "email",
+   rows)
+
+cur.execute("SHOW FULL TABLES")
+rows = cur.fetchall()
+ok("[21.24 orm compat] SHOW FULL TABLES exposes BASE TABLE row",
+   ("orm24_users", "BASE TABLE") in rows,
+   rows)
+
+cur.execute("SHOW TABLE STATUS LIKE 'orm24_users'")
+rows = cur.fetchall()
+ok("[21.24 orm compat] SHOW TABLE STATUS returns table metadata",
+   len(rows) == 1 and rows[0][0] == "orm24_users" and rows[0][1] == "InnoDB",
+   rows)
+
+cur.execute("SHOW CREATE TABLE orm24_users")
+rows = cur.fetchall()
+ok("[21.24 orm compat] SHOW CREATE TABLE reconstructs auto-increment DDL",
+   len(rows) == 1 and "AUTO_INCREMENT" in rows[0][1],
+   rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

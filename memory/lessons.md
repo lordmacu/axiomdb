@@ -1,5 +1,11 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 21.24
+
+- **Do not match wire intercepts on broad substrings when SQL has nearby statement families.** `SHOW STATUS` vs `SHOW TABLE STATUS` looked safe under `lower.contains("status")` until the ORM smoke ran through the full wire path.
+- **If a feature works in executor tests but fails over MySQL wire, inspect the shared read-only path before touching parser/catalog.** Here the missing behavior lived in `execute_read_only_with_ctx`, not in the main dispatcher that integration SQL tests were already exercising.
+- **Compatibility audits must clean stale docs as part of the deliverable.** `docs/gaps-mysql-compat.md` still listed several implemented SHOW probes as open gaps; leaving that stale would have made the new tier-2 claim misleading.
+
 ## 2026-04-22 - Phase 21.23
 
 - **Acceptance suites should target interactions, not restate feature-unit

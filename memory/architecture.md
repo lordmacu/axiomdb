@@ -1,5 +1,13 @@
 # Architecture Notes
 
+## 2026-04-22 - ORM compatibility tier 2 (21.24)
+
+- `parser/mod.rs`: `SHOW FULL FIELDS` is a synonym of `SHOW FULL COLUMNS`
+- `executor/exec_entry.rs`: read-only shared execution path now covers MySQL
+  SHOW metadata statements beyond `SHOW TABLES` / `SHOW DATABASES`
+- `handler_sql_intercept.rs`: intercept only real `SHOW STATUS` forms; let
+  `SHOW TABLE STATUS` fall through to SQL execution
+
 ## 2026-04-22 - Advanced SQL acceptance suite (21.23)
 
 - **`21.23` is a consolidation layer, not a feature layer.** The new

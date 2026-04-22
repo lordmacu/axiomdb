@@ -655,22 +655,27 @@ ORM schema discovery uses these variants:
 - `SHOW FULL COLUMNS FROM t` — adds `Privileges` and `Comment` columns; Prisma and TypeORM use this
 - `SHOW TABLE STATUS [FROM db] [LIKE pattern]` — returns rows/engine/charset per table; schema tools use this for metadata
 
-Parser currently does not handle the `FULL` modifier or `TABLE STATUS`.
+Status: implemented. `SHOW FULL TABLES`, `SHOW FULL COLUMNS`, `SHOW TABLE STATUS`,
+and the MySQL synonym `SHOW FULL FIELDS FROM t` are accepted by the parser and
+covered by integration tests. This section is no longer an open gap.
 
 ### `SHOW ENGINES` / `SHOW CHARSET` / `SHOW COLLATION`
 
-Not parsed. MySQL Workbench, DBeaver, TablePlus probe these on connect:
+MySQL Workbench, DBeaver, TablePlus probe these on connect:
 
 - `SHOW ENGINES` — list storage engines; return a single row: `AxiomDB | DEFAULT | ...`
 - `SHOW CHARSET` / `SHOW CHARACTER SET` — list supported charsets; return utf8mb4, utf8, latin1
 - `SHOW COLLATION [LIKE pattern]` — list collations; return utf8mb4_unicode_ci, utf8mb4_bin, etc.
 
+Status: implemented and covered by `integration_show_full.rs`.
+
 ### `SHOW CREATE TABLE`
 
 Used by MySQL Workbench, Sequel Pro, and `mysqldump` to reconstruct schemas.
 
-- No AST node yet; add `ShowCreateTableStmt` + parse `SHOW CREATE TABLE t`
-- Executor: reconstruct `CREATE TABLE` SQL from catalog (columns + indexes + constraints)
+Status: implemented. The parser has `ShowCreateTableStmt`, the executor
+reconstructs DDL from catalog metadata, and SQL integration tests cover both
+ordinary and temp/unlogged cases.
 
 ### `DECIMAL` / `NUMERIC` column type
 
@@ -683,10 +688,17 @@ Used by MySQL Workbench, Sequel Pro, and `mysqldump` to reconstruct schemas.
 ### `SHOW VARIABLES` / `SHOW STATUS`
 
 MySQL clients (JDBC, MySQL Connector, many ORMs) issue these on connect to detect
-server capabilities. Currently not parsed.
+server capabilities.
 
-- Add to parser SHOW dispatch
-- Executor: return a static table of known variables (e.g. `character_set_server`, `max_allowed_packet`)
+Status: implemented in the wire/intercept layer and covered by existing tests.
+
+### Remaining ORM tier-2 blockers
+
+The main remaining ORM-visible blockers are now larger deferred features, not
+missing metadata probes:
+
+- `GENERATED ALWAYS AS IDENTITY` — tracked by `24.1c`
+- `DEFERRABLE INITIALLY DEFERRED/IMMEDIATE` foreign keys — tracked by `21.16`
 
 ### Multi-column foreign keys
 

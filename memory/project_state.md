@@ -3,19 +3,22 @@
 ## Current (2026-04-22)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.23 COMPLETE — advanced SQL acceptance suite closed.
-Phase 21 now has a dedicated interaction-level regression layer in
-`integration_advanced_sql.rs`: non-recursive + recursive CTEs, `MERGE`
-coexisting with savepoints, cursors over CTE-backed grouped queries,
-`CHECKPOINT`, and grouping sets are all covered as multi-statement acceptance
-flows instead of only per-feature unit-style tests. `tools/wire-test.py` also
-adds a protocol smoke for a `MERGE` + `SAVEPOINT` workflow. The stale
-`window functions` wording was removed from `docs/progreso.md` because SQL
-`OVER (...)` support is still deferred to later phases.
+**Active subphase:** Phase 21.24 COMPLETE — ORM compatibility tier 2 closed.
+Phase 21 now has a bounded ORM-facing compatibility baseline: migration-style
+`INSERT ... RETURNING` plus MySQL metadata probes (`SHOW FULL FIELDS`,
+`SHOW FULL TABLES`, `SHOW TABLE STATUS`, `SHOW CREATE TABLE`) all work over
+the wire, and dump-style `SET foreign_key_checks/unique_checks/sql_notes`
+continue to behave as harmless compatibility toggles. `SHOW FULL FIELDS` now
+parses as a synonym of `SHOW FULL COLUMNS`; the SQL read-only executor was
+expanded so SHOW metadata paths behave consistently under the shared wire path;
+and the MySQL `SHOW STATUS` intercept no longer hijacks `SHOW TABLE STATUS`.
+The remaining ORM-visible blockers are explicitly documented: `GENERATED
+ALWAYS AS IDENTITY` stays in `24.1c`, and deferred / `DEFERRABLE` FK semantics
+stay in `21.16`.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_advanced_sql`; `python3 tools/wire-test.py` (428/428); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_orm_compat --test integration_show_full --test integration_g9_ddl --test integration_returning`; `python3 tools/wire-test.py` (433/433); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.24 ORM compatibility tier 2.
+**Next:** Phase 21.25 PIVOT dynamic.
 
 ### Phase 21 subphase status
 
@@ -35,6 +38,7 @@ adds a protocol smoke for a `MERGE` + `SAVEPOINT` workflow. The stale
 | 21.20 CHECKPOINT | ✅ closed |
 | 21.11 Query hints | ✅ closed |
 | 21.23 Advanced SQL tests | ✅ closed |
+| 21.24 ORM compatibility tier 2 | ✅ closed |
 
 ### Phase 11 subphase status
 

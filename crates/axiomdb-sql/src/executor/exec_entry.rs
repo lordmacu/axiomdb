@@ -39,9 +39,31 @@ pub fn execute_read_only_with_ctx(
             ctx.conn_txn = conn;
             r
         }
+        Stmt::ShowDatabases(_) => {
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let dbs = reader.list_databases()?;
+            let out_cols = vec![ColumnMeta::computed(
+                String::from("Database"),
+                DataType::Text,
+            )];
+            let rows: Vec<Row> = dbs.into_iter().map(|d| vec![Value::Text(d.name)]).collect();
+            Ok(QueryResult::Rows {
+                columns: out_cols,
+                rows,
+            })
+        }
         Stmt::ShowTables(s) => {
             let db = ctx.effective_database();
-            let snap = txn.snapshot();
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
             let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
             let mut seen = std::collections::HashSet::new();
             let mut tables = Vec::new();
@@ -61,30 +83,404 @@ pub fn execute_read_only_with_ctx(
                 .as_deref()
                 .unwrap_or_else(|| ctx.default_create_schema());
             let col_name = format!("Tables_in_{schema}");
-            let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
-            let rows: Vec<Row> = tables
-                .into_iter()
-                .map(|t| vec![Value::Text(t.table_name)])
+            if s.full {
+                let out_cols = vec![
+                    ColumnMeta::computed(col_name, DataType::Text),
+                    ColumnMeta::computed("Table_type", DataType::Text),
+                ];
+                let rows: Vec<Row> = tables
+                    .into_iter()
+                    .map(|t| vec![Value::Text(t.table_name), Value::Text("BASE TABLE".into())])
+                    .collect();
+                Ok(QueryResult::Rows {
+                    columns: out_cols,
+                    rows,
+                })
+            } else {
+                let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
+                let rows: Vec<Row> = tables
+                    .into_iter()
+                    .map(|t| vec![Value::Text(t.table_name)])
+                    .collect();
+                Ok(QueryResult::Rows {
+                    columns: out_cols,
+                    rows,
+                })
+            }
+        }
+        Stmt::ShowColumns(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let table_def = if let Some(schema) = s.table.schema.as_deref() {
+                reader
+                    .get_table_in_database(&db, schema, &s.table.name)?
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: s.table.name.clone(),
+                    })?
+            } else {
+                let mut found = None;
+                for schema in &ctx.search_path {
+                    if let Some(def) = reader.get_table_in_database(&db, schema, &s.table.name)? {
+                        found = Some(def);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| DbError::TableNotFound {
+                    name: s.table.name.clone(),
+                })?
+            };
+            let columns = reader.list_columns(table_def.id)?;
+            let base_cols = vec![
+                ColumnMeta::computed("Field", DataType::Text),
+                ColumnMeta::computed("Type", DataType::Text),
+                ColumnMeta::computed("Null", DataType::Text),
+                ColumnMeta::computed("Key", DataType::Text),
+                ColumnMeta::computed("Default", DataType::Text),
+                ColumnMeta::computed("Extra", DataType::Text),
+            ];
+            let out_cols = if s.full {
+                let mut cols = base_cols;
+                cols.push(ColumnMeta::computed("Collation", DataType::Text));
+                cols.push(ColumnMeta::computed("Privileges", DataType::Text));
+                cols.push(ColumnMeta::computed("Comment", DataType::Text));
+                cols
+            } else {
+                base_cols
+            };
+            let rows: Vec<Row> = columns
+                .iter()
+                .map(|c| {
+                    let type_str = column_type_to_sql_name(c.col_type);
+                    let null_str = if c.nullable { "YES" } else { "NO" };
+                    let extra = if c.auto_increment {
+                        "auto_increment"
+                    } else {
+                        ""
+                    };
+                    let mut row = vec![
+                        Value::Text(c.name.clone()),
+                        Value::Text(type_str.into()),
+                        Value::Text(null_str.into()),
+                        Value::Text("".into()),
+                        Value::Null,
+                        Value::Text(extra.into()),
+                    ];
+                    if s.full {
+                        let coll = match c.col_type {
+                            ColumnType::Text | ColumnType::Bytes => {
+                                Value::Text("utf8mb4_general_ci".into())
+                            }
+                            _ => Value::Null,
+                        };
+                        row.push(coll);
+                        row.push(Value::Text("select,insert,update,references".into()));
+                        row.push(Value::Text("".into()));
+                    }
+                    row
+                })
                 .collect();
             Ok(QueryResult::Rows {
                 columns: out_cols,
                 rows,
             })
         }
-        Stmt::ShowDatabases(_) => {
-            let snap = txn.snapshot();
+        Stmt::ShowIndex(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
             let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
-            let dbs = reader.list_databases()?;
-            let out_cols = vec![ColumnMeta::computed(
-                String::from("Database"),
-                DataType::Text,
-            )];
-            let rows: Vec<Row> = dbs.into_iter().map(|d| vec![Value::Text(d.name)]).collect();
+            let table_def = if let Some(schema) = s.table.schema.as_deref() {
+                reader
+                    .get_table_in_database(&db, schema, &s.table.name)?
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: s.table.name.clone(),
+                    })?
+            } else {
+                let mut found = None;
+                for schema in &ctx.search_path {
+                    if let Some(def) = reader.get_table_in_database(&db, schema, &s.table.name)? {
+                        found = Some(def);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| DbError::TableNotFound {
+                    name: s.table.name.clone(),
+                })?
+            };
+            let col_defs = reader.list_columns(table_def.id)?;
+            let indexes = reader.list_indexes(table_def.id)?;
+            let out_cols = vec![
+                ColumnMeta::computed("Table", DataType::Text),
+                ColumnMeta::computed("Non_unique", DataType::Int),
+                ColumnMeta::computed("Key_name", DataType::Text),
+                ColumnMeta::computed("Seq_in_index", DataType::Int),
+                ColumnMeta::computed("Column_name", DataType::Text),
+                ColumnMeta::computed("Collation", DataType::Text),
+                ColumnMeta::computed("Cardinality", DataType::Int),
+                ColumnMeta::computed("Sub_part", DataType::Text),
+                ColumnMeta::computed("Packed", DataType::Text),
+                ColumnMeta::computed("Null", DataType::Text),
+                ColumnMeta::computed("Index_type", DataType::Text),
+                ColumnMeta::computed("Comment", DataType::Text),
+                ColumnMeta::computed("Index_comment", DataType::Text),
+                ColumnMeta::computed("Visible", DataType::Text),
+            ];
+            let mut rows: Vec<Row> = Vec::new();
+            for idx in &indexes {
+                let key_name = if idx.is_primary {
+                    "PRIMARY".to_string()
+                } else {
+                    idx.name.clone()
+                };
+                let non_unique = if idx.is_unique || idx.is_primary {
+                    Value::Int(0)
+                } else {
+                    Value::Int(1)
+                };
+                for (seq, ic) in idx.columns.iter().enumerate() {
+                    let col_name = col_defs
+                        .iter()
+                        .find(|c| c.col_idx == ic.col_idx)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| format!("col_{}", ic.col_idx));
+                    let nullable_flag = col_defs
+                        .iter()
+                        .find(|c| c.col_idx == ic.col_idx)
+                        .map(|c| if c.nullable { "YES" } else { "" })
+                        .unwrap_or("YES");
+                    rows.push(vec![
+                        Value::Text(s.table.name.clone()),
+                        non_unique.clone(),
+                        Value::Text(key_name.clone()),
+                        Value::Int((seq + 1) as i32),
+                        Value::Text(col_name),
+                        Value::Text("A".into()),
+                        Value::Int(0),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text(nullable_flag.into()),
+                        Value::Text("BTREE".into()),
+                        Value::Text("".into()),
+                        Value::Text("".into()),
+                        Value::Text("YES".into()),
+                    ]);
+                }
+            }
             Ok(QueryResult::Rows {
                 columns: out_cols,
                 rows,
             })
         }
+        Stmt::ShowCreateTable(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let table_def = if let Some(schema) = s.table.schema.as_deref() {
+                reader
+                    .get_table_in_database(&db, schema, &s.table.name)?
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: s.table.name.clone(),
+                    })?
+            } else {
+                let mut found = None;
+                for schema in &ctx.search_path {
+                    if let Some(def) = reader.get_table_in_database(&db, schema, &s.table.name)? {
+                        found = Some(def);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| DbError::TableNotFound {
+                    name: s.table.name.clone(),
+                })?
+            };
+            let columns = reader.list_columns(table_def.id)?;
+            let indexes = reader.list_indexes(table_def.id)?;
+            let create_prefix = match table_def.persistence {
+                axiomdb_catalog::TablePersistence::Permanent => "CREATE TABLE",
+                axiomdb_catalog::TablePersistence::Temporary => "CREATE TEMPORARY TABLE",
+                axiomdb_catalog::TablePersistence::Unlogged => "CREATE UNLOGGED TABLE",
+            };
+            let mut ddl = format!("{create_prefix} `{}` (\n", table_def.table_name);
+            for col in &columns {
+                let type_str = column_type_to_sql_name(col.col_type);
+                let null_str = if col.nullable { "" } else { " NOT NULL" };
+                let extra = if col.auto_increment {
+                    " AUTO_INCREMENT"
+                } else {
+                    ""
+                };
+                ddl.push_str(&format!(
+                    "  `{}` {}{}{},\n",
+                    col.name, type_str, null_str, extra
+                ));
+            }
+            if let Some(pk) = indexes.iter().find(|i| i.is_primary) {
+                let pk_cols: Vec<String> = pk
+                    .columns
+                    .iter()
+                    .filter_map(|ic| columns.iter().find(|c| c.col_idx == ic.col_idx))
+                    .map(|c| format!("`{}`", c.name))
+                    .collect();
+                if !pk_cols.is_empty() {
+                    ddl.push_str(&format!("  PRIMARY KEY ({}),\n", pk_cols.join(", ")));
+                }
+            }
+            for idx in indexes.iter().filter(|i| !i.is_primary) {
+                let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+                let idx_cols: Vec<String> = idx
+                    .columns
+                    .iter()
+                    .filter_map(|ic| columns.iter().find(|c| c.col_idx == ic.col_idx))
+                    .map(|c| format!("`{}`", c.name))
+                    .collect();
+                if !idx_cols.is_empty() {
+                    ddl.push_str(&format!(
+                        "  {}KEY `{}` ({}),\n",
+                        unique_kw,
+                        idx.name,
+                        idx_cols.join(", ")
+                    ));
+                }
+            }
+            if ddl.ends_with(",\n") {
+                ddl.truncate(ddl.len() - 2);
+                ddl.push('\n');
+            }
+            ddl.push_str(") ENGINE=InnoDB");
+            Ok(QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta::computed("Table", DataType::Text),
+                    ColumnMeta::computed("Create Table", DataType::Text),
+                ],
+                rows: vec![vec![
+                    Value::Text(table_def.table_name.clone()),
+                    Value::Text(ddl),
+                ]],
+            })
+        }
+        Stmt::ShowTableStatus(s) => {
+            let db = ctx.effective_database().to_string();
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let mut seen = std::collections::HashSet::new();
+            let mut tables = Vec::new();
+            if let Some(schema) = s.schema.as_deref() {
+                tables = reader.list_tables_in_database(&db, schema)?;
+            } else {
+                for schema in &ctx.search_path {
+                    for table in reader.list_tables_in_database(&db, schema)? {
+                        if seen.insert(table.table_name.clone()) {
+                            tables.push(table);
+                        }
+                    }
+                }
+            }
+            let out_cols = vec![
+                ColumnMeta::computed("Name", DataType::Text),
+                ColumnMeta::computed("Engine", DataType::Text),
+                ColumnMeta::computed("Version", DataType::Int),
+                ColumnMeta::computed("Row_format", DataType::Text),
+                ColumnMeta::computed("Rows", DataType::BigInt),
+                ColumnMeta::computed("Avg_row_length", DataType::BigInt),
+                ColumnMeta::computed("Data_length", DataType::BigInt),
+                ColumnMeta::computed("Max_data_length", DataType::BigInt),
+                ColumnMeta::computed("Index_length", DataType::BigInt),
+                ColumnMeta::computed("Data_free", DataType::BigInt),
+                ColumnMeta::computed("Auto_increment", DataType::BigInt),
+                ColumnMeta::computed("Create_time", DataType::Text),
+                ColumnMeta::computed("Update_time", DataType::Text),
+                ColumnMeta::computed("Check_time", DataType::Text),
+                ColumnMeta::computed("Collation", DataType::Text),
+                ColumnMeta::computed("Checksum", DataType::Text),
+                ColumnMeta::computed("Create_options", DataType::Text),
+                ColumnMeta::computed("Comment", DataType::Text),
+            ];
+            let mut rows: Vec<Row> = Vec::new();
+            for table in tables {
+                if let Some(pat) = &s.like_pattern {
+                    if !sql_like_match(&table.table_name, pat) {
+                        continue;
+                    }
+                }
+                let stats = reader.list_stats(table.id).unwrap_or_default();
+                let row_count = stats.first().map(|st| st.row_count).unwrap_or(0) as i64;
+                rows.push(vec![
+                    Value::Text(table.table_name),
+                    Value::Text("InnoDB".into()),
+                    Value::Int(10),
+                    Value::Text("Dynamic".into()),
+                    Value::BigInt(row_count),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("utf8mb4_general_ci".into()),
+                    Value::Null,
+                    Value::Text("".into()),
+                    Value::Text("".into()),
+                ]);
+            }
+            Ok(QueryResult::Rows {
+                columns: out_cols,
+                rows,
+            })
+        }
+        Stmt::ShowEngines => Ok(execute_show_engines()),
+        Stmt::ShowCharset => Ok(execute_show_charset()),
+        Stmt::ShowCollation => Ok(execute_show_collation()),
+        Stmt::ShowWarnings { limit } => {
+            let warnings = ctx.warnings.to_vec();
+            let mut result = show_warnings_result(&warnings);
+            if let Some(n) = limit {
+                if let QueryResult::Rows { ref mut rows, .. } = result {
+                    rows.truncate(n as usize);
+                }
+            }
+            Ok(result)
+        }
+        Stmt::ShowErrors { limit } => {
+            let errors: Vec<_> = ctx
+                .warnings
+                .iter()
+                .filter(|w| w.level == "Error")
+                .cloned()
+                .collect();
+            let mut result = show_warnings_result(&errors);
+            if let Some(n) = limit {
+                if let QueryResult::Rows { ref mut rows, .. } = result {
+                    rows.truncate(n as usize);
+                }
+            }
+            Ok(result)
+        }
+        Stmt::ShowVariables | Stmt::ShowStatus => Ok(QueryResult::Rows {
+            columns: vec![
+                ColumnMeta::computed("Variable_name", DataType::Text),
+                ColumnMeta::computed("Value", DataType::Text),
+            ],
+            rows: vec![],
+        }),
         _ => Err(DbError::NotImplemented {
             feature: "read-only executor does not handle this statement type".into(),
         }),
