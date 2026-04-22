@@ -47,7 +47,7 @@ use crate::{
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{
         ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, StatsDef, TableDatabaseDef,
-        TableDef, TableId, TableStorageLayout,
+        TableDef, TableId, TablePersistence, TableStorageLayout,
     },
 };
 
@@ -355,7 +355,13 @@ impl<'a> CatalogWriter<'a> {
         name: &str,
         storage_layout: TableStorageLayout,
     ) -> Result<TableDef, DbError> {
-        self.create_table_with_options(schema, name, storage_layout, false)
+        self.create_table_with_options(
+            schema,
+            name,
+            storage_layout,
+            false,
+            TablePersistence::Permanent,
+        )
     }
 
     /// Allocates a new table with full option control.
@@ -368,6 +374,7 @@ impl<'a> CatalogWriter<'a> {
         name: &str,
         storage_layout: TableStorageLayout,
         immutable: bool,
+        persistence: TablePersistence,
     ) -> Result<TableDef, DbError> {
         let table_id = alloc_table_id(self.storage)?;
         let root_page_id = self.allocate_table_root(storage_layout)?;
@@ -380,6 +387,7 @@ impl<'a> CatalogWriter<'a> {
             table_name: name.to_string(),
             schema_version: 1,
             immutable,
+            persistence,
         };
         let data = def.to_bytes();
 

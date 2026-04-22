@@ -310,6 +310,21 @@ fn validate_generated_expr_refs(
     }
 }
 
+fn ensure_schema_exists_for_create(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    database: &str,
+    schema: &str,
+) -> Result<(), DbError> {
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if !reader.schema_exists(database, schema)? {
+        CatalogWriter::new(storage, txn, conn_txn)?.create_schema(database, schema)?;
+    }
+    Ok(())
+}
+
 fn execute_create_table(
     stmt: CreateTableStmt,
     storage: &dyn StorageEngine,
@@ -333,6 +348,10 @@ fn execute_create_table(
     };
     validate_create_table_generated_columns(&stmt)?;
 
+    if stmt.persistence == axiomdb_catalog::TablePersistence::Temporary {
+        ensure_schema_exists_for_create(storage, txn, conn_txn, database, schema)?;
+    }
+
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
         let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
@@ -353,6 +372,7 @@ fn execute_create_table(
         &stmt.table.name,
         storage_layout,
         stmt.immutable,
+        stmt.persistence,
     )?;
     let table_id = table_def.id;
     if database != DEFAULT_DATABASE_NAME {
@@ -1045,6 +1065,71 @@ fn ast_fk_action_to_catalog(action: crate::ast::ForeignKeyAction) -> axiomdb_cat
     }
 }
 
+fn reject_fk_persistence(
+    persistence: axiomdb_catalog::TablePersistence,
+    parent_side: bool,
+) -> Result<(), DbError> {
+    match (persistence, parent_side) {
+        (axiomdb_catalog::TablePersistence::Permanent, _) => Ok(()),
+        (axiomdb_catalog::TablePersistence::Temporary, false) => Err(DbError::NotImplemented {
+            feature: "foreign keys on temporary tables".into(),
+        }),
+        (axiomdb_catalog::TablePersistence::Unlogged, false) => Err(DbError::NotImplemented {
+            feature: "foreign keys on unlogged tables".into(),
+        }),
+        (axiomdb_catalog::TablePersistence::Temporary, true) => Err(DbError::NotImplemented {
+            feature: "foreign keys referencing temporary tables".into(),
+        }),
+        (axiomdb_catalog::TablePersistence::Unlogged, true) => Err(DbError::NotImplemented {
+            feature: "foreign keys referencing unlogged tables".into(),
+        }),
+    }
+}
+
+fn resolve_fk_parent_table(
+    database: &str,
+    ref_table: &str,
+    child_schema: &str,
+    storage: &dyn StorageEngine,
+    snap: axiomdb_core::TransactionSnapshot,
+) -> Result<axiomdb_catalog::TableDef, DbError> {
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let matches: Vec<_> = reader
+        .list_tables_owned_by_database(database)?
+        .into_iter()
+        .filter(|table| table.table_name == ref_table)
+        .collect();
+
+    if let Some(table) = matches
+        .iter()
+        .find(|table| table.schema_name == child_schema && table.persistence == axiomdb_catalog::TablePersistence::Temporary)
+    {
+        reject_fk_persistence(table.persistence, true)?;
+    }
+
+    if let Some(table) = matches.iter().find(|table| {
+        table.schema_name == "public"
+            && table.persistence == axiomdb_catalog::TablePersistence::Unlogged
+    }) {
+        reject_fk_persistence(table.persistence, true)?;
+    }
+
+    if let Some(table) = matches.iter().find(|table| table.schema_name == "public") {
+        return Ok(table.clone());
+    }
+
+    if let Some(table) = matches
+        .iter()
+        .find(|table| table.persistence == axiomdb_catalog::TablePersistence::Temporary)
+    {
+        reject_fk_persistence(table.persistence, true)?;
+    }
+
+    Err(DbError::TableNotFound {
+        name: ref_table.to_string(),
+    })
+}
+
 /// Validates and persists a single FK constraint definition.
 ///
 /// Called from `execute_create_table` (inline `REFERENCES` and table-level
@@ -1077,15 +1162,20 @@ fn persist_fk_constraint(
 
     let snap = txn.active_snapshot(conn_txn);
 
-    // 1. Resolve parent table.
-    let parent_def = {
+    let child_table_def = {
         let mut reader = CatalogReader::new(storage, snap.clone())?;
         reader
-            .get_table_in_database(database, "public", ref_table)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: ref_table.to_string(),
+            .get_table_by_id(child_table_id)?
+            .ok_or(DbError::CatalogTableNotFound {
+                table_id: child_table_id,
             })?
     };
+    reject_fk_persistence(child_table_def.persistence, false)?;
+
+    // 1. Resolve parent table.
+    let parent_def =
+        resolve_fk_parent_table(database, ref_table, &child_table_def.schema_name, storage, snap.clone())?;
+    reject_fk_persistence(parent_def.persistence, true)?;
 
     // 2. Find the referenced column in the parent table.
     let parent_cols = {
@@ -1169,17 +1259,7 @@ fn persist_fk_constraint(
         use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Read child table def once to check if it is clustered.
-        let child_table_def_for_fk = {
-            let mut reader = CatalogReader::new(storage, snap.clone())?;
-            reader
-                .get_table_by_id(child_table_id)?
-                .ok_or(DbError::CatalogTableNotFound {
-                    table_id: child_table_id,
-                })?
-        };
-
-        if child_table_def_for_fk.is_clustered() {
+        if child_table_def.is_clustered() {
             // Clustered child table: FK auto-index (composite heap RID key) is
             // incompatible with the clustered layout. Enforcement always falls back
             // to a full scan via scan_clustered_table (fk_index_id = 0 path).
@@ -1218,7 +1298,7 @@ fn persist_fk_constraint(
                 // Insert composite key entry for every existing child row.
                 let rows = TableEngine::scan_table(
                     storage,
-                    &child_table_def_for_fk,
+                    &child_table_def,
                     &child_cols,
                     snap,
                     None,
@@ -1289,22 +1369,42 @@ fn execute_create_table_like(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
 
     let new_schema = stmt.new_table.schema.as_deref().unwrap_or("public");
-    let src_schema = stmt.source_table.schema.as_deref().unwrap_or("public");
     let src_db = stmt.source_table.database.as_deref().unwrap_or(database);
 
     // 1. Resolve source table (read-only snapshot).
     let source = {
         let snap = txn.active_snapshot(conn_txn);
-        let mut resolver = SchemaResolver::new(storage, snap, src_db, src_schema)?;
-        resolver.resolve_table(Some(src_schema), &stmt.source_table.name)?
+        if let Some(src_schema) = stmt.source_table.schema.as_deref() {
+            let mut resolver = SchemaResolver::new(storage, snap, src_db, src_schema)?;
+            resolver.resolve_table(Some(src_schema), &stmt.source_table.name)?
+        } else if let Some(search_path) = search_path {
+            let mut resolved = None;
+            for schema in search_path {
+                let mut resolver = SchemaResolver::new(storage, snap.clone(), src_db, schema)?;
+                if let Ok(table) = resolver.resolve_table(Some(schema), &stmt.source_table.name) {
+                    resolved = Some(table);
+                    break;
+                }
+            }
+            resolved.ok_or_else(|| DbError::TableNotFound {
+                name: stmt.source_table.name.clone(),
+            })?
+        } else {
+            let mut resolver = SchemaResolver::new(storage, snap, src_db, "public")?;
+            resolver.resolve_table(Some("public"), &stmt.source_table.name)?
+        }
     };
 
     // 2. Check the destination does not already exist.
+    if stmt.persistence == axiomdb_catalog::TablePersistence::Temporary {
+        ensure_schema_exists_for_create(storage, txn, conn_txn, database, new_schema)?;
+    }
     {
         let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
         if resolver.table_exists(Some(new_schema), &stmt.new_table.name)? {
@@ -1321,10 +1421,12 @@ fn execute_create_table_like(
     // 3. Create the new table with the same storage layout.
     let new_def = {
         let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
-        let def = writer.create_table_with_layout(
+        let def = writer.create_table_with_options(
             new_schema,
             &stmt.new_table.name,
             source.def.storage_layout,
+            false,
+            stmt.persistence,
         )?;
         if database != DEFAULT_DATABASE_NAME {
             writer.bind_table_to_database(def.id, database)?;
@@ -1443,7 +1545,7 @@ fn execute_create_table_as_select(
         .new_table
         .schema
         .clone()
-        .unwrap_or_else(|| ctx.current_schema().to_string());
+        .unwrap_or_else(|| ctx.default_create_schema().to_string());
     let database = ctx.effective_database().to_string();
     let new_name = stmt.new_table.name.clone();
 
@@ -1493,6 +1595,10 @@ fn execute_create_table_as_select(
         .collect();
 
     // 3. Check destination table does not already exist.
+    if stmt.persistence == axiomdb_catalog::TablePersistence::Temporary {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        ensure_schema_exists_for_create(storage, txn, conn_txn, &database, &new_schema)?;
+    }
     {
         let conn_txn = ctx.conn_txn.as_ref().expect("conn_txn set for DDL");
         let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
@@ -1508,10 +1614,12 @@ fn execute_create_table_as_select(
     let new_def = {
         let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
         let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
-        let def = writer.create_table_with_layout(
+        let def = writer.create_table_with_options(
             &new_schema,
             &new_name,
             axiomdb_catalog::schema::TableStorageLayout::Heap,
+            false,
+            stmt.persistence,
         )?;
         if database != DEFAULT_DATABASE_NAME {
             writer.bind_table_to_database(def.id, &database)?;
@@ -1597,15 +1705,20 @@ fn persist_composite_fk_constraint(
 
     let snap = txn.active_snapshot(conn_txn);
 
-    // 1. Resolve parent table + columns.
-    let parent_def = {
+    let child_table_def = {
         let mut reader = CatalogReader::new(storage, snap.clone())?;
         reader
-            .get_table_in_database(database, "public", ref_table)?
-            .ok_or_else(|| DbError::TableNotFound {
-                name: ref_table.to_string(),
+            .get_table_by_id(child_table_id)?
+            .ok_or(DbError::CatalogTableNotFound {
+                table_id: child_table_id,
             })?
     };
+    reject_fk_persistence(child_table_def.persistence, false)?;
+
+    // 1. Resolve parent table + columns.
+    let parent_def =
+        resolve_fk_parent_table(database, ref_table, &child_table_def.schema_name, storage, snap.clone())?;
+    reject_fk_persistence(parent_def.persistence, true)?;
     let parent_cols = {
         let mut reader = CatalogReader::new(storage, snap.clone())?;
         reader.list_columns(parent_def.id)?

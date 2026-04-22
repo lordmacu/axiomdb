@@ -133,13 +133,33 @@ fn execute_show_tables(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
+    default_schema: Option<&str>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
-    let schema = stmt.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
-    let tables = reader.list_tables_in_database(database, schema)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut tables = Vec::new();
+    if let Some(schema) = stmt.schema.as_deref() {
+        tables = reader.list_tables_in_database(database, schema)?;
+    } else if let Some(search_path) = search_path {
+        for schema in search_path {
+            for table in reader.list_tables_in_database(database, schema)? {
+                if seen.insert(table.table_name.clone()) {
+                    tables.push(table);
+                }
+            }
+        }
+    } else {
+        tables = reader.list_tables_in_database(database, "public")?;
+    }
 
+    let schema = stmt
+        .schema
+        .as_deref()
+        .or(default_schema)
+        .unwrap_or("public");
     let col_name = format!("Tables_in_{schema}");
     if stmt.full {
         let out_cols = vec![
@@ -172,17 +192,35 @@ fn execute_show_columns(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
-    let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
-
-    let table_def = reader
-        .get_table_in_database(database, schema, &stmt.table.name)?
-        .ok_or_else(|| DbError::TableNotFound {
+    let table_def = if let Some(schema) = stmt.table.schema.as_deref() {
+        reader
+            .get_table_in_database(database, schema, &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?
+    } else if let Some(search_path) = search_path {
+        let mut found = None;
+        for schema in search_path {
+            if let Some(def) = reader.get_table_in_database(database, schema, &stmt.table.name)? {
+                found = Some(def);
+                break;
+            }
+        }
+        found.ok_or_else(|| DbError::TableNotFound {
             name: stmt.table.name.clone(),
-        })?;
+        })?
+    } else {
+        reader
+            .get_table_in_database(database, "public", &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?
+    };
     let columns = reader.list_columns(table_def.id)?;
 
     let base_cols = vec![
@@ -255,17 +293,35 @@ pub(crate) fn execute_show_index(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
-    let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
-
-    let table_def = reader
-        .get_table_in_database(database, schema, &stmt.table.name)?
-        .ok_or_else(|| DbError::TableNotFound {
+    let table_def = if let Some(schema) = stmt.table.schema.as_deref() {
+        reader
+            .get_table_in_database(database, schema, &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?
+    } else if let Some(search_path) = search_path {
+        let mut found = None;
+        for schema in search_path {
+            if let Some(def) = reader.get_table_in_database(database, schema, &stmt.table.name)? {
+                found = Some(def);
+                break;
+            }
+        }
+        found.ok_or_else(|| DbError::TableNotFound {
             name: stmt.table.name.clone(),
-        })?;
+        })?
+    } else {
+        reader
+            .get_table_in_database(database, "public", &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?
+    };
     let col_defs = reader.list_columns(table_def.id)?;
     let indexes = reader.list_indexes(table_def.id)?;
 
@@ -350,22 +406,45 @@ fn execute_show_create_table(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
-    let schema = stmt.table.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
-
-    let table_def = reader
-        .get_table_in_database(database, schema, &stmt.table.name)?
-        .ok_or_else(|| DbError::TableNotFound {
+    let table_def = if let Some(schema) = stmt.table.schema.as_deref() {
+        reader
+            .get_table_in_database(database, schema, &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?
+    } else if let Some(search_path) = search_path {
+        let mut found = None;
+        for schema in search_path {
+            if let Some(def) = reader.get_table_in_database(database, schema, &stmt.table.name)? {
+                found = Some(def);
+                break;
+            }
+        }
+        found.ok_or_else(|| DbError::TableNotFound {
             name: stmt.table.name.clone(),
-        })?;
+        })?
+    } else {
+        reader
+            .get_table_in_database(database, "public", &stmt.table.name)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: stmt.table.name.clone(),
+            })?
+    };
 
     let columns = reader.list_columns(table_def.id)?;
     let indexes = reader.list_indexes(table_def.id)?;
 
-    let mut ddl = format!("CREATE TABLE `{}` (\n", table_def.table_name);
+    let create_prefix = match table_def.persistence {
+        axiomdb_catalog::TablePersistence::Permanent => "CREATE TABLE",
+        axiomdb_catalog::TablePersistence::Temporary => "CREATE TEMPORARY TABLE",
+        axiomdb_catalog::TablePersistence::Unlogged => "CREATE UNLOGGED TABLE",
+    };
+    let mut ddl = format!("{create_prefix} `{}` (\n", table_def.table_name);
 
     // Columns
     for col in &columns {
@@ -481,12 +560,26 @@ fn execute_show_table_status(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
-    let schema = stmt.schema.as_deref().unwrap_or("public");
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
-    let tables = reader.list_tables_in_database(database, schema)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut tables = Vec::new();
+    if let Some(schema) = stmt.schema.as_deref() {
+        tables = reader.list_tables_in_database(database, schema)?;
+    } else if let Some(search_path) = search_path {
+        for schema in search_path {
+            for table in reader.list_tables_in_database(database, schema)? {
+                if seen.insert(table.table_name.clone()) {
+                    tables.push(table);
+                }
+            }
+        }
+    } else {
+        tables = reader.list_tables_in_database(database, "public")?;
+    }
 
     let out_cols = vec![
         ColumnMeta::computed("Name", DataType::Text),

@@ -45,7 +45,8 @@ use axiomdb_sql::{
     execute_read_only_with_ctx, execute_with_ctx_locked, parse_with_sql_mode,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
-    verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
+    truncate_table_unchecked_on_open, verify_and_repair_indexes_on_open, SchemaCache,
+    SessionContext,
 };
 use axiomdb_storage::{DbConfig, MmapStorage, WalDurabilityPolicy};
 use axiomdb_types::{DataType, Value};
@@ -156,7 +157,11 @@ impl SharedDatabase {
         let (storage, mut txn) = if db_path.exists() {
             let mut storage = MmapStorage::open(&db_path)?;
             CatalogBootstrap::ensure_database_roots(&storage)?;
+            let dirty_open = !storage.clean_shutdown_on_open();
             let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+            if dirty_open {
+                truncate_unlogged_tables_after_dirty_open(&storage, &txn)?;
+            }
             verify_and_repair_indexes_on_open(&storage, &txn)?;
             (storage, txn)
         } else {
@@ -739,6 +744,36 @@ impl SharedDatabase {
             }
         }
     }
+}
+
+fn truncate_unlogged_tables_after_dirty_open(
+    storage: &dyn axiomdb_storage::StorageEngine,
+    txn: &TxnManager,
+) -> Result<(), DbError> {
+    let snap = txn.snapshot();
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let databases = reader.list_databases()?;
+
+    for database in databases {
+        for table in reader.list_tables_owned_by_database(&database.name)? {
+            if table.persistence != axiomdb_catalog::TablePersistence::Unlogged {
+                continue;
+            }
+            let resolved = {
+                let snap = txn.snapshot();
+                let mut resolver = axiomdb_catalog::SchemaResolver::new(
+                    storage,
+                    snap,
+                    &database.name,
+                    &table.schema_name,
+                )?;
+                resolver.resolve_table(Some(&table.schema_name), &table.table_name)?
+            };
+            truncate_table_unchecked_on_open(storage, txn, &resolved)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Returns `true` if `stmt` is a DDL statement that modifies the schema.

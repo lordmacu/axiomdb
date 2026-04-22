@@ -3,20 +3,21 @@
 ## Current (2026-04-21)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.6b COMPLETE — Exclusion constraints closed.
-`CREATE TABLE` and `ALTER TABLE ... ADD CONSTRAINT` now accept the equality-only
-subset of `EXCLUDE USING btree (... WITH =)`. Exclusion metadata persists in
-`axiom_constraints` with owned helper-index ids and constrained column order,
-runtime UNIQUE conflicts from helper indexes are translated back to
-table/constraint-scoped exclusion violations, `DROP CONSTRAINT` removes the
-owned helper index, and `information_schema` reports `EXCLUSION` without
-leaking the helper UNIQUE index as a normal unique constraint. GiST/range
-overlap, predicates, expressions, and non-`=` operators remain explicit
-follow-ups via `NotImplemented`.
+**Active subphase:** Phase 21.7 COMPLETE — TEMP and UNLOGGED tables closed.
+`CREATE TEMP[TORARY] TABLE` / `CREATE UNLOGGED TABLE` now persist
+`TablePersistence` across normal CREATE, LIKE, and CTAS. TEMP tables are
+stored in hidden per-session schemas, shadow `public` during unqualified
+resolution, and auto-drop on disconnect, `COM_RESET_CONNECTION`, and
+`COM_CHANGE_USER`, while `SHOW`/`information_schema` only expose the current
+session's TEMP tables. UNLOGGED tables keep normal runtime write paths but
+truncate automatically after dirty reopen via a clean-shutdown marker, while
+clean reopen preserves their rows. `SHOW CREATE TABLE` reconstructs
+`TEMPORARY` / `UNLOGGED`, and FK attempts involving TEMP/UNLOGGED tables now
+fail explicitly with `NotImplemented`.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-catalog`; `cargo test -p axiomdb-sql --test integration_ddl_parser`; `cargo test -p axiomdb-sql --test integration_g11_information_schema`; `cargo test -p axiomdb-sql --test integration_exclusion_constraints`; `cargo test -p axiomdb-sql --test integration_errors`; `cargo test -p axiomdb-sql --test integration_g5_dml`; `cargo test -p axiomdb-sql`; `cargo clippy -p axiomdb-sql -- -D warnings`; `python3 tools/wire-test.py` (419/419); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-catalog`; `cargo test -p axiomdb-storage`; `cargo test -p axiomdb-sql --test integration_ddl_parser`; `cargo test -p axiomdb-sql --test integration_namespacing_schema`; `cargo test -p axiomdb-sql --test integration_g11_information_schema`; `cargo test -p axiomdb-sql --test integration_show_full`; `cargo test -p axiomdb-sql --test integration_g5_dml`; `cargo test -p axiomdb-sql --test integration_temp_unlogged_tables`; `cargo test -p axiomdb-sql`; `cargo test -p axiomdb-network --test integration_connection_lifecycle`; `cargo test -p axiomdb-network --test integration_open_integrity`; `cargo test -p axiomdb-network`; `cargo clippy -p axiomdb-sql -- -D warnings`; `cargo clippy -p axiomdb-network -- -D warnings`; `python3 tools/wire-test.py` (419/419); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.7 TEMP and UNLOGGED tables, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.8 Expression indexes, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -30,7 +31,8 @@ follow-ups via `NotImplemented`.
 | 21.5f GENERATED ALWAYS AS columns | ✅ closed |
 | 21.6 CHECK constraints | ✅ closed |
 | 21.6b Exclusion constraints | ✅ closed |
-| 21.7 TEMP and UNLOGGED tables | ⏳ next |
+| 21.7 TEMP and UNLOGGED tables | ✅ closed |
+| 21.8 Expression indexes | ⏳ next |
 
 ### Phase 11 subphase status
 

@@ -50,7 +50,9 @@ fn dispatch(
         Stmt::CreateSchema(s) => {
             execute_create_schema(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
-        Stmt::DropTable(s) => execute_drop_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
+        Stmt::DropTable(s) => {
+            execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
+        }
         Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
             feature: "DROP DATABASE requires session context".into(),
         }),
@@ -98,13 +100,22 @@ fn dispatch(
         }
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn, conn_txn),
         Stmt::ShowTables(s) => {
-            execute_show_tables(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+            execute_show_tables(s, storage, txn, conn_txn, None, None, DEFAULT_DATABASE_NAME)
         }
         Stmt::ShowColumns(s) => {
-            execute_show_columns(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+            execute_show_columns(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
-        Stmt::ShowIndex(s) => execute_show_index(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
-        Stmt::ShowCreateTable(s) => execute_show_create_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
+        Stmt::ShowIndex(s) => {
+            execute_show_index(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
+        }
+        Stmt::ShowCreateTable(s) => execute_show_create_table(
+            s,
+            storage,
+            txn,
+            conn_txn,
+            None,
+            DEFAULT_DATABASE_NAME,
+        ),
         Stmt::RenameTable(s) => execute_rename_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
@@ -125,7 +136,7 @@ fn dispatch(
         Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
         // G5.5: CREATE TABLE LIKE
         Stmt::CreateTableLike(s) => {
-            execute_create_table_like(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+            execute_create_table_like(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
         // G5.6: CREATE TABLE AS SELECT — requires session context (cannot run via dispatch)
         Stmt::CreateTableAsSelect(_) => Err(DbError::NotImplemented {
@@ -133,7 +144,7 @@ fn dispatch(
         }),
         // 5.9f: SHOW TABLE STATUS
         Stmt::ShowTableStatus(s) => {
-            execute_show_table_status(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+            execute_show_table_status(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
         // 5.9g: SHOW ENGINES / CHARSET / COLLATION
         Stmt::ShowEngines => Ok(execute_show_engines()),

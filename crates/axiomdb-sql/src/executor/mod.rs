@@ -126,6 +126,49 @@ include!("ddl_alter_rebuild.rs");
 include!("staging.rs");
 include!("union.rs");
 
+/// Startup-only helper used by the server layer to empty UNLOGGED tables after
+/// a dirty open. This bypasses user-facing TRUNCATE semantics (FK checks,
+/// immutable-table checks, affected-row reporting) and performs the same root
+/// rotation directly under an internal transaction.
+pub fn truncate_table_unchecked_on_open(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    table: &ResolvedTable,
+) -> Result<(), DbError> {
+    let mut conn_txn = txn.begin()?;
+    let snap = txn.active_snapshot(&conn_txn);
+    let all_indexes: Vec<axiomdb_catalog::IndexDef> = table
+        .indexes
+        .iter()
+        .filter(|i| !i.columns.is_empty())
+        .cloned()
+        .collect();
+    let noop_bloom = crate::bloom::BloomRegistry::new();
+    let plan = if table.def.is_clustered() {
+        plan_bulk_empty_clustered_table(storage, &table.def, &all_indexes, snap)?
+    } else {
+        plan_bulk_empty_table(storage, &table.def, &all_indexes, snap)?
+    };
+
+    let result = apply_bulk_empty_table(storage, txn, &mut conn_txn, &noop_bloom, &table.def, plan);
+    match result {
+        Ok(()) => {
+            let tid = conn_txn.txn_id;
+            let _ = txn.commit(conn_txn)?;
+            txn.release_immediate_committed_frees(storage, tid)?;
+            txn.drain_committed_page_batches(storage)?;
+            AUTO_INC_SEQ.with(|seq| {
+                seq.borrow_mut().remove(&table.def.id);
+            });
+            Ok(())
+        }
+        Err(e) => {
+            let _ = rollback_with_index_undo(txn, conn_txn, storage, &noop_bloom);
+            Err(e)
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

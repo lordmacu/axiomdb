@@ -64,10 +64,18 @@ fn dispatch_ctx(
         }
         Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
-            let db = ddl_database(&s.table.database, ctx);
-            if s.table.schema.is_none() {
-                s.table.schema = Some(ctx.current_schema().to_string());
+            if s.persistence == axiomdb_catalog::TablePersistence::Temporary {
+                if s.table.database.is_some() || s.table.schema.is_some() {
+                    return Err(DbError::InvalidValue {
+                        reason: "temporary tables cannot specify an explicit database or schema"
+                            .into(),
+                    });
+                }
+                s.table.schema = Some(ctx.ensure_temp_schema());
+            } else if s.table.schema.is_none() {
+                s.table.schema = Some(ctx.default_create_schema().to_string());
             }
+            let db = ddl_database(&s.table.database, ctx);
             execute_create_table(
                 s,
                 storage,
@@ -104,6 +112,7 @@ fn dispatch_ctx(
         }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
+            let search_path = ctx.search_path.clone();
             let db = s
                 .tables
                 .first()
@@ -117,6 +126,7 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
                 &db,
             )
         }
@@ -184,11 +194,10 @@ fn dispatch_ctx(
                 .as_mut()
                 .expect("conn_txn must be set before dispatch_ctx"),
         ),
-        Stmt::ShowTables(mut s) => {
-            if s.schema.is_none() {
-                s.schema = Some(ctx.current_schema().to_string());
-            }
+        Stmt::ShowTables(s) => {
             let db = ctx.effective_database().to_string();
+            let search_path = ctx.search_path.clone();
+            let default_schema = ctx.default_create_schema().to_string();
             execute_show_tables(
                 s,
                 storage,
@@ -196,11 +205,14 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
+                Some(default_schema.as_str()),
                 &db,
             )
         }
         Stmt::ShowColumns(s) => {
             let db = ddl_database(&s.table.database, ctx);
+            let search_path = ctx.search_path.clone();
             execute_show_columns(
                 s,
                 storage,
@@ -208,11 +220,13 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
                 &db,
             )
         }
         Stmt::ShowIndex(s) => {
             let db = ddl_database(&s.table.database, ctx);
+            let search_path = ctx.search_path.clone();
             execute_show_index(
                 s,
                 storage,
@@ -220,11 +234,13 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
                 &db,
             )
         }
         Stmt::ShowCreateTable(s) => {
             let db = ddl_database(&s.table.database, ctx);
+            let search_path = ctx.search_path.clone();
             execute_show_create_table(
                 s,
                 storage,
@@ -232,6 +248,7 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
                 &db,
             )
         }
@@ -263,8 +280,20 @@ fn dispatch_ctx(
         // G5.1: CALL / DO — execute as Noop
         Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
         // G5.5: CREATE TABLE ... LIKE
-        Stmt::CreateTableLike(s) => {
+        Stmt::CreateTableLike(mut s) => {
             ctx.invalidate_all();
+            if s.persistence == axiomdb_catalog::TablePersistence::Temporary {
+                if s.new_table.database.is_some() || s.new_table.schema.is_some() {
+                    return Err(DbError::InvalidValue {
+                        reason: "temporary tables cannot specify an explicit database or schema"
+                            .into(),
+                    });
+                }
+                s.new_table.schema = Some(ctx.ensure_temp_schema());
+            } else if s.new_table.schema.is_none() {
+                s.new_table.schema = Some(ctx.default_create_schema().to_string());
+            }
+            let search_path = ctx.search_path.clone();
             let db = ddl_database(&s.new_table.database, ctx);
             execute_create_table_like(
                 s,
@@ -273,20 +302,30 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
                 &db,
             )
         }
         // G5.6: CREATE TABLE ... AS SELECT
-        Stmt::CreateTableAsSelect(s) => {
+        Stmt::CreateTableAsSelect(mut s) => {
             ctx.invalidate_all();
+            if s.persistence == axiomdb_catalog::TablePersistence::Temporary {
+                if s.new_table.database.is_some() || s.new_table.schema.is_some() {
+                    return Err(DbError::InvalidValue {
+                        reason: "temporary tables cannot specify an explicit database or schema"
+                            .into(),
+                    });
+                }
+                s.new_table.schema = Some(ctx.ensure_temp_schema());
+            } else if s.new_table.schema.is_none() {
+                s.new_table.schema = Some(ctx.default_create_schema().to_string());
+            }
             execute_create_table_as_select(s, exec_ctx, ctx)
         }
         // 5.9f: SHOW TABLE STATUS — needs database context
-        Stmt::ShowTableStatus(mut s) => {
-            if s.schema.is_none() {
-                s.schema = Some(ctx.current_schema().to_string());
-            }
+        Stmt::ShowTableStatus(s) => {
             let db = ctx.effective_database().to_string();
+            let search_path = ctx.search_path.clone();
             execute_show_table_status(
                 s,
                 storage,
@@ -294,6 +333,7 @@ fn dispatch_ctx(
                 ctx.conn_txn
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
                 &db,
             )
         }
@@ -475,7 +515,7 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
             let raw = match set_value_to_setting_string(&stmt.value)? {
                 None => {
                     // RESET search_path → restore default
-                    ctx.search_path = vec!["public".to_string()];
+                    ctx.set_search_path(vec!["public".to_string()]);
                     return Ok(QueryResult::Empty);
                 }
                 Some(s) => s,
@@ -490,7 +530,7 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
                     reason: "search_path cannot be empty".into(),
                 });
             }
-            ctx.search_path = schemas;
+            ctx.set_search_path(schemas);
         }
         "transaction_isolation" | "tx_isolation" => {
             let raw = match set_value_to_setting_string(&stmt.value)? {

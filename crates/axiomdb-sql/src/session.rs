@@ -1,6 +1,9 @@
 //! Session context — per-connection state including the schema cache and warnings.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use axiomdb_catalog::{
     schema::{ColumnDef, TableDef, DEFAULT_DATABASE_NAME},
@@ -109,6 +112,8 @@ pub fn session_collation_name(c: SessionCollation) -> &'static str {
         SessionCollation::Es => "es",
     }
 }
+
+static TEMP_SCHEMA_SEQ: AtomicU64 = AtomicU64::new(1);
 
 // ── OnErrorMode ───────────────────────────────────────────────────────────────
 
@@ -577,6 +582,11 @@ pub struct SessionContext {
     /// Schema search path for unqualified name resolution (PostgreSQL-style).
     /// Default: `["public"]`. Reset to `["public"]` on every `USE db`.
     pub search_path: Vec<String>,
+    /// Hidden schema name used for session-local TEMP tables.
+    ///
+    /// When present, it is always kept at the front of `search_path` so
+    /// unqualified lookups resolve temporary tables before permanent ones.
+    pub temp_schema: Option<String>,
     /// Session default isolation level for new explicit transactions.
     /// Default: `RepeatableRead` (MySQL default).
     pub transaction_isolation: axiomdb_core::IsolationLevel,
@@ -634,6 +644,7 @@ impl SessionContext {
             in_explicit_txn: false,
             current_database: String::new(),
             search_path: vec!["public".to_string()],
+            temp_schema: None,
             transaction_isolation: axiomdb_core::IsolationLevel::default(),
             next_txn_isolation: None,
             lock_timeout_secs: 30,
@@ -796,7 +807,7 @@ impl SessionContext {
     /// Also resets the search path to `["public"]` since schema names are per-database.
     pub fn set_current_database(&mut self, database: impl Into<String>) {
         self.current_database = database.into();
-        self.search_path = vec!["public".to_string()];
+        self.set_search_path(vec!["public".to_string()]);
         self.invalidate_all();
     }
 
@@ -807,6 +818,64 @@ impl SessionContext {
             .first()
             .map(|s| s.as_str())
             .unwrap_or("public")
+    }
+
+    /// Returns the default schema for ordinary CREATE/DDL targets.
+    ///
+    /// Temporary schemas are skipped so permanent objects continue to land in
+    /// the first non-temp schema even when TEMP shadowing is active.
+    pub fn default_create_schema(&self) -> &str {
+        self.search_path
+            .iter()
+            .find(|schema| self.temp_schema.as_deref() != Some(schema.as_str()))
+            .map(|s| s.as_str())
+            .unwrap_or("public")
+    }
+
+    /// Replaces the user-visible search path while preserving any active TEMP
+    /// schema as an implicit first entry.
+    pub fn set_search_path(&mut self, mut schemas: Vec<String>) {
+        if schemas.is_empty() {
+            schemas.push("public".to_string());
+        }
+        if let Some(temp_schema) = self.temp_schema.clone() {
+            schemas.retain(|schema| schema != &temp_schema);
+            schemas.insert(0, temp_schema);
+        }
+        self.search_path = schemas;
+    }
+
+    /// Allocates the hidden TEMP schema name for this session if needed and
+    /// keeps it at the front of `search_path`.
+    pub fn ensure_temp_schema(&mut self) -> String {
+        if let Some(existing) = &self.temp_schema {
+            return existing.clone();
+        }
+        let temp_schema = format!(
+            "__axiom_temp_session_{}",
+            TEMP_SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        self.temp_schema = Some(temp_schema.clone());
+        self.set_search_path(self.search_path.clone());
+        self.invalidate_all();
+        temp_schema
+    }
+
+    /// Returns the active hidden TEMP schema name, if any.
+    pub fn temp_schema_name(&self) -> Option<&str> {
+        self.temp_schema.as_deref()
+    }
+
+    /// Clears the session TEMP schema and removes it from `search_path`.
+    pub fn clear_temp_schema(&mut self) {
+        let Some(temp_schema) = self.temp_schema.take() else {
+            return;
+        };
+        self.search_path.retain(|schema| schema != &temp_schema);
+        if self.search_path.is_empty() {
+            self.search_path.push("public".to_string());
+        }
+        self.invalidate_all();
     }
 
     /// Returns the isolation level for the next `BEGIN`, consuming any per-txn
@@ -836,6 +905,29 @@ mod tests {
         assert!(
             !ctx.ansi_quotes,
             "ansi_quotes must default to false (MySQL default)"
+        );
+    }
+
+    #[test]
+    fn test_temp_schema_prefixes_search_path_but_not_default_create_schema() {
+        let mut ctx = SessionContext::new();
+        ctx.set_search_path(vec!["custom".into(), "public".into()]);
+        let temp_schema = ctx.ensure_temp_schema();
+        assert_eq!(ctx.current_schema(), temp_schema);
+        assert_eq!(ctx.default_create_schema(), "custom");
+        assert_eq!(ctx.search_path[0], temp_schema);
+    }
+
+    #[test]
+    fn test_set_current_database_preserves_temp_schema_prefix() {
+        let mut ctx = SessionContext::new();
+        let temp_schema = ctx.ensure_temp_schema();
+        ctx.set_current_database("analytics");
+        assert_eq!(ctx.current_schema(), temp_schema);
+        assert_eq!(ctx.default_create_schema(), "public");
+        assert_eq!(
+            ctx.search_path,
+            vec![temp_schema.to_string(), "public".to_string()]
         );
     }
 

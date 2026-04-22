@@ -95,6 +95,8 @@ pub enum Token<'src> {
     Create,
     #[token("TABLE", ignore(ascii_case))]
     Table,
+    #[regex("TEMP(?:ORARY)?", ignore(ascii_case))]
+    Temp,
     #[token("INDEX", ignore(ascii_case))]
     Index,
     #[token("DROP", ignore(ascii_case))]
@@ -129,6 +131,8 @@ pub enum Token<'src> {
     Exists,
     #[token("TRUNCATE", ignore(ascii_case))]
     Truncate,
+    #[token("UNLOGGED", ignore(ascii_case))]
+    Unlogged,
     #[token("VACUUM", ignore(ascii_case))]
     Vacuum,
     #[token("SAVEPOINT", ignore(ascii_case))]

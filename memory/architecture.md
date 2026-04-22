@@ -1,5 +1,29 @@
 # Architecture Notes
 
+## 2026-04-21 - TEMP and UNLOGGED tables (21.7)
+
+- **Persistence is catalog metadata, not a separate executor branch.**
+  `TablePersistence::{Permanent, Temporary, Unlogged}` is threaded through
+  CREATE/LIKE/CTAS and stored in `TableDef`, so all later visibility and
+  recovery logic can branch on one stable catalog field.
+- **Session-local TEMP isolation is namespace-based.** TEMP tables live in a
+  hidden per-session schema that is prepended to `search_path`, which lets
+  ordinary name resolution shadow `public` without inventing TEMP-specific DML
+  or DDL code paths.
+- **Lookup schema and create-target schema must stay separate.**
+  `SessionContext.default_create_schema()` exists because once TEMP prefixes
+  `search_path`, unqualified lookup should hit TEMP first but ordinary
+  permanent `CREATE TABLE` must still target `public` unless TEMP was
+  explicitly requested.
+- **TEMP cleanup belongs to connection lifecycle boundaries.** Reset,
+  change-user, and disconnect all funnel through one cleanup helper that drops
+  tables from the session temp schema after transaction rollback, then clears
+  the temp-schema token from session state.
+- **UNLOGGED semantics are enforced at open time, not per write.**
+  `MmapStorage` writes a conservative clean-shutdown flag in page 0; dirty-open
+  detection in `SharedDatabase::open_with_config` truncates only UNLOGGED
+  tables before the server starts accepting queries.
+
 ## 2026-04-21 - Exclusion constraints (21.6b)
 
 - **Owned-helper model:** 21.6b does not add a new row-vs-row exclusion

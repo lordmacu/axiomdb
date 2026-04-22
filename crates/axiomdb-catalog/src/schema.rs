@@ -104,6 +104,7 @@ mod tests {
             table_name: "users".to_string(),
             schema_version: 1,
             immutable: false,
+            persistence: TablePersistence::Permanent,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -123,6 +124,7 @@ mod tests {
                 table_name: "t".into(),
                 schema_version: 1,
                 immutable: false,
+                persistence: TablePersistence::Permanent,
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
             assert_eq!(back.root_page_id, root);
@@ -139,6 +141,7 @@ mod tests {
             table_name: String::new(),
             schema_version: 1,
             immutable: false,
+            persistence: TablePersistence::Permanent,
         };
         let bytes = def.to_bytes();
         let (back, _) = TableDef::from_bytes(&bytes).unwrap();
@@ -155,6 +158,7 @@ mod tests {
             table_name: "t".into(),
             schema_version: 1,
             immutable: false,
+            persistence: TablePersistence::Permanent,
         };
         let bytes = def.to_bytes();
         // Minimum is 14 bytes; truncate to 10 (has id+root but no schema_len).
@@ -173,6 +177,7 @@ mod tests {
             table_name: "orders".into(),
             schema_version: 1,
             immutable: false,
+            persistence: TablePersistence::Permanent,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -196,7 +201,26 @@ mod tests {
         assert_eq!(back.storage_layout, TableStorageLayout::Heap);
         assert_eq!(back.schema_name, "public");
         assert_eq!(back.table_name, "users");
+        assert_eq!(back.persistence, TablePersistence::Permanent);
         assert_eq!(consumed, legacy.len());
+    }
+
+    #[test]
+    fn test_table_def_roundtrip_unlogged_persistence() {
+        let def = TableDef {
+            id: 17,
+            root_page_id: 55,
+            storage_layout: TableStorageLayout::Heap,
+            schema_name: "public".into(),
+            table_name: "events".into(),
+            schema_version: 4,
+            immutable: false,
+            persistence: TablePersistence::Unlogged,
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
     }
 
     // ── ColumnDef ─────────────────────────────────────────────────────────────

@@ -68,6 +68,7 @@ fn execute_select_ctx(
             txn,
             conn_txn,
             default_db,
+            ctx.temp_schema_name(),
         );
     }
 

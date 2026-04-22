@@ -17,12 +17,20 @@ fn execute_information_schema_select(
     txn: &TxnManager,
     conn_txn: Option<&ConnectionTxn>,
     default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<QueryResult, DbError> {
     let table_name_lower = from_table_ref.name.to_ascii_lowercase();
 
     // Generate virtual rows from the catalog.
     let (derived_cols, derived_rows) =
-        generate_is_rows(&table_name_lower, storage, txn, conn_txn, default_database)?;
+        generate_is_rows(
+            &table_name_lower,
+            storage,
+            txn,
+            conn_txn,
+            default_database,
+            temp_schema,
+        )?;
 
     // Apply WHERE filter.
     let mut combined_rows: Vec<Row> = Vec::new();
@@ -90,6 +98,7 @@ fn generate_is_rows(
     txn: &TxnManager,
     conn_txn: Option<&ConnectionTxn>,
     default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<(Vec<ColumnMeta>, Vec<Row>), DbError> {
     let snap = conn_txn
         .map(|c| txn.active_snapshot(c))
@@ -109,14 +118,18 @@ fn generate_is_rows(
     let mut reader = CatalogReader::new(storage, snap)?;
 
     let rows = match table_name {
-        "tables" => generate_is_tables_rows(&mut reader, default_database)?,
-        "columns" => generate_is_columns_rows(&mut reader, default_database)?,
-        "key_column_usage" => generate_is_key_column_usage_rows(&mut reader, default_database)?,
-        "table_constraints" => generate_is_table_constraints_rows(&mut reader, default_database)?,
-        "referential_constraints" => {
-            generate_is_referential_constraints_rows(&mut reader, default_database)?
+        "tables" => generate_is_tables_rows(&mut reader, default_database, temp_schema)?,
+        "columns" => generate_is_columns_rows(&mut reader, default_database, temp_schema)?,
+        "key_column_usage" => {
+            generate_is_key_column_usage_rows(&mut reader, default_database, temp_schema)?
         }
-        "statistics" => generate_is_statistics_rows(&mut reader, default_database)?,
+        "table_constraints" => {
+            generate_is_table_constraints_rows(&mut reader, default_database, temp_schema)?
+        }
+        "referential_constraints" => {
+            generate_is_referential_constraints_rows(&mut reader, default_database, temp_schema)?
+        }
+        "statistics" => generate_is_statistics_rows(&mut reader, default_database, temp_schema)?,
         _ => {
             return Err(DbError::TableNotFound {
                 name: format!("information_schema.{table_name}"),
@@ -127,6 +140,21 @@ fn generate_is_rows(
     Ok((derived_cols, rows))
 }
 
+fn visible_is_tables_for_session(
+    reader: &mut CatalogReader,
+    database: &str,
+    temp_schema: Option<&str>,
+) -> Result<Vec<axiomdb_catalog::TableDef>, DbError> {
+    let tables = reader.list_tables_owned_by_database(database)?;
+    Ok(tables
+        .into_iter()
+        .filter(|table| {
+            table.persistence != axiomdb_catalog::TablePersistence::Temporary
+                || Some(table.schema_name.as_str()) == temp_schema
+        })
+        .collect())
+}
+
 // ── Row generators ────────────────────────────────────────────────────────────
 
 /// `information_schema.TABLES` — one row per user table.
@@ -135,12 +163,13 @@ fn generate_is_rows(
 fn generate_is_tables_rows(
     reader: &mut CatalogReader,
     _default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<Vec<Row>, DbError> {
     let databases = reader.list_databases()?;
     let mut rows = Vec::new();
 
     for db in &databases {
-        let tables = reader.list_tables_in_database(&db.name, "public")?;
+        let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
         for t in tables {
             rows.push(vec![
                 Value::Text("def".into()),                // TABLE_CATALOG
@@ -177,12 +206,13 @@ fn generate_is_tables_rows(
 fn generate_is_columns_rows(
     reader: &mut CatalogReader,
     _default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<Vec<Row>, DbError> {
     let databases = reader.list_databases()?;
     let mut rows = Vec::new();
 
     for db in &databases {
-        let tables = reader.list_tables_in_database(&db.name, "public")?;
+        let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
         for t in tables {
             let columns = reader.list_columns(t.id)?;
             for col in &columns {
@@ -242,12 +272,13 @@ fn generate_is_columns_rows(
 fn generate_is_key_column_usage_rows(
     reader: &mut CatalogReader,
     _default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<Vec<Row>, DbError> {
     let databases = reader.list_databases()?;
     let mut rows = Vec::new();
 
     for db in &databases {
-        let tables = reader.list_tables_in_database(&db.name, "public")?;
+        let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
         for t in tables {
             let columns = reader.list_columns(t.id)?;
             let indexes = reader.list_indexes(t.id)?;
@@ -333,12 +364,13 @@ fn generate_is_key_column_usage_rows(
 fn generate_is_table_constraints_rows(
     reader: &mut CatalogReader,
     _default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<Vec<Row>, DbError> {
     let databases = reader.list_databases()?;
     let mut rows = Vec::new();
 
     for db in &databases {
-        let tables = reader.list_tables_in_database(&db.name, "public")?;
+        let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
         for t in tables {
             let indexes = reader.list_indexes(t.id)?;
             let constraints = reader.list_constraints(t.id)?;
@@ -399,6 +431,7 @@ fn generate_is_table_constraints_rows(
 fn generate_is_referential_constraints_rows(
     _reader: &mut CatalogReader,
     _default_database: &str,
+    _temp_schema: Option<&str>,
 ) -> Result<Vec<Row>, DbError> {
     Ok(vec![])
 }
@@ -409,12 +442,13 @@ fn generate_is_referential_constraints_rows(
 fn generate_is_statistics_rows(
     reader: &mut CatalogReader,
     _default_database: &str,
+    temp_schema: Option<&str>,
 ) -> Result<Vec<Row>, DbError> {
     let databases = reader.list_databases()?;
     let mut rows = Vec::new();
 
     for db in &databases {
-        let tables = reader.list_tables_in_database(&db.name, "public")?;
+        let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
         for t in tables {
             let columns = reader.list_columns(t.id)?;
             let indexes = reader.list_indexes(t.id)?;
