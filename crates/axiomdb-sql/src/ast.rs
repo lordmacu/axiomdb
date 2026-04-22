@@ -1131,6 +1131,8 @@ pub enum Stmt {
     /// `RELEASE [SAVEPOINT] name` — destroy the named savepoint (changes persist).
     ReleaseSavepoint(String),
     // Maintenance
+    /// `CHECKPOINT` — flush storage pages and record a durable checkpoint LSN.
+    Checkpoint,
     /// `VACUUM [table_name]` — remove dead rows and dead index entries (Phase 7.11).
     Vacuum(VacuumStmt),
     /// `EXPLAIN SELECT ...` — show the chosen query plan (Phase 8.4).

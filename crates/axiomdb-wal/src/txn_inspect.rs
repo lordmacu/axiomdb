@@ -140,6 +140,21 @@ impl TxnManager {
         &self.wal
     }
 
+    /// Runs a durable checkpoint without rotating the WAL file.
+    ///
+    /// **Must be called with no active transaction.**
+    pub fn checkpoint(&self, storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        {
+            let set = self.active_set.read().unwrap();
+            if !set.is_empty() {
+                let first_id = *set.iter().next().unwrap();
+                return Err(DbError::TransactionAlreadyActive { txn_id: first_id });
+            }
+        }
+
+        Checkpointer::checkpoint(storage, &self.wal)
+    }
+
     // ── WAL Rotation ──────────────────────────────────────────────────────────
 
     /// Triggers a checkpoint and rotates the WAL file.
@@ -161,7 +176,7 @@ impl TxnManager {
             }
         }
 
-        let checkpoint_lsn = Checkpointer::checkpoint(storage, &self.wal)?;
+        let checkpoint_lsn = self.checkpoint(storage)?;
         ConcurrentWalWriter::rotate_file(wal_path, checkpoint_lsn)?;
         self.wal = ConcurrentWalWriter::open(wal_path)?;
 

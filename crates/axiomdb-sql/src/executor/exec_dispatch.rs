@@ -181,6 +181,10 @@ fn dispatch_ctx(
             )
         }
         Stmt::Analyze(s) => execute_analyze(s, exec_ctx, ctx),
+        Stmt::Checkpoint => {
+            txn.checkpoint(storage)?;
+            Ok(QueryResult::Empty)
+        }
         Stmt::Explain(inner) => execute_explain(*inner, exec_ctx, ctx),
         Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, exec_ctx, ctx),
         Stmt::DeclareCursor(s) => execute_declare_cursor(s, exec_ctx, ctx),

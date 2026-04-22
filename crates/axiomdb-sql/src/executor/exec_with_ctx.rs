@@ -199,6 +199,11 @@ pub fn execute_with_ctx_locked(
                 ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
+            Stmt::Checkpoint => dispatch_ctx(
+                Stmt::Checkpoint,
+                &ExecutionContext::new(storage, txn, bloom, lock_mgr),
+                ctx,
+            ),
             Stmt::Commit => {
                 ctx.warn(1592, "There is no active transaction");
                 Ok(QueryResult::Empty)
@@ -243,6 +248,11 @@ pub fn execute_with_ctx_locked(
                 ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
+            Stmt::Checkpoint => dispatch_ctx(
+                Stmt::Checkpoint,
+                &ExecutionContext::new(storage, txn, bloom, lock_mgr),
+                ctx,
+            ),
             Stmt::Commit => {
                 ctx.warn(1592, "There is no active transaction");
                 Ok(QueryResult::Empty)

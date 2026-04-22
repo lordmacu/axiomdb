@@ -1,19 +1,18 @@
 # Project State
 
-## Current (2026-04-21)
+## Current (2026-04-22)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.10 COMPLETE — SQL cursors closed.
-`DECLARE`, `FETCH`, and `CLOSE` now work as transaction-scoped SQL cursors
-backed by materialized rowsets in `SessionContext`. The parser/analyzer/executor
-support read-only cursor statements over `SELECT` and `SetOp` queries, `FETCH`
-returns deterministic row windows without re-executing the query, and cursor
-state is cleaned up on `COMMIT`, `ROLLBACK`, `COM_RESET_CONNECTION`,
-`COM_CHANGE_USER`, and other session lifecycle resets.
+**Active subphase:** Phase 21.20 COMPLETE — SQL `CHECKPOINT` closed.
+`CHECKPOINT` now parses and executes as a real administrative SQL statement.
+It delegates to the existing WAL/storage checkpoint engine, persists a durable
+checkpoint LSN without rotating the WAL file, rejects execution while any
+transaction is active, and is special-cased to run outside implicit executor
+transactions in both legacy and session-aware paths.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_cursors`; `cargo test -p axiomdb-network --test integration_connection_lifecycle`; `cargo test -p axiomdb-sql`; `python3 tools/wire-test.py` (422/422); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_checkpoint --test integration_ddl_parser`; `cargo test -p axiomdb-network --test integration_connection_lifecycle`; `python3 tools/wire-test.py` (424/424); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.20 CHECKPOINT, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.11 Query hints, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -30,7 +29,8 @@ state is cleaned up on `COMMIT`, `ROLLBACK`, `COM_RESET_CONNECTION`,
 | 21.7 TEMP and UNLOGGED tables | ✅ closed |
 | 21.8 Expression indexes | ✅ closed |
 | 21.10 Cursors | ✅ closed |
-| 21.20 CHECKPOINT | ⏳ next |
+| 21.20 CHECKPOINT | ✅ closed |
+| 21.11 Query hints | ⏳ next |
 
 ### Phase 11 subphase status
 

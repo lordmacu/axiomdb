@@ -135,6 +135,8 @@ pub enum Token<'src> {
     Unlogged,
     #[token("VACUUM", ignore(ascii_case))]
     Vacuum,
+    #[token("CHECKPOINT", ignore(ascii_case))]
+    Checkpoint,
     #[token("SAVEPOINT", ignore(ascii_case))]
     SavepointKw,
     #[token("RELEASE", ignore(ascii_case))]

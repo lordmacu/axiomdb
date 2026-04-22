@@ -195,6 +195,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::DropIndex(_)
             | Stmt::TruncateTable(_)
             | Stmt::AlterTable(_)
+            | Stmt::Checkpoint
             | Stmt::Analyze(_) => Ok(()),
             // Introspection — catalog meta tables, no user data table deps.
             Stmt::ShowTables(_)
