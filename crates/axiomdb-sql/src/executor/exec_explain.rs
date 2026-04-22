@@ -120,6 +120,10 @@ fn dispatch(
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::Checkpoint => {
+            txn.checkpoint(storage)?;
+            Ok(QueryResult::Empty)
+        }
         Stmt::Vacuum(_) => Err(DbError::NotImplemented {
             feature: "VACUUM requires session context — use execute_with_ctx".into(),
         }),

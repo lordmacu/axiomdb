@@ -130,6 +130,10 @@ pub fn execute(
             EXECUTE_CONN.with(|cell| *cell.borrow_mut() = Some(conn));
             Ok(QueryResult::Empty)
         }
+        Stmt::Checkpoint => {
+            txn.checkpoint(storage)?;
+            Ok(QueryResult::Empty)
+        }
         Stmt::Commit => Err(DbError::NoActiveTransaction),
         Stmt::Rollback => Err(DbError::NoActiveTransaction),
         other => {

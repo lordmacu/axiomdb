@@ -1,5 +1,24 @@
 # Architecture Notes
 
+## 2026-04-22 - SQL CHECKPOINT (21.20)
+
+- **`CHECKPOINT` is an admin SQL statement, not a WAL-rotation alias.** The
+  SQL surface delegates to `TxnManager::checkpoint(storage)`, which wraps
+  `Checkpointer::checkpoint(...)` only; WAL rotation remains a separate
+  administrative path.
+- **Checkpoint safety is enforced at the transaction manager boundary.**
+  `TxnManager::checkpoint` shares the same "no active txns" contract used by
+  WAL rotation, so every caller gets one authoritative guard instead of
+  reimplementing `active_set` checks.
+- **Implicit executor transactions must be bypassed explicitly.** The normal
+  autocommit path opens a transaction before dispatch; administrative
+  statements like `CHECKPOINT` need dedicated branches in `execute` and
+  `execute_with_ctx` so they do not self-conflict.
+- **Planner/cache dependencies for `CHECKPOINT` are empty, but it is still a
+  mutating statement at the server gate.** It touches durability state, so the
+  read-only/degraded-mode fast checks must treat it as mutating even though it
+  has no table dependencies.
+
 ## 2026-04-21 - SQL cursors (21.10)
 
 - **21.10 is SQL-session state, not a wire cursor feature.** `DECLARE`,

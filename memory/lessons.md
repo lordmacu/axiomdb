@@ -1,5 +1,17 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 21.20
+
+- **Administrative SQL can break if it reuses ordinary autocommit blindly.**
+  `CHECKPOINT` looked trivial until the executor wrapped it in an implicit
+  transaction and caused a false `TransactionAlreadyActive` against itself.
+- **Checkpoint and WAL rotation are different operational contracts.**
+  Exposing SQL `CHECKPOINT` cleanly meant reusing only the durable-checkpoint
+  path, not smuggling in file rotation or truncation side effects.
+- **The wire harness is the right place to catch admin-statement lifecycle
+  drift.** A simple `CHECKPOINT` OK + explicit-txn rejection smoke protects
+  the user-visible contract better than parser or unit tests alone.
+
 ## 2026-04-21 - Phase 21.10
 
 - **SQL cursors were the right cut; streaming portals were not.** A

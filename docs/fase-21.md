@@ -1,5 +1,58 @@
 # Fase 21 - Advanced SQL
 
+## 21.20 CHECKPOINT - cerrada 2026-04-22
+
+La subfase 21.20 cierra el statement administrativo SQL `CHECKPOINT`.
+La implementacion reutiliza el motor de checkpoint que ya existia en WAL y
+storage, pero ahora lo expone por SQL con el contrato correcto: persiste un
+LSN de checkpoint durable, no rota el WAL, y rechaza la operacion mientras
+haya cualquier transaccion activa.
+
+### Superficie SQL cerrada
+
+```sql
+CHECKPOINT;
+```
+
+Alcance implementado:
+
+- Parser/AST: nuevo `Stmt::Checkpoint` con soporte directo en lexer/parser y
+  cobertura de parser en `integration_ddl_parser`.
+- WAL/admin: `TxnManager::checkpoint(storage)` encapsula el guard de
+  `active_set` y delega en `Checkpointer::checkpoint(...)` sin mezclarlo con
+  `rotate_wal`.
+- Executor: `CHECKPOINT` corre como statement real tanto en la ruta legacy
+  (`execute`) como en la session-aware (`execute_with_ctx` / `dispatch_ctx`).
+- Semantica de transaccion: las rutas autocommit y non-autocommit sin
+  transaccion abierta lo ejecutan fuera de cualquier `BEGIN` implicito; si ya
+  existe una transaccion activa, devuelve `TransactionAlreadyActive`.
+- Wire/read-only gating: `sql_may_mutate(...)` ya trata `CHECKPOINT` como
+  statement mutante para respetar las barreras de modo read-only degradado.
+
+### Diferido explicito
+
+- Rotacion/truncado de WAL como parte del statement SQL.
+- Politicas mas finas que "cualquier transaccion activa bloquea CHECKPOINT".
+- Nuevos statements administrativos estilo `FLUSH LOGS` / `CHECKPOINT FORCE`.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_checkpoint --test integration_ddl_parser` - paso, 76 tests.
+- `cargo test -p axiomdb-network --test integration_connection_lifecycle` - paso, 17 tests.
+- `tools/wire-test.py` - paso, 424/424 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
+### Nota de implementacion
+
+El bug facil aqui era dejar que `CHECKPOINT` entrara por la ruta normal de
+autocommit. Eso abría una transaccion implicita, la metia en `active_set` y el
+statement terminaba auto-bloqueandose. El cierre correcto fue tratar
+`CHECKPOINT` como una operacion administrativa fuera de transaccion implicita,
+manteniendo el mismo guard compartido para el caso donde otra sesion o la
+sesion actual ya tiene una transaccion abierta.
+
 ## 21.10 SQL cursors - cerrada 2026-04-21
 
 La subfase 21.10 cierra el soporte MVP de cursores SQL de sesion:

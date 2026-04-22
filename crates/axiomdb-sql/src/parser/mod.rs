@@ -403,6 +403,10 @@ impl<'src> Parser<'src> {
                 };
                 Ok(Stmt::Vacuum(crate::ast::VacuumStmt { table }))
             }
+            Token::Checkpoint => {
+                self.advance();
+                Ok(Stmt::Checkpoint)
+            }
             Token::Analyze => {
                 self.advance();
                 // ANALYZE [TABLE name [(column)]]
@@ -1168,6 +1172,7 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         Token::Lock => "lock".into(),
         Token::Unlock => "unlock".into(),
         Token::Flush => "flush".into(),
+        Token::Checkpoint => "checkpoint".into(),
         Token::Kill => "kill".into(),
         Token::Query => "query".into(),
         Token::Connection => "connection".into(),

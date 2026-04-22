@@ -841,6 +841,7 @@ pub fn sql_may_mutate(sql: &str) -> bool {
         || lower.starts_with("rollback")
         || lower.starts_with("savepoint")
         || lower.starts_with("release")
+        || lower.starts_with("checkpoint")
 }
 
 /// Returns `true` if the parsed `Stmt` may mutate durable state.

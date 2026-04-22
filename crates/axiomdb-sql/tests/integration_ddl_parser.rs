@@ -32,6 +32,14 @@ fn alter_table(sql: &str) -> axiomdb_sql::ast::AlterTableStmt {
     }
 }
 
+#[test]
+fn test_checkpoint_parses() {
+    assert!(matches!(
+        parse("CHECKPOINT", None).unwrap(),
+        Stmt::Checkpoint
+    ));
+}
+
 // ── Basic CREATE TABLE ────────────────────────────────────────────────────────
 
 #[test]

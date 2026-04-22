@@ -22,7 +22,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression),
              21.5 (INSERT ON CONFLICT + MERGE smoke),
              21.5f (GENERATED ALWAYS AS STORED insert/update smoke),
-             21.10 (SQL cursors)
+             21.10 (SQL cursors),
+             21.20 (CHECKPOINT)
 """
 import os
 import signal
@@ -3780,6 +3781,22 @@ ok("[21.10 cursors] FETCH ALL returns remaining rows",
    f"got {rows}")
 cur.execute("CLOSE c")
 cur.execute("COMMIT")
+
+# ── Phase 21.20 — CHECKPOINT ────────────────────────────────────────────────
+
+print("\n[21.20 checkpoint]")
+
+cur.execute("CHECKPOINT")
+ok("[21.20 checkpoint] CHECKPOINT returns OK in autocommit", True)
+
+cur.execute("BEGIN")
+try:
+    cur.execute("CHECKPOINT")
+    ok("[21.20 checkpoint] active txn rejects CHECKPOINT", False, "statement succeeded")
+except pymysql.MySQLError as e:
+    ok("[21.20 checkpoint] active txn rejects CHECKPOINT", e.args[0] == 1213, e.args)
+finally:
+    cur.execute("ROLLBACK")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
