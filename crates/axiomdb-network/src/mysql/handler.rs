@@ -24,7 +24,11 @@ use tracing::{debug, info, warn};
 
 use axiomdb_catalog::CatalogReader;
 use axiomdb_core::error::DbError;
-use axiomdb_sql::{ast::Stmt, plan_deps::extract_table_deps, result::ColumnMeta};
+use axiomdb_sql::{
+    ast::{DropTableStmt, Stmt, TableRef},
+    plan_deps::extract_table_deps,
+    result::ColumnMeta,
+};
 use axiomdb_types::DataType;
 
 use super::charset::DEFAULT_SERVER_COLLATION;
@@ -149,6 +153,123 @@ async fn rollback_active_session_txn(
             "failed to rollback active session transaction during connection cleanup"
         );
     }
+}
+
+async fn drop_session_temp_tables(
+    db: &Arc<SharedDatabase>,
+    engine: &mut ConnectionEngineCtx,
+    conn_id: u32,
+    reason: &str,
+) {
+    let Some(temp_schema) = engine.session.temp_schema_name().map(str::to_string) else {
+        return;
+    };
+
+    debug!(
+        conn_id,
+        reason = reason,
+        temp_schema = %temp_schema,
+        "dropping session temp tables during connection cleanup"
+    );
+
+    let tables_by_database = {
+        let _catalog_guard = db.catalog_lock.read().await;
+        let snap = db.txn.snapshot();
+        let mut reader = match CatalogReader::new(&db.storage, snap) {
+            Ok(reader) => reader,
+            Err(e) => {
+                warn!(
+                    conn_id,
+                    reason = reason,
+                    err = %e,
+                    "failed to open catalog reader for temp-table cleanup"
+                );
+                return;
+            }
+        };
+
+        let mut out = Vec::new();
+        match reader.list_databases() {
+            Ok(databases) => {
+                for database in databases {
+                    match reader.list_tables_in_database(&database.name, &temp_schema) {
+                        Ok(tables) if !tables.is_empty() => out.push((
+                            database.name,
+                            tables.into_iter().map(|t| t.table_name).collect::<Vec<_>>(),
+                        )),
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                conn_id,
+                                reason = reason,
+                                database = %database.name,
+                                temp_schema = %temp_schema,
+                                err = %e,
+                                "failed to enumerate temp tables in database during cleanup"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    conn_id,
+                    reason = reason,
+                    err = %e,
+                    "failed to enumerate databases for temp-table cleanup"
+                );
+                return;
+            }
+        }
+        out
+    };
+
+    for (database_name, table_names) in tables_by_database {
+        let drop_stmt = Stmt::DropTable(DropTableStmt {
+            if_exists: true,
+            tables: table_names
+                .into_iter()
+                .map(|table_name| TableRef {
+                    database: Some(database_name.clone()),
+                    schema: Some(temp_schema.clone()),
+                    name: table_name,
+                    alias: None,
+                })
+                .collect(),
+            cascade: false,
+        });
+
+        let result = {
+            let _catalog_guard = db.catalog_lock.write().await;
+            db.execute_stmt(drop_stmt, &mut engine.session)
+        };
+        match result {
+            Ok((_qr, commit_rx)) => {
+                if let Err(e) = await_commit_rx(commit_rx).await {
+                    warn!(
+                        conn_id,
+                        reason = reason,
+                        database = %database_name,
+                        temp_schema = %temp_schema,
+                        err = %e,
+                        "temp-table cleanup commit failed"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    conn_id,
+                    reason = reason,
+                    database = %database_name,
+                    temp_schema = %temp_schema,
+                    err = %e,
+                    "failed to drop session temp tables during cleanup"
+                );
+            }
+        }
+    }
+
+    engine.session.clear_temp_schema();
 }
 
 /// Handles one MySQL connection from handshake to disconnection.
@@ -941,6 +1062,7 @@ pub async fn handle_connection_with_timeouts(
             0x1f => {
                 rollback_active_session_txn(&db, &mut engine, conn_id, "COM_RESET_CONNECTION")
                     .await;
+                drop_session_temp_tables(&db, &mut engine, conn_id, "COM_RESET_CONNECTION").await;
                 engine.reset();
                 conn_state.reset_for_connection_reuse();
                 // Restore the codec limit to the default after session reset.
@@ -1435,6 +1557,7 @@ pub async fn handle_connection_with_timeouts(
             0x11 => {
                 debug!(conn_id, "COM_CHANGE_USER — reset session");
                 rollback_active_session_txn(&db, &mut engine, conn_id, "COM_CHANGE_USER").await;
+                drop_session_temp_tables(&db, &mut engine, conn_id, "COM_CHANGE_USER").await;
                 engine.reset();
                 conn_state.reset_for_connection_reuse();
                 reader
@@ -1509,6 +1632,7 @@ pub async fn handle_connection_with_timeouts(
     }
 
     rollback_active_session_txn(&db, &mut engine, conn_id, "connection_close").await;
+    drop_session_temp_tables(&db, &mut engine, conn_id, "connection_close").await;
     info!(conn_id, "connection closed");
 }
 

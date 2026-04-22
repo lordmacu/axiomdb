@@ -20,7 +20,8 @@ pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
     ColumnDef, ColumnType, ConstraintDef, ConstraintKind, ConstraintOperator, DatabaseDef,
     ExclusionElementDef, FkAction, FkDef, IndexColumnDef, IndexDef, SchemaDef, SortOrder, StatsDef,
-    TableDatabaseDef, TableDef, TableId, TableStorageLayout, DEFAULT_DATABASE_NAME,
+    TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
+    DEFAULT_DATABASE_NAME,
 };
 pub use writer::{
     CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_DATABASES,

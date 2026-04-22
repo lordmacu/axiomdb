@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-21 - Phase 21.7
+
+- **TEMP tables fit best as a namespace problem, not a storage problem.**
+  Reusing hidden schemas plus normal resolution avoided a parallel executor
+  path and made TEMP shadowing/drop behavior line up with existing catalog and
+  DDL machinery.
+- **Once TEMP prefixes lookup, creation needs its own default-schema rule.**
+  Using `search_path[0]` for both lookup and target schema silently redirects
+  permanent creates into the temp namespace; splitting
+  `default_create_schema()` from lookup resolution keeps the semantics sane.
+- **Dirty-open cleanup is safer when the storage layer is conservative.**
+  Mark the database dirty as soon as it opens, only flip it back to clean on a
+  graceful close, and let startup truncate `UNLOGGED` tables from that one
+  signal instead of scattering per-table crash heuristics.
+
 ## 2026-04-21 - Phase 21.6b
 
 - **Reuse owned UNIQUE enforcement before inventing a new exclusion engine.**

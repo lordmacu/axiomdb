@@ -815,6 +815,7 @@ mod tests {
             table_name: "t".into(),
             schema_version: 1,
             immutable: false,
+            persistence: axiomdb_catalog::schema::TablePersistence::Permanent,
         }
     }
 

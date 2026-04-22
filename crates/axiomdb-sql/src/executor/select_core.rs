@@ -95,6 +95,7 @@ fn execute_select(
             txn,
             conn_txn,
             DEFAULT_DATABASE_NAME,
+            None,
         );
     }
 

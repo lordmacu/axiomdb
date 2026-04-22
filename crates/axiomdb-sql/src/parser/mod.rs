@@ -775,9 +775,19 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_schema(self)
             }
+            Token::Temp => {
+                self.advance();
+                self.expect(&Token::Table)?;
+                ddl::parse_create_table(self, axiomdb_catalog::TablePersistence::Temporary)
+            }
+            Token::Unlogged => {
+                self.advance();
+                self.expect(&Token::Table)?;
+                ddl::parse_create_table(self, axiomdb_catalog::TablePersistence::Unlogged)
+            }
             Token::Table => {
                 self.advance();
-                ddl::parse_create_table(self)
+                ddl::parse_create_table(self, axiomdb_catalog::TablePersistence::Permanent)
             }
             Token::Unique => {
                 self.advance();
@@ -790,7 +800,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

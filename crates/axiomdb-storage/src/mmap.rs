@@ -37,6 +37,7 @@ const DEFERRED_FREE_WARN_THRESHOLD: usize = 4096;
 // Fixed offsets for in-place updates without re-parsing the full meta page.
 // PageHeader(64) + db_magic(8) + version(4) + _pad(4) = 80
 const PAGE_COUNT_OFFSET: usize = HEADER_SIZE + 8 + 4 + 4;
+const CLEAN_SHUTDOWN_OFFSET: usize = HEADER_SIZE + crate::meta::CLEAN_SHUTDOWN_BODY_OFFSET;
 // Offset of the `checksum` field inside PageHeader.
 const CHECKSUM_OFFSET: usize = 12;
 
@@ -128,10 +129,22 @@ pub struct MmapStorage {
     /// freelist `Mutex`. Used by `LocalPageBatch::pop_or_refill` to scale
     /// the refill batch size adaptively under contention.
     extension_waiters: AtomicU32,
+    /// Snapshot of the clean-shutdown flag as it was found on disk at open
+    /// time, before this process marked the database as running/dirty.
+    clean_shutdown_on_open: bool,
 }
 
 impl Drop for MmapStorage {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            if let Err(e) = self.write_clean_shutdown_flag(true).and_then(|_| {
+                self.file
+                    .sync_all()
+                    .map_err(|e| classify_io(e, "storage close fsync"))
+            }) {
+                warn!(error = %e, "failed to mark clean shutdown on close");
+            }
+        }
         if let Err(e) = self.file.unlock() {
             warn!(error = %e, "failed to release file lock on close");
         } else {
@@ -202,6 +215,7 @@ impl MmapStorage {
             page_count: AtomicU64::new(GROW_PAGES),
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
+            clean_shutdown_on_open: true,
         })
     }
 
@@ -238,7 +252,7 @@ impl MmapStorage {
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Validate page 0.
-        let db_page_count = {
+        let (db_page_count, clean_shutdown_on_open) = {
             let meta_page = Self::read_page_from_mmap(&mmap, 0)?;
             let file_meta = Self::parse_file_meta(&meta_page);
 
@@ -254,7 +268,10 @@ impl MmapStorage {
                     file_meta.version
                 )));
             }
-            file_meta.page_count
+            (
+                file_meta.page_count,
+                meta_page.body()[crate::meta::CLEAN_SHUTDOWN_BODY_OFFSET] != 0,
+            )
         };
 
         // Load FreeList from page 1.
@@ -276,7 +293,7 @@ impl MmapStorage {
             "freelist loaded from disk"
         );
 
-        Ok(MmapStorage {
+        let storage = MmapStorage {
             mmap: RwLock::new(mmap),
             file,
             freelist: Mutex::new(freelist),
@@ -290,7 +307,14 @@ impl MmapStorage {
             page_count: AtomicU64::new(db_page_count),
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
-        })
+            clean_shutdown_on_open,
+        };
+        storage.write_clean_shutdown_flag(false)?;
+        storage
+            .file
+            .sync_all()
+            .map_err(|e| classify_io(e, "storage open fsync"))?;
+        Ok(storage)
     }
 
     /// Releases deferred-free pages back to the freelist.
@@ -506,6 +530,25 @@ impl MmapStorage {
         let checksum = crc32c::crc32c(&bytes[HEADER_SIZE..PAGE_SIZE]);
         bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
         self.pwrite_bytes(0, &bytes)
+    }
+
+    fn write_clean_shutdown_flag(&self, clean: bool) -> Result<(), DbError> {
+        let mut bytes = {
+            let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+            let mut b = [0u8; PAGE_SIZE];
+            b.copy_from_slice(&mmap[0..PAGE_SIZE]);
+            b
+        };
+        bytes[CLEAN_SHUTDOWN_OFFSET] = u8::from(clean);
+        let checksum = crc32c::crc32c(&bytes[HEADER_SIZE..PAGE_SIZE]);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+        self.pwrite_bytes(0, &bytes)
+    }
+
+    /// Returns the clean-shutdown flag as it was found on disk when this
+    /// process opened the database file.
+    pub fn clean_shutdown_on_open(&self) -> bool {
+        self.clean_shutdown_on_open
     }
 }
 

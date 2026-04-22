@@ -606,6 +606,39 @@ async fn test_reset_connection_clears_local_status_counters() {
 }
 
 #[tokio::test]
+async fn test_reset_connection_drops_session_temp_tables() {
+    let server = spawn_server(LifecycleTimeouts {
+        auth_timeout: Duration::from_millis(200),
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate(&mut stream, false).await.expect("auth");
+
+    let ok = com_query(&mut stream, "CREATE TEMP TABLE temp_reset (id INT)")
+        .await
+        .expect("CREATE TEMP TABLE");
+    assert_eq!(ok[0], 0x00, "CREATE TEMP TABLE must return OK");
+
+    let ok = com_query(&mut stream, "INSERT INTO temp_reset VALUES (1)")
+        .await
+        .expect("INSERT temp row");
+    assert_eq!(ok[0], 0x00, "INSERT into temp table must return OK");
+
+    let ok = com_reset_connection(&mut stream)
+        .await
+        .expect("COM_RESET_CONNECTION");
+    assert_eq!(ok[0], 0x00, "COM_RESET_CONNECTION must return OK");
+
+    let err = com_query(&mut stream, "SELECT COUNT(*) FROM temp_reset")
+        .await
+        .expect("SELECT after reset");
+    assert_eq!(err[0], 0xff, "temp table must be gone after reset");
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn test_change_user_resets_session_state_and_preserves_handshake_charset() {
     let server = spawn_server_with_setup(
         LifecycleTimeouts {
@@ -659,6 +692,37 @@ async fn test_change_user_resets_session_state_and_preserves_handshake_charset()
         Some("latin1"),
         "change user must restore the handshake charset baseline"
     );
+
+    com_quit(&mut stream).await.expect("COM_QUIT");
+    server.task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_change_user_drops_session_temp_tables() {
+    let server = spawn_server(LifecycleTimeouts {
+        auth_timeout: Duration::from_millis(200),
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.addr).await.expect("connect");
+    authenticate(&mut stream, false).await.expect("auth");
+
+    let ok = com_query(&mut stream, "CREATE TEMP TABLE temp_change_user (id INT)")
+        .await
+        .expect("CREATE TEMP TABLE");
+    assert_eq!(ok[0], 0x00, "CREATE TEMP TABLE must return OK");
+
+    let ok = com_query(&mut stream, "INSERT INTO temp_change_user VALUES (1)")
+        .await
+        .expect("INSERT temp row");
+    assert_eq!(ok[0], 0x00, "INSERT into temp table must return OK");
+
+    let ok = com_change_user(&mut stream).await.expect("COM_CHANGE_USER");
+    assert_eq!(ok[0], 0x00, "COM_CHANGE_USER must return OK");
+
+    let err = com_query(&mut stream, "SELECT COUNT(*) FROM temp_change_user")
+        .await
+        .expect("SELECT after change user");
+    assert_eq!(err[0], 0xff, "temp table must be gone after change user");
 
     com_quit(&mut stream).await.expect("COM_QUIT");
     server.task.await.expect("server task");

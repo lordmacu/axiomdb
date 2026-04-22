@@ -1,5 +1,6 @@
 //! Integration tests for the DDL parser (subfase 4.3 + 4.3a–4.3d).
 
+use axiomdb_catalog::TablePersistence;
 use axiomdb_core::DbError;
 use axiomdb_sql::expr::{BinaryOp, Expr, UnaryOp};
 use axiomdb_sql::{
@@ -50,12 +51,55 @@ fn test_create_table_if_not_exists() {
     let ct = create_table("CREATE TABLE IF NOT EXISTS t (id INT)");
     assert!(ct.if_not_exists);
     assert_eq!(ct.table.name, "t");
+    assert_eq!(ct.persistence, TablePersistence::Permanent);
 }
 
 #[test]
 fn test_create_table_without_if_not_exists() {
     let ct = create_table("CREATE TABLE t (id INT)");
     assert!(!ct.if_not_exists);
+    assert_eq!(ct.persistence, TablePersistence::Permanent);
+}
+
+#[test]
+fn test_create_temp_table_persistence() {
+    let ct = create_table("CREATE TEMP TABLE t (id INT)");
+    assert_eq!(ct.persistence, TablePersistence::Temporary);
+}
+
+#[test]
+fn test_create_temporary_table_persistence() {
+    let ct = create_table("CREATE TEMPORARY TABLE t (id INT)");
+    assert_eq!(ct.persistence, TablePersistence::Temporary);
+}
+
+#[test]
+fn test_create_unlogged_table_persistence() {
+    let ct = create_table("CREATE UNLOGGED TABLE t (id INT)");
+    assert_eq!(ct.persistence, TablePersistence::Unlogged);
+}
+
+#[test]
+fn test_create_temp_table_like_persistence() {
+    match parse("CREATE TEMP TABLE t LIKE base_t", None).unwrap() {
+        Stmt::CreateTableLike(stmt) => {
+            assert_eq!(stmt.persistence, TablePersistence::Temporary);
+            assert_eq!(stmt.new_table.name, "t");
+            assert_eq!(stmt.source_table.name, "base_t");
+        }
+        other => panic!("expected CreateTableLike, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_create_unlogged_table_as_select_persistence() {
+    match parse("CREATE UNLOGGED TABLE t AS SELECT 1 AS id", None).unwrap() {
+        Stmt::CreateTableAsSelect(stmt) => {
+            assert_eq!(stmt.persistence, TablePersistence::Unlogged);
+            assert_eq!(stmt.new_table.name, "t");
+        }
+        other => panic!("expected CreateTableAsSelect, got {other:?}"),
+    }
 }
 
 // ── All data types ────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@
 //! body[60..64] _catalog_pad: u32
 //! body[104..112] catalog_databases_root: u64 LE — axiom_databases heap root
 //! body[112..120] catalog_table_databases_root: u64 LE — axiom_table_databases heap root
+//! body[128]     clean_shutdown: u8     — 1 = cleanly closed, 0 = dirty/open
 //! ```
 
 use axiomdb_core::error::DbError;
@@ -134,6 +135,10 @@ pub const CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET: usize = 112;
 /// legacy databases; lazily initialized on first `CREATE SCHEMA`.
 pub const CATALOG_SCHEMAS_ROOT_BODY_OFFSET: usize = 120;
 
+/// body offset of `clean_shutdown: u8` — set to 1 on clean close and reset to
+/// 0 on open before the server starts accepting work.
+pub const CLEAN_SHUTDOWN_BODY_OFFSET: usize = 128;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -152,6 +157,11 @@ const _: () = assert!(
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMAS_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
     "schema catalog root must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + CLEAN_SHUTDOWN_BODY_OFFSET < crate::page::PAGE_SIZE,
+    "clean_shutdown flag must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.
@@ -211,6 +221,25 @@ pub fn write_meta_u64(
     let mut page = Page::from_bytes(bytes)?;
     let off = HEADER_SIZE + body_offset;
     page.as_bytes_mut()[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    page.update_checksum();
+    storage.write_page(0, &page)?;
+    Ok(())
+}
+
+/// Returns `true` when the database was marked as cleanly closed.
+pub fn read_clean_shutdown(storage: &dyn StorageEngine) -> Result<bool, DbError> {
+    let page = storage.read_page(0)?;
+    let raw = page.as_bytes();
+    let off = HEADER_SIZE + CLEAN_SHUTDOWN_BODY_OFFSET;
+    Ok(raw[off] != 0)
+}
+
+/// Sets the `clean_shutdown` flag in page 0.
+pub fn write_clean_shutdown(storage: &dyn StorageEngine, clean: bool) -> Result<(), DbError> {
+    let bytes = *storage.read_page(0)?.as_bytes();
+    let mut page = Page::from_bytes(bytes)?;
+    let off = HEADER_SIZE + CLEAN_SHUTDOWN_BODY_OFFSET;
+    page.as_bytes_mut()[off] = u8::from(clean);
     page.update_checksum();
     storage.write_page(0, &page)?;
     Ok(())

@@ -1,5 +1,6 @@
 //! DDL statement parsers — CREATE/DROP DATABASE, CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX.
 
+use axiomdb_catalog::TablePersistence;
 use axiomdb_core::error::DbError;
 use axiomdb_types::DataType;
 
@@ -67,8 +68,11 @@ pub(crate) fn parse_create_schema(p: &mut Parser) -> Result<Stmt, DbError> {
     }))
 }
 
-/// Parses everything after `CREATE TABLE` has been consumed.
-pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
+/// Parses everything after `CREATE [TEMP[TORARY]|UNLOGGED] TABLE` has been consumed.
+pub(crate) fn parse_create_table(
+    p: &mut Parser,
+    persistence: TablePersistence,
+) -> Result<Stmt, DbError> {
     let if_not_exists = eat_if_not_exists(p)?;
     let new_table = p.parse_table_ref()?;
 
@@ -79,6 +83,7 @@ pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
             if_not_exists,
             new_table,
             source_table,
+            persistence,
         }));
     }
 
@@ -91,6 +96,7 @@ pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
         return Ok(Stmt::CreateTableAsSelect(CreateTableAsSelectStmt {
             new_table,
             select,
+            persistence,
         }));
     }
 
@@ -140,6 +146,7 @@ pub(crate) fn parse_create_table(p: &mut Parser) -> Result<Stmt, DbError> {
         columns,
         table_constraints,
         immutable,
+        persistence,
     }))
 }
 

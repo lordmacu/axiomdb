@@ -39,15 +39,27 @@ pub fn execute_read_only_with_ctx(
             ctx.conn_txn = conn;
             r
         }
-        Stmt::ShowTables(mut s) => {
-            if s.schema.is_none() {
-                s.schema = Some(ctx.current_schema().to_string());
-            }
+        Stmt::ShowTables(s) => {
             let db = ctx.effective_database();
-            let schema = s.schema.as_deref().unwrap_or("public");
             let snap = txn.snapshot();
             let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
-            let tables = reader.list_tables_in_database(db, schema)?;
+            let mut seen = std::collections::HashSet::new();
+            let mut tables = Vec::new();
+            if let Some(schema) = s.schema.as_deref() {
+                tables = reader.list_tables_in_database(db, schema)?;
+            } else {
+                for schema in &ctx.search_path {
+                    for table in reader.list_tables_in_database(db, schema)? {
+                        if seen.insert(table.table_name.clone()) {
+                            tables.push(table);
+                        }
+                    }
+                }
+            }
+            let schema = s
+                .schema
+                .as_deref()
+                .unwrap_or_else(|| ctx.default_create_schema());
             let col_name = format!("Tables_in_{schema}");
             let out_cols = vec![ColumnMeta::computed(col_name, DataType::Text)];
             let rows: Vec<Row> = tables

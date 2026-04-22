@@ -5,15 +5,45 @@ fn execute_drop_table(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
     for table_ref in stmt.tables {
-        let schema = table_ref.schema.as_deref().unwrap_or("public");
+        let table_db = table_ref.database.as_deref().unwrap_or(database);
         let snap = txn.active_snapshot(conn_txn);
 
-        let table_id = {
+        let table_id = if let Some(schema) = table_ref.schema.as_deref() {
             let mut reader = CatalogReader::new(storage, snap)?;
-            match reader.get_table_in_database(database, schema, &table_ref.name)? {
+            match reader.get_table_in_database(table_db, schema, &table_ref.name)? {
+                Some(def) => def.id,
+                None if stmt.if_exists => continue,
+                None => {
+                    return Err(DbError::TableNotFound {
+                        name: table_ref.name.clone(),
+                    })
+                }
+            }
+        } else if let Some(search_path) = search_path {
+            let mut found = None;
+            for schema in search_path {
+                let mut reader = CatalogReader::new(storage, snap.clone())?;
+                if let Some(def) = reader.get_table_in_database(table_db, schema, &table_ref.name)? {
+                    found = Some(def.id);
+                    break;
+                }
+            }
+            match found {
+                Some(id) => id,
+                None if stmt.if_exists => continue,
+                None => {
+                    return Err(DbError::TableNotFound {
+                        name: table_ref.name.clone(),
+                    })
+                }
+            }
+        } else {
+            let mut reader = CatalogReader::new(storage, snap)?;
+            match reader.get_table_in_database(table_db, "public", &table_ref.name)? {
                 Some(def) => def.id,
                 None if stmt.if_exists => continue,
                 None => {
@@ -73,4 +103,3 @@ fn drop_table_fully(
     CatalogWriter::new(storage, txn, conn_txn)?.delete_table(table_id)?;
     Ok(())
 }
-

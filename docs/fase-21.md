@@ -1,5 +1,86 @@
 # Fase 21 - Advanced SQL
 
+## 21.7 TEMP and UNLOGGED tables - cerrada 2026-04-21
+
+La subfase 21.7 agrega soporte de primera clase para
+`CREATE TEMP[TORARY] TABLE` y `CREATE UNLOGGED TABLE` sin abrir un segundo
+executor ni un segundo catalogo. Las tablas TEMP se implementan como tablas
+normales dentro de un schema oculto por sesion; las UNLOGGED reutilizan el
+camino de escritura existente pero vacian sus filas si la base reabre en
+estado sucio.
+
+### Superficie SQL cerrada
+
+```sql
+CREATE TEMP TABLE scratch_rows (
+    id INT PRIMARY KEY,
+    payload TEXT
+);
+
+CREATE UNLOGGED TABLE scratch_cache (
+    id INT PRIMARY KEY,
+    payload TEXT
+);
+
+CREATE TEMP TABLE scratch_copy LIKE scratch_rows;
+CREATE UNLOGGED TABLE cache_snapshot AS SELECT * FROM scratch_cache;
+```
+
+Alcance implementado:
+
+- Parser/AST/catalogo: `TablePersistence` ahora viaja por `CREATE TABLE`,
+  `CREATE TABLE ... LIKE`, `CREATE TABLE ... AS SELECT` y `TableDef`.
+- Namespace de sesion: el primer `CREATE TEMP` aloca un schema oculto y
+  antepone ese schema al `search_path`; la resolucion sin calificar sombrea a
+  `public`, pero `CREATE TABLE` permanente sigue usando el schema por defecto
+  no-temporal.
+- Ciclo de vida TEMP: `COM_RESET_CONNECTION`, `COM_CHANGE_USER` y cierre de
+  conexion limpian todas las tablas del schema temporal de la sesion.
+- Recuperacion UNLOGGED: `MmapStorage` marca la base como dirty al abrir y
+  clean al cerrar limpio; si la reapertura detecta dirty-open, las tablas
+  `UNLOGGED` se truncan antes de servir consultas.
+- Metadata: `SHOW CREATE TABLE` recompone prefijos `TEMPORARY` /
+  `UNLOGGED`; `information_schema` y `SHOW` solo exponen TEMP de la sesion
+  actual, mientras siguen exponiendo todas las UNLOGGED.
+- Integridad: cualquier FK sobre tablas TEMP/UNLOGGED, o apuntando a ellas,
+  falla explicitamente con `DbError::NotImplemented`.
+
+### Diferido explicito
+
+- `ON COMMIT DELETE ROWS`, `ON COMMIT DROP` y `ON COMMIT PRESERVE ROWS`.
+- Sintaxis `DROP TEMPORARY TABLE`.
+- Bypass de WAL en runtime para `UNLOGGED`.
+- Persistencia temporal equivalente para vistas, secuencias o bases.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-catalog` - paso.
+- `cargo test -p axiomdb-storage` - paso.
+- `cargo test -p axiomdb-sql --test integration_ddl_parser` - paso.
+- `cargo test -p axiomdb-sql --test integration_namespacing_schema` - paso.
+- `cargo test -p axiomdb-sql --test integration_g11_information_schema` - paso.
+- `cargo test -p axiomdb-sql --test integration_show_full` - paso.
+- `cargo test -p axiomdb-sql --test integration_g5_dml` - paso.
+- `cargo test -p axiomdb-sql --test integration_temp_unlogged_tables` - paso.
+- `cargo test -p axiomdb-sql` - paso.
+- `cargo test -p axiomdb-network --test integration_connection_lifecycle` - paso.
+- `cargo test -p axiomdb-network --test integration_open_integrity` - paso.
+- `cargo test -p axiomdb-network` - paso.
+- `cargo clippy -p axiomdb-sql -- -D warnings` - paso.
+- `cargo clippy -p axiomdb-network -- -D warnings` - paso.
+- `tools/wire-test.py` - paso, 419/419 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
+### Nota de implementacion
+
+La decision clave fue modelar TEMP como namespace y no como storage especial:
+schema oculto + `search_path` + cleanup centralizado en el lifecycle de la
+conexion. Para `UNLOGGED`, el equivalente robusto fue un bit conservador de
+clean shutdown en page 0 y un truncate-on-open acotado a las tablas marcadas
+como `Unlogged`.
+
 ## 21.6b Exclusion constraints - cerrada 2026-04-21
 
 La subfase 21.6b cierra el subset equality-only de exclusion constraints:

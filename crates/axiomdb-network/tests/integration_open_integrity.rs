@@ -1,8 +1,14 @@
+use std::os::unix::fs::FileExt;
+
 use axiomdb_catalog::CatalogReader;
 use axiomdb_core::error::DbError;
 use axiomdb_network::mysql::Database;
 use axiomdb_sql::{SchemaCache, SessionContext};
-use axiomdb_storage::{MmapStorage, StorageEngine};
+use axiomdb_storage::{
+    meta::CLEAN_SHUTDOWN_BODY_OFFSET,
+    page::{Page, HEADER_SIZE, PAGE_SIZE},
+    MmapStorage, StorageEngine,
+};
 use axiomdb_wal::TxnManager;
 
 fn rewrite_server_index_root(
@@ -36,6 +42,23 @@ fn rewrite_server_index_root(
     }
     txn.commit(conn_txn).expect("commit catalog txn");
     storage.flush().expect("flush corrupted index");
+}
+
+fn mark_database_dirty_open(data_dir: &std::path::Path) {
+    let db_path = data_dir.join("axiomdb.db");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&db_path)
+        .expect("open db file");
+
+    let mut page = [0u8; PAGE_SIZE];
+    file.read_exact_at(&mut page, 0).expect("read page 0");
+    let mut page = Page::from_bytes(page).expect("decode page 0");
+    page.as_bytes_mut()[HEADER_SIZE + CLEAN_SHUTDOWN_BODY_OFFSET] = 0;
+    page.update_checksum();
+    file.write_all_at(page.as_bytes(), 0).expect("write page 0");
+    file.sync_all().expect("fsync dirty-open marker");
 }
 
 #[test]
@@ -88,4 +111,105 @@ fn test_database_open_fails_for_unreadable_unique_index() {
             && index == "uq_email"
             && (reason.contains("page") || reason.contains("B+ tree"))
     ));
+}
+
+#[test]
+fn test_dirty_open_truncates_unlogged_tables_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let db = Database::open(dir.path()).expect("open server db");
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::new();
+        db.execute_query(
+            "CREATE TABLE logged_rows (id INT PRIMARY KEY)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create logged table");
+        db.execute_query(
+            "CREATE UNLOGGED TABLE scratch_rows (id INT PRIMARY KEY)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create unlogged table");
+        db.execute_query(
+            "INSERT INTO logged_rows VALUES (1)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("insert logged row");
+        db.execute_query(
+            "INSERT INTO scratch_rows VALUES (1)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("insert unlogged row");
+    }
+
+    mark_database_dirty_open(dir.path());
+
+    let db = Database::open(dir.path()).expect("reopen server db");
+    let mut session = SessionContext::new();
+    let mut cache = SchemaCache::new();
+
+    let (logged, _) = db
+        .execute_query("SELECT COUNT(*) FROM logged_rows", &mut session, &mut cache)
+        .expect("count logged rows");
+    let (scratch, _) = db
+        .execute_query(
+            "SELECT COUNT(*) FROM scratch_rows",
+            &mut session,
+            &mut cache,
+        )
+        .expect("count unlogged rows");
+
+    let axiomdb_sql::QueryResult::Rows { rows, .. } = logged else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][0], axiomdb_types::Value::BigInt(1));
+
+    let axiomdb_sql::QueryResult::Rows { rows, .. } = scratch else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][0], axiomdb_types::Value::BigInt(0));
+}
+
+#[test]
+fn test_clean_reopen_preserves_unlogged_tables() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let db = Database::open(dir.path()).expect("open server db");
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::new();
+        db.execute_query(
+            "CREATE UNLOGGED TABLE scratch_rows (id INT PRIMARY KEY)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create unlogged table");
+        db.execute_query(
+            "INSERT INTO scratch_rows VALUES (1)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("insert unlogged row");
+    }
+
+    let db = Database::open(dir.path()).expect("reopen server db");
+    let mut session = SessionContext::new();
+    let mut cache = SchemaCache::new();
+    let (scratch, _) = db
+        .execute_query(
+            "SELECT COUNT(*) FROM scratch_rows",
+            &mut session,
+            &mut cache,
+        )
+        .expect("count unlogged rows");
+
+    let axiomdb_sql::QueryResult::Rows { rows, .. } = scratch else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][0], axiomdb_types::Value::BigInt(1));
 }

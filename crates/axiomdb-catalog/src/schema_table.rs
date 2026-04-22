@@ -17,6 +17,40 @@
 ///
 /// v0 rows decode as `storage_layout = Heap, schema_version = 1`.
 /// v1 rows decode as `schema_version = 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TablePersistence {
+    #[default]
+    Permanent,
+    Temporary,
+    Unlogged,
+}
+
+impl From<TablePersistence> for u8 {
+    fn from(value: TablePersistence) -> Self {
+        match value {
+            TablePersistence::Permanent => 0,
+            TablePersistence::Temporary => 1,
+            TablePersistence::Unlogged => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for TablePersistence {
+    type Error = DbError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Permanent),
+            1 => Ok(Self::Temporary),
+            2 => Ok(Self::Unlogged),
+            other => Err(DbError::ParseError {
+                message: format!("invalid table persistence byte {other}"),
+                position: None,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
     pub id: TableId,
@@ -43,6 +77,9 @@ pub struct TableDef {
     /// an immutable table; INSERTs still succeed. Stored in the v3 on-disk
     /// row format; v0–v2 rows decode as `false`.
     pub immutable: bool,
+    /// Persistence class of the table. Stored in the v4 on-disk row format;
+    /// v0–v3 rows decode as permanent.
+    pub persistence: TablePersistence,
 }
 
 impl TableDef {
@@ -63,7 +100,7 @@ impl TableDef {
         Ok(())
     }
 
-    /// Serializes to binary row format (v2).
+    /// Serializes to binary row format (v4).
     ///
     /// Format:
     /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1][schema_version:8 LE]`
@@ -77,7 +114,7 @@ impl TableDef {
         debug_assert!(name.len() <= 255, "table_name too long");
 
         let mut buf =
-            Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1);
+            Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1 + 1);
         buf.extend_from_slice(&self.id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(schema.len() as u8);
@@ -90,6 +127,9 @@ impl TableDef {
         // treat the extra byte as unexpected trailing data; newer readers
         // accept either 9 (v2) or 10 (v3) trailing bytes.
         buf.push(self.immutable as u8);
+        // v4 trailer: 1-byte persistence flag (Phase 21.7). Older rows decode
+        // as permanent.
+        buf.push(self.persistence.into());
         buf
     }
 
@@ -141,16 +181,22 @@ impl TableDef {
             .to_string();
         let mut consumed = pos + name_len;
         // On-disk formats — decode trailing bytes by total remaining size:
-        //   v0 (0 trailing):  storage_layout = Heap, schema_version = 1, immutable = false
-        //   v1 (1 trailing):  storage_layout from byte, schema_version = 1, immutable = false
-        //   v2 (9 trailing):  storage_layout + schema_version, immutable = false
-        //   v3 (10 trailing): v2 + 1-byte immutable flag (Phase 13.9)
-        let (storage_layout, schema_version, immutable) = match bytes.len() - consumed {
-            0 => (TableStorageLayout::Heap, 1u64, false),
+        //   v0 (0 trailing):  storage_layout = Heap, schema_version = 1, immutable = false, persistence = Permanent
+        //   v1 (1 trailing):  storage_layout from byte, schema_version = 1, immutable = false, persistence = Permanent
+        //   v2 (9 trailing):  storage_layout + schema_version, immutable = false, persistence = Permanent
+        //   v3 (10 trailing): v2 + 1-byte immutable flag (Phase 13.9), persistence = Permanent
+        //   v4 (11 trailing): v3 + 1-byte persistence flag (Phase 21.7)
+        let (storage_layout, schema_version, immutable, persistence) = match bytes.len() - consumed {
+            0 => (
+                TableStorageLayout::Heap,
+                1u64,
+                false,
+                TablePersistence::Permanent,
+            ),
             1 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
                 consumed += 1;
-                (layout, 1u64, false)
+                (layout, 1u64, false, TablePersistence::Permanent)
             }
             9 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -161,7 +207,7 @@ impl TableDef {
                         .expect("slice is exactly 8 bytes"),
                 );
                 consumed += 8;
-                (layout, v, false)
+                (layout, v, false, TablePersistence::Permanent)
             }
             10 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -174,7 +220,22 @@ impl TableDef {
                 consumed += 8;
                 let imm = bytes[consumed] != 0;
                 consumed += 1;
-                (layout, v, imm)
+                (layout, v, imm, TablePersistence::Permanent)
+            }
+            11 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                let v = u64::from_le_bytes(
+                    bytes[consumed..consumed + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                consumed += 8;
+                let imm = bytes[consumed] != 0;
+                consumed += 1;
+                let persistence = TablePersistence::try_from(bytes[consumed])?;
+                consumed += 1;
+                (layout, v, imm, persistence)
             }
             _ => {
                 return Err(DbError::ParseError {
@@ -193,6 +254,7 @@ impl TableDef {
                 table_name,
                 schema_version,
                 immutable,
+                persistence,
             },
             consumed,
         ))

@@ -10,6 +10,7 @@
 //!   is the *stored* form. The executor converts between them.
 //! - `FromClause::Subquery` boxes `SelectStmt` to break the mutual recursion.
 
+use axiomdb_catalog::TablePersistence;
 use axiomdb_types::DataType;
 
 use crate::expr::Expr;
@@ -744,6 +745,7 @@ pub struct CreateTableLikeStmt {
     pub if_not_exists: bool,
     pub new_table: TableRef,
     pub source_table: TableRef,
+    pub persistence: TablePersistence,
 }
 
 /// `CREATE TABLE new_table AS SELECT ...` — derive schema from query result.
@@ -751,6 +753,7 @@ pub struct CreateTableLikeStmt {
 pub struct CreateTableAsSelectStmt {
     pub new_table: TableRef,
     pub select: SelectStmt,
+    pub persistence: TablePersistence,
 }
 
 // ── DDL statements ────────────────────────────────────────────────────────────
@@ -764,6 +767,7 @@ pub struct CreateTableStmt {
     pub table_constraints: Vec<TableConstraint>,
     /// `CREATE TABLE ... IMMUTABLE` (Phase 13.9) — rejects any UPDATE/DELETE.
     pub immutable: bool,
+    pub persistence: TablePersistence,
 }
 
 /// Index access method (Phase 11.1b).
@@ -1220,6 +1224,7 @@ mod tests {
             ],
             table_constraints: vec![],
             immutable: false,
+            persistence: TablePersistence::Permanent,
         });
         assert!(matches!(stmt, Stmt::CreateTable(_)));
     }
@@ -1260,6 +1265,7 @@ mod tests {
                 },
             ],
             immutable: false,
+            persistence: TablePersistence::Permanent,
         });
         if let Stmt::CreateTable(ct) = stmt {
             assert_eq!(ct.table_constraints.len(), 2);
