@@ -1,5 +1,74 @@
 # Fase 21 - Advanced SQL
 
+## 21.10 SQL cursors - cerrada 2026-04-21
+
+La subfase 21.10 cierra el soporte MVP de cursores SQL de sesion:
+`DECLARE`, `FETCH` y `CLOSE`. La implementacion es deliberadamente
+transaction-scoped y materializada: el query se ejecuta una sola vez al
+declarar el cursor, y los `FETCH` siguientes solo consumen ventanas sobre el
+rowset persistido en `SessionContext`.
+
+### Superficie SQL cerrada
+
+```sql
+BEGIN;
+
+DECLARE c CURSOR FOR
+    WITH x AS (SELECT 1 AS id)
+    SELECT id FROM x
+    UNION ALL
+    SELECT 2;
+
+FETCH NEXT FROM c;
+FETCH 10 FROM c;
+FETCH ALL FROM c;
+
+CLOSE c;
+COMMIT;
+```
+
+Alcance implementado:
+
+- Parser/AST/analyzer: `Stmt::{DeclareCursor, FetchCursor, CloseCursor}` con
+  soporte para `FETCH NEXT`, `FETCH n`, `FETCH FORWARD n`, `FETCH ALL`,
+  `FROM`/`IN` y queries row-returning via `SELECT` o `SetOp`.
+- Estado de sesion: `SessionContext` ahora guarda `SessionCursor { columns,
+  rows, pos }` en un mapa case-insensitive, con helpers dedicados para
+  declarar, buscar y cerrar cursores.
+- Executor: `DECLARE` exige transaccion explicita y materializa el resultado;
+  `FETCH` devuelve ventanas sobre `rows[pos..]` sin re-ejecutar el query;
+  `CLOSE name` y `CLOSE ALL` limpian el estado correspondiente.
+- Lifecycle: `COMMIT`, `ROLLBACK`, rollback transaccional por error,
+  `COM_RESET_CONNECTION` y `COM_CHANGE_USER` cierran todos los cursores SQL.
+- Wire/tests: nuevo smoke `21.10` en `tools/wire-test.py` y cobertura de reset
+  / change-user en `integration_connection_lifecycle`.
+
+### Diferido explicito
+
+- `COM_STMT_FETCH` y cursores wire de prepared statements.
+- `WITH HOLD`, `MOVE`, `PRIOR`, `ABSOLUTE`, `RELATIVE`, `BACKWARD`.
+- Cursores actualizables (`FOR UPDATE`, `WHERE CURRENT OF`).
+- Streaming/suspended executors en vez de rowsets materializados.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_cursors` - paso, 6 tests.
+- `cargo test -p axiomdb-network --test integration_connection_lifecycle` - paso, 17 tests.
+- `cargo test -p axiomdb-sql` - paso.
+- `tools/wire-test.py` - paso, 422/422 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
+### Nota de implementacion
+
+La decision clave fue no mezclar dos modelos distintos de cursor. `21.10`
+cierra solo el lenguaje SQL de cursor sobre estado de sesion, mientras que
+`COM_STMT_FETCH` sigue siendo un problema wire aparte. Eso mantuvo el cambio
+en parser/analyzer/session/executor, evitó executor suspendido, y dejó un MVP
+robusto que ya se limpia correctamente en todos los boundaries de transaccion
+y conexion.
+
 ## 21.8 Expression indexes - cerrada 2026-04-21
 
 La subfase 21.8 cierra el soporte usable de expression indexes:

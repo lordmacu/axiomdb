@@ -21,7 +21,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.9 (LATERAL joins: inner comma-join, LEFT JOIN null-pad),
              21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression),
              21.5 (INSERT ON CONFLICT + MERGE smoke),
-             21.5f (GENERATED ALWAYS AS STORED insert/update smoke)
+             21.5f (GENERATED ALWAYS AS STORED insert/update smoke),
+             21.10 (SQL cursors)
 """
 import os
 import signal
@@ -3755,6 +3756,30 @@ rows = cur.fetchall()
 ok("[21.8 expression index] partial + expression predicate returns active row only",
    rows == ((1,),),
    f"got {rows}")
+
+# ── Phase 21.10 — SQL cursors ────────────────────────────────────────────────
+
+print("\n[21.10 cursors]")
+
+cur.execute("CREATE TABLE cursor_wire (id INT PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO cursor_wire VALUES (1, 'a')")
+cur.execute("INSERT INTO cursor_wire VALUES (2, 'b')")
+cur.execute("INSERT INTO cursor_wire VALUES (3, 'c')")
+cur.execute("COMMIT")
+cur.execute("BEGIN")
+cur.execute("DECLARE c CURSOR FOR SELECT id, name FROM cursor_wire ORDER BY id")
+cur.execute("FETCH 2 FROM c")
+rows = cur.fetchall()
+ok("[21.10 cursors] FETCH 2 returns first window",
+   rows == ((1, 'a'), (2, 'b')),
+   f"got {rows}")
+cur.execute("FETCH ALL FROM c")
+rows = cur.fetchall()
+ok("[21.10 cursors] FETCH ALL returns remaining rows",
+   rows == ((3, 'c'),),
+   f"got {rows}")
+cur.execute("CLOSE c")
+cur.execute("COMMIT")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

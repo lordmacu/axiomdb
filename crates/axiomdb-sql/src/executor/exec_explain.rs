@@ -131,6 +131,11 @@ fn dispatch(
                 feature: "SAVEPOINT requires session context — use execute_with_ctx".into(),
             })
         }
+        Stmt::DeclareCursor(_) | Stmt::FetchCursor(_) | Stmt::CloseCursor(_) => {
+            Err(DbError::NotImplemented {
+                feature: "SQL cursors require session context — use execute_with_ctx".into(),
+            })
+        }
         Stmt::Noop => Ok(QueryResult::Empty),
         // G5.1: CALL / DO — execute as Noop (no session context needed)
         Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),

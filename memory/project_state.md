@@ -3,18 +3,17 @@
 ## Current (2026-04-21)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.8 COMPLETE — Expression indexes closed.
-Expression indexes now persist canonical SQL in `IndexColumnDef.expr`,
-compile once for CREATE/build/write-maintenance paths, and work on both heap
-and clustered tables. The planner matches expression predicates for equality
-and prefix-LIKE probes, and partial expression indexes are now eligible when
-the query's full `WHERE` clause implies the stored predicate. `EXPLAIN`
-reports expression-index usage for deterministic cases, and wire smoke now
-covers expression + partial-expression index behavior.
+**Active subphase:** Phase 21.10 COMPLETE — SQL cursors closed.
+`DECLARE`, `FETCH`, and `CLOSE` now work as transaction-scoped SQL cursors
+backed by materialized rowsets in `SessionContext`. The parser/analyzer/executor
+support read-only cursor statements over `SELECT` and `SetOp` queries, `FETCH`
+returns deterministic row windows without re-executing the query, and cursor
+state is cleaned up on `COMMIT`, `ROLLBACK`, `COM_RESET_CONNECTION`,
+`COM_CHANGE_USER`, and other session lifecycle resets.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_expression_index`; `cargo test -p axiomdb-sql`; `python3 tools/wire-test.py` (420/420); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_cursors`; `cargo test -p axiomdb-network --test integration_connection_lifecycle`; `cargo test -p axiomdb-sql`; `python3 tools/wire-test.py` (422/422); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.10 Cursors, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.20 CHECKPOINT, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -30,7 +29,8 @@ covers expression + partial-expression index behavior.
 | 21.6b Exclusion constraints | ✅ closed |
 | 21.7 TEMP and UNLOGGED tables | ✅ closed |
 | 21.8 Expression indexes | ✅ closed |
-| 21.10 Cursors | ⏳ next |
+| 21.10 Cursors | ✅ closed |
+| 21.20 CHECKPOINT | ⏳ next |
 
 ### Phase 11 subphase status
 
