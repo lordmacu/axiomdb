@@ -8,8 +8,8 @@ use crate::{
     ast::{
         Assignment, DeleteStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinClause,
         JoinCondition, JoinType, LockMode, MergeAction, MergeActionCondition, MergeActionKind,
-        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, SelectItem,
-        SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
+        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, SelectHint,
+        SelectItem, SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -116,6 +116,12 @@ fn eat_ident_ci(p: &mut Parser, keyword: &str) -> bool {
 
 /// Parses everything after `SELECT` has been consumed.
 pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
+    let hints = if matches!(p.peek(), Token::OptimizerHint(_)) {
+        parse_optimizer_hints(p)?
+    } else {
+        Vec::new()
+    };
+
     let saw_distinct = p.eat(&Token::Distinct);
 
     // Phase 21.12 — DISTINCT ON (expr, …): key-based first-row-per-group.
@@ -221,6 +227,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         with_ctes: Vec::new(),
         distinct,
         distinct_on,
+        hints,
         calc_found_rows,
         columns,
         from,
@@ -234,6 +241,176 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         lock_mode,
         set_op_rest: vec![],
     })
+}
+
+fn parse_optimizer_hints(p: &mut Parser) -> Result<Vec<SelectHint>, DbError> {
+    let pos = p.current_pos();
+    let raw = match p.advance().token.clone() {
+        Token::OptimizerHint(s) => s,
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected optimizer hint comment, found {other:?}"),
+                position: Some(pos),
+            });
+        }
+    };
+
+    parse_optimizer_hint_payload(&raw, pos)
+}
+
+fn parse_optimizer_hint_payload(raw: &str, pos: usize) -> Result<Vec<SelectHint>, DbError> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0usize;
+    let mut hints = Vec::new();
+
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+
+        let name_start = i;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if name_start == i {
+            return Err(DbError::ParseError {
+                message: format!("invalid optimizer hint syntax near '{}'", chars[i]),
+                position: Some(pos),
+            });
+        }
+        let name: String = chars[name_start..i].iter().collect();
+        while i < chars.len() && chars[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        let arg = if i < chars.len() && chars[i] == '(' {
+            i += 1;
+            let arg_start = i;
+            let mut depth = 1usize;
+            while i < chars.len() {
+                match chars[i] {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if i >= chars.len() || chars[i] != ')' {
+                return Err(DbError::ParseError {
+                    message: format!("unterminated optimizer hint arguments for {name}"),
+                    position: Some(pos),
+                });
+            }
+            let payload: String = chars[arg_start..i].iter().collect();
+            i += 1;
+            Some(payload)
+        } else {
+            None
+        };
+
+        let hint = match name.to_ascii_uppercase().as_str() {
+            "HASH_JOIN" => {
+                if arg.is_some() {
+                    return Err(DbError::ParseError {
+                        message: "HASH_JOIN does not accept arguments".into(),
+                        position: Some(pos),
+                    });
+                }
+                SelectHint::HashJoin
+            }
+            "PARALLEL" => {
+                let workers = arg
+                    .ok_or_else(|| DbError::ParseError {
+                        message: "PARALLEL requires a worker count".into(),
+                        position: Some(pos),
+                    })?
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| DbError::ParseError {
+                        message: "PARALLEL requires a positive integer worker count".into(),
+                        position: Some(pos),
+                    })?;
+                if workers == 0 {
+                    return Err(DbError::ParseError {
+                        message: "PARALLEL requires a positive integer worker count".into(),
+                        position: Some(pos),
+                    });
+                }
+                SelectHint::Parallel { workers }
+            }
+            "INDEX" => {
+                let payload = arg.ok_or_else(|| DbError::ParseError {
+                    message: "INDEX requires table and index arguments".into(),
+                    position: Some(pos),
+                })?;
+                let args = split_hint_args(&payload);
+                if args.len() != 2 {
+                    return Err(DbError::ParseError {
+                        message: "INDEX requires exactly two arguments: table and index".into(),
+                        position: Some(pos),
+                    });
+                }
+                SelectHint::Index {
+                    table: args[0].clone(),
+                    index: args[1].clone(),
+                }
+            }
+            _ => {
+                return Err(DbError::ParseError {
+                    message: format!("unsupported optimizer hint {name}"),
+                    position: Some(pos),
+                });
+            }
+        };
+
+        hints.push(hint);
+    }
+
+    Ok(hints)
+}
+
+fn split_hint_args(payload: &str) -> Vec<String> {
+    let chars: Vec<char> = payload.chars().collect();
+    let mut args = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        while i < chars.len() && (chars[i].is_ascii_whitespace() || chars[i] == ',') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+
+        if chars[i] == '`' {
+            i += 1;
+            let start = i;
+            while i < chars.len() && chars[i] != '`' {
+                i += 1;
+            }
+            args.push(chars[start..i.min(chars.len())].iter().collect());
+            if i < chars.len() && chars[i] == '`' {
+                i += 1;
+            }
+            continue;
+        }
+
+        let start = i;
+        while i < chars.len() && !chars[i].is_ascii_whitespace() && chars[i] != ',' {
+            i += 1;
+        }
+        args.push(chars[start..i].iter().collect());
+    }
+
+    args
 }
 
 // ── SELECT list ───────────────────────────────────────────────────────────────

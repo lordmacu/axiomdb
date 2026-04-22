@@ -1,5 +1,76 @@
 # Fase 21 - Advanced SQL
 
+## 21.11 Query hints - cerrada 2026-04-22
+
+La subfase 21.11 cierra un MVP acotado de optimizer hints sobre `SELECT`.
+La implementacion no intenta replicar todo el framework de MariaDB/MySQL;
+resuelve el corte pragmatico que faltaba en AxiomDB: capturar `/*+ ... */`
+antes de que el lexer descarte los block comments, llevar esos hints al AST
+y darles efecto real en planner / join execution donde hoy ya existe una base
+tecnica reutilizable.
+
+### Superficie SQL cerrada
+
+```sql
+SELECT /*+ INDEX(users idx_users_email) */ id
+FROM users
+WHERE email = 'alice@example.com';
+
+SELECT /*+ HASH_JOIN */ *
+FROM t
+JOIN u ON t.id = u.t_id;
+
+SELECT /*+ PARALLEL(4) */ id
+FROM users
+WHERE email = 'alice@example.com';
+```
+
+Alcance implementado:
+
+- Lexer/parser/AST: nuevo `Token::OptimizerHint(String)` y
+  `SelectStmt.hints: Vec<SelectHint>`; los hints soportados en esta subfase
+  son `INDEX(table index)`, `HASH_JOIN` y `PARALLEL(n)`.
+- Compatibilidad de comentarios: `/*+ ... */` ya no se pierde en el `skip`
+  general de block comments; los comentarios normales `/* ... */` y los
+  version comments `/*! ... */` conservan su comportamiento previo.
+- Planner: en SELECT de una sola tabla, `INDEX(table index)` puede
+  re-planificar contra un index nombrado y usarlo si el predicado es
+  compatible; si el index existe pero no aplica, se conserva el plan normal.
+- Join executor: `HASH_JOIN` fuerza el camino hash cuando el join ya es un
+  equijoin soportado por la implementacion existente; si no lo es, cae al
+  nested-loop normal sin cambiar resultados.
+- EXPLAIN / wire: `EXPLAIN` expone el index hinted elegido y deja visible el
+  hint de hash join; `PARALLEL(n)` se acepta como advisory-only y se refleja
+  en `Extra`.
+
+### Diferido explicito
+
+- Framework completo estilo MariaDB (`QB_NAME`, `NO_*`, `JOIN_ORDER`,
+  `INDEX_MERGE`, etc.).
+- Hints en `UPDATE` / `DELETE` / `INSERT` / `MERGE`.
+- Garantias fuertes de paralelismo para `PARALLEL(n)`.
+- `INDEX(...)` sobre joins multi-tabla; el MVP actual lo limita
+  explicitamente al planner single-table.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --lib --test integration_dml_parser --test integration_query_hints` - paso.
+- `cargo test -p axiomdb-sql --test integration_query_hints --test integration_expression_index --test integration_executor_joins` - paso.
+- `tools/wire-test.py` - paso, 427/427 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
+### Nota de implementacion
+
+El error facil aqui era atacar `21.11` como si el gap fueran los viejos
+modifiers tipo `HIGH_PRIORITY` o `STRAIGHT_JOIN`. Eso ya estaba cerrado. El
+trabajo real era mas bajo nivel: mientras `lexer.rs` siguiera descartando
+todo `/* ... */`, ningun optimizer hint podia llegar al parser. Una vez
+resuelto ese punto de entrada, el MVP correcto fue conectar hints solamente a
+los caminos que ya existen y son seguros hoy: planner single-table,
+heuristica hash-vs-nested-loop, y metadata advisory en `EXPLAIN`.
+
 ## 21.20 CHECKPOINT - cerrada 2026-04-22
 
 La subfase 21.20 cierra el statement administrativo SQL `CHECKPOINT`.

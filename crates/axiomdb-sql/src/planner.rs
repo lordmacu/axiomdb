@@ -20,6 +20,7 @@
 //! - Indexes with empty `columns` field (pre-6.1) are ignored.
 
 use axiomdb_catalog::{ColumnDef, IndexDef, StatsDef};
+use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
 
 use axiomdb_catalog::ColumnType;

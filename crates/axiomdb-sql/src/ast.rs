@@ -11,6 +11,7 @@
 //! - `FromClause::Subquery` boxes `SelectStmt` to break the mutual recursion.
 
 use axiomdb_catalog::TablePersistence;
+use axiomdb_core::error::DbError;
 use axiomdb_types::DataType;
 
 use crate::expr::Expr;
@@ -43,6 +44,73 @@ impl TableRef {
             name: name.into(),
             alias: None,
         }
+    }
+}
+
+impl SelectStmt {
+    pub fn has_hash_join_hint(&self) -> bool {
+        self.hints
+            .iter()
+            .any(|hint| matches!(hint, SelectHint::HashJoin))
+    }
+
+    pub fn parallel_hint_workers(&self) -> Option<usize> {
+        self.hints.iter().find_map(|hint| match hint {
+            SelectHint::Parallel { workers } => Some(*workers),
+            _ => None,
+        })
+    }
+
+    pub fn hinted_index_name_for_table<'a>(
+        &'a self,
+        table_ref: &TableRef,
+        resolved_table_name: &str,
+    ) -> Result<Option<&'a str>, DbError> {
+        let mut matched = None;
+        for hint in &self.hints {
+            let SelectHint::Index { table, index } = hint else {
+                continue;
+            };
+            let table_matches = table.eq_ignore_ascii_case(resolved_table_name)
+                || table.eq_ignore_ascii_case(&table_ref.name)
+                || table_ref
+                    .alias
+                    .as_deref()
+                    .map(|alias| table.eq_ignore_ascii_case(alias))
+                    .unwrap_or(false);
+            if !table_matches {
+                continue;
+            }
+            if matched.replace(index.as_str()).is_some() {
+                return Err(DbError::Other(format!(
+                    "multiple INDEX hints matched table '{}'",
+                    resolved_table_name
+                )));
+            }
+        }
+
+        if matched.is_some() {
+            return Ok(matched);
+        }
+
+        for hint in &self.hints {
+            if let SelectHint::Index { table, .. } = hint {
+                let known_name = table_ref.name.eq_ignore_ascii_case(table)
+                    || resolved_table_name.eq_ignore_ascii_case(table)
+                    || table_ref
+                        .alias
+                        .as_deref()
+                        .map(|alias| alias.eq_ignore_ascii_case(table))
+                        .unwrap_or(false);
+                if !known_name {
+                    return Err(DbError::TableNotFound {
+                        name: table.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -558,6 +626,14 @@ impl GroupByClause {
     }
 }
 
+/// Phase 21.11 — bounded optimizer hints attached to one SELECT statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectHint {
+    Index { table: String, index: String },
+    HashJoin,
+    Parallel { workers: usize },
+}
+
 /// `from` is `None` for `SELECT` without `FROM` (e.g. `SELECT 1`, `SELECT NOW()`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
@@ -571,6 +647,8 @@ pub struct SelectStmt {
     /// Non-empty implies `distinct == false`. Evaluated against pre-projection rows
     /// (same scope as ORDER BY), so source columns not in the SELECT list are accessible.
     pub distinct_on: Vec<Expr>,
+    /// Phase 21.11 — optimizer comment hints from `SELECT /*+ ... */`.
+    pub hints: Vec<SelectHint>,
     /// `SQL_CALC_FOUND_ROWS` modifier: stash pre-LIMIT count for `FOUND_ROWS()` (4.5e).
     pub calc_found_rows: bool,
     pub columns: Vec<SelectItem>,
@@ -1170,6 +1248,7 @@ mod tests {
             with_ctes: Vec::new(),
             distinct: false,
             distinct_on: vec![],
+            hints: vec![],
             calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
             from: Some(FromClause::Table(TableRef::simple("users"))),
@@ -1197,6 +1276,7 @@ mod tests {
             with_ctes: Vec::new(),
             distinct: false,
             distinct_on: vec![],
+            hints: vec![],
             calc_found_rows: false,
             columns: vec![SelectItem::Expr {
                 expr: Expr::int(1),
@@ -1400,6 +1480,7 @@ mod tests {
             with_ctes: Vec::new(),
             distinct: false,
             distinct_on: vec![],
+            hints: vec![],
             calc_found_rows: false,
             columns: vec![SelectItem::Wildcard],
             from: Some(FromClause::Table(TableRef::simple("users"))),

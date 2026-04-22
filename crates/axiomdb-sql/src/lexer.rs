@@ -68,6 +68,11 @@ impl<'src> SpannedToken<'src> {
 #[logos(skip r"--[^\n]*")] // line comment (--) MySQL also supports # but it collides with #> #>> #- operators
 #[logos(skip r"/\*([^*]|\*[^/])*\*/")] // block comment /* */
 pub enum Token<'src> {
+    /// `/*+ ... */` optimizer hint comment — preserved so the parser can
+    /// decide whether it is valid in the current statement position.
+    #[regex(r"/\*\+([^*]|\*[^/])*\*/", |lex| parse_optimizer_hint_comment(lex.slice()))]
+    OptimizerHint(String),
+
     // ── DML keywords ─────────────────────────────────────────────────────────
     #[token("SELECT", ignore(ascii_case))]
     Select,
@@ -761,6 +766,13 @@ fn process_double_quoted_identifier(raw: &str) -> Option<String> {
     Some(result)
 }
 
+fn parse_optimizer_hint_comment(raw: &str) -> Option<String> {
+    if !raw.starts_with("/*+") || !raw.ends_with("*/") {
+        return None;
+    }
+    Some(raw[3..raw.len() - 2].trim().to_string())
+}
+
 // ── MySQL `#` comment stripper ───────────────────────────────────────────────
 
 /// Strips MySQL `#` line comments from `input` before tokenization.
@@ -1026,6 +1038,14 @@ mod tests {
         assert!(matches!(
             &tok("_col")[0],
             Token::Ident(s) if *s == "_col"
+        ));
+    }
+
+    #[test]
+    fn test_optimizer_hint_comment_tokenized() {
+        assert!(matches!(
+            &tok("SELECT /*+ HASH_JOIN */ 1")[1],
+            Token::OptimizerHint(s) if s == "HASH_JOIN"
         ));
     }
 
