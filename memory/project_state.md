@@ -3,22 +3,19 @@
 ## Current (2026-04-22)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.24 COMPLETE — ORM compatibility tier 2 closed.
-Phase 21 now has a bounded ORM-facing compatibility baseline: migration-style
-`INSERT ... RETURNING` plus MySQL metadata probes (`SHOW FULL FIELDS`,
-`SHOW FULL TABLES`, `SHOW TABLE STATUS`, `SHOW CREATE TABLE`) all work over
-the wire, and dump-style `SET foreign_key_checks/unique_checks/sql_notes`
-continue to behave as harmless compatibility toggles. `SHOW FULL FIELDS` now
-parses as a synonym of `SHOW FULL COLUMNS`; the SQL read-only executor was
-expanded so SHOW metadata paths behave consistently under the shared wire path;
-and the MySQL `SHOW STATUS` intercept no longer hijacks `SHOW TABLE STATUS`.
-The remaining ORM-visible blockers are explicitly documented: `GENERATED
-ALWAYS AS IDENTITY` stays in `24.1c`, and deferred / `DEFERRABLE` FK semantics
-stay in `21.16`.
+**Active subphase:** Phase 21.25 COMPLETE — PIVOT dynamic closed.
+Phase 21 now has a bounded SQL `PIVOT` implementation for row-to-column
+reshaping with explicit `IN (...)` values. Parser/AST accept `FROM source
+PIVOT (...) [AS alias]`; the analyzer derives a stable output schema before
+execution and lowers the pivot to a derived grouped SELECT with
+`aggregate(CASE WHEN ...)`; the MySQL wire smoke now covers the feature end to
+end. The roadmap wording "dynamic" is now concretely implemented as explicit
+pivot-value lists, while true runtime-discovered columns and `UNPIVOT` remain
+outside this subphase.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_orm_compat --test integration_show_full --test integration_g9_ddl --test integration_returning`; `python3 tools/wire-test.py` (433/433); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_pivot`; `python3 tools/wire-test.py` (434/434); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.25 PIVOT dynamic.
+**Next:** Phase 21.16 DEFERRABLE constraints.
 
 ### Phase 21 subphase status
 
@@ -39,6 +36,7 @@ stay in `21.16`.
 | 21.11 Query hints | ✅ closed |
 | 21.23 Advanced SQL tests | ✅ closed |
 | 21.24 ORM compatibility tier 2 | ✅ closed |
+| 21.25 PIVOT dynamic | ✅ closed |
 
 ### Phase 11 subphase status
 

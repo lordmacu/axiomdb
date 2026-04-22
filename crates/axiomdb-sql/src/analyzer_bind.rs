@@ -329,6 +329,60 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        FromClause::Pivot(pivot) => {
+            let mut local_col_offset = 0usize;
+            let source_bounds = bound_from_clause(
+                &pivot.source,
+                storage,
+                snapshot.clone(),
+                default_database,
+                default_schema,
+                &mut local_col_offset,
+                outer_scopes,
+            )?;
+            if source_bounds.len() != 1 {
+                return Err(DbError::Internal {
+                    message: "PIVOT source must bind to exactly one table shape".into(),
+                });
+            }
+            let source_ctx = BindContext {
+                tables: source_bounds,
+            };
+            let state = AnalyzeState {
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            };
+            let resolved_pivot_expr = resolve_expr_full(
+                pivot.pivot_expr.clone(),
+                &source_ctx,
+                outer_scopes,
+                Some(&state),
+            )?;
+            let resolved_aggregate_arg = resolve_expr_full(
+                pivot.aggregate_arg.clone(),
+                &source_ctx,
+                outer_scopes,
+                Some(&state),
+            )?;
+            let virtual_cols = build_pivot_virtual_columns(
+                pivot,
+                &source_ctx.tables[0].columns,
+                &resolved_pivot_expr,
+                &resolved_aggregate_arg,
+            )?;
+            let n = virtual_cols.len();
+            let alias = pivot_result_alias(pivot);
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
         // Phase 11.20a — JSON_TABLE: publish the COLUMNS(...) declarations
         // as a virtual BoundTable. The `doc` expression is resolved later in
         // `analyze_select_with_outer` against the accumulated BindContext.

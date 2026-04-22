@@ -488,6 +488,11 @@ fn collect_dml_join_candidates_ctx(
                     feature: "recursive CTE as UPDATE/DELETE JOIN source deferred".into(),
                 });
             }
+            FromClause::Pivot(_) => {
+                return Err(DbError::Internal {
+                    message: "unlowered PIVOT reached DML join executor".into(),
+                });
+            }
         }
     }
 

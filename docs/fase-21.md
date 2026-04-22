@@ -1,5 +1,53 @@
 # Fase 21 - Advanced SQL
 
+## 21.25 PIVOT dynamic - cerrada 2026-04-22
+
+La subfase 21.25 cierra el gap de reshaping SQL con un `PIVOT` real pero
+recortado de forma compatible con la arquitectura actual. No se implemento un
+motor de columnas descubiertas en runtime; se implemento el corte util y
+estable: `PIVOT` con lista `IN (...)` explicita, schema fijo en analisis y
+rewrite a agregacion agrupada ya existente.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `FROM tabla PIVOT (SUM(expr) FOR key IN ('A', 'B', ...)) [AS alias]`
+- un agregado por pivot
+- uso del resultado pivotado como fuente derivada para `SELECT`, `JOIN`,
+  `ORDER BY` y proyecciones exteriores
+
+Deferred explicitamente:
+
+- columnas descubiertas dinamicamente desde los datos en tiempo de ejecucion
+- `UNPIVOT`
+- multi-aggregate pivot en una sola clausula
+
+### Ajustes tecnicos de cierre
+
+- AST/parser: nuevo `FromClause::Pivot(Box<PivotClause>)` y parseo de
+  `PIVOT (...)` como sufijo de una fuente de `FROM`.
+- Analyzer: derivacion de columnas passthrough + columnas generadas del pivot
+  antes de ejecutar; lowering a `FromClause::Subquery` con rewrite a
+  `aggregate(CASE WHEN ...)`.
+- Executor reuse: no se agrego un operador fisico nuevo; el pivot corre sobre
+  la infraestructura agrupada existente.
+- Aggregates: `AggExpr::matches_simple` dejo de asumir que todo agregado simple
+  tiene argumento columna, para soportar el nuevo caso `SUM(CASE ...)`.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_pivot.rs`
+- `crates/axiomdb-sql/tests/integration_ddl_parser.rs`
+- `tools/wire-test.py` bloque `21.25 pivot`
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_pivot` - paso.
+- `tools/wire-test.py` - paso, 434/434 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 21.24 ORM compatibility tier 2 - cerrada 2026-04-22
 
 La subfase 21.24 cierra un baseline ORM acotado y honesto. El objetivo no era

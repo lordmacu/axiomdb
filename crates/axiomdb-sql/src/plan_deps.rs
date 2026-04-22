@@ -349,6 +349,15 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 self.visit_select(&rc.base)?;
                 self.visit_select(&rc.step)
             }
+            FromClause::Pivot(pivot) => {
+                self.visit_from_clause(&pivot.source)?;
+                self.visit_expr(&pivot.aggregate_arg)?;
+                self.visit_expr(&pivot.pivot_expr)?;
+                for value in &pivot.values {
+                    self.visit_expr(value)?;
+                }
+                Ok(())
+            }
         }
     }
 
