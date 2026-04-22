@@ -1,5 +1,70 @@
 # Fase 21 - Advanced SQL
 
+## 21.8 Expression indexes - cerrada 2026-04-21
+
+La subfase 21.8 cierra el soporte usable de expression indexes:
+`CREATE INDEX ... ((expr))` y `CREATE INDEX ... (LOWER(col))` ya persisten la
+expresion canonica en catalogo, construyen y mantienen las claves evaluando la
+expresion por fila, y permiten al planner reutilizar esos indexes en
+predicados equivalentes.
+
+### Superficie SQL cerrada
+
+```sql
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    email TEXT,
+    active BOOLEAN
+);
+
+CREATE INDEX idx_lower_email ON users (LOWER(email));
+CREATE INDEX idx_lower_email_active
+    ON users (LOWER(email))
+    WHERE active = TRUE;
+
+EXPLAIN SELECT id
+FROM users
+WHERE LOWER(email) = 'alice@example.com';
+```
+
+Alcance implementado:
+
+- Catalogo: `IndexColumnDef.expr` persiste SQL canonico por columna indexada;
+  `CREATE INDEX`, `CREATE TABLE ... LIKE` y round-trips del catalogo conservan
+  esa metadata.
+- Build y mantenimiento: heap y clustered evalúan expresiones durante
+  `CREATE INDEX`, INSERT, UPDATE y DELETE, compartiendo el compile-once usado
+  tambien por partial indexes.
+- Planner: equality y prefix-LIKE pueden usar expression indexes; ademas,
+  los expression indexes parciales ahora se consideran cuando el `WHERE`
+  completo implica el predicado guardado.
+- EXPLAIN / wire: `EXPLAIN` reporta el index para casos deterministas y el
+  wire smoke agrega cobertura de expression index + partial expression index.
+
+### Diferido explicito
+
+- Estadisticas especificas para expresiones.
+- Canonicalizacion algebraica mas agresiva que igualdad SQL normalizada.
+- Opclasses / metodos no-BTree para expresiones.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_expression_index` - paso, 22 tests.
+- `cargo test -p axiomdb-sql` - paso.
+- `tools/wire-test.py` - paso, 420/420 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
+### Nota de implementacion
+
+El cierre encontro un gap real: el matcher del planner descartaba cualquier
+expression index parcial antes de evaluar implicacion del predicado. La
+correccion fue mover ese filtro a `predicate_implied_by_query(...)` y buscar
+el expression match dentro de arboles `AND` usando el `WHERE` completo como
+contexto, en vez de tratar expression indexes y partial indexes como caminos
+separados.
+
 ## 21.7 TEMP and UNLOGGED tables - cerrada 2026-04-21
 
 La subfase 21.7 agrega soporte de primera clase para
