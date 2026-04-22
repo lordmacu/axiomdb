@@ -1,4 +1,9 @@
-# Plan: 21.8 Expression Indexes
+# Plan: 21.8 — Expression indexes
+
+Phase: 21 — Advanced SQL
+Task: 21.8 Expression indexes
+Spec: specs/fase-21/spec-21.8-expression-indexes.md
+Status: completed
 
 ## Files to create/modify
 

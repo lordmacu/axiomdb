@@ -1,5 +1,25 @@
 # Architecture Notes
 
+## 2026-04-21 - Expression indexes (21.8)
+
+- **Expression indexes are catalog-first metadata.** `IndexColumnDef.expr`
+  stores canonical SQL text per indexed column, so ordinary B-Tree metadata
+  can describe plain, partial, and expression indexes without a parallel
+  storage format.
+- **Compile once, evaluate everywhere.** CREATE INDEX build paths and shared
+  DML index-maintenance paths parse stored expression SQL one time and then
+  evaluate the resolved `Expr` against each row, which keeps heap and
+  clustered maintenance semantics aligned.
+- **Planner matching is normalized-SQL plus predicate implication.**
+  Expression lookup/range planning still starts from normalized expression SQL
+  equality, but partial expression indexes must additionally pass
+  `predicate_implied_by_query(...)` using the full query `WHERE`.
+- **Partial-expression matching must recurse through `AND`, not stop at the
+  top-level predicate.** The usable expression may live on one branch while
+  the other branch supplies the predicate implication needed for the partial
+  index, so the planner walks subclauses while preserving the full filter as
+  implication context.
+
 ## 2026-04-21 - TEMP and UNLOGGED tables (21.7)
 
 - **Persistence is catalog metadata, not a separate executor branch.**

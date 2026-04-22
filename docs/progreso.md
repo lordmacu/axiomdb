@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 138/442 subphases (31.2%) — Phase 21 active**
+> **MySQL+PG parity path: 139/442 subphases (31.4%) — Phase 21 active**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
@@ -248,7 +248,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [x] ✅ 21.6 CHECK constraints — column-level `col INT CHECK (col >= 0)` + table-level `CHECK (lo <= hi)` persisted at CREATE TABLE; ALTER ADD CONSTRAINT validates existing rows; enforcement on INSERT (heap + clustered + ODKU) and UPDATE (heap + clustered + multi-table JOIN); SQL-standard NULL→pass semantics (only explicit FALSE violates); column-name resolution via `resolve_column_refs` walks re-parsed expr; 7 integration tests in `tests/integration_check_constraint.rs`. DOMAIN types deferred to 21.6c.
 - [x] 21.6b ✅ Exclusion constraints — equality-only `EXCLUDE USING btree (... WITH = ...)` now lands as a first-class constraint backed by an owned helper UNIQUE index; parser/catalog/DDL/`DROP CONSTRAINT`/`information_schema` all understand the constraint, helper-index duplicate errors translate to exclusion violations, and helper UNIQUE metadata is hidden from ordinary constraint views; GiST/range overlap, predicates, expressions, and non-`=` operators remain deferred — completed 2026-04-21
 - [x] 21.7 ✅ TEMP and UNLOGGED tables — completed 2026-04-21
-- [ ] 21.8 ⏳ Expression indexes — `CREATE INDEX ON users(LOWER(email))`
+- [x] 21.8 ✅ Expression indexes — `CREATE INDEX ON users(LOWER(email))`; catalog now persists canonical expression SQL per index column, CREATE/INSERT/UPDATE/DELETE maintain expression keys on heap and clustered tables, planner matches equality and prefix-LIKE predicates, and partial expression indexes are eligible when the query implies the stored predicate — completed 2026-04-21
 - [x] ✅ 21.9 LATERAL joins — `lateral: bool` on `FromClause::Subquery`; parser consumes `LATERAL` keyword before `(SELECT ...)`; SELECT executor detects correlation via `subquery_is_correlated(query, effective_left_cols)` (includes chained lateral accumulation via `lateral_accum_cols`); correlated path stores AST + infers placeholder schema from SELECT list, runs `substitute_outer` + `execute_select_ctx` per outer row via `apply_correlated_subquery_join`; non-correlated LATERAL materializes once (same as derived table); LEFT JOIN null-pads unmatched outer rows; RIGHT/FULL LATERAL → NotImplemented (PG-compatible); DML (UPDATE/DELETE) JOIN path mirrors SELECT with placeholder columns + `substitute_outer` in `apply_correlated_subquery_dml_join`; `analyze_update`/`analyze_delete` inject outer scope for LATERAL subqueries so `t.id` references become `OuterColumn` nodes; 11 integration tests in `tests/integration_lateral_join.rs` (inner, left, cross, first-from, chain, outer-ref, right/full rejected, regression, UPDATE/DELETE JOIN).
 - [ ] 21.10 ⏳ Cursors — `DECLARE`, `FETCH`, `CLOSE`
 - [ ] 21.11 ⏳ Query hints — `/*+ INDEX() HASH_JOIN() PARALLEL() */`

@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-21 - Phase 21.8
+
+- **A closed-looking feature can still hide a planner gap.** Expression
+  indexes were already implemented across parser/catalog/executor, but the
+  planner still rejected the partial-expression case until we audited the
+  matcher end to end.
+- **Partial expression indexes need two different predicates at once.** One
+  subexpression proves "this index key is relevant" (`LOWER(email) = ...`);
+  the full `WHERE` proves "the partial predicate is satisfied"
+  (`active = TRUE`). Treating those as the same expression loses valid plans.
+- **`EXPLAIN` on tiny tables is a poor oracle for planner matcher tests.**
+  Cost gating can legitimately choose `ALL` even when the matcher works, so
+  the stable coverage for partial expression indexes belongs in planner unit
+  tests, not in small-table EXPLAIN assertions.
+
 ## 2026-04-21 - Phase 21.7
 
 - **TEMP tables fit best as a namespace problem, not a storage problem.**

@@ -1,4 +1,8 @@
-# Spec: 21.8 Expression Indexes
+# Spec: 21.8 — Expression indexes
+
+Phase: 21 — Advanced SQL
+Task: 21.8 Expression indexes
+Status: completed
 
 ## What to build (not how)
 
@@ -35,17 +39,17 @@ An expression index stores the result of evaluating an expression per row, and t
 
 ## Acceptance criteria
 
-1. [ ] `CREATE INDEX ON t(LOWER(col))` parses, stores expression in catalog, builds index evaluating `LOWER(col)` per row
-2. [ ] `SELECT * FROM t WHERE LOWER(col) = 'literal'` uses IndexLookup against the expression index (planner predicate pushdown)
-3. [ ] `SELECT * FROM t WHERE LOWER(col) LIKE 'foo%'` uses IndexRange where applicable
-4. [ ] INSERT/UPDATE/DELETE maintain expression index correctly (evaluate expression per row)
-5. [ ] Expression index combined with partial index WHERE clause works
-6. [ ] Expression index on clustered tables works
-7. [ ] Multi-column expression index: `CREATE INDEX ON t(col1 + col2)` works
-8. [ ] Expression with multiple column references: `CREATE INDEX ON t(UPPER(first_name) || ' ' || UPPER(last_name))`
-9. [ ] Rejects disallowed constructs: subqueries, window functions, aggregates in expression index (at parse/compile time)
-10. [ ] Existing B-Tree index behavior unchanged for non-expression columns
-11. [ ] `EXPLAIN` shows correct index usage for expression indexes
+1. [x] `CREATE INDEX ON t(LOWER(col))` parses, stores expression in catalog, builds index evaluating `LOWER(col)` per row
+2. [x] `SELECT * FROM t WHERE LOWER(col) = 'literal'` uses IndexLookup against the expression index (planner predicate pushdown)
+3. [x] `SELECT * FROM t WHERE LOWER(col) LIKE 'foo%'` uses IndexRange where applicable
+4. [x] INSERT/UPDATE/DELETE maintain expression index correctly (evaluate expression per row)
+5. [x] Expression index combined with partial index WHERE clause works
+6. [x] Expression index on clustered tables works
+7. [x] Multi-column expression index: `CREATE INDEX ON t(col1 + col2)` works
+8. [x] Expression with multiple column references: `CREATE INDEX ON t(UPPER(first_name) || ' ' || UPPER(last_name))`
+9. [x] Rejects disallowed constructs: subqueries, window functions, aggregates in expression index (at parse/compile time)
+10. [x] Existing B-Tree index behavior unchanged for non-expression columns
+11. [x] `EXPLAIN` shows correct index usage for expression indexes
 
 ## Out of scope
 

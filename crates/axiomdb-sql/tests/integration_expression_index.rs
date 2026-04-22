@@ -157,6 +157,27 @@ fn expr_index_lower_equality_used_by_planner() {
 }
 
 #[test]
+fn expr_index_explain_reports_expression_index_usage() {
+    let mut db = Db::new();
+    setup!(
+        db,
+        "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)",
+        "CREATE INDEX idx_lower_email ON users (LOWER(email))",
+        "INSERT INTO users VALUES (1, 'Alice@Example.COM')",
+        "INSERT INTO users VALUES (2, 'bob@example.com')"
+    );
+
+    let rows = db.rows("EXPLAIN SELECT id FROM users WHERE LOWER(email) = 'alice@example.com'");
+    assert_eq!(rows.len(), 1, "EXPLAIN returns a single plan row");
+    assert_eq!(rows[0][3], Value::Text("range".into()));
+    assert_eq!(rows[0][5], Value::Text("idx_lower_email".into()));
+    assert_eq!(
+        rows[0][9],
+        Value::Text("Using where; Using index condition".into())
+    );
+}
+
+#[test]
 fn expr_index_upper_equality_used_by_planner() {
     let mut db = Db::new();
     setup!(

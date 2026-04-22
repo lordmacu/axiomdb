@@ -3,21 +3,18 @@
 ## Current (2026-04-21)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.7 COMPLETE — TEMP and UNLOGGED tables closed.
-`CREATE TEMP[TORARY] TABLE` / `CREATE UNLOGGED TABLE` now persist
-`TablePersistence` across normal CREATE, LIKE, and CTAS. TEMP tables are
-stored in hidden per-session schemas, shadow `public` during unqualified
-resolution, and auto-drop on disconnect, `COM_RESET_CONNECTION`, and
-`COM_CHANGE_USER`, while `SHOW`/`information_schema` only expose the current
-session's TEMP tables. UNLOGGED tables keep normal runtime write paths but
-truncate automatically after dirty reopen via a clean-shutdown marker, while
-clean reopen preserves their rows. `SHOW CREATE TABLE` reconstructs
-`TEMPORARY` / `UNLOGGED`, and FK attempts involving TEMP/UNLOGGED tables now
-fail explicitly with `NotImplemented`.
+**Active subphase:** Phase 21.8 COMPLETE — Expression indexes closed.
+Expression indexes now persist canonical SQL in `IndexColumnDef.expr`,
+compile once for CREATE/build/write-maintenance paths, and work on both heap
+and clustered tables. The planner matches expression predicates for equality
+and prefix-LIKE probes, and partial expression indexes are now eligible when
+the query's full `WHERE` clause implies the stored predicate. `EXPLAIN`
+reports expression-index usage for deterministic cases, and wire smoke now
+covers expression + partial-expression index behavior.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-catalog`; `cargo test -p axiomdb-storage`; `cargo test -p axiomdb-sql --test integration_ddl_parser`; `cargo test -p axiomdb-sql --test integration_namespacing_schema`; `cargo test -p axiomdb-sql --test integration_g11_information_schema`; `cargo test -p axiomdb-sql --test integration_show_full`; `cargo test -p axiomdb-sql --test integration_g5_dml`; `cargo test -p axiomdb-sql --test integration_temp_unlogged_tables`; `cargo test -p axiomdb-sql`; `cargo test -p axiomdb-network --test integration_connection_lifecycle`; `cargo test -p axiomdb-network --test integration_open_integrity`; `cargo test -p axiomdb-network`; `cargo clippy -p axiomdb-sql -- -D warnings`; `cargo clippy -p axiomdb-network -- -D warnings`; `python3 tools/wire-test.py` (419/419); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_expression_index`; `cargo test -p axiomdb-sql`; `python3 tools/wire-test.py` (420/420); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.8 Expression indexes, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.10 Cursors, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -32,7 +29,8 @@ fail explicitly with `NotImplemented`.
 | 21.6 CHECK constraints | ✅ closed |
 | 21.6b Exclusion constraints | ✅ closed |
 | 21.7 TEMP and UNLOGGED tables | ✅ closed |
-| 21.8 Expression indexes | ⏳ next |
+| 21.8 Expression indexes | ✅ closed |
+| 21.10 Cursors | ⏳ next |
 
 ### Phase 11 subphase status
 

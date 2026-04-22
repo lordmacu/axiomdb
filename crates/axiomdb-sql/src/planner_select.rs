@@ -99,7 +99,8 @@ pub fn plan_select(
     // ── Rule 1b: expression index lookup ──────────────────────────────────────────
     // Handles patterns like `LOWER(email) = 'foo'` or `LOWER(email) LIKE 'foo%'`
     // where an expression index `LOWER(email)` exists.
-    if let Some((idx, lo_key, hi_key)) = find_expression_index(expr, indexes) {
+    if let Some((idx, lo_key, hi_key)) = find_expression_index(expr, indexes, columns, Some(expr))
+    {
         let use_index =
             idx.is_primary || stats_cost_gate(&idx, columns, table_id, table_stats, stale_tracker);
         if use_index {
@@ -534,8 +535,20 @@ fn extract_indexable_expr(e: &Expr) -> Option<&Expr> {
 fn find_expression_index(
     where_expr: &Expr,
     indexes: &[IndexDef],
+    columns: &[ColumnDef],
+    query_where: Option<&Expr>,
 ) -> Option<(IndexDef, Option<Vec<u8>>, Option<Vec<u8>>)> {
     use crate::key_encoding::encode_index_key;
+
+    if let Expr::BinaryOp {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = where_expr
+    {
+        return find_expression_index(left, indexes, columns, query_where)
+            .or_else(|| find_expression_index(right, indexes, columns, query_where));
+    }
 
     // Match either BinaryOp::Eq or Expr::Like.
     let (indexable_expr, literal_expr, is_eq) = match where_expr {
@@ -583,13 +596,16 @@ fn find_expression_index(
         if idx.is_primary || idx.is_fk_index {
             return false;
         }
-        // Partial indexes not yet supported for expression matching.
-        if idx.predicate.is_some() {
-            return false;
-        }
         // Expression indexes are always single-column.
         if idx.columns.len() != 1 {
             return false;
+        }
+        // Partial-index guard: expression indexes remain usable only when the
+        // query WHERE implies the stored predicate.
+        if let Some(pred_sql) = &idx.predicate {
+            if !crate::partial_index::predicate_implied_by_query(pred_sql, query_where, columns) {
+                return false;
+            }
         }
         let idx_col = &idx.columns[0];
         let Some(stored_expr) = &idx_col.expr else {

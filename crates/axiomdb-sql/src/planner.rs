@@ -76,6 +76,23 @@ mod tests {
         }
     }
 
+    fn make_bool_col(name: &str, col_idx: u16) -> ColumnDef {
+        ColumnDef {
+            table_id: 1,
+            col_idx,
+            name: name.to_string(),
+            col_type: ColumnType::Bool,
+            nullable: false,
+            auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
+            on_update_expr: None,
+            generated_expr: None,
+            generated_stored: false,
+        }
+    }
+
     fn make_index(name: &str, col_idx: u16, is_primary: bool) -> IndexDef {
         IndexDef {
             index_id: 1,
@@ -90,6 +107,33 @@ mod tests {
                 expr: None,
             }],
             predicate: None,
+            fillfactor: 90,
+            is_fk_index: false,
+            include_columns: vec![],
+            index_type: 0,
+            pages_per_range: 128,
+        }
+    }
+
+    fn make_expression_index(
+        name: &str,
+        col_idx: u16,
+        expr_sql: &str,
+        predicate: Option<&str>,
+    ) -> IndexDef {
+        IndexDef {
+            index_id: 1,
+            table_id: 1,
+            name: name.to_string(),
+            root_page_id: 10,
+            is_unique: false,
+            is_primary: false,
+            columns: vec![IndexColumnDef {
+                col_idx,
+                order: SortOrder::Asc,
+                expr: Some(expr_sql.to_string()),
+            }],
+            predicate: predicate.map(|s| s.to_string()),
             fillfactor: 90,
             is_fk_index: false,
             include_columns: vec![],
@@ -332,6 +376,51 @@ mod tests {
             &[],
         );
         assert!(matches!(am, AccessMethod::IndexRange { .. }));
+    }
+
+    #[test]
+    fn test_expression_partial_index_used_when_query_implies_predicate() {
+        let cols = vec![make_text_col("email", 0), make_bool_col("active", 1)];
+        let idxs = vec![make_expression_index(
+            "idx_lower_email_active",
+            0,
+            "LOWER(email)",
+            Some("active = TRUE"),
+        )];
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::And,
+            left: Box::new(Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Function {
+                    name: "LOWER".into(),
+                    args: vec![col_expr("email")],
+                }),
+                right: Box::new(Expr::Literal(Value::Text("alice@example.com".into()))),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column {
+                    col_idx: 1,
+                    name: "active".into(),
+                }),
+                right: Box::new(Expr::Literal(Value::Bool(true))),
+            }),
+        };
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+            &[],
+        );
+        match am {
+            AccessMethod::IndexRange { index_def, .. } => {
+                assert_eq!(index_def.name, "idx_lower_email_active");
+            }
+            other => panic!("expected IndexRange for partial expression index, got {other:?}"),
+        }
     }
 
     #[test]

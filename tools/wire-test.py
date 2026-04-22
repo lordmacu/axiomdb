@@ -3734,6 +3734,28 @@ ok("[21.5f generated columns] update recomputes stored value",
    rows == ((18,),),
    f"got {rows}")
 
+# ── Phase 21.8 — Expression indexes ──────────────────────────────────────────
+
+print("\n[21.8 expression indexes]")
+
+cur.execute("CREATE TABLE expr_wire (id INT PRIMARY KEY, email TEXT, active BOOL)")
+cur.execute("INSERT INTO expr_wire VALUES (1, 'Alice@Example.COM', TRUE)")
+cur.execute("INSERT INTO expr_wire VALUES (2, 'alice@example.com', FALSE)")
+cur.execute("INSERT INTO expr_wire VALUES (3, 'Bob@Example.COM', TRUE)")
+cur.execute("CREATE INDEX idx_expr_wire_lower ON expr_wire (LOWER(email))")
+cur.execute(
+    "CREATE INDEX idx_expr_wire_lower_active ON expr_wire (LOWER(email)) WHERE active = TRUE"
+)
+
+cur.execute(
+    "SELECT id FROM expr_wire "
+    "WHERE LOWER(email) = 'alice@example.com' AND active = TRUE"
+)
+rows = cur.fetchall()
+ok("[21.8 expression index] partial + expression predicate returns active row only",
+   rows == ((1,),),
+   f"got {rows}")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
