@@ -1,5 +1,49 @@
 # Fase 21 - Advanced SQL
 
+## 21.23 Advanced SQL tests - cerrada 2026-04-22
+
+La subfase 21.23 cierra la capa de aceptacion integrada de Fase 21. El
+objetivo no era agregar otra feature SQL, sino consolidar cobertura
+interaction-level sobre las features avanzadas ya cerradas para detectar
+regresiones entre session state, transacciones y DML complejo.
+
+### Cobertura cerrada
+
+Nueva suite principal:
+
+- `crates/axiomdb-sql/tests/integration_advanced_sql.rs`
+
+Escenarios cubiertos:
+
+- CTE no recursivo y `WITH RECURSIVE` en flujos reales de lectura.
+- `MERGE` combinado con `SAVEPOINT` / `ROLLBACK TO SAVEPOINT`, verificando
+  que se preserva el estado pre-savepoint.
+- Cursores SQL sobre consultas con CTE + agregacion, incluyendo cierre por
+  `COMMIT`.
+- `CHECKPOINT` en camino SQL normal y rechazo con transaccion activa.
+- `GROUPING SETS` / subtotales / grand total dentro de la suite compartida.
+
+### Ajuste de alcance
+
+`docs/progreso.md` todavia describia `21.23` como una suite sobre "window
+functions". Ese wording estaba stale: el repo aun no implementa SQL
+`OVER (...)`, asi que `21.23` se recorto explicitamente a features ya
+existentes. Las window functions siguen deferidas a fases posteriores.
+
+### Wire smoke
+
+`tools/wire-test.py` ahora agrega un bloque `21.23` que valida por protocolo
+MySQL un flujo multi-step de `MERGE` + `SAVEPOINT`, incluyendo rollback al
+punto intermedio y verificacion del estado final visible.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_advanced_sql` - paso, 5 tests.
+- `tools/wire-test.py` - paso, 428/428 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 21.11 Query hints - cerrada 2026-04-22
 
 La subfase 21.11 cierra un MVP acotado de optimizer hints sobre `SELECT`.

@@ -3,17 +3,19 @@
 ## Current (2026-04-22)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.11 COMPLETE — query hints closed.
-`SELECT /*+ ... */` now supports a bounded optimizer-hint MVP: `INDEX(table index)`
-can steer single-table planner selection when compatible, `HASH_JOIN` can force
-the existing hash-join path on eligible equijoins below the normal size threshold,
-and `PARALLEL(n)` is accepted as advisory metadata and surfaced via `EXPLAIN`.
-Regular block comments still skip normally, while optimizer comments are preserved
-through lexing as `Token::OptimizerHint`.
+**Active subphase:** Phase 21.23 COMPLETE — advanced SQL acceptance suite closed.
+Phase 21 now has a dedicated interaction-level regression layer in
+`integration_advanced_sql.rs`: non-recursive + recursive CTEs, `MERGE`
+coexisting with savepoints, cursors over CTE-backed grouped queries,
+`CHECKPOINT`, and grouping sets are all covered as multi-statement acceptance
+flows instead of only per-feature unit-style tests. `tools/wire-test.py` also
+adds a protocol smoke for a `MERGE` + `SAVEPOINT` workflow. The stale
+`window functions` wording was removed from `docs/progreso.md` because SQL
+`OVER (...)` support is still deferred to later phases.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --lib --test integration_dml_parser --test integration_query_hints`; `cargo test -p axiomdb-sql --test integration_query_hints --test integration_expression_index --test integration_executor_joins`; `python3 tools/wire-test.py` (427/427); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_advanced_sql`; `python3 tools/wire-test.py` (428/428); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.23 Advanced SQL tests, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.24 ORM compatibility tier 2.
 
 ### Phase 21 subphase status
 
@@ -32,6 +34,7 @@ through lexing as `Token::OptimizerHint`.
 | 21.10 Cursors | ✅ closed |
 | 21.20 CHECKPOINT | ✅ closed |
 | 21.11 Query hints | ✅ closed |
+| 21.23 Advanced SQL tests | ✅ closed |
 
 ### Phase 11 subphase status
 

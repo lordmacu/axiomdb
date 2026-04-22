@@ -1,5 +1,21 @@
 # Architecture Notes
 
+## 2026-04-22 - Advanced SQL acceptance suite (21.23)
+
+- **`21.23` is a consolidation layer, not a feature layer.** The new
+  `integration_advanced_sql.rs` file deliberately composes already-implemented
+  Phase 21 features in multi-statement flows instead of duplicating parser or
+  single-feature executor tests.
+- **Session-heavy features need interaction tests, not only isolated ones.**
+  Savepoints, cursors, `MERGE`, and `CHECKPOINT` can all pass in their own
+  files while still drifting at the boundaries between transaction lifecycle,
+  session state, and mixed DML/admin flows.
+- **The wire harness runs with `autocommit=False`, so smoke blocks must settle
+  their own setup transactions before explicit `BEGIN`.** A `CREATE TABLE` or
+  setup `INSERT` in the same block can otherwise leave an implicit transaction
+  open and make the next explicit `BEGIN` fail for harness reasons, not engine
+  reasons.
+
 ## 2026-04-22 - Query hints (21.11)
 
 - **`21.11` is comment-preservation first, not planner syntax first.**
