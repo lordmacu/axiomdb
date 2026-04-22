@@ -22,6 +22,7 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.12 (DISTINCT ON: latest-per-group, LIMIT, expr-not-in-select, plain-DISTINCT regression),
              21.5 (INSERT ON CONFLICT + MERGE smoke),
              21.5f (GENERATED ALWAYS AS STORED insert/update smoke),
+             21.11 (query hints),
              21.10 (SQL cursors),
              21.20 (CHECKPOINT)
 """
@@ -3757,6 +3758,41 @@ rows = cur.fetchall()
 ok("[21.8 expression index] partial + expression predicate returns active row only",
    rows == ((1,),),
    f"got {rows}")
+
+# ── Phase 21.11 — Query hints ────────────────────────────────────────────────
+
+print("\n[21.11 query hints]")
+
+cur.execute("CREATE TABLE hint_wire_users (id INT PRIMARY KEY, email TEXT)")
+cur.execute("CREATE INDEX idx_hint_wire_email ON hint_wire_users(email)")
+cur.execute("INSERT INTO hint_wire_users VALUES (1, 'alice@example.com')")
+cur.execute(
+    "EXPLAIN SELECT /*+ INDEX(hint_wire_users idx_hint_wire_email) */ id "
+    "FROM hint_wire_users WHERE email = 'alice@example.com'"
+)
+rows = cur.fetchall()
+ok("[21.11 query hints] INDEX hint is visible in EXPLAIN key",
+   len(rows) == 1 and rows[0][5] == "idx_hint_wire_email",
+   rows)
+
+cur.execute("CREATE TABLE hint_wire_t (id INT PRIMARY KEY)")
+cur.execute("CREATE TABLE hint_wire_u (t_id INT PRIMARY KEY)")
+cur.execute("INSERT INTO hint_wire_t VALUES (1)")
+cur.execute("INSERT INTO hint_wire_u VALUES (1)")
+cur.execute(
+    "EXPLAIN SELECT /*+ HASH_JOIN */ * "
+    "FROM hint_wire_t JOIN hint_wire_u ON hint_wire_t.id = hint_wire_u.t_id"
+)
+rows = cur.fetchall()
+ok("[21.11 query hints] HASH_JOIN hint is visible in EXPLAIN Extra",
+   len(rows) == 1 and rows[0][9] == "Using hash join (hint)",
+   rows)
+
+cur.execute("SELECT /*+ PARALLEL(2) */ id FROM hint_wire_users WHERE email = 'alice@example.com'")
+rows = cur.fetchall()
+ok("[21.11 query hints] PARALLEL hint executes successfully",
+   rows == ((1,),),
+   rows)
 
 # ── Phase 21.10 — SQL cursors ────────────────────────────────────────────────
 

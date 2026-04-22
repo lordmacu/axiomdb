@@ -2,7 +2,8 @@
 
 use axiomdb_sql::{
     ast::{
-        FromClause, InsertSource, JoinCondition, JoinType, NullsOrder, SelectItem, SortOrder, Stmt,
+        FromClause, InsertSource, JoinCondition, JoinType, NullsOrder, SelectHint, SelectItem,
+        SortOrder, Stmt,
     },
     expr::{BinaryOp, Expr},
     parse,
@@ -239,6 +240,36 @@ fn test_select_column_with_alias() {
 fn test_select_distinct() {
     let s = select("SELECT DISTINCT country FROM users");
     assert!(s.distinct);
+}
+
+#[test]
+fn test_select_optimizer_hash_join_hint() {
+    let s = select("SELECT /*+ HASH_JOIN */ * FROM users");
+    assert_eq!(s.hints, vec![SelectHint::HashJoin]);
+}
+
+#[test]
+fn test_select_optimizer_parallel_hint() {
+    let s = select("SELECT /*+ PARALLEL(4) */ * FROM users");
+    assert_eq!(s.hints, vec![SelectHint::Parallel { workers: 4 }]);
+}
+
+#[test]
+fn test_select_optimizer_index_hint() {
+    let s = select("SELECT /*+ INDEX(users idx_users_email) */ * FROM users");
+    assert_eq!(
+        s.hints,
+        vec![SelectHint::Index {
+            table: "users".into(),
+            index: "idx_users_email".into(),
+        }]
+    );
+}
+
+#[test]
+fn test_select_optimizer_unknown_hint_rejected() {
+    let err = parse_err("SELECT /*+ NO_HASH_JOIN */ * FROM users");
+    assert!(matches!(err, axiomdb_core::DbError::ParseError { .. }));
 }
 
 #[test]

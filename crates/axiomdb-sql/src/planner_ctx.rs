@@ -61,6 +61,48 @@ pub fn plan_select_ctx(
     }
 }
 
+/// Re-plans a single-table SELECT against a hinted index when one was supplied.
+///
+/// If the named index exists and is compatible with the query predicate, the
+/// hinted access method is returned. If the named index exists but is not
+/// compatible with the predicate, the original `base` plan is kept.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_select_index_hint_ctx(
+    base: AccessMethod,
+    hinted_index_name: &str,
+    where_clause: Option<&Expr>,
+    indexes: &[IndexDef],
+    columns: &[ColumnDef],
+    table_id: u32,
+    table_stats: &[StatsDef],
+    stale_tracker: &mut StaleStatsTracker,
+    select_col_idxs: &[u16],
+    collation: SessionCollation,
+) -> Result<AccessMethod, DbError> {
+    let hinted_index = indexes
+        .iter()
+        .find(|idx| idx.name.eq_ignore_ascii_case(hinted_index_name))
+        .ok_or_else(|| DbError::IndexNotFound {
+            name: hinted_index_name.to_string(),
+        })?;
+
+    let hinted = plan_select_ctx(
+        where_clause,
+        std::slice::from_ref(hinted_index),
+        columns,
+        table_id,
+        table_stats,
+        stale_tracker,
+        select_col_idxs,
+        collation,
+    );
+
+    Ok(match hinted {
+        AccessMethod::Scan => base,
+        other => other,
+    })
+}
+
 // ── DELETE-specific candidate planner (Phase 6.3b) ───────────────────────────
 
 /// Chooses the best index-access method for discovering DELETE candidate rows.

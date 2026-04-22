@@ -72,6 +72,17 @@ fn execute_select_ctx(
         );
     }
 
+    if !stmt.joins.is_empty()
+        && stmt
+            .hints
+            .iter()
+            .any(|hint| matches!(hint, crate::ast::SelectHint::Index { .. }))
+    {
+        return Err(DbError::NotImplemented {
+            feature: "INDEX(table index) hint on joined SELECT — single-table MVP only".into(),
+        });
+    }
+
     if stmt.joins.is_empty() {
         // Single-table path — use cache.
         let resolved = resolve_table_cached(storage, txn, ctx, conn_txn, &from_table_ref)?;
@@ -125,8 +136,22 @@ fn execute_select_ctx(
 
         // Compute collation before the mutable borrow of ctx.stats below.
         let effective_coll = ctx.effective_collation();
-        let access_method = normalize_clustered_access_method(
-            crate::planner::plan_select_ctx(
+        let mut access_method = crate::planner::plan_select_ctx(
+            stmt.where_clause.as_ref(),
+            &resolved.indexes,
+            &resolved.columns,
+            resolved.def.id,
+            &table_stats,
+            &mut ctx.stats,
+            &select_col_idxs,
+            effective_coll,
+        );
+        if let Some(hinted_index) =
+            stmt.hinted_index_name_for_table(&from_table_ref, &resolved.def.table_name)?
+        {
+            access_method = crate::planner::apply_select_index_hint_ctx(
+                access_method,
+                hinted_index,
                 stmt.where_clause.as_ref(),
                 &resolved.indexes,
                 &resolved.columns,
@@ -135,9 +160,10 @@ fn execute_select_ctx(
                 &mut ctx.stats,
                 &select_col_idxs,
                 effective_coll,
-            ),
-            resolved.def.is_clustered(),
-        );
+            )?;
+        }
+        let access_method =
+            normalize_clustered_access_method(access_method, resolved.def.is_clustered());
 
         /// Collects column indices referenced by an expression into a mask.
         fn collect_expr_columns(e: &crate::expr::Expr, mask: &mut [bool]) {

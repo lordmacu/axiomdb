@@ -72,6 +72,7 @@ fn apply_join(
     right_rows: &[Row],
     left_col_count: usize,
     right_col_count: usize,
+    force_hash_join: bool,
     join_type: JoinType,
     condition: &JoinCondition,
     left_schema: &[(String, usize)],
@@ -79,7 +80,8 @@ fn apply_join(
     right_columns: &[ColumnMeta],
 ) -> Result<Vec<Row>, DbError> {
     // Phase 9.9: Adaptive join selection.
-    let is_large = left_rows.len() >= HASH_JOIN_MIN_ROWS || right_rows.len() >= HASH_JOIN_MIN_ROWS;
+    let is_large =
+        force_hash_join || left_rows.len() >= HASH_JOIN_MIN_ROWS || right_rows.len() >= HASH_JOIN_MIN_ROWS;
 
     if is_large {
         if let Some((l_idx, r_combined_idx)) = detect_equijoin(condition, left_col_count) {

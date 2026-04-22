@@ -1,5 +1,24 @@
 # Architecture Notes
 
+## 2026-04-22 - Query hints (21.11)
+
+- **`21.11` is comment-preservation first, not planner syntax first.**
+  MySQL-style optimizer comments were impossible until `lexer.rs` stopped
+  dropping `/*+ ... */` together with ordinary block comments; the parser work
+  depends on that preservation boundary.
+- **Bounded hint enums are cheaper than a generic hint framework.**
+  `SelectHint::{Index, HashJoin, Parallel}` is enough to thread validated hint
+  state through parser, executor, and `EXPLAIN` without introducing a global
+  optimizer-hint DSL or precedence engine.
+- **Index hints are safest as a constrained re-plan, not as a forced access
+  path.** Re-planning against the named index and falling back when the
+  predicate is incompatible preserves correctness while still honoring the
+  hint whenever the current planner can legally use that index.
+- **Hash-join hints should override only the threshold, never legality.**
+  `HASH_JOIN` now bypasses `HASH_JOIN_MIN_ROWS`, but still relies on the
+  existing equijoin detection and join-type support so the hint cannot invent
+  unsupported hash-join semantics.
+
 ## 2026-04-22 - SQL CHECKPOINT (21.20)
 
 - **`CHECKPOINT` is an admin SQL statement, not a WAL-rotation alias.** The

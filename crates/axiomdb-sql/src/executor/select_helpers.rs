@@ -101,6 +101,7 @@ fn execute_select_with_joins(
     // Progressive nested-loop join.
     let mut combined_rows: Vec<Row> = scanned[0].clone();
     let mut left_col_count = all_sources[0].columns.len();
+    let force_hash_join = stmt.has_hash_join_hint();
 
     // left_schema tracks (col_name, global_col_idx) for all accumulated left columns.
     // Used by USING conditions to locate column positions by name.
@@ -121,6 +122,7 @@ fn execute_select_with_joins(
             &scanned[right_idx],
             left_col_count,
             right_col_count,
+            force_hash_join,
             join.join_type,
             &join.condition,
             &left_schema,

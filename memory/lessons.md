@@ -1,5 +1,18 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 21.11
+
+- **The visible SQL feature was blocked by lexer behavior, not by planner code.**
+  Until `/*+ ... */` survived tokenization, every discussion about hinted
+  access paths was premature.
+- **A narrow, effectful hint MVP is better than a large fake compatibility
+  surface.** Shipping `INDEX`, `HASH_JOIN`, and advisory `PARALLEL` with real
+  semantics closed the user-visible gap without taking on MariaDB's full hint
+  precedence matrix.
+- **Hinted plans need explicit guard rails against over-forcing.**
+  Re-planning on the named index and falling back cleanly is safer than
+  blindly forcing a path the current predicate cannot support.
+
 ## 2026-04-22 - Phase 21.20
 
 - **Administrative SQL can break if it reuses ordinary autocommit blindly.**

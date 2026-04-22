@@ -99,6 +99,17 @@ fn execute_select(
         );
     }
 
+    if !stmt.joins.is_empty()
+        && stmt
+            .hints
+            .iter()
+            .any(|hint| matches!(hint, crate::ast::SelectHint::Index { .. }))
+    {
+        return Err(DbError::NotImplemented {
+            feature: "INDEX(table index) hint on joined SELECT — single-table MVP only".into(),
+        });
+    }
+
     if stmt.joins.is_empty() {
         // ── Single-table path (no JOIN) ───────────────────────────────────────
         let resolved = {
@@ -112,18 +123,34 @@ fn execute_select(
 
         // ── Query planner: pick the best access method (non-ctx path) ────
         // No session context available — use conservative defaults (no stats).
-        let access_method = normalize_clustered_access_method(
-            crate::planner::plan_select(
+        let mut stale_tracker = crate::session::StaleStatsTracker::default();
+        let mut access_method = crate::planner::plan_select(
+            stmt.where_clause.as_ref(),
+            &resolved.indexes,
+            &resolved.columns,
+            resolved.def.id,
+            &[], // no stats in non-ctx path — always use index (conservative)
+            &mut stale_tracker,
+            &[], // no select_col_idxs in non-ctx path — no index-only scan
+        );
+        if let Some(hinted_index) =
+            stmt.hinted_index_name_for_table(&from_table_ref, &resolved.def.table_name)?
+        {
+            access_method = crate::planner::apply_select_index_hint_ctx(
+                access_method,
+                hinted_index,
                 stmt.where_clause.as_ref(),
                 &resolved.indexes,
                 &resolved.columns,
                 resolved.def.id,
-                &[], // no stats in non-ctx path — always use index (conservative)
-                &mut crate::session::StaleStatsTracker::default(),
-                &[], // no select_col_idxs in non-ctx path — no index-only scan
-            ),
-            resolved.def.is_clustered(),
-        );
+                &[],
+                &mut stale_tracker,
+                &[],
+                crate::session::SessionCollation::Binary,
+            )?;
+        }
+        let access_method =
+            normalize_clustered_access_method(access_method, resolved.def.is_clustered());
 
         // ── Fetch rows via the chosen access method ───────────────────────
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {

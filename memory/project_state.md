@@ -3,16 +3,17 @@
 ## Current (2026-04-22)
 
 **Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.20 COMPLETE — SQL `CHECKPOINT` closed.
-`CHECKPOINT` now parses and executes as a real administrative SQL statement.
-It delegates to the existing WAL/storage checkpoint engine, persists a durable
-checkpoint LSN without rotating the WAL file, rejects execution while any
-transaction is active, and is special-cased to run outside implicit executor
-transactions in both legacy and session-aware paths.
+**Active subphase:** Phase 21.11 COMPLETE — query hints closed.
+`SELECT /*+ ... */` now supports a bounded optimizer-hint MVP: `INDEX(table index)`
+can steer single-table planner selection when compatible, `HASH_JOIN` can force
+the existing hash-join path on eligible equijoins below the normal size threshold,
+and `PARALLEL(n)` is accepted as advisory metadata and surfaced via `EXPLAIN`.
+Regular block comments still skip normally, while optimizer comments are preserved
+through lexing as `Token::OptimizerHint`.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_checkpoint --test integration_ddl_parser`; `cargo test -p axiomdb-network --test integration_connection_lifecycle`; `python3 tools/wire-test.py` (424/424); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --lib --test integration_dml_parser --test integration_query_hints`; `cargo test -p axiomdb-sql --test integration_query_hints --test integration_expression_index --test integration_executor_joins`; `python3 tools/wire-test.py` (427/427); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.11 Query hints, unless we pivot back to deferred JSONB operator work.
+**Next:** Phase 21.23 Advanced SQL tests, unless we pivot back to deferred JSONB operator work.
 
 ### Phase 21 subphase status
 
@@ -30,7 +31,7 @@ transactions in both legacy and session-aware paths.
 | 21.8 Expression indexes | ✅ closed |
 | 21.10 Cursors | ✅ closed |
 | 21.20 CHECKPOINT | ✅ closed |
-| 21.11 Query hints | ⏳ next |
+| 21.11 Query hints | ✅ closed |
 
 ### Phase 11 subphase status
 

@@ -260,6 +260,7 @@ fn execute_select_with_joins_first_materialized(
 
     let mut combined_rows: Vec<Row> = scanned[0].clone();
     let mut left_col_count = all_sources[0].columns.len();
+    let force_hash_join = stmt.has_hash_join_hint();
 
     let mut left_schema: Vec<(String, usize)> = all_sources[0]
         .columns
@@ -328,6 +329,7 @@ fn execute_select_with_joins_first_materialized(
                 &scanned[right_idx],
                 left_col_count,
                 right_col_count,
+                force_hash_join,
                 join.join_type,
                 &join.condition,
                 &left_schema,

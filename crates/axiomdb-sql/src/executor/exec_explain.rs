@@ -313,7 +313,7 @@ fn explain_select(
 
     let effective_coll = ctx.effective_collation();
     let select_col_idxs_u16: Vec<u16> = select_col_idxs.iter().map(|&i| i as u16).collect();
-    let access_method = crate::planner::plan_select_ctx(
+    let mut access_method = crate::planner::plan_select_ctx(
         stmt.where_clause.as_ref(),
         &secondary_indexes,
         &resolved.columns,
@@ -327,6 +327,56 @@ fn explain_select(
     // Format the plan as MySQL EXPLAIN row.
     let table_name = &resolved.def.table_name;
     let row_count = table_stats.first().map(|s| s.row_count).unwrap_or(0);
+
+    if !stmt.joins.is_empty() {
+        if stmt
+            .hints
+            .iter()
+            .any(|hint| matches!(hint, crate::ast::SelectHint::Index { .. }))
+        {
+            return Err(DbError::NotImplemented {
+                feature: "INDEX(table index) hint on joined SELECT — single-table MVP only".into(),
+            });
+        }
+        let mut extra = if stmt.has_hash_join_hint() {
+            "Using hash join (hint)".to_string()
+        } else {
+            "Using nested loop join".to_string()
+        };
+        if let Some(workers) = stmt.parallel_hint_workers() {
+            extra.push_str(&format!("; PARALLEL({workers}) hint"));
+        }
+        let rows = vec![vec![
+            Value::Int(1),
+            Value::Text("SIMPLE".into()),
+            Value::Text(table_name.clone()),
+            Value::Text("ALL".into()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Int(row_count as i32),
+            Value::Text(extra),
+        ]];
+        return Ok(QueryResult::Rows { columns, rows });
+    }
+
+    if let Some(hinted_index) =
+        stmt.hinted_index_name_for_table(from_table_ref, &resolved.def.table_name)?
+    {
+        access_method = crate::planner::apply_select_index_hint_ctx(
+            access_method,
+            hinted_index,
+            stmt.where_clause.as_ref(),
+            &secondary_indexes,
+            &resolved.columns,
+            resolved.def.id,
+            &table_stats,
+            &mut ctx.stats,
+            &select_col_idxs_u16,
+            effective_coll,
+        )?;
+    }
 
     let (access_type, key_name, key_len, ref_val, est_rows, extra) = match &access_method {
         crate::planner::AccessMethod::Scan => (
@@ -426,7 +476,16 @@ fn explain_select(
         key_len,                         // key_len
         ref_val,                         // ref
         est_rows,                        // rows
-        Value::Text(extra.into()),       // Extra
+        Value::Text({
+            let mut extra = extra.to_string();
+            if let Some(workers) = stmt.parallel_hint_workers() {
+                if !extra.is_empty() {
+                    extra.push_str("; ");
+                }
+                extra.push_str(&format!("PARALLEL({workers}) hint"));
+            }
+            extra
+        }), // Extra
     ]];
 
     Ok(QueryResult::Rows { columns, rows })

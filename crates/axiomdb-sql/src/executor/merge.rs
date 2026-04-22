@@ -345,6 +345,7 @@ fn materialize_merge_source(
         with_ctes: Vec::new(),
         distinct: false,
         distinct_on: vec![],
+        hints: vec![],
         calc_found_rows: false,
         columns: vec![SelectItem::Wildcard],
         from: Some(source),
