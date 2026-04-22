@@ -1005,6 +1005,35 @@ pub struct CreateSchemaStmt {
     pub if_not_exists: bool,
 }
 
+/// `DECLARE name CURSOR FOR <query>`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclareCursorStmt {
+    pub name: String,
+    pub query: Box<Stmt>,
+}
+
+/// Row-window selector for `FETCH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchCount {
+    Next,
+    Forward(u64),
+    All,
+}
+
+/// `FETCH ... FROM name`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchCursorStmt {
+    pub name: String,
+    pub count: FetchCount,
+}
+
+/// `CLOSE name` or `CLOSE ALL`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseCursorStmt {
+    One(String),
+    All,
+}
+
 // ── Stmt ──────────────────────────────────────────────────────────────────────
 
 /// A complete SQL statement as produced by the parser.
@@ -1092,6 +1121,9 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    DeclareCursor(DeclareCursorStmt),
+    FetchCursor(FetchCursorStmt),
+    CloseCursor(CloseCursorStmt),
     /// `SAVEPOINT name` — create a named savepoint within an explicit transaction.
     Savepoint(String),
     /// `ROLLBACK TO [SAVEPOINT] name` — undo changes back to the named savepoint.

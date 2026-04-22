@@ -1,5 +1,19 @@
 # Lessons Learned
 
+## 2026-04-21 - Phase 21.10
+
+- **SQL cursors were the right cut; streaming portals were not.** A
+  materialized-session MVP closed the user-visible `DECLARE` / `FETCH` /
+  `CLOSE` gap without entangling executor suspension, snapshot lifetime, or
+  MySQL prepared-statement cursor semantics.
+- **Lifecycle cleanup has to be centralized, not statement-specific.** Cursor
+  leaks would have shown up on `COM_RESET_CONNECTION` and `COM_CHANGE_USER`
+  long before ordinary SQL tests caught them, so cleanup needed to live on the
+  shared transaction/session boundary paths.
+- **Wire harnesses with `autocommit=False` accumulate implicit transaction
+  state between blocks.** A new explicit-transaction smoke can fail even when
+  the engine is correct unless the setup writes are committed before `BEGIN`.
+
 ## 2026-04-21 - Phase 21.8
 
 - **A closed-looking feature can still hide a planner gap.** Expression

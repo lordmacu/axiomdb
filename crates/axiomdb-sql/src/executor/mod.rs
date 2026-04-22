@@ -93,6 +93,7 @@ include!("exec_entry.rs");
 include!("exec_with_ctx.rs");
 include!("exec_dispatch.rs");
 include!("exec_explain.rs");
+include!("cursor.rs");
 
 include!("shared.rs");
 include!("joins.rs");

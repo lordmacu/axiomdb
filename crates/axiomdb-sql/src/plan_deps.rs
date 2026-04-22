@@ -215,9 +215,12 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::Begin
             | Stmt::Commit
             | Stmt::Rollback
+            | Stmt::FetchCursor(_)
+            | Stmt::CloseCursor(_)
             | Stmt::Savepoint(_)
             | Stmt::RollbackToSavepoint(_)
             | Stmt::ReleaseSavepoint(_) => Ok(()),
+            Stmt::DeclareCursor(s) => self.visit_stmt(&s.query),
             // Maintenance.
             Stmt::Vacuum(v) => {
                 if let Some(tref) = &v.table {

@@ -851,6 +851,9 @@ fn stmt_may_mutate(stmt: &Stmt) -> bool {
     !matches!(
         stmt,
         Stmt::Select(_)
+            | Stmt::DeclareCursor(_)
+            | Stmt::FetchCursor(_)
+            | Stmt::CloseCursor(_)
             | Stmt::ShowTables(_)
             | Stmt::ShowDatabases(_)
             | Stmt::ShowColumns(_)

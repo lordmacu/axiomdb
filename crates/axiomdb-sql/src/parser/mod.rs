@@ -355,6 +355,18 @@ impl<'src> Parser<'src> {
                 self.advance();
                 dml::parse_replace(self)
             }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("declare") => {
+                self.advance();
+                self.parse_declare_cursor()
+            }
+            Token::Fetch => {
+                self.advance();
+                self.parse_fetch_cursor()
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("close") => {
+                self.advance();
+                self.parse_close_cursor()
+            }
             Token::Truncate => {
                 self.advance();
                 // TRUNCATE [TABLE] table_name
@@ -763,6 +775,95 @@ impl<'src> Parser<'src> {
                 position: Some(self.current_pos()),
             }),
         }
+    }
+
+    fn parse_declare_cursor(&mut self) -> Result<Stmt, DbError> {
+        let name = self.parse_identifier()?;
+        if !self.eat_ident_ci("CURSOR") {
+            return Err(DbError::ParseError {
+                message: "expected CURSOR after DECLARE <name>".into(),
+                position: Some(self.current_pos()),
+            });
+        }
+        self.expect(&Token::For)?;
+        let query = self.parse_stmt()?;
+        match query {
+            Stmt::Select(_) | Stmt::SetOp { .. } => {
+                Ok(Stmt::DeclareCursor(crate::ast::DeclareCursorStmt {
+                    name,
+                    query: Box::new(query),
+                }))
+            }
+            other => Err(DbError::ParseError {
+                message: format!(
+                    "DECLARE CURSOR requires a row-returning query, found {:?}",
+                    other
+                ),
+                position: Some(self.current_pos()),
+            }),
+        }
+    }
+
+    fn parse_fetch_cursor(&mut self) -> Result<Stmt, DbError> {
+        let count = match self.peek().clone() {
+            Token::Next => {
+                self.advance();
+                crate::ast::FetchCount::Next
+            }
+            Token::All => {
+                self.advance();
+                crate::ast::FetchCount::All
+            }
+            Token::Integer(n) if n >= 0 => {
+                self.advance();
+                crate::ast::FetchCount::Forward(n as u64)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("forward") => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::Integer(n) if n >= 0 => {
+                        self.advance();
+                        crate::ast::FetchCount::Forward(n as u64)
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "expected non-negative integer after FETCH FORWARD, found {other:?}"
+                            ),
+                            position: Some(self.current_pos()),
+                        });
+                    }
+                }
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "expected NEXT, ALL, integer count, or FORWARD after FETCH, found {other:?}"
+                    ),
+                    position: Some(self.current_pos()),
+                });
+            }
+        };
+
+        if !(self.eat(&Token::From) || self.eat(&Token::In)) {
+            return Err(DbError::ParseError {
+                message: "expected FROM or IN after FETCH selector".into(),
+                position: Some(self.current_pos()),
+            });
+        }
+        let name = self.parse_identifier()?;
+        Ok(Stmt::FetchCursor(crate::ast::FetchCursorStmt {
+            name,
+            count,
+        }))
+    }
+
+    fn parse_close_cursor(&mut self) -> Result<Stmt, DbError> {
+        if self.eat(&Token::All) {
+            return Ok(Stmt::CloseCursor(crate::ast::CloseCursorStmt::All));
+        }
+        let name = self.parse_identifier()?;
+        Ok(Stmt::CloseCursor(crate::ast::CloseCursorStmt::One(name)))
     }
 
     fn parse_create(&mut self) -> Result<Stmt, DbError> {

@@ -80,6 +80,16 @@ fn analyze_stmt(
                 .collect();
             Ok(Stmt::SetOp { first, rest: rest? })
         }
+        Stmt::DeclareCursor(mut s) => {
+            s.query = Box::new(analyze_stmt(
+                *s.query,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            )?);
+            Ok(Stmt::DeclareCursor(s))
+        }
         // Statements that need no semantic analysis for Phase 4.18:
         other => Ok(other),
     }

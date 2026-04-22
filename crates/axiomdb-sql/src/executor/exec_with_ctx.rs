@@ -26,6 +26,7 @@ pub fn execute_with_ctx_locked(
                 flush_pending_inserts_ctx(&exec_ctx, ctx)?;
                 flush_clustered_insert_batch(&exec_ctx, ctx)?;
                 ctx.in_explicit_txn = false;
+                ctx.close_all_cursors();
                 ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
                 let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                 let tid = conn.txn_id;
@@ -43,6 +44,7 @@ pub fn execute_with_ctx_locked(
                 // Discard staged rows without writing to heap or WAL.
                 ctx.discard_pending_inserts();
                 ctx.discard_clustered_insert_batch();
+                ctx.close_all_cursors();
                 ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
                 let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                 let tid = conn.txn_id;
@@ -105,6 +107,7 @@ pub fn execute_with_ctx_locked(
             flush_pending_inserts_ctx(&exec_ctx, ctx)?;
             flush_clustered_insert_batch(&exec_ctx, ctx)?;
             ctx.in_explicit_txn = false;
+            ctx.close_all_cursors();
             let pre_conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
             let pre_tid = pre_conn.txn_id;
             // Pre-DDL commit: discard any pending deferred (pipeline handles it).
@@ -153,6 +156,7 @@ pub fn execute_with_ctx_locked(
                 OnErrorMode::RollbackTransaction => {
                     ctx.discard_pending_inserts();
                     ctx.discard_clustered_insert_batch();
+                    ctx.close_all_cursors();
                     let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                     let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                     Err(e)
@@ -170,6 +174,7 @@ pub fn execute_with_ctx_locked(
                 OnErrorMode::Ignore => {
                     ctx.discard_pending_inserts();
                     ctx.discard_clustered_insert_batch();
+                    ctx.close_all_cursors();
                     let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                     let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                     Err(e)
@@ -379,4 +384,3 @@ fn is_ddl(stmt: &Stmt) -> bool {
             | Stmt::TruncateTable(_)
     )
 }
-

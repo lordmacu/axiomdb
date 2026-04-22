@@ -1,5 +1,27 @@
 # Architecture Notes
 
+## 2026-04-21 - SQL cursors (21.10)
+
+- **21.10 is SQL-session state, not a wire cursor feature.** `DECLARE`,
+  `FETCH`, and `CLOSE` live entirely in `SessionContext`; MySQL
+  `COM_STMT_FETCH` remains unsupported and intentionally separate from this
+  implementation.
+- **Materialize at `DECLARE`, slice at `FETCH`.** Cursor queries execute once,
+  immediately, and persist `QueryResult::Rows` as `SessionCursor { columns,
+  rows, pos }`, which keeps fetches O(k) over returned rows and avoids pinned
+  executor state.
+- **Cleanup belongs to transaction and connection boundaries.** Cursor state is
+  cleared on `COMMIT`, `ROLLBACK`, implicit full-transaction rollback paths,
+  reset-connection, and change-user handling so stale session state cannot leak
+  across lifecycle boundaries.
+- **Planner/cache dependencies come from the declared query, not the cursor
+  command.** `DeclareCursor` contributes the inner query's table dependencies;
+  `FetchCursor` and `CloseCursor` are session-local and dependency-free.
+- **Wire smokes that run with `autocommit=False` must close setup transactions
+  before explicit cursor `BEGIN`.** The harness itself can enter an implicit
+  transaction via setup DDL/DML, so cursor protocol smokes need an explicit
+  `COMMIT` before testing `BEGIN`.
+
 ## 2026-04-21 - Expression indexes (21.8)
 
 - **Expression indexes are catalog-first metadata.** `IndexColumnDef.expr`

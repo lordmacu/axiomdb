@@ -15,6 +15,7 @@ use axiomdb_wal::ConnectionTxn;
 
 use crate::clustered_secondary::ClusteredSecondaryLayout;
 use crate::expr::Expr;
+use crate::result::{ColumnMeta, Row};
 
 // ── CompatMode ────────────────────────────────────────────────────────────────
 
@@ -114,6 +115,16 @@ pub fn session_collation_name(c: SessionCollation) -> &'static str {
 }
 
 static TEMP_SCHEMA_SEQ: AtomicU64 = AtomicU64::new(1);
+
+// ── SQL cursors ───────────────────────────────────────────────────────────────
+
+/// Materialized transaction-scoped SQL cursor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionCursor {
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Row>,
+    pub pos: usize,
+}
 
 // ── OnErrorMode ───────────────────────────────────────────────────────────────
 
@@ -617,6 +628,11 @@ pub struct SessionContext {
     /// `Some(txn_id)`. Consumed by the network layer to drive the fsync
     /// pipeline. `None` for read-only or immediate commits.
     pub pending_deferred_txn_id: Option<axiomdb_core::TxnId>,
+    /// Session-local SQL cursors declared via `DECLARE ... CURSOR`.
+    ///
+    /// Keyed by normalized lowercase cursor name. Cleared on transaction end
+    /// and connection/session reset.
+    pub cursors: HashMap<String, SessionCursor>,
 }
 
 impl Default for SessionContext {
@@ -651,6 +667,7 @@ impl SessionContext {
             savepoints: Vec::new(),
             conn_txn: None,
             pending_deferred_txn_id: None,
+            cursors: HashMap::new(),
         }
     }
 
@@ -689,6 +706,43 @@ impl SessionContext {
     /// Returns the number of warnings from the last statement.
     pub fn warning_count(&self) -> u16 {
         self.warnings.len().min(u16::MAX as usize) as u16
+    }
+
+    fn normalize_cursor_name(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
+    pub fn cursor(&self, name: &str) -> Option<&SessionCursor> {
+        self.cursors.get(&Self::normalize_cursor_name(name))
+    }
+
+    pub fn cursor_mut(&mut self, name: &str) -> Option<&mut SessionCursor> {
+        self.cursors.get_mut(&Self::normalize_cursor_name(name))
+    }
+
+    pub fn declare_cursor(&mut self, name: &str, cursor: SessionCursor) -> Result<(), DbError> {
+        let key = Self::normalize_cursor_name(name);
+        if self.cursors.contains_key(&key) {
+            return Err(DbError::InvalidValue {
+                reason: format!("cursor '{name}' already exists"),
+            });
+        }
+        self.cursors.insert(key, cursor);
+        Ok(())
+    }
+
+    pub fn close_cursor(&mut self, name: &str) -> Result<(), DbError> {
+        let key = Self::normalize_cursor_name(name);
+        if self.cursors.remove(&key).is_none() {
+            return Err(DbError::InvalidValue {
+                reason: format!("cursor '{name}' was not found"),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn close_all_cursors(&mut self) {
+        self.cursors.clear();
     }
 
     // ── Collation / compat ────────────────────────────────────────────────────
@@ -1155,5 +1209,46 @@ mod tests {
         // Explicit override still wins over the compat-derived default.
         ctx.explicit_collation = Some(SessionCollation::Binary);
         assert_eq!(ctx.effective_collation(), SessionCollation::Binary);
+    }
+
+    #[test]
+    fn test_cursor_names_are_case_insensitive() {
+        let mut ctx = SessionContext::new();
+        ctx.declare_cursor(
+            "SalesCur",
+            SessionCursor {
+                columns: vec![],
+                rows: vec![],
+                pos: 0,
+            },
+        )
+        .unwrap();
+        assert!(ctx.cursor("salescur").is_some());
+        assert!(ctx.cursor("SALESCUR").is_some());
+    }
+
+    #[test]
+    fn test_close_all_cursors_clears_state() {
+        let mut ctx = SessionContext::new();
+        ctx.declare_cursor(
+            "c1",
+            SessionCursor {
+                columns: vec![],
+                rows: vec![],
+                pos: 0,
+            },
+        )
+        .unwrap();
+        ctx.declare_cursor(
+            "c2",
+            SessionCursor {
+                columns: vec![],
+                rows: vec![],
+                pos: 0,
+            },
+        )
+        .unwrap();
+        ctx.close_all_cursors();
+        assert!(ctx.cursors.is_empty());
     }
 }
