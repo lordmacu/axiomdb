@@ -42,5 +42,6 @@ use crate::{
 
 include!("analyzer_bind.rs");
 include!("analyzer_expr.rs");
+include!("analyzer_pivot.rs");
 include!("analyzer_stmt.rs");
 include!("analyzer_ddl.rs");

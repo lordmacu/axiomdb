@@ -349,6 +349,9 @@ pub enum FromClause {
         alias: String,
         lateral: bool,
     },
+    /// Phase 21.25 — bounded `PIVOT` source. Lowered by the analyzer to
+    /// `FromClause::Subquery` before execution.
+    Pivot(Box<PivotClause>),
     /// `JSON_TABLE(doc, '$.path' COLUMNS (...)) [AS alias]` — SQL:2016
     /// table-valued function (Phase 11.20a, flat subset).
     JsonTable(Box<JsonTable>),
@@ -364,6 +367,17 @@ pub enum FromClause {
     /// the analyzer when a `FromClause::Table` matches a recursive CTE
     /// name; carries base+step SELECTs plus iteration semantics.
     RecursiveCte(Box<RecursiveCteClause>),
+}
+
+/// Phase 21.25 — bounded `FROM source PIVOT (...) [AS alias]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PivotClause {
+    pub source: Box<FromClause>,
+    pub aggregate_name: String,
+    pub aggregate_arg: Expr,
+    pub pivot_expr: Expr,
+    pub values: Vec<Expr>,
+    pub alias: Option<String>,
 }
 
 /// Phase 21.2 — one binding in a `WITH` clause.

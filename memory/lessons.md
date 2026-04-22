@@ -1,5 +1,21 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 21.25
+
+- **If a roadmap says "dynamic" but the binder requires stable schemas, cut the
+  feature at explicit-value lowering.** Trying to discover pivot columns during
+  execution would have fought `BindContext`, virtual-column publication, and
+  prepared/wire metadata for little real user value in this slice.
+- **Parser precedence can silently absorb DSL keywords into ordinary SQL
+  expressions.** `FOR month IN (...)` initially parsed as one `Expr::In`,
+  which was the right fix point: reuse the normal expression parser and then
+  reinterpret that shape inside the pivot grammar instead of inventing a
+  bespoke precedence fork.
+- **Aggregate registries that only recognize column args are too narrow for SQL
+  rewrites.** The pivot rewrite emitted `SUM(CASE ...)`; until aggregate
+  descriptor matching compared general expression structure, valid grouped
+  queries failed at projection time with internal "not pre-registered" errors.
+
 ## 2026-04-22 - Phase 21.24
 
 - **Do not match wire intercepts on broad substrings when SQL has nearby statement families.** `SHOW STATUS` vs `SHOW TABLE STATUS` looked safe under `lower.contains("status")` until the ORM smoke ran through the full wire path.

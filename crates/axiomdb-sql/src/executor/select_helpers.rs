@@ -94,6 +94,11 @@ fn execute_select_with_joins(
                         feature: "recursive CTE JOIN via the non-ctx executor path".into(),
                     });
                 }
+                FromClause::Pivot(_) => {
+                    return Err(DbError::Internal {
+                        message: "unlowered PIVOT reached non-ctx join executor".into(),
+                    });
+                }
             }
         }
     }

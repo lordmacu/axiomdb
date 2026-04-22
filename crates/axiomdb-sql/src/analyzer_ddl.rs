@@ -565,6 +565,14 @@ fn analyze_merge_source(
             }
             Ok(FromClause::Values(vc))
         }
+        FromClause::Pivot(pivot) => lower_pivot_clause_to_subquery(
+            *pivot,
+            storage,
+            snapshot,
+            default_database,
+            default_schema,
+            &[],
+        ),
         other @ FromClause::Table(_) | other @ FromClause::RecursiveCte(_) => Ok(other),
     }
 }

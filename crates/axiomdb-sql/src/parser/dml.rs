@@ -608,11 +608,14 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
             } else {
                 None
             };
-            return Ok(FromClause::Values(Box::new(crate::ast::ValuesClause {
+            return parse_optional_pivot_clause(
+                p,
+                FromClause::Values(Box::new(crate::ast::ValuesClause {
                 rows,
                 alias,
                 column_names,
-            })));
+                })),
+            );
         }
         p.expect(&Token::Select)?;
         let mut sub = parse_select(p)?;
@@ -638,11 +641,14 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         p.expect(&Token::RParen)?;
         p.eat(&Token::As);
         let alias = p.parse_identifier()?;
-        return Ok(FromClause::Subquery {
-            query: Box::new(sub),
-            alias,
-            lateral: lateral_consumed,
-        });
+        return parse_optional_pivot_clause(
+            p,
+            FromClause::Subquery {
+                query: Box::new(sub),
+                alias,
+                lateral: lateral_consumed,
+            },
+        );
     }
 
     // Phase 11.20a — `JSON_TABLE(...)` table-valued function. Only dispatch
@@ -651,7 +657,8 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
     if let Token::Ident(s) = p.peek() {
         if s.eq_ignore_ascii_case("JSON_TABLE") && matches!(p.peek_at(1), Token::LParen) {
             p.advance(); // consume the JSON_TABLE identifier
-            return crate::parser::json_table::parse_json_table_call(p);
+            let from = crate::parser::json_table::parse_json_table_call(p)?;
+            return parse_optional_pivot_clause(p, from);
         }
     }
 
@@ -663,16 +670,17 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
                 p.expect(&Token::LParen)?;
                 let doc = crate::parser::expr::parse_expr(p)?;
                 p.expect(&Token::RParen)?;
-                let alias = if p.eat(&Token::As) || is_implicit_alias_token(p.peek()) {
+                let alias = if p.eat(&Token::As)
+                    || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p))
+                {
                     Some(p.parse_identifier()?)
                 } else {
                     None
                 };
-                return Ok(FromClause::JsonbSrf(Box::new(crate::ast::JsonbSrf {
-                    kind,
-                    doc,
-                    alias,
-                })));
+                return parse_optional_pivot_clause(
+                    p,
+                    FromClause::JsonbSrf(Box::new(crate::ast::JsonbSrf { kind, doc, alias })),
+                );
             }
         }
     }
@@ -682,11 +690,92 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
 
     // Optional alias: `AS name` or implicit `name` (if next is a plain identifier,
     // not a keyword like JOIN, WHERE, ON, etc.)
-    if p.eat(&Token::As) || is_implicit_alias_token(p.peek()) {
+    if p.eat(&Token::As) || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p)) {
         table_ref.alias = Some(p.parse_identifier()?);
     }
 
-    Ok(FromClause::Table(table_ref))
+    parse_optional_pivot_clause(p, FromClause::Table(table_ref))
+}
+
+fn parse_optional_pivot_clause(p: &mut Parser, source: FromClause) -> Result<FromClause, DbError> {
+    if !is_pivot_clause_start(p) {
+        return Ok(source);
+    }
+
+    p.advance(); // PIVOT
+    p.expect(&Token::LParen)?;
+
+    let (aggregate_name, aggregate_arg) = match parse_expr(p)? {
+        Expr::Function { name, args } if args.len() == 1 => {
+            (name, args.into_iter().next().unwrap())
+        }
+        Expr::Function { name, args } => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "PIVOT aggregate `{name}` must take exactly one argument, found {}",
+                    args.len()
+                ),
+                position: Some(p.current_pos()),
+            });
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "PIVOT requires an aggregate function call, found {:?}",
+                    other
+                ),
+                position: Some(p.current_pos()),
+            });
+        }
+    };
+
+    if !p.eat(&Token::For) {
+        return Err(DbError::ParseError {
+            message: "expected FOR in PIVOT clause".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    let (pivot_expr, values) = match parse_expr(p)? {
+        Expr::In {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if !list.iter().all(|value| matches!(value, Expr::Literal(_))) {
+                return Err(DbError::ParseError {
+                    message: "PIVOT IN values must be literals".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            (*expr, list)
+        }
+        _ => {
+            return Err(DbError::ParseError {
+                message: "expected IN (...) in PIVOT clause".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+    };
+    p.expect(&Token::RParen)?;
+
+    let alias = if p.eat(&Token::As) || is_implicit_alias_token(p.peek()) {
+        Some(p.parse_identifier()?)
+    } else {
+        None
+    };
+
+    Ok(FromClause::Pivot(Box::new(crate::ast::PivotClause {
+        source: Box::new(source),
+        aggregate_name,
+        aggregate_arg,
+        pivot_expr,
+        values,
+        alias,
+    })))
+}
+
+fn is_pivot_clause_start(p: &Parser) -> bool {
+    peek_ident_ci_at(p, 0, "PIVOT") && p.peek_at(1) == &Token::LParen
 }
 
 /// Returns true if the current token can start an implicit table alias
@@ -1572,7 +1661,8 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         | FromClause::JsonTable(_)
         | FromClause::JsonbSrf(_)
         | FromClause::Values(_)
-        | FromClause::RecursiveCte(_) => {
+        | FromClause::RecursiveCte(_)
+        | FromClause::Pivot(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -1786,7 +1876,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::JsonTable(_)
             | FromClause::JsonbSrf(_)
             | FromClause::Values(_)
-            | FromClause::RecursiveCte(_) => {
+            | FromClause::RecursiveCte(_)
+            | FromClause::Pivot(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -1804,7 +1895,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::JsonTable(_)
             | FromClause::JsonbSrf(_)
             | FromClause::Values(_)
-            | FromClause::RecursiveCte(_) => {
+            | FromClause::RecursiveCte(_)
+            | FromClause::Pivot(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

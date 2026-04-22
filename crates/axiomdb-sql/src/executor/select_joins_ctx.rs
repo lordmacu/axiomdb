@@ -254,6 +254,11 @@ fn execute_select_with_joins_first_materialized(
                             .into(),
                     });
                 }
+                FromClause::Pivot(_) => {
+                    return Err(DbError::Internal {
+                        message: "unlowered PIVOT reached join executor".into(),
+                    });
+                }
             }
         }
     }

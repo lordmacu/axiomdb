@@ -26,7 +26,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.10 (SQL cursors),
              21.20 (CHECKPOINT),
              21.23 (advanced SQL acceptance smoke),
-             21.24 (ORM compatibility tier 2 smoke)
+             21.24 (ORM compatibility tier 2 smoke),
+             21.25 (PIVOT smoke)
 """
 import os
 import signal
@@ -3902,6 +3903,29 @@ cur.execute("SHOW CREATE TABLE orm24_users")
 rows = cur.fetchall()
 ok("[21.24 orm compat] SHOW CREATE TABLE reconstructs auto-increment DDL",
    len(rows) == 1 and "AUTO_INCREMENT" in rows[0][1],
+   rows)
+
+# ── Phase 21.25 — PIVOT dynamic ──────────────────────────────────────────────
+
+print("\n[21.25 pivot]")
+
+cur.execute("CREATE TABLE pivot25_sales (region TEXT, month TEXT, amount INT)")
+cur.execute(
+    "INSERT INTO pivot25_sales VALUES "
+    "('north', 'Jan', 10), "
+    "('north', 'Feb', 20), "
+    "('south', 'Jan', 15)"
+)
+conn.commit()
+cur.execute(
+    "SELECT * "
+    "FROM pivot25_sales "
+    "PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb')) AS p "
+    "ORDER BY region"
+)
+rows = cur.fetchall()
+ok("[21.25 pivot] PIVOT rewrites rows into stable generated columns",
+   rows == (("north", "10", "20"), ("south", "15", None)),
    rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────

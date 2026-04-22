@@ -274,6 +274,11 @@ fn explain_select(
                 "EXPLAIN for recursive CTE FROM not yet supported".into(),
             ))
         }
+        crate::ast::FromClause::Pivot(_) => {
+            return Err(DbError::Internal {
+                message: "unlowered PIVOT reached EXPLAIN".into(),
+            })
+        }
     };
 
     let conn = ctx.conn_txn.take();

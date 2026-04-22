@@ -151,6 +151,7 @@ impl AggExpr {
                         Some(Expr::Column { col_idx: a, .. }),
                         Some(Expr::Column { col_idx: b, .. }),
                     ) => a == b,
+                    (Some(a), Some(b)) => a == b,
                     _ => false,
                 }
             }

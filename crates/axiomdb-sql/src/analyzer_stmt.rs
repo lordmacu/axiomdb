@@ -276,6 +276,17 @@ fn analyze_select_with_outer(
         });
     }
 
+    if let Some(FromClause::Pivot(pivot)) = s.from {
+        s.from = Some(lower_pivot_clause_to_subquery(
+            *pivot,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+            outer_scopes,
+        )?);
+    }
+
     // AnalyzeState is needed so that subquery arms inside expressions can
     // recurse back into analyze_select_with_outer.
     let state = AnalyzeState {
@@ -371,6 +382,23 @@ fn analyze_select_with_outer(
                     }
                 }
                 join.table = FromClause::Values(vc);
+            }
+            FromClause::Pivot(pivot) => {
+                let effective_scopes = if pivot_source_lateral(&pivot.source) {
+                    let mut scopes = outer_scopes.to_vec();
+                    scopes.push(&ctx);
+                    scopes
+                } else {
+                    outer_scopes.to_vec()
+                };
+                join.table = lower_pivot_clause_to_subquery(
+                    *pivot,
+                    storage,
+                    state.snapshot.clone(),
+                    state.default_database,
+                    state.default_schema,
+                    &effective_scopes,
+                )?;
             }
             FromClause::Table(_) => {}
             // Phase 21.3 — recursive CTE already pre-analyzed by expand_ctes.

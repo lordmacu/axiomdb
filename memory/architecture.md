@@ -1,5 +1,22 @@
 # Architecture Notes
 
+## 2026-04-22 - PIVOT dynamic (21.25)
+
+- **`PIVOT` is analyzer-lowered, not executor-native.** The parser introduces
+  `FromClause::Pivot`, but the analyzer rewrites it to
+  `FromClause::Subquery` before execution, so grouped execution reuses the
+  existing aggregate pipeline instead of learning a new physical operator.
+- **Stable result schema is derived before execution.** `build_context` now
+  computes passthrough columns plus generated pivot columns from the source
+  shape and the resolved pivot/value expressions, which keeps derived-table
+  metadata compatible with bind-time column publication and wire result
+  metadata.
+- **Aggregate descriptor matching must support non-column aggregate args.**
+  Once pivot lowering emitted `SUM(CASE WHEN ... THEN ... END)`, the aggregate
+  registry had to match structural expression equality, not only plain column
+  args, or grouped projection/HAVING would treat valid aggregates as
+  "not pre-registered".
+
 ## 2026-04-22 - ORM compatibility tier 2 (21.24)
 
 - `parser/mod.rs`: `SHOW FULL FIELDS` is a synonym of `SHOW FULL COLUMNS`
