@@ -1,5 +1,59 @@
 # Fase 21 - Advanced SQL
 
+## 21.24 ORM compatibility tier 2 - cerrada 2026-04-22
+
+La subfase 21.24 cierra un baseline ORM acotado y honesto. El objetivo no era
+implementar todas las expectativas de Prisma o ActiveRecord, sino dejar
+funcionando por wire el conjunto de metadata y migracion basica que hoy si cabe
+en la superficie existente de AxiomDB, y documentar de forma explicita lo que
+sigue bloqueado por subfases futuras.
+
+### Superficie compat cerrada
+
+Flujo ORM-style ya cubierto:
+
+- `SET foreign_key_checks = 0`, `SET unique_checks = 0`,
+  `SET sql_notes = 0` como toggles no-op de compatibilidad.
+- `CREATE TABLE ... (id INT SERIAL, ...)`.
+- `INSERT ... RETURNING`.
+- `SHOW FULL FIELDS FROM t` como sinonimo MySQL de `SHOW FULL COLUMNS`.
+- `SHOW FULL TABLES`.
+- `SHOW TABLE STATUS [LIKE ...]`.
+- `SHOW CREATE TABLE t`.
+
+Cobertura agregada:
+
+- `crates/axiomdb-sql/tests/integration_orm_compat.rs`
+- `tools/wire-test.py` bloque `21.24 orm compat`
+
+### Ajustes tecnicos de cierre
+
+- Parser: `SHOW FULL FIELDS FROM t` ahora entra por el mismo camino que
+  `SHOW FULL COLUMNS`.
+- Executor SQL read-only: la ruta shared usada por el servidor MySQL ya cubre
+  `SHOW COLUMNS/FIELDS`, `SHOW INDEX`, `SHOW CREATE TABLE`,
+  `SHOW TABLE STATUS`, `SHOW ENGINES`, `SHOW CHARSET`, `SHOW COLLATION`,
+  `SHOW WARNINGS`, `SHOW ERRORS`, `SHOW VARIABLES` y `SHOW STATUS`, en vez de
+  limitarse a `SELECT`, `SHOW TABLES` y `SHOW DATABASES`.
+- Wire intercept: `SHOW STATUS` ya no captura por error `SHOW TABLE STATUS`
+  solo por contener la palabra `status`.
+- Inventario de compatibilidad: `docs/gaps-mysql-compat.md` fue corregido para
+  marcar como implementados varios probes MySQL/ORM que estaban stale.
+
+### Incompatibilidades explicitamente deferidas
+
+- `GENERATED ALWAYS AS IDENTITY` sigue en `24.1c`.
+- `DEFERRABLE INITIALLY DEFERRED/IMMEDIATE` y enforcement diferido de FK
+  siguen en `21.16`.
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_orm_compat --test integration_show_full --test integration_g9_ddl --test integration_returning` - paso.
+- `tools/wire-test.py` - paso, 433/433 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 21.23 Advanced SQL tests - cerrada 2026-04-22
 
 La subfase 21.23 cierra la capa de aceptacion integrada de Fase 21. El

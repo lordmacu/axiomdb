@@ -4,7 +4,7 @@ fn execute_show_databases(
     _stmt: ShowDatabasesStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
@@ -132,7 +132,7 @@ fn execute_show_tables(
     stmt: crate::ast::ShowTablesStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     search_path: Option<&[String]>,
     default_schema: Option<&str>,
     database: &str,
@@ -191,7 +191,7 @@ fn execute_show_columns(
     stmt: crate::ast::ShowColumnsStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -292,7 +292,7 @@ pub(crate) fn execute_show_index(
     stmt: crate::ast::ShowIndexStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -405,7 +405,7 @@ fn execute_show_create_table(
     stmt: crate::ast::ShowCreateTableStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {
@@ -559,7 +559,7 @@ fn execute_show_table_status(
     stmt: crate::ast::ShowTableStatusStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
     search_path: Option<&[String]>,
     database: &str,
 ) -> Result<QueryResult, DbError> {

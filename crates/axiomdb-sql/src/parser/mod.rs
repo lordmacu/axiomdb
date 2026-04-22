@@ -484,8 +484,11 @@ impl<'src> Parser<'src> {
                         let table = self.parse_table_ref()?;
                         Ok(Stmt::ShowCreateTable(crate::ast::ShowCreateTableStmt { table }))
                     }
-                    // COLUMNS is not a reserved keyword — it tokenizes as Ident
-                    Token::Ident(kw) | Token::QuotedIdent(kw) if kw.eq_ignore_ascii_case("columns") => {
+                    // COLUMNS / FIELDS are not reserved keywords — they tokenize as Ident.
+                    Token::Ident(kw) | Token::QuotedIdent(kw)
+                        if kw.eq_ignore_ascii_case("columns")
+                            || kw.eq_ignore_ascii_case("fields") =>
+                    {
                         self.advance();
                         self.expect(&Token::From)?;
                         let table = self.parse_table_ref()?;

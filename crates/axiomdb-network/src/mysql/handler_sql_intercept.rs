@@ -117,7 +117,7 @@ fn intercept_special_query(
     }
 
     // ── SHOW [GLOBAL|SESSION|LOCAL] STATUS [LIKE '...'] (5.9c) ───────────────
-    if lower.starts_with("show") && lower.contains("status") {
+    if lower.starts_with("show") {
         use super::status::{build_status_rows, parse_show_status};
         if let Some(query) = parse_show_status(&lower) {
             let qr = build_status_rows(&query, status, &conn_state.session_status);
@@ -126,19 +126,6 @@ fn intercept_special_query(
                     .expect("utf8mb4 encoding always valid for ASCII data"),
             ));
         }
-        // Unrecognised SHOW ... STATUS variant — return empty two-column rowset.
-        let cols = vec![
-            ColumnMeta::computed("Variable_name".to_string(), DataType::Text),
-            ColumnMeta::computed("Value".to_string(), DataType::Text),
-        ];
-        let qr = QueryResult::Rows {
-            columns: cols,
-            rows: vec![],
-        };
-        return Ok(Some(
-            serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
-                .expect("utf8mb4 encoding always valid for ASCII data"),
-        ));
     }
 
     // ── SHOW [FULL] PROCESSLIST (GAP-B.7) ────────────────────────────────────
@@ -308,4 +295,35 @@ fn single_null_row(col_name: &str) -> Vec<(u8, Vec<u8>)> {
     };
     serialize_query_result(qr, 1, DEFAULT_SERVER_COLLATION)
         .expect("utf8mb4 encoding always valid for ASCII data")
+}
+
+#[cfg(test)]
+mod intercept_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    use super::intercept_special_query;
+    use crate::mysql::processlist::Registry;
+    use crate::mysql::session::ConnectionState;
+    use crate::mysql::status::StatusRegistry;
+
+    #[test]
+    fn show_table_status_is_not_captured_by_show_status_intercept() {
+        let mut conn = ConnectionState::default();
+        let status = Arc::new(StatusRegistry::default());
+        let registry: Registry = Arc::new(RwLock::new(HashMap::new()));
+
+        let intercepted = intercept_special_query(
+            "SHOW TABLE STATUS LIKE 'users'",
+            &mut conn,
+            &status,
+            &registry,
+        )
+        .expect("intercept should not error");
+
+        assert!(
+            intercepted.is_none(),
+            "SHOW TABLE STATUS must fall through to the SQL executor"
+        );
+    }
 }
