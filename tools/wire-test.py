@@ -24,7 +24,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.5f (GENERATED ALWAYS AS STORED insert/update smoke),
              21.11 (query hints),
              21.10 (SQL cursors),
-             21.20 (CHECKPOINT)
+             21.20 (CHECKPOINT),
+             21.23 (advanced SQL acceptance smoke)
 """
 import os
 import signal
@@ -3833,6 +3834,36 @@ except pymysql.MySQLError as e:
     ok("[21.20 checkpoint] active txn rejects CHECKPOINT", e.args[0] == 1213, e.args)
 finally:
     cur.execute("ROLLBACK")
+
+# ── Phase 21.23 — Advanced SQL acceptance smoke ─────────────────────────────
+
+print("\n[21.23 advanced sql]")
+
+cur.execute("ROLLBACK")
+cur.execute("CREATE TABLE adv23_dst (id INT, qty INT)")
+cur.execute("INSERT INTO adv23_dst VALUES (1, 10)")
+cur.execute("COMMIT")
+cur.execute("BEGIN")
+cur.execute(
+    "MERGE INTO adv23_dst AS d USING (VALUES (1, 20), (2, 5)) AS s(id, qty) "
+    "ON d.id = s.id "
+    "WHEN MATCHED THEN UPDATE SET qty = s.qty "
+    "WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s.id, s.qty)"
+)
+cur.execute("SAVEPOINT adv23_sp")
+cur.execute(
+    "MERGE INTO adv23_dst AS d USING (VALUES (1, 99), (3, 9)) AS s(id, qty) "
+    "ON d.id = s.id "
+    "WHEN MATCHED THEN UPDATE SET qty = s.qty "
+    "WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (s.id, s.qty)"
+)
+cur.execute("ROLLBACK TO SAVEPOINT adv23_sp")
+cur.execute("SELECT id, qty FROM adv23_dst ORDER BY id")
+rows = cur.fetchall()
+ok("[21.23 advanced sql] MERGE + SAVEPOINT workflow preserves pre-savepoint state",
+   rows == ((1, 20), (2, 5)),
+   rows)
+cur.execute("COMMIT")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

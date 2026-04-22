@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 21.23
+
+- **Acceptance suites should target interactions, not restate feature-unit
+  coverage.** The value of `21.23` came from composing CTEs, `MERGE`,
+  savepoints, cursors, `CHECKPOINT`, and grouping sets in shared workflows,
+  not from reasserting every parser edge already tested elsewhere.
+- **A stale roadmap line can pull the implementation in the wrong direction.**
+  `21.23` still mentioned window functions in `docs/progreso.md`, but the repo
+  has no SQL `OVER (...)` support yet; fixing the wording first prevented a
+  test-only subphase from silently turning into feature expansion.
+- **Wire smokes with `autocommit=False` are easy to invalidate with local
+  setup writes.** If a block does DDL/DML setup and then starts an explicit
+  transaction, it must commit or rollback its own implicit transaction first
+  or the smoke will fail for harness-state reasons.
+
 ## 2026-04-22 - Phase 21.11
 
 - **The visible SQL feature was blocked by lexer behavior, not by planner code.**
