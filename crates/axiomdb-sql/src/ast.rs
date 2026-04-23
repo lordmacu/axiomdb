@@ -863,6 +863,15 @@ pub struct CreateTableAsSelectStmt {
     pub persistence: TablePersistence,
 }
 
+/// `CREATE MATERIALIZED VIEW name AS SELECT ...` — store query + materialized rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateMaterializedViewStmt {
+    pub if_not_exists: bool,
+    pub view: TableRef,
+    pub select: SelectStmt,
+    pub query_sql: String,
+}
+
 // ── DDL statements ────────────────────────────────────────────────────────────
 
 /// `CREATE TABLE`
@@ -930,6 +939,20 @@ pub struct DropTableStmt {
     /// Multiple tables can be dropped in one statement: `DROP TABLE a, b, c`.
     pub tables: Vec<TableRef>,
     pub cascade: bool,
+}
+
+/// `DROP MATERIALIZED VIEW`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropMaterializedViewStmt {
+    pub if_exists: bool,
+    pub views: Vec<TableRef>,
+    pub cascade: bool,
+}
+
+/// `REFRESH MATERIALIZED VIEW`
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshMaterializedViewStmt {
+    pub view: TableRef,
 }
 
 /// `DROP INDEX`
@@ -1185,12 +1208,16 @@ pub enum Stmt {
     CreateTableLike(CreateTableLikeStmt),
     /// `CREATE TABLE new AS SELECT ...` — derive schema + populate from query.
     CreateTableAsSelect(CreateTableAsSelectStmt),
+    /// `CREATE MATERIALIZED VIEW name AS SELECT ...`.
+    CreateMaterializedView(CreateMaterializedViewStmt),
     CreateDatabase(CreateDatabaseStmt),
     CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
+    DropMaterializedView(DropMaterializedViewStmt),
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
+    RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
     /// `ANALYZE [TABLE name [(col)]]` — refresh per-column statistics (Phase 6.12).

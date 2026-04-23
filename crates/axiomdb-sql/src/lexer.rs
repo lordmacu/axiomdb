@@ -100,6 +100,10 @@ pub enum Token<'src> {
     Create,
     #[token("TABLE", ignore(ascii_case))]
     Table,
+    #[token("MATERIALIZED", ignore(ascii_case))]
+    Materialized,
+    #[token("VIEW", ignore(ascii_case))]
+    View,
     #[regex("TEMP(?:ORARY)?", ignore(ascii_case))]
     Temp,
     #[token("INDEX", ignore(ascii_case))]
@@ -146,6 +150,8 @@ pub enum Token<'src> {
     SavepointKw,
     #[token("RELEASE", ignore(ascii_case))]
     Release,
+    #[token("REFRESH", ignore(ascii_case))]
+    Refresh,
 
     // ── Constraints ───────────────────────────────────────────────────────────
     #[token("PRIMARY", ignore(ascii_case))]

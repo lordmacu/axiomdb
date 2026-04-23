@@ -19,8 +19,8 @@ pub use reader::CatalogReader;
 pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
     ColumnDef, ColumnType, ConstraintDef, ConstraintKind, ConstraintOperator, DatabaseDef,
-    ExclusionElementDef, FkAction, FkDef, IndexColumnDef, IndexDef, SchemaDef, SortOrder, StatsDef,
-    TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
+    ExclusionElementDef, FkAction, FkDef, IndexColumnDef, IndexDef, RelationKind, SchemaDef,
+    SortOrder, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
     DEFAULT_DATABASE_NAME,
 };
 pub use writer::{

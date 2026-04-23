@@ -98,12 +98,15 @@ fn stmt_changes_schema(stmt: &Stmt) -> bool {
     matches!(
         stmt,
         Stmt::CreateTable(_)
+            | Stmt::CreateMaterializedView(_)
             | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
+            | Stmt::DropMaterializedView(_)
             | Stmt::DropDatabase(_)
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
+            | Stmt::RefreshMaterializedView(_)
             | Stmt::TruncateTable(_)
     )
 }

@@ -40,9 +40,34 @@ fn analyze_stmt(
             )?;
             Ok(Stmt::CreateTableAsSelect(s))
         }
+        Stmt::CreateMaterializedView(mut s) => {
+            s.select = analyze_select(
+                s.select,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            )?;
+            Ok(Stmt::CreateMaterializedView(s))
+        }
         Stmt::DropTable(s) => {
             analyze_drop_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::DropTable)
+        }
+        Stmt::DropMaterializedView(s) => {
+            let drop_stmt = crate::ast::DropTableStmt {
+                if_exists: s.if_exists,
+                tables: s.views,
+                cascade: s.cascade,
+            };
+            analyze_drop_table(drop_stmt, storage, snapshot, default_database, default_schema)
+                .map(|drop_stmt| {
+                    Stmt::DropMaterializedView(crate::ast::DropMaterializedViewStmt {
+                        if_exists: drop_stmt.if_exists,
+                        views: drop_stmt.tables,
+                        cascade: drop_stmt.cascade,
+                    })
+                })
         }
         Stmt::CreateIndex(s) => {
             analyze_create_index(s, storage, snapshot, default_database, default_schema)
@@ -120,7 +145,9 @@ fn analyze_stmt_cached(
         Stmt::CreateTable(_)
         | Stmt::CreateTableLike(_)
         | Stmt::CreateTableAsSelect(_)
+        | Stmt::CreateMaterializedView(_)
         | Stmt::DropTable(_)
+        | Stmt::DropMaterializedView(_)
         | Stmt::AlterTable(_) => {
             cache.invalidate();
             analyze_stmt(stmt, storage, snapshot, default_database, default_schema)

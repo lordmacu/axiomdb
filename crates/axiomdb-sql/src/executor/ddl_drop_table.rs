@@ -9,50 +9,17 @@ fn execute_drop_table(
     database: &str,
 ) -> Result<QueryResult, DbError> {
     for table_ref in stmt.tables {
-        let table_db = table_ref.database.as_deref().unwrap_or(database);
-        let snap = txn.active_snapshot(conn_txn);
-
-        let table_id = if let Some(schema) = table_ref.schema.as_deref() {
-            let mut reader = CatalogReader::new(storage, snap)?;
-            match reader.get_table_in_database(table_db, schema, &table_ref.name)? {
-                Some(def) => def.id,
-                None if stmt.if_exists => continue,
-                None => {
-                    return Err(DbError::TableNotFound {
-                        name: table_ref.name.clone(),
-                    })
-                }
+        let Some(def) =
+            resolve_relation_def(storage, txn, conn_txn, &table_ref, search_path, database)?
+        else {
+            if stmt.if_exists {
+                continue;
             }
-        } else if let Some(search_path) = search_path {
-            let mut found = None;
-            for schema in search_path {
-                let mut reader = CatalogReader::new(storage, snap.clone())?;
-                if let Some(def) = reader.get_table_in_database(table_db, schema, &table_ref.name)? {
-                    found = Some(def.id);
-                    break;
-                }
-            }
-            match found {
-                Some(id) => id,
-                None if stmt.if_exists => continue,
-                None => {
-                    return Err(DbError::TableNotFound {
-                        name: table_ref.name.clone(),
-                    })
-                }
-            }
-        } else {
-            let mut reader = CatalogReader::new(storage, snap)?;
-            match reader.get_table_in_database(table_db, "public", &table_ref.name)? {
-                Some(def) => def.id,
-                None if stmt.if_exists => continue,
-                None => {
-                    return Err(DbError::TableNotFound {
-                        name: table_ref.name.clone(),
-                    })
-                }
-            }
-        }; // reader dropped — immutable borrow released
+            return Err(DbError::TableNotFound {
+                name: table_ref.name.clone(),
+            });
+        };
+        let table_id = def.id;
 
         // Bump schema_version before dropping so cross-connection plan caches
         // that hold a dep on this table_id see a version mismatch on next lookup
@@ -64,6 +31,66 @@ fn execute_drop_table(
     }
 
     Ok(QueryResult::Empty)
+}
+
+fn execute_drop_materialized_view(
+    stmt: crate::ast::DropMaterializedViewStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    search_path: Option<&[String]>,
+    database: &str,
+) -> Result<QueryResult, DbError> {
+    for view_ref in stmt.views {
+        let Some(def) =
+            resolve_relation_def(storage, txn, conn_txn, &view_ref, search_path, database)?
+        else {
+            if stmt.if_exists {
+                continue;
+            }
+            return Err(DbError::TableNotFound {
+                name: view_ref.name.clone(),
+            });
+        };
+        if !def.is_materialized_view() {
+            return Err(DbError::InvalidValue {
+                reason: format!("'{}' is not a materialized view", view_ref.name),
+            });
+        }
+
+        let _ = CatalogWriter::new(storage, txn, conn_txn)?.bump_table_schema_version(def.id);
+        drop_table_fully(storage, txn, conn_txn, def.id)?;
+    }
+
+    Ok(QueryResult::Empty)
+}
+
+fn resolve_relation_def(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
+    table_ref: &TableRef,
+    search_path: Option<&[String]>,
+    database: &str,
+) -> Result<Option<axiomdb_catalog::TableDef>, DbError> {
+    let table_db = table_ref.database.as_deref().unwrap_or(database);
+    let snap = txn.active_snapshot(conn_txn);
+    if let Some(schema) = table_ref.schema.as_deref() {
+        let mut reader = CatalogReader::new(storage, snap)?;
+        return reader.get_table_in_database(table_db, schema, &table_ref.name);
+    }
+    if let Some(search_path) = search_path {
+        for schema in search_path {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            if let Some(def) = reader.get_table_in_database(table_db, schema, &table_ref.name)? {
+                return Ok(Some(def));
+            }
+        }
+        return Ok(None);
+    }
+
+    let mut reader = CatalogReader::new(storage, snap)?;
+    reader.get_table_in_database(table_db, "public", &table_ref.name)
 }
 
 fn drop_table_fully(

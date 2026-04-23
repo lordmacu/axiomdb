@@ -55,7 +55,7 @@ pub fn parse_with_sql_mode(
         None => input,
     };
     let tokens = crate::lexer::tokenize_with_sql_mode(effective, max_bytes, sql_mode)?;
-    let mut p = Parser::new(&tokens);
+    let mut p = Parser::new(&tokens, effective);
     let stmt = p.parse_stmt()?;
 
     // After parsing, only Eof (or Semicolon+Eof) should remain.
@@ -86,7 +86,7 @@ pub fn parse_expr_only_with_sql_mode(
     sql_mode: SqlModeFlags,
 ) -> Result<crate::expr::Expr, DbError> {
     let tokens = crate::lexer::tokenize_with_sql_mode(input, None, sql_mode)?;
-    let mut p = Parser::new(&tokens);
+    let mut p = Parser::new(&tokens, input);
     let e = expr::parse_expr(&mut p)?;
     Ok(e)
 }
@@ -97,6 +97,7 @@ pub fn parse_expr_only_with_sql_mode(
 ///
 /// The lifetime `'src` is tied to the original SQL input string.
 pub(crate) struct Parser<'src> {
+    input: &'src str,
     tokens: &'src [SpannedToken<'src>],
     pos: usize,
     /// Parameter index counter for `?` placeholders in prepared statement templates.
@@ -114,8 +115,9 @@ pub(crate) struct Parser<'src> {
 }
 
 impl<'src> Parser<'src> {
-    pub(crate) fn new(tokens: &'src [SpannedToken<'src>]) -> Self {
+    pub(crate) fn new(tokens: &'src [SpannedToken<'src>], input: &'src str) -> Self {
         Self {
+            input,
             tokens,
             pos: 0,
             param_count: 0,
@@ -158,6 +160,18 @@ impl<'src> Parser<'src> {
             .get(self.pos)
             .map(|st| st.span)
             .unwrap_or(Span { start: 0, end: 0 })
+    }
+
+    pub(crate) fn previous_end(&self) -> usize {
+        self.pos
+            .checked_sub(1)
+            .and_then(|idx| self.tokens.get(idx))
+            .map(|st| st.span.end)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn slice_sql(&self, start: usize, end: usize) -> String {
+        self.input.get(start..end).unwrap_or("").trim().to_string()
     }
 
     // ── Advance helpers ───────────────────────────────────────────────────────
@@ -406,6 +420,10 @@ impl<'src> Parser<'src> {
             Token::Checkpoint => {
                 self.advance();
                 Ok(Stmt::Checkpoint)
+            }
+            Token::Refresh => {
+                self.advance();
+                ddl::parse_refresh_materialized_view(self)
             }
             Token::Analyze => {
                 self.advance();
@@ -897,6 +915,11 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_table(self, axiomdb_catalog::TablePersistence::Permanent)
             }
+            Token::Materialized => {
+                self.advance();
+                self.expect(&Token::View)?;
+                ddl::parse_create_materialized_view(self)
+            }
             Token::Unique => {
                 self.advance();
                 self.expect(&Token::Index)?;
@@ -908,7 +931,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE, MATERIALIZED VIEW or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -926,13 +949,18 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_table(self)
             }
+            Token::Materialized => {
+                self.advance();
+                self.expect(&Token::View)?;
+                ddl::parse_drop_materialized_view(self)
+            }
             Token::Index => {
                 self.advance();
                 ddl::parse_drop_index(self)
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, MATERIALIZED VIEW or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

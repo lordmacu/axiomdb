@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 13.1
+
+- **Do not wait for regular views if the roadmap item is physically
+  materialized data.** Treating `13.1` as a catalog-owned table cut the scope
+  to something the current engine can actually ship instead of blocking on
+  `CREATE VIEW`.
+- **Refresh logic cannot reuse stale relation metadata after truncate.**
+  `TRUNCATE` rotates the heap root, so a refresh path that inserts back through
+  the pre-truncate `TableDef` quietly writes to the wrong root and appears to
+  "lose" rows.
+- **If a new relation kind is user-visible, metadata tests need to pin it
+  immediately.** `SHOW FULL TABLES`, `SHOW CREATE TABLE`, and
+  `information_schema.TABLES` were the places most likely to leak the new MV as
+  a plain table even when core DDL/storage already worked.
+
 ## 2026-04-22 - Phase 11.21h
 
 - **The right first JSONPath pushdown is "simple key probes with recheck", not

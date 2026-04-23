@@ -105,6 +105,8 @@ mod tests {
             schema_version: 1,
             immutable: false,
             persistence: TablePersistence::Permanent,
+            relation_kind: RelationKind::Table,
+            defining_query: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -125,6 +127,8 @@ mod tests {
                 schema_version: 1,
                 immutable: false,
                 persistence: TablePersistence::Permanent,
+                relation_kind: RelationKind::Table,
+                defining_query: None,
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
             assert_eq!(back.root_page_id, root);
@@ -142,6 +146,8 @@ mod tests {
             schema_version: 1,
             immutable: false,
             persistence: TablePersistence::Permanent,
+            relation_kind: RelationKind::Table,
+            defining_query: None,
         };
         let bytes = def.to_bytes();
         let (back, _) = TableDef::from_bytes(&bytes).unwrap();
@@ -159,6 +165,8 @@ mod tests {
             schema_version: 1,
             immutable: false,
             persistence: TablePersistence::Permanent,
+            relation_kind: RelationKind::Table,
+            defining_query: None,
         };
         let bytes = def.to_bytes();
         // Minimum is 14 bytes; truncate to 10 (has id+root but no schema_len).
@@ -178,6 +186,8 @@ mod tests {
             schema_version: 1,
             immutable: false,
             persistence: TablePersistence::Permanent,
+            relation_kind: RelationKind::Table,
+            defining_query: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -202,6 +212,8 @@ mod tests {
         assert_eq!(back.schema_name, "public");
         assert_eq!(back.table_name, "users");
         assert_eq!(back.persistence, TablePersistence::Permanent);
+        assert_eq!(back.relation_kind, RelationKind::Table);
+        assert_eq!(back.defining_query, None);
         assert_eq!(consumed, legacy.len());
     }
 
@@ -216,11 +228,34 @@ mod tests {
             schema_version: 4,
             immutable: false,
             persistence: TablePersistence::Unlogged,
+            relation_kind: RelationKind::Table,
+            defining_query: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
         assert_eq!(back, def);
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_table_def_roundtrip_materialized_view() {
+        let def = TableDef {
+            id: 33,
+            root_page_id: 91,
+            storage_layout: TableStorageLayout::Heap,
+            schema_name: "public".into(),
+            table_name: "mv_sales".into(),
+            schema_version: 1,
+            immutable: false,
+            persistence: TablePersistence::Permanent,
+            relation_kind: RelationKind::MaterializedView,
+            defining_query: Some("SELECT region, SUM(total) FROM sales GROUP BY region".into()),
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+        assert!(back.is_materialized_view());
     }
 
     // ── ColumnDef ─────────────────────────────────────────────────────────────
