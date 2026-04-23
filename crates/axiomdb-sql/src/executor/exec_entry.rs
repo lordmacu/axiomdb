@@ -491,6 +491,20 @@ pub fn execute_read_only_with_ctx(
             }
             Ok(result)
         }
+        Stmt::ShowNotifications => {
+            let rows = ctx
+                .drain_notifications()
+                .into_iter()
+                .map(|notif| vec![Value::Text(notif.channel), Value::Text(notif.payload)])
+                .collect();
+            Ok(QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta::computed("channel", DataType::Text),
+                    ColumnMeta::computed("payload", DataType::Text),
+                ],
+                rows,
+            })
+        }
         Stmt::ShowErrors { limit } => {
             let errors: Vec<_> = ctx
                 .warnings

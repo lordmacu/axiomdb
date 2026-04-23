@@ -48,11 +48,11 @@ pub use ast::{
     CreateTableStmt, DeclareCursorStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
     DropMaterializedViewStmt, DropTableStmt, ExclusionElement, ExclusionElementTarget,
     ExclusionOperator, FetchCount, FetchCursorStmt, ForeignKeyAction, FromClause, IndexColumn,
-    InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, MergeAction,
-    MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder, OnConflictAction,
+    InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, ListenStmt, MergeAction,
+    MergeActionCondition, MergeActionKind, MergeStmt, NotifyStmt, NullsOrder, OnConflictAction,
     OnConflictClause, OrderByItem, RefreshMaterializedViewStmt, SelectItem, SelectStmt, SetStmt,
     SetValue, ShowColumnsStmt, ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt,
-    TableConstraint, TableRef, TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
+    TableConstraint, TableRef, TruncateTableStmt, UnlistenStmt, UpdateStmt, UseDatabaseStmt,
 };
 pub use bloom::BloomRegistry;
 pub use eval::{

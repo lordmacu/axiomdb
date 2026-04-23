@@ -1,5 +1,19 @@
 # Lessons Learned
 
+## 2026-04-23 - Phase 13.4
+
+- **If a feature works in direct executor tests but fails over the wire, check
+  the shared read-only path before blaming transaction logic.** `LISTEN` /
+  `NOTIFY` itself was correct; the real bug was that `SHOW NOTIFICATIONS` went
+  through `execute_read_only_with_ctx(...)` and returned a stub empty result.
+- **Session-draining statements are not “free” just because they are not
+  durable writes.** `SHOW NOTIFICATIONS` mutates per-session queue state, so
+  every execution path that can route it must drain the queue consistently.
+- **MySQL-wire lifecycle tests are essential for session features.** The final
+  closeout needed explicit coverage for cross-connection delivery, commit
+  boundaries, savepoint rollback, and connection reset because plain SQL-layer
+  unit tests do not exercise the same handler path.
+
 ## 2026-04-23 - Phase 13.3
 
 - **Do not re-implement a feature just because it reappears in another phase.**

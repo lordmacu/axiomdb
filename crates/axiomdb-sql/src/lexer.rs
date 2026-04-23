@@ -292,6 +292,12 @@ pub enum Token<'src> {
     Commit,
     #[token("ROLLBACK", ignore(ascii_case))]
     Rollback,
+    #[token("LISTEN", ignore(ascii_case))]
+    Listen,
+    #[token("UNLISTEN", ignore(ascii_case))]
+    Unlisten,
+    #[token("NOTIFY", ignore(ascii_case))]
+    Notify,
     #[token("START", ignore(ascii_case))]
     Start,
     #[token("TRANSACTION", ignore(ascii_case))]

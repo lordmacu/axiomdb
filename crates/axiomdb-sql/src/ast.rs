@@ -1164,6 +1164,26 @@ pub struct FetchCursorStmt {
     pub count: FetchCount,
 }
 
+/// `LISTEN channel`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenStmt {
+    pub channel: String,
+}
+
+/// `UNLISTEN channel` or `UNLISTEN *`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlistenStmt {
+    /// `None` means `UNLISTEN *`.
+    pub channel: Option<String>,
+}
+
+/// `NOTIFY channel [, payload]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotifyStmt {
+    pub channel: String,
+    pub payload: Option<Expr>,
+}
+
 /// `CLOSE name` or `CLOSE ALL`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseCursorStmt {
@@ -1252,6 +1272,8 @@ pub enum Stmt {
     ShowWarnings {
         limit: Option<u64>,
     },
+    /// `SHOW NOTIFICATIONS` — drains queued LISTEN / NOTIFY events for this session.
+    ShowNotifications,
     /// `SHOW ERRORS [LIMIT n]` — returns per-session error list (5.9e).
     ShowErrors {
         limit: Option<u64>,
@@ -1262,6 +1284,9 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    Listen(ListenStmt),
+    Unlisten(UnlistenStmt),
+    Notify(NotifyStmt),
     DeclareCursor(DeclareCursorStmt),
     FetchCursor(FetchCursorStmt),
     CloseCursor(CloseCursorStmt),

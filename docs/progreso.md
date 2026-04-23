@@ -182,7 +182,20 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [x] 13.1 ✅ Materialized views — closed 2026-04-22: `CREATE MATERIALIZED VIEW name AS SELECT ...` materializes into a catalog-owned physical relation (`TableDef.relation_kind = MaterializedView`, `defining_query` persisted in v5 table rows); `REFRESH MATERIALIZED VIEW` reparses the stored defining SQL, materializes the source query before truncation, bulk-empties the existing relation, reloads the fresh `TableDef` root after truncate, and repopulates rows; `DROP MATERIALIZED VIEW` rejects plain tables and reuses the normal drop path for true MVs. Metadata now exposes MVs distinctly via `SHOW FULL TABLES`, `SHOW CREATE TABLE` (returned as `CREATE MATERIALIZED VIEW ... AS ...` with `View` / `Create View` columns), and `information_schema.TABLES.TABLE_TYPE = 'MATERIALIZED VIEW'`. Coverage: `crates/axiomdb-sql/tests/integration_materialized_views.rs`, catalog roundtrip tests for relation kind + defining query, and wire smoke block `[13.1 materialized views]` in `tools/wire-test.py` (445/445).
 - [x] 13.2 ✅ Window functions (ranking MVP) — closed 2026-04-23: `ROW_NUMBER()`, `RANK()`, and `DENSE_RANK()` now support `OVER ( [PARTITION BY ...] ORDER BY ... )` as top-level `SELECT` expressions on non-grouped, non-join queries. Analyzer enforces the bounded contract: windows are rejected in `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `JOIN ON`, `DISTINCT`, and when nested inside larger expressions; grouped/aggregate mixes are deferred. Executor computes ranking values in a dedicated post-scan decoration pass over materialized rows, so final query `ORDER BY` can differ from the window `ORDER BY`. Coverage: `crates/axiomdb-sql/tests/integration_window_functions.rs`, parser/analyzer regressions through the existing SQL suites, and a new `[13.2 window functions]` wire smoke in `tools/wire-test.py` (446/446). `LAG`, `LEAD`, aggregate windows like `SUM(...) OVER (...)`, named windows, and frame clauses remain deferred.
 - [x] 13.3 ✅ Generated columns — closed 2026-04-23 as the bounded generated-columns slice already delivered in `21.5f`: `CREATE TABLE ... GENERATED ALWAYS AS (expr) STORED` persists metadata in `axiom_columns`, recomputes on write across the supported DML paths, and is covered by SQL + wire acceptance. `VIRTUAL` generated columns and `ALTER TABLE ... GENERATED` remain explicit `NotImplemented` follow-ups rather than implied support.
-- [ ] 13.4 ⏳ LISTEN / NOTIFY — native pub-sub with `DashMap` of channels
+- [x] 13.4 ✅ LISTEN / NOTIFY — closed 2026-04-23: parser/executor now support
+  `LISTEN channel`, `UNLISTEN channel`, `UNLISTEN *`, `NOTIFY channel[, payload]`,
+  and pull-based `SHOW NOTIFICATIONS`. Runtime uses an in-process broker keyed by
+  normalized lowercase channel names plus per-session FIFO queues in
+  `SessionContext`. `NOTIFY` delivery is transaction-safe: events queue inside the
+  emitting session and only fan out after successful `COMMIT`; rollback,
+  savepoint rollback, `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, and disconnect
+  clear pending state appropriately. `LISTEN` / `UNLISTEN` are session-scoped and
+  apply immediately rather than rolling back with the current transaction.
+  Coverage: `crates/axiomdb-sql/tests/integration_listen_notify.rs`,
+  `crates/axiomdb-network/tests/integration_listen_notify.rs`, and wire smoke
+  block `[13.4 listen notify]` in `tools/wire-test.py` (451/451). Deferred:
+  async server-push to idle clients, `pg_notify(...)`, filtered notifications,
+  and restart persistence.
 - [ ] 13.5 ⏳ Covering indexes — store INCLUDE column values in B+ Tree leaf nodes; 6.13 already has catalog storage + IndexOnlyScan for key columns only; this phase adds the actual value payload to the leaf layout so index-only scans can return non-key projected columns without touching the heap
 - [ ] 13.6 ⏳ Non-blocking ALTER TABLE — shadow table + WAL delta + atomic swap
 - [ ] 13.7 ⏳ Row-level locking — lock specific row during UPDATE/DELETE; reduces contention vs per-table lock from 7.5; **production-grade implementation moved to Phase 40.5** (hierarchical S/X/IS/IX intent locking, per-table lock table, wait queues); Phase 13.7 is superseded

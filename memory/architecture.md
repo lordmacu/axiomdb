@@ -1,5 +1,21 @@
 # Architecture Notes
 
+## 2026-04-23 - LISTEN / NOTIFY (13.4)
+
+- **The first SQL notification slice is session-scoped runtime state, not a
+  storage feature.** `LISTEN` / `UNLISTEN` subscriptions and queued
+  notifications live entirely in `SessionContext` plus a process-local broker;
+  nothing is persisted in catalog or WAL formats.
+- **`NOTIFY` is queued at statement time but published at transaction commit.**
+  The engine stores pending notification events alongside other session-local
+  transactional state and flushes them only from `commit_active_txn(...)`,
+  which keeps rollback and savepoint semantics coherent.
+- **Read-only MySQL paths still need real session semantics.** `SHOW
+  NOTIFICATIONS` looks read-only from a durability perspective, but it drains a
+  session queue; the shared `execute_read_only_with_ctx(...)` path therefore
+  has to execute the same draining behavior as the main dispatcher instead of a
+  placeholder empty result.
+
 ## 2026-04-23 - Generated columns (13.3 closeout)
 
 - **Phase closeout can point at an existing implementation when the contract is

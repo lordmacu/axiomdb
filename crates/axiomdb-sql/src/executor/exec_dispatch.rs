@@ -187,6 +187,9 @@ fn dispatch_ctx(
         }
         Stmt::Explain(inner) => execute_explain(*inner, exec_ctx, ctx),
         Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, exec_ctx, ctx),
+        Stmt::Listen(s) => execute_listen(s, ctx),
+        Stmt::Unlisten(s) => execute_unlisten(s, ctx),
+        Stmt::Notify(s) => execute_notify(s, ctx),
         Stmt::DeclareCursor(s) => execute_declare_cursor(s, exec_ctx, ctx),
         Stmt::FetchCursor(s) => execute_fetch_cursor(s, ctx),
         Stmt::CloseCursor(s) => execute_close_cursor(s, ctx),
@@ -245,6 +248,7 @@ fn dispatch_ctx(
                 &db,
             )
         }
+        Stmt::ShowNotifications => execute_show_notifications(ctx),
         Stmt::ShowCreateTable(s) => {
             let db = ddl_database(&s.table.database, ctx);
             let search_path = ctx.search_path.clone();

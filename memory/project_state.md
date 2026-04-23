@@ -3,16 +3,18 @@
 ## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.3 — `13.3` Generated columns closed.
-Phase 13 now closes over the real generated-columns contract already shipped in
-`21.5f`: `CREATE TABLE ... GENERATED ALWAYS AS (expr) STORED` persists catalog
-metadata and recomputes on write across the supported DML paths. `VIRTUAL`
-generated columns and `ALTER TABLE ... GENERATED` remain explicit deferred
-follow-ups and are documented as such instead of implied support.
+**Active subphase:** Phase 13.4 — `13.4` LISTEN / NOTIFY closed.
+Phase 13 now includes a real first SQL pub-sub slice: `LISTEN channel`,
+`UNLISTEN channel`, `UNLISTEN *`, `NOTIFY channel[, 'payload']`, and the
+pull-based `SHOW NOTIFICATIONS` surface over the current MySQL wire loop.
+Notifications are process-local and in-memory, subscriptions are session-scoped
+and survive transaction rollback, and queued `NOTIFY` events are delivered only
+after a successful `COMMIT`. `pg_notify(...)`, async server-push to idle
+clients, persistence across restart, and filtered delivery remain deferred.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_generated_columns`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_listen_notify`; `cargo test -p axiomdb-network --test integration_listen_notify`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.4 LISTEN / NOTIFY.
+**Next:** Phase 13.5 Covering indexes.
 
 ### Phase 21 subphase status
 

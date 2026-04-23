@@ -92,3 +92,59 @@ fn execute_close_cursor(
     }
     Ok(QueryResult::Empty)
 }
+
+fn execute_listen(
+    stmt: crate::ast::ListenStmt,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    ctx.listen_channel(&stmt.channel)?;
+    Ok(QueryResult::Empty)
+}
+
+fn execute_unlisten(
+    stmt: crate::ast::UnlistenStmt,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    match stmt.channel {
+        Some(channel) => ctx.unlisten_channel(&channel)?,
+        None => ctx.unlisten_all_channels(),
+    }
+    Ok(QueryResult::Empty)
+}
+
+fn execute_notify(
+    stmt: crate::ast::NotifyStmt,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let payload = match stmt.payload {
+        None => String::new(),
+        Some(crate::expr::Expr::Literal(axiomdb_types::Value::Text(s))) => s,
+        Some(other) => {
+            return Err(DbError::InvalidValue {
+                reason: format!("NOTIFY payload must be a string literal, found {other:?}"),
+            });
+        }
+    };
+    ctx.enqueue_notification(&stmt.channel, payload)?;
+    Ok(QueryResult::Empty)
+}
+
+fn execute_show_notifications(ctx: &mut SessionContext) -> Result<QueryResult, DbError> {
+    let rows = ctx
+        .drain_notifications()
+        .into_iter()
+        .map(|notif| {
+            vec![
+                axiomdb_types::Value::Text(notif.channel),
+                axiomdb_types::Value::Text(notif.payload),
+            ]
+        })
+        .collect();
+    Ok(QueryResult::Rows {
+        columns: vec![
+            crate::result::ColumnMeta::computed("channel", axiomdb_types::DataType::Text),
+            crate::result::ColumnMeta::computed("payload", axiomdb_types::DataType::Text),
+        ],
+        rows,
+    })
+}
