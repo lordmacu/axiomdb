@@ -69,7 +69,7 @@ use crate::{
     session::{
         normalize_sql_mode, parse_boolish_setting, parse_compat_mode_setting,
         parse_on_error_setting, parse_session_collation_setting, sql_mode_is_strict, OnErrorMode,
-        SessionCollation, SessionContext,
+        SessionCollation, SessionContext, SessionSavepoint,
     },
     table::TableEngine,
     text_semantics::compare_text,
@@ -85,6 +85,7 @@ type InlineFkSpec = (
         Option<String>,
         crate::ast::ForeignKeyAction,
         crate::ast::ForeignKeyAction,
+        crate::ast::ConstraintDeferrability,
     ),
 );
 

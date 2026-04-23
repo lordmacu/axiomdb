@@ -171,6 +171,19 @@ impl Default for ForeignKeyAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConstraintTiming {
+    #[default]
+    Immediate,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConstraintDeferrability {
+    pub deferrable: bool,
+    pub initially: ConstraintTiming,
+}
+
 // ── Column and constraint types ───────────────────────────────────────────────
 
 /// Storage kind for a generated column.
@@ -255,6 +268,7 @@ pub enum ColumnConstraint {
         column: Option<String>,
         on_delete: ForeignKeyAction,
         on_update: ForeignKeyAction,
+        deferrability: ConstraintDeferrability,
     },
     /// `CHECK (expr)`
     Check(Expr),
@@ -287,6 +301,7 @@ pub enum TableConstraint {
         ref_columns: Vec<String>,
         on_delete: ForeignKeyAction,
         on_update: ForeignKeyAction,
+        deferrability: ConstraintDeferrability,
     },
     Check {
         name: Option<String>,
@@ -1390,6 +1405,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: ForeignKeyAction::Cascade,
                     on_update: ForeignKeyAction::NoAction,
+                    deferrability: ConstraintDeferrability::default(),
                 },
             ],
             immutable: false,

@@ -5,8 +5,9 @@ use axiomdb_core::DbError;
 use axiomdb_sql::expr::{BinaryOp, Expr, UnaryOp};
 use axiomdb_sql::{
     ast::{
-        AlterTableOp, ColumnConstraint, ExclusionElement, ExclusionElementTarget,
-        ExclusionOperator, ForeignKeyAction, SortOrder, Stmt, TableConstraint,
+        AlterTableOp, ColumnConstraint, ConstraintDeferrability, ConstraintTiming,
+        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction, SortOrder,
+        Stmt, TableConstraint,
     },
     parse,
 };
@@ -367,6 +368,62 @@ fn test_references_on_delete_and_update() {
             ..
         }
     ));
+}
+
+#[test]
+fn test_references_deferrable_initially_deferred() {
+    let ct =
+        create_table("CREATE TABLE t (uid INT REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED)");
+    assert!(matches!(
+        &ct.columns[0].constraints[0],
+        ColumnConstraint::References {
+            deferrability: ConstraintDeferrability {
+                deferrable: true,
+                initially: ConstraintTiming::Deferred,
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_table_foreign_key_deferrable_initially_immediate() {
+    let ct = create_table(
+        "CREATE TABLE t (uid INT, CONSTRAINT fk_u FOREIGN KEY (uid) REFERENCES users(id) DEFERRABLE INITIALLY IMMEDIATE)",
+    );
+    assert!(matches!(
+        &ct.table_constraints[0],
+        TableConstraint::ForeignKey {
+            deferrability: ConstraintDeferrability {
+                deferrable: true,
+                initially: ConstraintTiming::Immediate,
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_references_not_deferrable() {
+    let ct = create_table("CREATE TABLE t (uid INT REFERENCES users(id) NOT DEFERRABLE)");
+    assert!(matches!(
+        &ct.columns[0].constraints[0],
+        ColumnConstraint::References {
+            deferrability: ConstraintDeferrability {
+                deferrable: false,
+                initially: ConstraintTiming::Immediate,
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_references_not_deferrable_initially_deferred_error() {
+    let err = parse_err(
+        "CREATE TABLE t (uid INT REFERENCES users(id) NOT DEFERRABLE INITIALLY DEFERRED)",
+    );
+    assert!(matches!(err, DbError::ParseError { .. }));
 }
 
 // ── CHECK constraint (4.3b) ───────────────────────────────────────────────────

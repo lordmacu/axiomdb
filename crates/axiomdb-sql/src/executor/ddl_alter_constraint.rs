@@ -209,6 +209,7 @@ fn alter_add_constraint(
             ref_columns,
             on_delete,
             on_update,
+            deferrability,
         } => {
             // Resolve child col indexes.
             let child_col_idxs: Vec<u16> = columns
@@ -238,6 +239,7 @@ fn alter_add_constraint(
                     ref_col,
                     ast_fk_action_to_catalog(on_delete),
                     ast_fk_action_to_catalog(on_update),
+                    deferrability,
                     name.as_deref(),
                     storage,
                     txn,
@@ -254,6 +256,7 @@ fn alter_add_constraint(
                     &ref_columns,
                     ast_fk_action_to_catalog(on_delete),
                     ast_fk_action_to_catalog(on_update),
+                    deferrability,
                     name.as_deref(),
                     storage,
                     txn,

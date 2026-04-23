@@ -1,8 +1,8 @@
 //! Phase 21.24 — ORM compatibility tier 2.
 //!
 //! These tests intentionally model a small "connect + introspect + migrate"
-//! baseline for Prisma / ActiveRecord style clients without pretending that
-//! `GENERATED ... AS IDENTITY` or deferred FKs already exist.
+//! baseline for Prisma / ActiveRecord style clients while documenting the
+//! remaining `GENERATED ... AS IDENTITY` gap and validating DEFERRABLE FKs.
 
 mod common;
 
@@ -174,7 +174,7 @@ fn show_full_fields_is_alias_of_show_full_columns() {
 }
 
 #[test]
-fn orm_tier2_documents_identity_and_deferrable_as_not_implemented() {
+fn orm_tier2_documents_identity_gap_and_deferrable_fk_baseline() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup();
 
     let identity_err = run_ctx(
@@ -190,7 +190,14 @@ fn orm_tier2_documents_identity_and_deferrable_as_not_implemented() {
         other => panic!("unexpected identity error: {other:?}"),
     }
 
-    let deferrable_err = run_ctx(
+    run_ok(
+        "CREATE TABLE parent_probe (id INT PRIMARY KEY)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    run_ok(
         "CREATE TABLE child_probe (\
             id INT, \
             parent_id INT, \
@@ -200,10 +207,5 @@ fn orm_tier2_documents_identity_and_deferrable_as_not_implemented() {
         &mut txn,
         &mut bloom,
         &mut ctx,
-    )
-    .unwrap_err();
-    match deferrable_err {
-        DbError::ParseError { .. } | DbError::NotImplemented { .. } => {}
-        other => panic!("unexpected DEFERRABLE error: {other:?}"),
-    }
+    );
 }

@@ -123,10 +123,17 @@ fn execute_update_with_candidates(
     // FK child validation: check new FK values before applying any updates.
     if !resolved.foreign_keys.is_empty() {
         for (_, old_values, new_values) in &to_update {
+            let (immediate_fks, deferred_fk_ids) =
+                crate::fk_enforcement::split_child_update_foreign_keys(
+                    old_values,
+                    new_values,
+                    &resolved.foreign_keys,
+                );
+            ctx.mark_deferred_fk_constraints(deferred_fk_ids);
             crate::fk_enforcement::check_fk_child_update(
                 old_values,
                 new_values,
-                &resolved.foreign_keys,
+                &immediate_fks,
                 storage,
                 txn,
                 conn_txn,
@@ -151,6 +158,7 @@ fn execute_update_with_candidates(
             txn,
             conn_txn,
             bloom,
+            Some(&mut ctx.deferred_fk_constraint_ids),
         )?;
     }
 

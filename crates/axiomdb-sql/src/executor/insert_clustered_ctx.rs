@@ -80,9 +80,15 @@ fn execute_clustered_insert_ctx(
                 Err(e) => return Err(e),
                 Ok(()) => {
                     let fk_ok = if !resolved.foreign_keys.is_empty() {
+                        let (immediate_fks, deferred_fk_ids) =
+                            crate::fk_enforcement::split_child_insert_foreign_keys(
+                                &fv,
+                                &resolved.foreign_keys,
+                            );
+                        ctx.mark_deferred_fk_constraints(deferred_fk_ids);
                         match crate::fk_enforcement::check_fk_child_insert(
                             &fv,
-                            &resolved.foreign_keys,
+                            &immediate_fks,
                             storage,
                             txn,
                             &*conn_txn,
@@ -410,9 +416,15 @@ fn enqueue_clustered_insert_ctx(
             other => other?,
         }
         if !resolved.foreign_keys.is_empty() {
+            let (immediate_fks, deferred_fk_ids) =
+                crate::fk_enforcement::split_child_insert_foreign_keys(
+                    &full_values,
+                    &resolved.foreign_keys,
+                );
+            ctx.mark_deferred_fk_constraints(deferred_fk_ids);
             match crate::fk_enforcement::check_fk_child_insert(
                 &full_values,
-                &resolved.foreign_keys,
+                &immediate_fks,
                 storage,
                 txn,
                 &*conn_txn,

@@ -473,6 +473,23 @@ impl<'a> CatalogReader<'a> {
         Ok(None)
     }
 
+    /// Finds a FK constraint by catalog `fk_id`.
+    pub fn get_fk_by_id(&mut self, fk_id: u32) -> Result<Option<FkDef>, DbError> {
+        let root = self.page_ids.foreign_keys;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            if let Ok((def, _)) = FkDef::from_bytes(&data) {
+                if def.fk_id == fk_id {
+                    return Ok(Some(def));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // ── Statistics reads (Phase 6.10) ─────────────────────────────────────────
 
     /// Returns the stats for a specific `(table_id, col_idx)`.

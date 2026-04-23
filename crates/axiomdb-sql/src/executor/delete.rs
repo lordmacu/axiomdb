@@ -180,6 +180,7 @@ fn execute_delete_ctx(
             conn_txn,
             bloom,
             0,
+            Some(&mut ctx.deferred_fk_constraint_ids),
         )?;
     }
 
@@ -311,6 +312,7 @@ fn execute_clustered_delete(
             conn_txn,
             bloom,
             0,
+            Some(&mut ctx.deferred_fk_constraint_ids),
         )?;
     }
 

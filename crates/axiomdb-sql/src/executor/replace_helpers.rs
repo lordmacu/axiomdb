@@ -154,6 +154,7 @@ fn replace_displace_conflicts_heap(
                 conn_txn,
                 bloom,
                 0,
+                Some(&mut ctx.deferred_fk_constraint_ids),
             )?;
         }
 

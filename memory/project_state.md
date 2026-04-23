@@ -2,20 +2,18 @@
 
 ## Current (2026-04-22)
 
-**Active phase:** Phase 21 — Advanced SQL
-**Active subphase:** Phase 21.25 COMPLETE — PIVOT dynamic closed.
-Phase 21 now has a bounded SQL `PIVOT` implementation for row-to-column
-reshaping with explicit `IN (...)` values. Parser/AST accept `FROM source
-PIVOT (...) [AS alias]`; the analyzer derives a stable output schema before
-execution and lowers the pivot to a derived grouped SELECT with
-`aggregate(CASE WHEN ...)`; the MySQL wire smoke now covers the feature end to
-end. The roadmap wording "dynamic" is now concretely implemented as explicit
-pivot-value lists, while true runtime-discovered columns and `UNPIVOT` remain
-outside this subphase.
+**Active phase:** Phase 11 — Advanced Types
+**Active subphase:** Phase 21 COMPLETE — DEFERRABLE foreign keys closed.
+Phase 21 now closes with deferred foreign-key enforcement: FK declarations
+accept `DEFERRABLE` / `INITIALLY DEFERRED|IMMEDIATE`, catalog rows persist the
+flags compatibly, `DEFERRABLE INITIALLY DEFERRED` constraints are revalidated
+on `COMMIT`, and failed commit-time validation rolls the whole transaction
+back. Savepoints also truncate pending deferred-FK validation state, and the
+MySQL wire smoke now covers both repaired and failing commit flows.
 
-**Last verified gates:** `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_pivot`; `python3 tools/wire-test.py` (434/434); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_fk --test integration_deferrable_fk`; `cargo test -p axiomdb-sql`; `python3 tools/wire-test.py` (437/437); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 21.16 DEFERRABLE constraints.
+**Next:** Phase 11.18c JSONB operators follow-up.
 
 ### Phase 21 subphase status
 
@@ -37,6 +35,7 @@ outside this subphase.
 | 21.23 Advanced SQL tests | ✅ closed |
 | 21.24 ORM compatibility tier 2 | ✅ closed |
 | 21.25 PIVOT dynamic | ✅ closed |
+| 21.16 DEFERRABLE constraints | ✅ closed |
 
 ### Phase 11 subphase status
 

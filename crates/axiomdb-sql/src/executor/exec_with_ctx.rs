@@ -28,9 +28,12 @@ pub fn execute_with_ctx_locked(
                 ctx.in_explicit_txn = false;
                 ctx.close_all_cursors();
                 ctx.savepoints.clear(); // all savepoints destroyed on COMMIT
-                let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
-                let tid = conn.txn_id;
-                ctx.pending_deferred_txn_id = txn.commit(conn)?;
+                let tid = ctx
+                    .conn_txn
+                    .as_ref()
+                    .expect("conn_txn: checked by is_some() guard")
+                    .txn_id;
+                ctx.pending_deferred_txn_id = commit_active_txn(txn, storage, bloom, ctx)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
                 txn.drain_committed_page_batches(storage)?;
                 // Phase 40.11: release all row+table locks held by this txn.
@@ -46,6 +49,7 @@ pub fn execute_with_ctx_locked(
                 ctx.discard_clustered_insert_batch();
                 ctx.close_all_cursors();
                 ctx.savepoints.clear(); // all savepoints destroyed on ROLLBACK
+                ctx.clear_deferred_fk_constraints();
                 let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                 let tid = conn.txn_id;
                 let result = rollback_with_index_undo(txn, conn, storage, bloom);
@@ -63,7 +67,13 @@ pub fn execute_with_ctx_locked(
                 flush_pending_inserts_ctx(&exec_ctx, ctx)?;
                 flush_clustered_insert_batch(&exec_ctx, ctx)?;
                 let sp = txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn: checked by is_some() guard"));
-                ctx.savepoints.push((name.clone(), sp));
+                ctx.savepoints.push((
+                    name.clone(),
+                    SessionSavepoint {
+                        wal: sp,
+                        deferred_fk_len: ctx.deferred_fk_constraint_ids.len(),
+                    },
+                ));
                 return Ok(QueryResult::Empty);
             }
             Stmt::RollbackToSavepoint(ref name) => {
@@ -78,8 +88,9 @@ pub fn execute_with_ctx_locked(
                         ctx.discard_pending_inserts();
                         ctx.discard_clustered_insert_batch();
                         let sp = ctx.savepoints[idx].1;
+                        ctx.truncate_deferred_fk_constraints(sp.deferred_fk_len);
                         let conn = ctx.conn_txn.as_mut().expect("conn_txn: checked by is_some() guard");
-                        rollback_to_savepoint_with_index_undo(txn, conn, sp, storage, bloom)?;
+                        rollback_to_savepoint_with_index_undo(txn, conn, sp.wal, storage, bloom)?;
                         // Destroy all savepoints after the target (MySQL behavior).
                         ctx.savepoints.truncate(idx + 1);
                         return Ok(QueryResult::Empty);
@@ -108,10 +119,9 @@ pub fn execute_with_ctx_locked(
             flush_clustered_insert_batch(&exec_ctx, ctx)?;
             ctx.in_explicit_txn = false;
             ctx.close_all_cursors();
-            let pre_conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
-            let pre_tid = pre_conn.txn_id;
-            // Pre-DDL commit: discard any pending deferred (pipeline handles it).
-            let _ = txn.commit(pre_conn)?;
+            ctx.savepoints.clear();
+            let pre_tid = ctx.conn_txn.as_ref().expect("conn_txn: checked by is_some() guard").txn_id;
+            commit_active_txn(txn, storage, bloom, ctx)?;
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             txn.drain_committed_page_batches(storage)?;
             if let Some(lm) = lock_mgr { lm.release_all_for_txn(pre_tid); }
@@ -119,9 +129,8 @@ pub fn execute_with_ctx_locked(
             let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                 Ok(result) => {
-                    let ddl_conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
-                    let ddl_tid = ddl_conn.txn_id;
-                    ctx.pending_deferred_txn_id = txn.commit(ddl_conn)?;
+                    let ddl_tid = ctx.conn_txn.as_ref().expect("conn_txn: set by begin() on preceding line").txn_id;
+                    ctx.pending_deferred_txn_id = commit_active_txn(txn, storage, bloom, ctx)?;
                     txn.release_immediate_committed_frees(storage, ddl_tid)?;
                     txn.drain_committed_page_batches(storage)?;
                     Ok(result)
@@ -145,10 +154,17 @@ pub fn execute_with_ctx_locked(
         if should_flush_clustered_batch_before_stmt(&stmt, ctx) {
             flush_clustered_insert_batch(&exec_ctx, ctx)?;
         }
-        let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
+        let sp_opt: Option<SessionSavepoint> = if ctx.on_error == OnErrorMode::RollbackTransaction {
             None
         } else {
-            Some(txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn: checked by is_some() guard")))
+            Some(SessionSavepoint {
+                wal: txn.savepoint(
+                    ctx.conn_txn
+                        .as_ref()
+                        .expect("conn_txn: checked by is_some() guard"),
+                ),
+                deferred_fk_len: ctx.deferred_fk_constraint_ids.len(),
+            })
         };
         match dispatch_ctx(stmt, &exec_ctx, ctx) {
             Ok(result) => Ok(result),
@@ -157,15 +173,17 @@ pub fn execute_with_ctx_locked(
                     ctx.discard_pending_inserts();
                     ctx.discard_clustered_insert_batch();
                     ctx.close_all_cursors();
+                    ctx.clear_deferred_fk_constraints();
                     let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                     let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                     Err(e)
                 }
                 OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {
                     if let Some(sp) = sp_opt {
+                        ctx.truncate_deferred_fk_constraints(sp.deferred_fk_len);
                         if let Some(conn) = ctx.conn_txn.as_mut() {
                             let _ = rollback_to_savepoint_with_index_undo(
-                                txn, conn, sp, storage, bloom,
+                                txn, conn, sp.wal, storage, bloom,
                             );
                         }
                     }
@@ -175,15 +193,17 @@ pub fn execute_with_ctx_locked(
                     ctx.discard_pending_inserts();
                     ctx.discard_clustered_insert_batch();
                     ctx.close_all_cursors();
+                    ctx.clear_deferred_fk_constraints();
                     let conn = ctx.conn_txn.take().expect("conn_txn: checked by is_some() guard");
                     let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                     Err(e)
                 }
                 _ => {
                     if let Some(sp) = sp_opt {
+                        ctx.truncate_deferred_fk_constraints(sp.deferred_fk_len);
                         if let Some(conn) = ctx.conn_txn.as_mut() {
                             let _ = rollback_to_savepoint_with_index_undo(
-                                txn, conn, sp, storage, bloom,
+                                txn, conn, sp.wal, storage, bloom,
                             );
                         }
                     }
@@ -223,15 +243,15 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
-                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
-                        let tid = conn.txn_id;
-                        ctx.pending_deferred_txn_id = txn.commit(conn)?;
+                        let tid = ctx.conn_txn.as_ref().expect("conn_txn: set by begin() on preceding line").txn_id;
+                        ctx.pending_deferred_txn_id = commit_active_txn(txn, storage, bloom, ctx)?;
                         txn.release_immediate_committed_frees(storage, tid)?;
                         txn.drain_committed_page_batches(storage)?;
                         if let Some(lm) = lock_mgr { lm.release_all_for_txn(tid); }
                         Ok(result)
                     }
                     Err(e) => {
+                        ctx.clear_deferred_fk_constraints();
                         let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let tid = conn.txn_id;
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
@@ -266,11 +286,11 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
-                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
-                        let _ = txn.commit(conn)?;
+                        commit_active_txn(txn, storage, bloom, ctx)?;
                         Ok(result)
                     }
                     Err(e) => {
+                        ctx.clear_deferred_fk_constraints();
                         let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                         Err(e)
@@ -282,11 +302,11 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
-                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
-                        ctx.pending_deferred_txn_id = txn.commit(conn)?;
+                        ctx.pending_deferred_txn_id = commit_active_txn(txn, storage, bloom, ctx)?;
                         Ok(result)
                     }
                     Err(e) => {
+                        ctx.clear_deferred_fk_constraints();
                         let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                         Err(e)
@@ -295,10 +315,17 @@ pub fn execute_with_ctx_locked(
             }
             other => {
                 ctx.conn_txn = Some(txn.begin()?);
-                let sp_opt: Option<Savepoint> = if ctx.on_error == OnErrorMode::Savepoint
+                let sp_opt: Option<SessionSavepoint> = if ctx.on_error == OnErrorMode::Savepoint
                     || ctx.on_error == OnErrorMode::Ignore
                 {
-                    Some(txn.savepoint(ctx.conn_txn.as_ref().expect("conn_txn: set by begin() on preceding line")))
+                    Some(SessionSavepoint {
+                        wal: txn.savepoint(
+                            ctx.conn_txn
+                                .as_ref()
+                                .expect("conn_txn: set by begin() on preceding line"),
+                        ),
+                        deferred_fk_len: ctx.deferred_fk_constraint_ids.len(),
+                    })
                 } else {
                     None
                 };
@@ -308,9 +335,10 @@ pub fn execute_with_ctx_locked(
                     Err(e) => match ctx.on_error {
                         OnErrorMode::Ignore if crate::session::is_ignorable_on_error(&e) => {
                             if let Some(sp) = sp_opt {
+                                ctx.truncate_deferred_fk_constraints(sp.deferred_fk_len);
                                 if let Some(conn) = ctx.conn_txn.as_mut() {
                                     let _ = rollback_to_savepoint_with_index_undo(
-                                        txn, conn, sp, storage, bloom,
+                                        txn, conn, sp.wal, storage, bloom,
                                     );
                                 }
                             }
@@ -318,15 +346,17 @@ pub fn execute_with_ctx_locked(
                         }
                         OnErrorMode::Savepoint => {
                             if let Some(sp) = sp_opt {
+                                ctx.truncate_deferred_fk_constraints(sp.deferred_fk_len);
                                 if let Some(conn) = ctx.conn_txn.as_mut() {
                                     let _ = rollback_to_savepoint_with_index_undo(
-                                        txn, conn, sp, storage, bloom,
+                                        txn, conn, sp.wal, storage, bloom,
                                     );
                                 }
                             }
                             Err(e)
                         }
                         _ => {
+                            ctx.clear_deferred_fk_constraints();
                             let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
                             let _ = rollback_with_index_undo(txn, conn, storage, bloom);
                             Err(e)
@@ -336,6 +366,31 @@ pub fn execute_with_ctx_locked(
             }
         }
     }
+}
+
+fn commit_active_txn(
+    txn: &TxnManager,
+    storage: &dyn StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<Option<axiomdb_core::TxnId>, DbError> {
+    let conn = ctx
+        .conn_txn
+        .take()
+        .expect("conn_txn: active transaction required");
+    if let Err(e) = crate::fk_enforcement::validate_deferred_foreign_keys(
+        &ctx.deferred_fk_constraint_ids,
+        storage,
+        txn,
+        &conn,
+        bloom,
+    ) {
+        ctx.clear_deferred_fk_constraints();
+        let _ = rollback_with_index_undo(txn, conn, storage, bloom);
+        return Err(e);
+    }
+    ctx.clear_deferred_fk_constraints();
+    txn.commit(conn)
 }
 
 fn should_flush_pending_inserts_before_stmt(stmt: &Stmt, ctx: &SessionContext) -> bool {

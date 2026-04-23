@@ -1,5 +1,56 @@
 # Fase 21 - Advanced SQL
 
+## 21.16 DEFERRABLE constraints - cerrada 2026-04-22
+
+La subfase 21.16 cierra el gap de constraints diferidos con un corte util y
+controlado: **solo foreign keys**. No se introdujo un framework generico de
+constraints diferidos ni `SET CONSTRAINTS`; se implemento el flujo que de
+verdad desbloquea imports y escrituras fuera de orden: FK
+`DEFERRABLE INITIALLY DEFERRED` con validacion al `COMMIT`.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `REFERENCES ... DEFERRABLE`
+- `REFERENCES ... DEFERRABLE INITIALLY DEFERRED`
+- `REFERENCES ... DEFERRABLE INITIALLY IMMEDIATE`
+- `REFERENCES ... NOT DEFERRABLE`
+- lo mismo en constraints table-level `FOREIGN KEY (...)`
+
+Fuera de alcance en este corte:
+
+- `SET CONSTRAINTS ...`
+- CHECK deferrable
+- exclusion deferrable
+- cambios de modo deferred/immediate a mitad de transaccion
+
+### Ajustes tecnicos de cierre
+
+- AST/parser: nuevo metadata de deferrability en FKs de columna y de tabla.
+- Catalogo: `FkDef` persiste `deferrable` + `initially_deferred` con trailer
+  backward-compatible; filas legacy siguen decodificando como no deferrable.
+- Session state: `SessionContext` ahora rastrea los `fk_id` diferidos tocados
+  dentro de la transaccion y cada savepoint guarda la longitud de esa cola.
+- Commit path: antes del commit real se revalida el estado final de cada FK
+  diferido tocado; si falla, `COMMIT` devuelve violacion FK y hace rollback
+  total.
+- Savepoints: `ROLLBACK TO SAVEPOINT` trunca tambien la cola de FKs diferidos,
+  evitando validaciones fantasma en commits posteriores.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_deferrable_fk.rs`
+- `crates/axiomdb-sql/tests/integration_fk.rs`
+- `crates/axiomdb-sql/tests/integration_ddl_parser.rs`
+- `tools/wire-test.py` bloque `21.16 deferrable fk`
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_fk --test integration_deferrable_fk` - paso.
+- `cargo test -p axiomdb-sql` - paso.
+- `tools/wire-test.py` - paso, 437/437 assertions.
+
 ## 21.25 PIVOT dynamic - cerrada 2026-04-22
 
 La subfase 21.25 cierra el gap de reshaping SQL con un `PIVOT` real pero

@@ -6,10 +6,11 @@ use axiomdb_types::DataType;
 
 use crate::{
     ast::{
-        AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CreateIndexStmt,
-        CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, DropIndexStmt,
-        DropTableStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
-        ForeignKeyAction, GeneratedColumnKind, IndexColumn, SortOrder, Stmt, TableConstraint,
+        AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
+        ConstraintTiming, CreateIndexStmt, CreateTableAsSelectStmt, CreateTableLikeStmt,
+        CreateTableStmt, DropIndexStmt, DropTableStmt, ExclusionElement, ExclusionElementTarget,
+        ExclusionOperator, ForeignKeyAction, GeneratedColumnKind, IndexColumn, SortOrder, Stmt,
+        TableConstraint,
     },
     expr::Expr,
     lexer::Token,
@@ -423,6 +424,7 @@ fn parse_table_constraint(p: &mut Parser) -> Result<TableConstraint, DbError> {
                 ref_columns,
                 on_delete,
                 on_update,
+                deferrability: parse_fk_deferrability(p)?,
             })
         }
         Token::Check => {
@@ -570,6 +572,7 @@ fn parse_column_references(p: &mut Parser) -> Result<ColumnConstraint, DbError> 
         column,
         on_delete,
         on_update,
+        deferrability: parse_fk_deferrability(p)?,
     })
 }
 
@@ -648,6 +651,53 @@ fn parse_fk_action(p: &mut Parser) -> Result<ForeignKeyAction, DbError> {
             position: Some(p.current_pos()),
         }),
     }
+}
+
+fn parse_fk_deferrability(p: &mut Parser) -> Result<ConstraintDeferrability, DbError> {
+    let mut deferrability = ConstraintDeferrability::default();
+
+    match p.peek() {
+        Token::Deferrable => {
+            p.advance();
+            deferrability.deferrable = true;
+        }
+        Token::Not if matches!(p.peek_at(1), Token::Deferrable) => {
+            p.advance();
+            p.advance();
+        }
+        _ => return Ok(deferrability),
+    }
+
+    if p.eat(&Token::Initially) {
+        deferrability.initially = match p.peek() {
+            Token::Deferred => {
+                p.advance();
+                ConstraintTiming::Deferred
+            }
+            Token::Immediate => {
+                p.advance();
+                ConstraintTiming::Immediate
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "expected DEFERRED or IMMEDIATE after INITIALLY, found {:?}",
+                        other
+                    ),
+                    position: Some(p.current_pos()),
+                });
+            }
+        };
+    }
+
+    if !deferrability.deferrable && deferrability.initially == ConstraintTiming::Deferred {
+        return Err(DbError::ParseError {
+            message: "NOT DEFERRABLE cannot be INITIALLY DEFERRED".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    Ok(deferrability)
 }
 
 // ── Inline index helpers ──────────────────────────────────────────────────────
