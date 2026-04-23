@@ -1,5 +1,23 @@
 # Architecture Notes
 
+## 2026-04-22 - Materialized views (13.1)
+
+- **Materialized views are catalog-typed relations, not logical views.**
+  `TableDef` now persists `relation_kind` plus `defining_query`, so the engine
+  can distinguish ordinary tables from materialized views without waiting for
+  the future regular-view subsystem.
+- **`CREATE MATERIALIZED VIEW` reuses CTAS machinery instead of introducing a
+  second storage path.** The executor materializes the source `SELECT`,
+  infers/output columns the same way as CTAS, and allocates a normal heap root
+  owned by the materialized-view catalog row.
+- **`REFRESH` must materialize before truncate, then reload metadata after
+  truncate.** Querying first avoids destroying self-referenced source data, and
+  re-resolving the relation after `TRUNCATE` is necessary because bulk-empty
+  root rotation makes the pre-refresh `TableDef.root_page_id` stale.
+- **Metadata parity belongs in the same slice as DDL.** `SHOW FULL TABLES`,
+  `SHOW CREATE TABLE`, and `information_schema.TABLES` now derive table type
+  from relation kind so MVs are not silently exposed as `BASE TABLE`.
+
 ## 2026-04-22 - JSONPath planner pushdown (11.21h)
 
 - **Planner extraction is intentionally narrower than JSONPath execution.**

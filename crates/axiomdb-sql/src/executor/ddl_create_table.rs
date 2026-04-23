@@ -1543,36 +1543,31 @@ fn execute_create_table_like(
     Ok(QueryResult::Empty)
 }
 
-// ── CREATE TABLE AS SELECT ────────────────────────────────────────────────────
+// ── CREATE TABLE / MATERIALIZED VIEW AS SELECT ───────────────────────────────
 
-/// Implements `CREATE TABLE new_table AS SELECT …`.
-///
-/// 1. Executes the inner SELECT to materialize all rows.
-/// 2. Infers column types from the first non-NULL value in each output column
-///    (defaults to `TEXT` for all-NULL columns).
-/// 3. Creates a new Heap table with the inferred schema.
-/// 4. Inserts all rows.
-///
-/// The resulting table has no primary key, no indexes, and no FK constraints.
-fn execute_create_table_as_select(
-    stmt: crate::ast::CreateTableAsSelectStmt,
+fn create_relation_as_select(
+    if_not_exists: bool,
+    new_table: crate::ast::TableRef,
+    select: crate::ast::SelectStmt,
+    persistence: axiomdb_catalog::TablePersistence,
+    relation_kind: axiomdb_catalog::RelationKind,
+    defining_query: Option<String>,
     exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
-    let new_schema = stmt
-        .new_table
+    let new_schema = new_table
         .schema
         .clone()
         .unwrap_or_else(|| ctx.default_create_schema().to_string());
     let database = ctx.effective_database().to_string();
-    let new_name = stmt.new_table.name.clone();
+    let new_name = new_table.name.clone();
 
     // 1. Run the SELECT (read-only — borrows storage/txn immutably via coercion).
     let conn = ctx.conn_txn.take();
-    let result = execute_select_ctx(stmt.select, exec_ctx, conn.as_ref(), ctx)?;
+    let result = execute_select_ctx(select, exec_ctx, conn.as_ref(), ctx)?;
     ctx.conn_txn = conn;
     let (col_meta, rows) = match result {
         QueryResult::Rows { columns, rows } => (columns, rows),
@@ -1616,7 +1611,7 @@ fn execute_create_table_as_select(
         .collect();
 
     // 3. Check destination table does not already exist.
-    if stmt.persistence == axiomdb_catalog::TablePersistence::Temporary {
+    if persistence == axiomdb_catalog::TablePersistence::Temporary {
         let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
         ensure_schema_exists_for_create(storage, txn, conn_txn, &database, &new_schema)?;
     }
@@ -1624,6 +1619,9 @@ fn execute_create_table_as_select(
         let conn_txn = ctx.conn_txn.as_ref().expect("conn_txn set for DDL");
         let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
         if resolver.table_exists(Some(&new_schema), &new_name)? {
+            if if_not_exists {
+                return Ok(QueryResult::Empty);
+            }
             return Err(DbError::TableAlreadyExists {
                 schema: new_schema.clone(),
                 name: new_name.clone(),
@@ -1635,12 +1633,14 @@ fn execute_create_table_as_select(
     let new_def = {
         let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
         let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
-        let def = writer.create_table_with_options(
+        let def = writer.create_relation_with_options(
             &new_schema,
             &new_name,
             axiomdb_catalog::schema::TableStorageLayout::Heap,
             false,
-            stmt.persistence,
+            persistence,
+            relation_kind,
+            defining_query,
         )?;
         if database != DEFAULT_DATABASE_NAME {
             writer.bind_table_to_database(def.id, &database)?;
@@ -1692,6 +1692,150 @@ fn execute_create_table_as_select(
     for row in rows {
         let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
         TableEngine::insert_row(storage, txn, conn_txn, &new_def, &schema_cols, row)?;
+    }
+
+    Ok(QueryResult::Empty)
+}
+
+/// Implements `CREATE TABLE new_table AS SELECT …`.
+fn execute_create_table_as_select(
+    stmt: crate::ast::CreateTableAsSelectStmt,
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    create_relation_as_select(
+        false,
+        stmt.new_table,
+        stmt.select,
+        stmt.persistence,
+        axiomdb_catalog::RelationKind::Table,
+        None,
+        exec_ctx,
+        ctx,
+    )
+}
+
+fn execute_create_materialized_view(
+    stmt: crate::ast::CreateMaterializedViewStmt,
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let mut view = stmt.view;
+    if view.schema.is_none() {
+        view.schema = Some(ctx.default_create_schema().to_string());
+    }
+    create_relation_as_select(
+        stmt.if_not_exists,
+        view,
+        stmt.select,
+        axiomdb_catalog::TablePersistence::Permanent,
+        axiomdb_catalog::RelationKind::MaterializedView,
+        Some(stmt.query_sql),
+        exec_ctx,
+        ctx,
+    )
+}
+
+fn execute_refresh_materialized_view(
+    stmt: crate::ast::RefreshMaterializedViewStmt,
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let database = stmt
+        .view
+        .database
+        .clone()
+        .unwrap_or_else(|| ctx.effective_database().to_string());
+    let resolved = {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
+        resolver.resolve_table(stmt.view.schema.as_deref(), &stmt.view.name)?
+    };
+    if !resolved.def.is_materialized_view() {
+        return Err(DbError::InvalidValue {
+            reason: format!("'{}' is not a materialized view", stmt.view.name),
+        });
+    }
+    let query_sql = resolved
+        .def
+        .defining_query
+        .clone()
+        .ok_or_else(|| DbError::Internal {
+            message: format!(
+                "materialized view '{}' is missing its defining query",
+                resolved.def.table_name
+            ),
+        })?;
+
+    let conn = ctx.conn_txn.take();
+    let snapshot = conn
+        .as_ref()
+        .map(|txn_conn| txn.active_snapshot(txn_conn))
+        .unwrap_or_else(|| txn.snapshot());
+    let parsed = crate::parse(&query_sql, None)?;
+    let analyzed =
+        crate::analyze_with_defaults(parsed, storage, snapshot, &database, &resolved.def.schema_name)?;
+    let select = match analyzed {
+        crate::ast::Stmt::Select(select) => select,
+        other => {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "materialized view '{}' defining query must be a SELECT, found {other:?}",
+                    resolved.def.table_name
+                ),
+            })
+        }
+    };
+    let result = execute_select_ctx(select, exec_ctx, conn.as_ref(), ctx)?;
+    ctx.conn_txn = conn;
+    let rows = match result {
+        QueryResult::Rows { columns, rows } => {
+            if columns.len() != resolved.columns.len() {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "materialized view '{}' refresh produced {} columns but expected {}",
+                        resolved.def.table_name,
+                        columns.len(),
+                        resolved.columns.len()
+                    ),
+                });
+            }
+            rows
+        }
+        other => {
+            return Err(DbError::Other(format!(
+                "materialized view refresh query returned unexpected result: {other:?}"
+            )))
+        }
+    };
+
+    let truncate_stmt = crate::ast::TruncateTableStmt {
+        table: crate::ast::TableRef {
+            database: None,
+            schema: Some(resolved.def.schema_name.clone()),
+            name: resolved.def.table_name.clone(),
+            alias: None,
+        },
+    };
+    let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+    execute_truncate(truncate_stmt, storage, txn, conn_txn, &database)?;
+    let refreshed = {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), &database)?;
+        resolver.resolve_table(Some(&resolved.def.schema_name), &resolved.def.table_name)?
+    };
+    for row in rows {
+        let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");
+        TableEngine::insert_row(
+            storage,
+            txn,
+            conn_txn,
+            &refreshed.def,
+            &refreshed.columns,
+            row,
+        )?;
     }
 
     Ok(QueryResult::Empty)

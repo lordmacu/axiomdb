@@ -816,6 +816,8 @@ mod tests {
             schema_version: 1,
             immutable: false,
             persistence: axiomdb_catalog::schema::TablePersistence::Permanent,
+            relation_kind: axiomdb_catalog::schema::RelationKind::Table,
+            defining_query: None,
         }
     }
 

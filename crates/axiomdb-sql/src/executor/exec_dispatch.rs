@@ -329,6 +329,32 @@ fn dispatch_ctx(
             }
             execute_create_table_as_select(s, exec_ctx, ctx)
         }
+        Stmt::CreateMaterializedView(mut s) => {
+            ctx.invalidate_all();
+            if s.view.schema.is_none() {
+                s.view.schema = Some(ctx.default_create_schema().to_string());
+            }
+            execute_create_materialized_view(s, exec_ctx, ctx)
+        }
+        Stmt::DropMaterializedView(s) => {
+            ctx.invalidate_all();
+            let db = ctx.effective_database().to_string();
+            let search_path = ctx.search_path.clone();
+            execute_drop_materialized_view(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
+                &db,
+            )
+        }
+        Stmt::RefreshMaterializedView(s) => {
+            ctx.invalidate_all();
+            execute_refresh_materialized_view(s, exec_ctx, ctx)
+        }
         // 5.9f: SHOW TABLE STATUS — needs database context
         Stmt::ShowTableStatus(s) => {
             let db = ctx.effective_database().to_string();

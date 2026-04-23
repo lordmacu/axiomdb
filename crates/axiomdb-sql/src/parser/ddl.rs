@@ -7,10 +7,11 @@ use axiomdb_types::DataType;
 use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
-        ConstraintTiming, CreateIndexStmt, CreateTableAsSelectStmt, CreateTableLikeStmt,
-        CreateTableStmt, DropIndexStmt, DropTableStmt, ExclusionElement, ExclusionElementTarget,
-        ExclusionOperator, ForeignKeyAction, GeneratedColumnKind, IndexColumn, SortOrder, Stmt,
-        TableConstraint,
+        ConstraintTiming, CreateIndexStmt, CreateMaterializedViewStmt, CreateTableAsSelectStmt,
+        CreateTableLikeStmt, CreateTableStmt, DropIndexStmt, DropMaterializedViewStmt,
+        DropTableStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
+        ForeignKeyAction, GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, SortOrder,
+        Stmt, TableConstraint,
     },
     expr::Expr,
     lexer::Token,
@@ -148,6 +149,22 @@ pub(crate) fn parse_create_table(
         table_constraints,
         immutable,
         persistence,
+    }))
+}
+
+pub(crate) fn parse_create_materialized_view(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_not_exists = eat_if_not_exists(p)?;
+    let view = p.parse_table_ref()?;
+    p.expect(&Token::As)?;
+    let query_start = p.current_pos();
+    p.expect(&Token::Select)?;
+    let select = super::dml::parse_select(p)?;
+    let query_sql = p.slice_sql(query_start, p.previous_end());
+    Ok(Stmt::CreateMaterializedView(CreateMaterializedViewStmt {
+        if_not_exists,
+        view,
+        select,
+        query_sql,
     }))
 }
 
@@ -1177,6 +1194,29 @@ pub(crate) fn parse_drop_table(p: &mut Parser) -> Result<Stmt, DbError> {
         if_exists,
         tables,
         cascade,
+    }))
+}
+
+pub(crate) fn parse_drop_materialized_view(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let mut views = vec![p.parse_table_ref()?];
+    while p.eat(&Token::Comma) {
+        views.push(p.parse_table_ref()?);
+    }
+    let cascade = p.eat(&Token::Cascade);
+    Ok(Stmt::DropMaterializedView(DropMaterializedViewStmt {
+        if_exists,
+        views,
+        cascade,
+    }))
+}
+
+pub(crate) fn parse_refresh_materialized_view(p: &mut Parser) -> Result<Stmt, DbError> {
+    p.expect(&Token::Materialized)?;
+    p.expect(&Token::View)?;
+    let view = p.parse_table_ref()?;
+    Ok(Stmt::RefreshMaterializedView(RefreshMaterializedViewStmt {
+        view,
     }))
 }
 

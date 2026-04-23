@@ -3,16 +3,17 @@
 ## Current (2026-04-22)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 11 complete — `11.21h` JSONPath planner pushdown closed.
-Simple JSONPath predicates on JSONB columns (`doc @? '$.k'`, `doc @@ '$.flag'`)
-now plan as `GinScan` against the existing `jsonb_ops`-style GIN index when a
-matching index exists, while keeping full predicate recheck in the executor.
-This closes the remaining Phase 11 parity follow-up; `jsonb_path_ops` remains
-explicitly deferred as future index work, not part of the 11.21h cut.
+**Active subphase:** Phase 13.1 — `13.1` Materialized views closed.
+`CREATE MATERIALIZED VIEW ... AS SELECT ...`, `REFRESH MATERIALIZED VIEW`, and
+`DROP MATERIALIZED VIEW` now work as catalog-owned physical relations backed by
+ordinary table storage. `TableDef` persists `relation_kind` plus the defining
+query text, metadata surfaces show `MATERIALIZED VIEW` distinctly, and refresh
+rebuilds contents by materializing the stored query before truncating/reloading
+the relation root.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_jsonpath_planner_pushdown`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_materialized_views --test integration_show_full`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.1 Materialized views.
+**Next:** Phase 13.2 Window functions.
 
 ### Phase 21 subphase status
 

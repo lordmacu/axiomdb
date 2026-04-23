@@ -175,7 +175,7 @@ fn generate_is_tables_rows(
                 Value::Text("def".into()),                // TABLE_CATALOG
                 Value::Text(db.name.clone()),             // TABLE_SCHEMA
                 Value::Text(t.table_name.clone()),        // TABLE_NAME
-                Value::Text("BASE TABLE".into()),         // TABLE_TYPE
+                Value::Text(show_table_type_name(&t).into()), // TABLE_TYPE
                 Value::Text("InnoDB".into()),             // ENGINE
                 Value::BigInt(10),                        // VERSION
                 Value::Text("Dynamic".into()),            // ROW_FORMAT

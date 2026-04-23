@@ -29,7 +29,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.20 (CHECKPOINT),
              21.23 (advanced SQL acceptance smoke),
              21.24 (ORM compatibility tier 2 smoke),
-             21.25 (PIVOT smoke)
+             21.25 (PIVOT smoke),
+             13.1 (materialized views smoke)
 """
 import os
 import signal
@@ -4007,6 +4008,43 @@ cur.execute(
 rows = cur.fetchall()
 ok("[21.25 pivot] PIVOT rewrites rows into stable generated columns",
    rows == (("north", "10", "20"), ("south", "15", None)),
+   rows)
+
+# ── Phase 13.1 — Materialized views ──────────────────────────────────────────
+
+print("\n[13.1 materialized views]")
+
+cur.execute("CREATE TABLE mv13_sales (region TEXT, amount INT)")
+cur.execute(
+    "INSERT INTO mv13_sales VALUES "
+    "('north', 10), "
+    "('north', 15), "
+    "('south', 7)"
+)
+conn.commit()
+cur.execute(
+    "CREATE MATERIALIZED VIEW mv13_region_totals AS "
+    "SELECT region, SUM(amount) AS total FROM mv13_sales GROUP BY region"
+)
+cur.execute("SELECT region, total FROM mv13_region_totals ORDER BY region")
+rows = cur.fetchall()
+ok("[13.1 materialized views] CREATE MATERIALIZED VIEW materializes grouped rows",
+   rows == (("north", 25), ("south", 7)),
+   rows)
+
+cur.execute("INSERT INTO mv13_sales VALUES ('north', 5), ('east', 3)")
+conn.commit()
+cur.execute("REFRESH MATERIALIZED VIEW mv13_region_totals")
+cur.execute("SELECT region, total FROM mv13_region_totals ORDER BY region")
+rows = cur.fetchall()
+ok("[13.1 materialized views] REFRESH MATERIALIZED VIEW rebuilds materialized contents",
+   rows == (("east", 3), ("north", 30), ("south", 7)),
+   rows)
+
+cur.execute("SHOW FULL TABLES")
+rows = cur.fetchall()
+ok("[13.1 materialized views] SHOW FULL TABLES exposes MATERIALIZED VIEW type",
+   any(row[0] == "mv13_region_totals" and row[1] == "MATERIALIZED VIEW" for row in rows),
    rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────

@@ -90,7 +90,13 @@ pub fn execute_read_only_with_ctx(
                 ];
                 let rows: Vec<Row> = tables
                     .into_iter()
-                    .map(|t| vec![Value::Text(t.table_name), Value::Text("BASE TABLE".into())])
+                    .map(|t| {
+                        let table_type = show_table_type_name(&t).to_string();
+                        vec![
+                            Value::Text(t.table_name),
+                            Value::Text(table_type),
+                        ]
+                    })
                     .collect();
                 Ok(QueryResult::Rows {
                     columns: out_cols,
@@ -307,6 +313,32 @@ pub fn execute_read_only_with_ctx(
             };
             let columns = reader.list_columns(table_def.id)?;
             let indexes = reader.list_indexes(table_def.id)?;
+            if table_def.is_materialized_view() {
+                let defining_query =
+                    table_def
+                        .defining_query
+                        .clone()
+                        .ok_or_else(|| DbError::Internal {
+                            message: format!(
+                                "materialized view '{}' is missing its defining query",
+                                table_def.table_name
+                            ),
+                        })?;
+                let ddl = format!(
+                    "CREATE MATERIALIZED VIEW `{}` AS {}",
+                    table_def.table_name, defining_query
+                );
+                return Ok(QueryResult::Rows {
+                    columns: vec![
+                        ColumnMeta::computed("View", DataType::Text),
+                        ColumnMeta::computed("Create View", DataType::Text),
+                    ],
+                    rows: vec![vec![
+                        Value::Text(table_def.table_name.clone()),
+                        Value::Text(ddl),
+                    ]],
+                });
+            }
             let create_prefix = match table_def.persistence {
                 axiomdb_catalog::TablePersistence::Permanent => "CREATE TABLE",
                 axiomdb_catalog::TablePersistence::Temporary => "CREATE TEMPORARY TABLE",

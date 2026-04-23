@@ -44,14 +44,15 @@ pub mod values_clause;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, CloseCursorStmt, ColumnConstraint, ColumnDef,
-    CreateDatabaseStmt, CreateIndexStmt, CreateSchemaStmt, CreateTableStmt, DeclareCursorStmt,
-    DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, ExclusionElement,
-    ExclusionElementTarget, ExclusionOperator, FetchCount, FetchCursorStmt, ForeignKeyAction,
-    FromClause, IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
-    MergeAction, MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder, OnConflictAction,
-    OnConflictClause, OrderByItem, SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt,
-    ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt, TableConstraint, TableRef,
-    TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
+    CreateDatabaseStmt, CreateIndexStmt, CreateMaterializedViewStmt, CreateSchemaStmt,
+    CreateTableStmt, DeclareCursorStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
+    DropMaterializedViewStmt, DropTableStmt, ExclusionElement, ExclusionElementTarget,
+    ExclusionOperator, FetchCount, FetchCursorStmt, ForeignKeyAction, FromClause, IndexColumn,
+    InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, MergeAction,
+    MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder, OnConflictAction,
+    OnConflictClause, OrderByItem, RefreshMaterializedViewStmt, SelectItem, SelectStmt, SetStmt,
+    SetValue, ShowColumnsStmt, ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt,
+    TableConstraint, TableRef, TruncateTableStmt, UpdateStmt, UseDatabaseStmt,
 };
 pub use bloom::BloomRegistry;
 pub use eval::{

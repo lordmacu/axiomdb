@@ -191,8 +191,10 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::CreateSchema(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropTable(_)
+            | Stmt::DropMaterializedView(_)
             | Stmt::DropDatabase(_)
             | Stmt::DropIndex(_)
+            | Stmt::RefreshMaterializedView(_)
             | Stmt::TruncateTable(_)
             | Stmt::AlterTable(_)
             | Stmt::Checkpoint
@@ -239,6 +241,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::CreateTableLike(_) => Ok(()),
             // CREATE TABLE AS SELECT — deps come from the inner SELECT.
             Stmt::CreateTableAsSelect(s) => self.visit_select(&s.select),
+            // CREATE MATERIALIZED VIEW AS SELECT — deps come from the inner SELECT.
+            Stmt::CreateMaterializedView(s) => self.visit_select(&s.select),
             // Set ops — deps come from first + every tail SELECT.
             Stmt::SetOp { first, rest } => {
                 self.visit_select(first)?;

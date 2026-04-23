@@ -440,11 +440,14 @@ fn is_ddl(stmt: &Stmt) -> bool {
     matches!(
         stmt,
         Stmt::CreateTable(_)
+            | Stmt::CreateMaterializedView(_)
             | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
+            | Stmt::DropMaterializedView(_)
             | Stmt::DropDatabase(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
+            | Stmt::RefreshMaterializedView(_)
             | Stmt::AlterTable(_)
             | Stmt::TruncateTable(_)
     )

@@ -50,8 +50,15 @@ fn dispatch(
         Stmt::CreateSchema(s) => {
             execute_create_schema(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
+        Stmt::CreateMaterializedView(_) => Err(DbError::NotImplemented {
+            feature: "CREATE MATERIALIZED VIEW requires session context — use execute_with_ctx"
+                .into(),
+        }),
         Stmt::DropTable(s) => {
             execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
+        }
+        Stmt::DropMaterializedView(s) => {
+            execute_drop_materialized_view(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
         Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
             feature: "DROP DATABASE requires session context".into(),
@@ -95,6 +102,10 @@ fn dispatch(
         Stmt::TruncateTable(s) => {
             execute_truncate(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
+        Stmt::RefreshMaterializedView(_) => Err(DbError::NotImplemented {
+            feature: "REFRESH MATERIALIZED VIEW requires session context — use execute_with_ctx"
+                .into(),
+        }),
         Stmt::AlterTable(s) => {
             execute_alter_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }

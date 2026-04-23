@@ -46,8 +46,8 @@ use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{
-        ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, StatsDef, TableDatabaseDef,
-        TableDef, TableId, TablePersistence, TableStorageLayout,
+        ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, RelationKind, StatsDef,
+        TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
     },
 };
 
@@ -355,12 +355,14 @@ impl<'a> CatalogWriter<'a> {
         name: &str,
         storage_layout: TableStorageLayout,
     ) -> Result<TableDef, DbError> {
-        self.create_table_with_options(
+        self.create_relation_with_options(
             schema,
             name,
             storage_layout,
             false,
             TablePersistence::Permanent,
+            RelationKind::Table,
+            None,
         )
     }
 
@@ -376,6 +378,28 @@ impl<'a> CatalogWriter<'a> {
         immutable: bool,
         persistence: TablePersistence,
     ) -> Result<TableDef, DbError> {
+        self.create_relation_with_options(
+            schema,
+            name,
+            storage_layout,
+            immutable,
+            persistence,
+            RelationKind::Table,
+            None,
+        )
+    }
+
+    /// Allocates a new relation with full option control.
+    pub fn create_relation_with_options(
+        &mut self,
+        schema: &str,
+        name: &str,
+        storage_layout: TableStorageLayout,
+        immutable: bool,
+        persistence: TablePersistence,
+        relation_kind: RelationKind,
+        defining_query: Option<String>,
+    ) -> Result<TableDef, DbError> {
         let table_id = alloc_table_id(self.storage)?;
         let root_page_id = self.allocate_table_root(storage_layout)?;
 
@@ -388,6 +412,8 @@ impl<'a> CatalogWriter<'a> {
             schema_version: 1,
             immutable,
             persistence,
+            relation_kind,
+            defining_query,
         };
         let data = def.to_bytes();
 

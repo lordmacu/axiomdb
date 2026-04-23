@@ -51,6 +51,37 @@ impl TryFrom<u8> for TablePersistence {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelationKind {
+    #[default]
+    Table,
+    MaterializedView,
+}
+
+impl From<RelationKind> for u8 {
+    fn from(value: RelationKind) -> Self {
+        match value {
+            RelationKind::Table => 0,
+            RelationKind::MaterializedView => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for RelationKind {
+    type Error = DbError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Table),
+            1 => Ok(Self::MaterializedView),
+            other => Err(DbError::ParseError {
+                message: format!("invalid relation kind byte {other}"),
+                position: None,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
     pub id: TableId,
@@ -80,6 +111,11 @@ pub struct TableDef {
     /// Persistence class of the table. Stored in the v4 on-disk row format;
     /// v0–v3 rows decode as permanent.
     pub persistence: TablePersistence,
+    /// Relation kind. Stored in the v5 on-disk row format; older rows decode
+    /// as ordinary tables.
+    pub relation_kind: RelationKind,
+    /// Defining query for materialized views. `None` for ordinary tables.
+    pub defining_query: Option<String>,
 }
 
 impl TableDef {
@@ -91,6 +127,10 @@ impl TableDef {
         self.storage_layout == TableStorageLayout::Clustered
     }
 
+    pub fn is_materialized_view(&self) -> bool {
+        self.relation_kind == RelationKind::MaterializedView
+    }
+
     pub fn ensure_heap_runtime(&self, feature: &str) -> Result<(), DbError> {
         if self.is_clustered() {
             return Err(DbError::NotImplemented {
@@ -100,7 +140,7 @@ impl TableDef {
         Ok(())
     }
 
-    /// Serializes to binary row format (v4).
+    /// Serializes to binary row format (v5).
     ///
     /// Format:
     /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1][schema_version:8 LE]`
@@ -110,11 +150,14 @@ impl TableDef {
     pub fn to_bytes(&self) -> Vec<u8> {
         let schema = self.schema_name.as_bytes();
         let name = self.table_name.as_bytes();
+        let query = self.defining_query.as_deref().unwrap_or("").as_bytes();
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
+        debug_assert!(query.len() <= u16::MAX as usize, "defining_query too long");
 
-        let mut buf =
-            Vec::with_capacity(4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1 + 1);
+        let mut buf = Vec::with_capacity(
+            4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1 + 1 + 1 + 2 + query.len(),
+        );
         buf.extend_from_slice(&self.id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
         buf.push(schema.len() as u8);
@@ -130,6 +173,10 @@ impl TableDef {
         // v4 trailer: 1-byte persistence flag (Phase 21.7). Older rows decode
         // as permanent.
         buf.push(self.persistence.into());
+        // v5 trailer: relation kind + defining query length + defining query bytes.
+        buf.push(self.relation_kind.into());
+        buf.extend_from_slice(&(query.len() as u16).to_le_bytes());
+        buf.extend_from_slice(query);
         buf
     }
 
@@ -186,17 +233,28 @@ impl TableDef {
         //   v2 (9 trailing):  storage_layout + schema_version, immutable = false, persistence = Permanent
         //   v3 (10 trailing): v2 + 1-byte immutable flag (Phase 13.9), persistence = Permanent
         //   v4 (11 trailing): v3 + 1-byte persistence flag (Phase 21.7)
-        let (storage_layout, schema_version, immutable, persistence) = match bytes.len() - consumed {
+        //   v5 (>=14 trailing): v4 + relation kind + defining query bytes
+        let remaining = bytes.len() - consumed;
+        let (storage_layout, schema_version, immutable, persistence, relation_kind, defining_query) = match remaining {
             0 => (
                 TableStorageLayout::Heap,
                 1u64,
                 false,
                 TablePersistence::Permanent,
+                RelationKind::Table,
+                None,
             ),
             1 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
                 consumed += 1;
-                (layout, 1u64, false, TablePersistence::Permanent)
+                (
+                    layout,
+                    1u64,
+                    false,
+                    TablePersistence::Permanent,
+                    RelationKind::Table,
+                    None,
+                )
             }
             9 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -207,7 +265,14 @@ impl TableDef {
                         .expect("slice is exactly 8 bytes"),
                 );
                 consumed += 8;
-                (layout, v, false, TablePersistence::Permanent)
+                (
+                    layout,
+                    v,
+                    false,
+                    TablePersistence::Permanent,
+                    RelationKind::Table,
+                    None,
+                )
             }
             10 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -220,7 +285,14 @@ impl TableDef {
                 consumed += 8;
                 let imm = bytes[consumed] != 0;
                 consumed += 1;
-                (layout, v, imm, TablePersistence::Permanent)
+                (
+                    layout,
+                    v,
+                    imm,
+                    TablePersistence::Permanent,
+                    RelationKind::Table,
+                    None,
+                )
             }
             11 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -235,7 +307,60 @@ impl TableDef {
                 consumed += 1;
                 let persistence = TablePersistence::try_from(bytes[consumed])?;
                 consumed += 1;
-                (layout, v, imm, persistence)
+                (
+                    layout,
+                    v,
+                    imm,
+                    persistence,
+                    RelationKind::Table,
+                    None,
+                )
+            }
+            n if n >= 14 => {
+                let layout = TableStorageLayout::try_from(bytes[consumed])?;
+                consumed += 1;
+                let v = u64::from_le_bytes(
+                    bytes[consumed..consumed + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                consumed += 8;
+                let imm = bytes[consumed] != 0;
+                consumed += 1;
+                let persistence = TablePersistence::try_from(bytes[consumed])?;
+                consumed += 1;
+                let relation_kind = RelationKind::try_from(bytes[consumed])?;
+                consumed += 1;
+                let query_len = u16::from_le_bytes(
+                    bytes[consumed..consumed + 2]
+                        .try_into()
+                        .expect("slice is exactly 2 bytes"),
+                ) as usize;
+                consumed += 2;
+                if bytes.len() < consumed + query_len {
+                    return Err(err());
+                }
+                let defining_query = if query_len == 0 {
+                    None
+                } else {
+                    Some(
+                        std::str::from_utf8(&bytes[consumed..consumed + query_len])
+                            .map_err(|_| DbError::ParseError {
+                                message: "invalid UTF-8 in defining_query".into(),
+                                position: None,
+                            })?
+                            .to_string(),
+                    )
+                };
+                consumed += query_len;
+                (
+                    layout,
+                    v,
+                    imm,
+                    persistence,
+                    relation_kind,
+                    defining_query,
+                )
             }
             _ => {
                 return Err(DbError::ParseError {
@@ -255,6 +380,8 @@ impl TableDef {
                 schema_version,
                 immutable,
                 persistence,
+                relation_kind,
+                defining_query,
             },
             consumed,
         ))
