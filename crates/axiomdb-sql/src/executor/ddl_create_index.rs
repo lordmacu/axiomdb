@@ -6,6 +6,13 @@ pub(crate) struct IndexBuildResult {
     pub skipped_key_too_long: usize,
 }
 
+fn include_values_from_row(include_col_idxs: &[u16], row: &[Value]) -> Vec<Value> {
+    include_col_idxs
+        .iter()
+        .map(|col_idx| row.get(*col_idx as usize).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
 pub(crate) fn build_index_root_from_heap(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
@@ -46,7 +53,13 @@ pub(crate) fn build_index_root_from_heap(
             continue;
         };
 
-        match crate::index_maintenance::encode_index_entry_key(idx, &key_vals, *rid) {
+        let include_vals = include_values_from_row(&idx.include_columns, row_vals);
+        match crate::index_maintenance::encode_secondary_entry_key(
+            idx,
+            &key_vals,
+            &include_vals,
+            *rid,
+        ) {
             Ok(key) => BTree::insert_in(storage, &root_pid, &key, *rid, idx.fillfactor)?,
             Err(DbError::IndexKeyTooLong { .. }) => skipped_key_too_long += 1,
             Err(err) => return Err(err),
@@ -158,7 +171,7 @@ fn execute_create_index(
     bloom: &crate::bloom::BloomRegistry,
     database: &str,
 ) -> Result<QueryResult, DbError> {
-    use crate::key_encoding::{encode_index_key, MAX_INDEX_KEY};
+    use crate::key_encoding::MAX_INDEX_KEY;
     use axiomdb_index::page_layout::{cast_leaf_mut, NULL_PAGE};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -256,6 +269,27 @@ fn execute_create_index(
                 .transpose()
         })
         .collect::<Result<_, _>>()?;
+
+    let include_col_idxs: Vec<u16> = stmt
+        .include_columns
+        .iter()
+        .filter_map(|name| col_defs.iter().find(|c| &c.name == name).map(|c| c.col_idx))
+        .collect();
+    let heap_preview_index_def = IndexDef {
+        index_id: 0,
+        table_id: table_def.id,
+        name: stmt.name.clone(),
+        root_page_id,
+        is_unique: stmt.unique,
+        is_primary: false,
+        columns: index_columns.clone(),
+        predicate: None,
+        fillfactor: index_fillfactor,
+        is_fk_index: false,
+        include_columns: include_col_idxs.clone(),
+        index_type: 0,
+        pages_per_range: 128,
+    };
 
     let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
     let mut skipped = 0usize;
@@ -514,17 +548,14 @@ fn execute_create_index(
             if key_vals.len() != index_columns.len() {
                 continue;
             }
-            match encode_index_key(&key_vals) {
-                Ok(base_key) => {
-                    // Non-unique indexes append the RecordId so that multiple rows with
-                    // the same indexed value each get a unique B-Tree key (InnoDB approach).
-                    let key = if !stmt.unique {
-                        let mut k = base_key;
-                        k.extend_from_slice(&encode_rid(rid));
-                        k
-                    } else {
-                        base_key
-                    };
+            let include_vals = include_values_from_row(&include_col_idxs, row_vals);
+            match crate::index_maintenance::encode_secondary_entry_key(
+                &heap_preview_index_def,
+                &key_vals,
+                &include_vals,
+                rid,
+            ) {
+                Ok(key) => {
                     BTree::insert_in(storage, &root_pid, &key, rid, index_fillfactor)?;
                     bloom_keys.push(key);
                 }
@@ -553,12 +584,6 @@ fn execute_create_index(
         .map(crate::expr_to_sql::expr_to_sql_string);
 
     // Resolve INCLUDE column names to col_idx values for catalog storage (Phase 6.13).
-    let include_col_idxs: Vec<u16> = stmt
-        .include_columns
-        .iter()
-        .filter_map(|name| col_defs.iter().find(|c| &c.name == name).map(|c| c.col_idx))
-        .collect();
-
     let new_index_id = writer.create_index(IndexDef {
         index_id: 0, // allocated by CatalogWriter::create_index
         table_id: table_def.id,

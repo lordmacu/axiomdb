@@ -1,5 +1,63 @@
 # Fase 13 - Advanced PostgreSQL
 
+## 13.5 Covering indexes - cerrada 2026-04-23
+
+La subfase 13.5 cierra el soporte real de covering indexes sobre heap tables.
+`INCLUDE (...)` ya existia en parser/catalogo desde `6.13`, pero todavia no
+guardaba los valores incluidos dentro de la hoja secundaria; el planner podia
+aceptar la sintaxis, pero los read-paths seguian dependiendo de la heap row
+para proyectar columnas no-key. El cierre de 13.5 completa ese contrato.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `CREATE INDEX ... ON heap_table (key_cols...) INCLUDE (cover_cols...)`
+- `SELECT` cubiertos donde las columnas proyectadas viven entre key columns e
+  `include_columns`
+- mantenimiento correcto del payload `INCLUDE` en `INSERT`, `UPDATE`,
+  `DELETE`, rebuilds y paths batch
+- compatibilidad con `UNIQUE ... INCLUDE (...)` en probes logicos como FK
+  parent lookup
+
+Fuera de alcance en este corte:
+
+- covering indexes sobre clustered tables
+- nuevo cost model especifico para preferir aggressively covering scans
+- cambio de metadata/catalogo adicional para versionar layout de index leaf
+
+### Ajustes tecnicos de cierre
+
+- Formato fisico: las entradas secundarias heap ahora persisten
+  `logical_key ++ include_payload ++ optional_rid_suffix`, manteniendo la
+  buscabilidad por prefijo del logical key.
+- Planner: `index_covers_query(...)` ya cuenta `include_columns` como cobertura
+  real y `IndexOnlyScan` arrastra `n_include_cols` para poblar columnas no-key.
+- Ejecutor: `select_ctx` decodifica key + include payload desde la entrada de
+  indice; si encuentra una entrada legacy sin payload, hace fallback seguro a
+  heap row read.
+- Mantenimiento: inserts, batch inserts, updates y deletes generan/borran la
+  nueva forma fisica; para no romper compatibilidad con entradas pre-13.5,
+  deletes tambien intentan borrar la forma legacy sin payload.
+- Logical-key probes: unique checks, FK parent validation y otros lookups sobre
+  secundarios heap cambiaron de exact-key lookup a prefix scan por logical key,
+  porque el key fisico ya no coincide byte-a-byte con el key de busqueda.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_index_only.rs`
+- `crates/axiomdb-sql/tests/integration_fk.rs`
+- `crates/axiomdb-sql/tests/integration_executor_ddl.rs`
+- bloque wire `[13.5 covering indexes]` en `tools/wire-test.py`
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_index_only --test integration_fk --test integration_executor_ddl` - paso.
+- `python3 tools/wire-test.py` - paso, 453/453 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 13.1 Materialized views - cerrada 2026-04-22
 
 La subfase 13.1 cierra el primer corte real de materialized views en AxiomDB

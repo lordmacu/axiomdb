@@ -3,18 +3,19 @@
 ## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.4 — `13.4` LISTEN / NOTIFY closed.
-Phase 13 now includes a real first SQL pub-sub slice: `LISTEN channel`,
-`UNLISTEN channel`, `UNLISTEN *`, `NOTIFY channel[, 'payload']`, and the
-pull-based `SHOW NOTIFICATIONS` surface over the current MySQL wire loop.
-Notifications are process-local and in-memory, subscriptions are session-scoped
-and survive transaction rollback, and queued `NOTIFY` events are delivered only
-after a successful `COMMIT`. `pg_notify(...)`, async server-push to idle
-clients, persistence across restart, and filtered delivery remain deferred.
+**Active subphase:** Phase 13.5 — `13.5` Covering indexes closed.
+Heap secondary indexes now persist `INCLUDE (...)` payload values directly in
+their leaf entries, so covering reads can project non-key columns from the
+index-only path instead of falling back to heap row fetches. The planner's
+coverage check now treats `include_columns` as real coverage, update/delete
+maintenance rewrites INCLUDE payloads correctly, and logical-key probes were
+adjusted so FK checks and other unique-index lookups do not rely on the old
+exact-key layout. Legacy pre-13.5 entries remain compatible via delete/read
+fallbacks that tolerate keys without INCLUDE payload bytes.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_listen_notify`; `cargo test -p axiomdb-network --test integration_listen_notify`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_index_only --test integration_fk --test integration_executor_ddl`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.5 Covering indexes.
+**Next:** Phase 13.6 Non-blocking ALTER TABLE.
 
 ### Phase 21 subphase status
 

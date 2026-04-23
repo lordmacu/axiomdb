@@ -506,28 +506,11 @@ fn execute_select_ctx(
                 // key is in the B-Tree after INSERT, so the bloom check is wasted cycles.
                 if index_def.is_unique
                     && !index_def.is_primary
+                    && index_def.include_columns.is_empty()
                     && !bloom.might_exist(index_def.index_id, key)
                 {
                     vec![]
-                } else if index_def.is_unique {
-                    // Unique index: exact key lookup → at most one RecordId.
-                    match BTree::lookup_in(storage, index_def.root_page_id, key)? {
-                        None => vec![],
-                        Some(rid) => {
-                            if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap)?
-                            {
-                                vec![]
-                            } else {
-                                match TableEngine::read_row(storage, &resolved.columns, rid)? {
-                                    None => vec![],
-                                    Some(values) => vec![(rid, values)],
-                                }
-                            }
-                        }
-                    }
                 } else {
-                    // Non-unique index: key stored as key||RID — use range scan with
-                    // [key||0x00..00, key||0xFF..FF] to find all rows with this value.
                     let lo = rid_lo(key);
                     let hi = rid_hi(key);
                     let pairs =
@@ -622,20 +605,16 @@ fn execute_select_ctx(
                 index_def,
                 lo,
                 hi,
-                n_key_cols,
+                n_key_cols: _,
+                n_include_cols,
                 needed_key_positions: _,
             } => {
                 // Index-only scan (Phase 6.13): values decoded from B-Tree key bytes.
                 // Only the 24-byte heap slot header is read for MVCC visibility.
                 // Non-unique: lo/hi need RID suffix for correct range bounds.
-                let (lo_adj, hi_adj);
-                let (lo_ref, hi_ref) = if index_def.is_unique {
-                    (Some(lo.as_slice()), hi.as_deref())
-                } else {
-                    lo_adj = rid_lo(lo);
-                    hi_adj = hi.as_deref().map(rid_hi);
-                    (Some(lo_adj.as_slice()), hi_adj.as_deref())
-                };
+                let lo_adj = rid_lo(lo);
+                let hi_adj = hi.as_deref().map(rid_hi);
+                let (lo_ref, hi_ref) = (Some(lo_adj.as_slice()), hi_adj.as_deref());
                 let pairs = BTree::range_in(storage, index_def.root_page_id, lo_ref, hi_ref)?;
                 let n_table_cols = resolved.columns.len();
                 let mut result = Vec::with_capacity(pairs.len());
@@ -643,22 +622,42 @@ fn execute_select_ctx(
                     if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap.clone())? {
                         continue;
                     }
-                    let (all_key_vals, _) =
-                        crate::key_encoding::decode_index_key(&key_bytes, *n_key_cols)?;
-                    // Build a full-width row (Null for non-indexed cols) so that
-                    // WHERE and SELECT expressions can access values by table col_idx.
-                    // Populate all decoded key columns — not just the SELECT ones —
-                    // so that WHERE re-evaluation can access them too.
+                    let decoded =
+                        crate::index_maintenance::decode_secondary_entry_values(index_def, &key_bytes);
                     let mut row_values = vec![Value::Null; n_table_cols];
-                    for (key_pos, idx_col) in index_def.columns.iter().enumerate() {
-                        let table_idx = idx_col.col_idx as usize;
-                        if let (true, Some(val)) =
-                            (table_idx < n_table_cols, all_key_vals.get(key_pos))
-                        {
-                            row_values[table_idx] = val.clone();
+                    match decoded {
+                        Ok((all_key_vals, include_vals)) => {
+                            for (key_pos, idx_col) in index_def.columns.iter().enumerate() {
+                                let table_idx = idx_col.col_idx as usize;
+                                if let (true, Some(val)) =
+                                    (table_idx < n_table_cols, all_key_vals.get(key_pos))
+                                {
+                                    row_values[table_idx] = val.clone();
+                                }
+                            }
+                            if *n_include_cols == index_def.include_columns.len() {
+                                for (include_pos, col_idx) in index_def.include_columns.iter().enumerate() {
+                                    let table_idx = *col_idx as usize;
+                                    if let (true, Some(val)) =
+                                        (table_idx < n_table_cols, include_vals.get(include_pos))
+                                    {
+                                        row_values[table_idx] = val.clone();
+                                    }
+                                }
+                                result.push((rid, row_values));
+                            } else if let Some(values) =
+                                TableEngine::read_row(storage, &resolved.columns, rid)?
+                            {
+                                result.push((rid, values));
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)?
+                            {
+                                result.push((rid, values));
+                            }
                         }
                     }
-                    result.push((rid, row_values));
                 }
                 result
             }

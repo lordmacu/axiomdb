@@ -203,6 +203,13 @@ fn statement_might_affect_indexes(
         if key_overlap {
             return true;
         }
+        let include_overlap = idx
+            .include_columns
+            .iter()
+            .any(|c| assigned_cols.contains(&(*c as usize)));
+        if include_overlap {
+            return true;
+        }
         if let Some(pred_expr) = pred {
             let pred_cols = crate::partial_index::collect_column_indices(pred_expr);
             if pred_cols.iter().any(|c| assigned_cols.contains(c)) {
@@ -289,8 +296,13 @@ fn apply_update_index_maintenance(
                     if let Some(key_vals) = crate::index_maintenance::index_key_values_if_indexed(
                         idx, old_values, pred,
                     )? {
-                        let old_key = crate::index_maintenance::encode_index_entry_key(
-                            idx, &key_vals, *old_rid,
+                        let include_vals =
+                            crate::index_maintenance::index_include_values(idx, old_values);
+                        let old_key = crate::index_maintenance::encode_secondary_entry_key(
+                            idx,
+                            &key_vals,
+                            &include_vals,
+                            *old_rid,
                         )?;
                         // Record undo BEFORE deleting so ROLLBACK can re-insert the old key.
                         txn.record_index_delete(
@@ -301,7 +313,16 @@ fn apply_update_index_maintenance(
                             *old_rid,
                             idx.fillfactor,
                         );
-                        let delete_keys_for_idx = vec![old_key];
+                        let mut delete_keys_for_idx = vec![old_key];
+                        if !idx.include_columns.is_empty() {
+                            if let Ok(legacy_key) =
+                                crate::index_maintenance::encode_secondary_entry_key_legacy(
+                                    idx, &key_vals, *old_rid,
+                                )
+                            {
+                                delete_keys_for_idx.push(legacy_key);
+                            }
+                        }
                         if let Some(new_root) =
                             crate::index_maintenance::delete_many_from_single_index(
                                 idx,
@@ -332,8 +353,13 @@ fn apply_update_index_maintenance(
                 if let Some(key_vals) =
                     crate::index_maintenance::index_key_values_if_indexed(idx, vals, pred)?
                 {
-                    let key =
-                        crate::index_maintenance::encode_index_entry_key(idx, &key_vals, rid)?;
+                    let include_vals = crate::index_maintenance::index_include_values(idx, vals);
+                    let key = crate::index_maintenance::encode_secondary_entry_key(
+                        idx,
+                        &key_vals,
+                        &include_vals,
+                        rid,
+                    )?;
                     txn.record_index_insert(conn_txn, idx.index_id, idx.root_page_id, key);
                 }
             }

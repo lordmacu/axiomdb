@@ -44,11 +44,12 @@ pub fn plan_select(
             if index_covers_query(index_def, select_col_idxs) {
                 if let Some(lo_key) = lo.clone() {
                     return AccessMethod::IndexOnlyScan {
-                        n_key_cols: index_def.columns.len(),
-                        needed_key_positions: build_key_positions(index_def, select_col_idxs),
-                        hi: Some(lo_key.clone()),
-                        lo: lo_key,
                         index_def: index_def.clone(),
+                        lo: lo_key.clone(),
+                        hi: Some(lo_key),
+                        n_key_cols: index_def.columns.len(),
+                        n_include_cols: index_def.include_columns.len(),
+                        needed_key_positions: build_key_positions(index_def, select_col_idxs),
                     };
                 }
             }
@@ -74,6 +75,7 @@ pub fn plan_select(
                             lo: key.clone(),
                             hi: Some(key), // point lookup: lo == hi
                             n_key_cols: idx.columns.len(),
+                            n_include_cols: idx.include_columns.len(),
                             needed_key_positions: build_key_positions(idx, select_col_idxs),
                         };
                     }
@@ -308,24 +310,19 @@ fn extract_simple_jsonpath_key(literal: &Value) -> Option<String> {
 // ── Index-only scan coverage (Phase 6.13) ────────────────────────────────────
 
 /// Returns `true` if all columns in `select_col_idxs` are covered by the index
-/// KEY columns. Used to decide if an index-only scan is safe.
-///
-/// Only key columns count (not INCLUDE columns — B-Tree leaf storage for INCLUDE
-/// is deferred to Phase 6.15). For Phase 6.13, coverage means every needed col
-/// is directly decodable from the encoded key bytes.
+/// key columns or INCLUDE columns.
 fn index_covers_query(index_def: &IndexDef, select_col_idxs: &[u16]) -> bool {
     if select_col_idxs.is_empty() {
         return false; // SELECT * or unknown — never use index-only
     }
-    // Expression columns are NOT stored in the index — only the computed result
-    // is stored. Therefore they cannot be used for index-only scan coverage.
-    let key_cols: std::collections::HashSet<u16> = index_def
+    let mut covered_cols: std::collections::HashSet<u16> = index_def
         .columns
         .iter()
-        .filter(|c| c.expr.is_none()) // only plain columns count
+        .filter(|c| c.expr.is_none())
         .map(|c| c.col_idx)
         .collect();
-    select_col_idxs.iter().all(|col| key_cols.contains(col))
+    covered_cols.extend(index_def.include_columns.iter().copied());
+    select_col_idxs.iter().all(|col| covered_cols.contains(col))
 }
 
 /// Builds the `needed_key_positions` vector for `IndexOnlyScan`.

@@ -1160,22 +1160,23 @@ fn apply_limit_offset(
         .collect())
 }
 
-// ── Non-unique index key helpers ──────────────────────────────────────────────
+// ── Secondary-index logical-prefix helpers ───────────────────────────────────
 
-/// Returns the lower bound for a non-unique index range scan on `prefix`.
+/// Returns the lower bound for a secondary-index scan on a logical-key prefix.
 ///
-/// Non-unique secondary indexes store `encode_index_key(vals) || encode_rid(rid)`
-/// so that multiple rows with the same indexed value each get a unique B-Tree key.
-/// To find all entries with a given prefix, use `[prefix||0x00..00, prefix||0xFF..FF]`.
+/// All heap secondary entries begin with the logical encoded key, then may add
+/// INCLUDE payload bytes and/or a RID suffix depending on the index format.
 fn rid_lo(prefix: &[u8]) -> Vec<u8> {
-    let mut v = prefix.to_vec();
-    v.extend_from_slice(&[0u8; 10]);
-    v
+    prefix.to_vec()
 }
 
-/// Returns the upper bound for a non-unique index range scan on `prefix`.
+/// Returns the upper bound for a secondary-index scan on a logical-key prefix.
 fn rid_hi(prefix: &[u8]) -> Vec<u8> {
     let mut v = prefix.to_vec();
-    v.extend_from_slice(&[0xFFu8; 10]);
+    if v.len() < crate::key_encoding::MAX_INDEX_KEY {
+        v.resize(crate::key_encoding::MAX_INDEX_KEY, 0xFF);
+    } else {
+        v.push(0xFF);
+    }
     v
 }

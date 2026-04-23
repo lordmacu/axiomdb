@@ -33,7 +33,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              13.1 (materialized views smoke),
              13.2 (window functions smoke),
              13.3 (generated columns closeout smoke),
-             13.4 (LISTEN / NOTIFY pull-based smoke)
+             13.4 (LISTEN / NOTIFY pull-based smoke),
+             13.5 (covering indexes smoke)
 """
 import os
 import signal
@@ -4144,6 +4145,28 @@ ok("[13.4 listen notify] SHOW NOTIFICATIONS drains the session queue",
 
 conn_134_emit.close()
 conn_134_listen.close()
+
+# ── Phase 13.5 — Covering indexes ────────────────────────────────────────────
+
+print("\n[13.5 covering indexes]")
+
+cur.execute("CREATE TABLE cover13_items (id INT, sku TEXT, qty INT, price INT, note TEXT)")
+cur.execute("CREATE UNIQUE INDEX idx_cover13_sku ON cover13_items (sku) INCLUDE (qty, price)")
+cur.execute("INSERT INTO cover13_items VALUES (1, 'sku-1', 8, 120, 'promo')")
+cur.execute("UPDATE cover13_items SET qty = 11, price = 135, note = 'updated' WHERE sku = 'sku-1'")
+conn.commit()
+
+cur.execute("EXPLAIN SELECT qty, price FROM cover13_items WHERE sku = 'sku-1'")
+plan_rows = cur.fetchall()
+ok("[13.5 covering indexes] EXPLAIN chooses the covering secondary index",
+   any(len(row) >= 5 and row[4] == "idx_cover13_sku" for row in plan_rows),
+   plan_rows)
+
+cur.execute("SELECT qty, price FROM cover13_items WHERE sku = 'sku-1'")
+rows = cur.fetchall()
+ok("[13.5 covering indexes] INCLUDE payload serves non-key projection after update",
+   rows == ((11, 135),),
+   rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

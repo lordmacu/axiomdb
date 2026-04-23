@@ -40,7 +40,8 @@ pub enum AccessMethod {
         hi: Option<Vec<u8>>,
     },
 
-    /// Index-only scan: all needed columns are in the index key columns (Phase 6.13).
+    /// Index-only scan: all needed columns are in the index key columns or
+    /// INCLUDE payload (Phase 13.5).
     ///
     /// The executor decodes column values from the B-Tree key bytes instead of
     /// fetching the full heap row. A lightweight MVCC check (slot header only)
@@ -54,6 +55,8 @@ pub enum AccessMethod {
         hi: Option<Vec<u8>>,
         /// Number of columns in the index key (= `index_def.columns.len()`).
         n_key_cols: usize,
+        /// Number of INCLUDE columns physically stored after the key bytes.
+        n_include_cols: usize,
         /// For each needed SELECT column (in output order): the position within
         /// the decoded key values (0 = first key column, 1 = second, …).
         needed_key_positions: Vec<usize>,

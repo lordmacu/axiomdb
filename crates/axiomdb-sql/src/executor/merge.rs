@@ -315,10 +315,16 @@ fn merge_lookup_target_by_unique(
     }
 
     let key = crate::key_encoding::encode_index_key(&[key_value])?;
-    if !bloom.might_exist(access.index.index_id, &key) {
+    if access.index.include_columns.is_empty() && !bloom.might_exist(access.index.index_id, &key) {
         return Ok(None);
     }
-    let Some(rid) = BTree::lookup_in(storage, access.index.root_page_id, &key)? else {
+    let Some(rid) = crate::index_maintenance::lookup_secondary_rids_by_logical_key(
+        storage,
+        &access.index,
+        &key,
+    )?
+    .into_iter()
+    .next() else {
         return Ok(None);
     };
     let snap = txn.active_snapshot(conn_txn);
