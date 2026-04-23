@@ -843,6 +843,9 @@ fn infer_expr_type_join(
     all_sources: &[JoinSourceSchema],
     nullable_tables: &[bool],
 ) -> (DataType, bool) {
+    if matches!(expr, Expr::Window { .. }) {
+        return (DataType::BigInt, false);
+    }
     if let Expr::Column { col_idx, .. } = expr {
         // Find which table owns this col_idx and what the column type is.
         let mut offset = 0;

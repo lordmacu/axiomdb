@@ -426,6 +426,14 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
                 collect_col_idxs_non_agg(a, out);
             }
         }
+        Expr::Window { spec, .. } => {
+            for e in &spec.partition_by {
+                collect_col_idxs_non_agg(e, out);
+            }
+            for item in &spec.order_by {
+                collect_col_idxs_non_agg(&item.expr, out);
+            }
+        }
         Expr::Cast { expr, .. } => collect_col_idxs_non_agg(expr, out),
         Expr::IsNull { expr, .. } => collect_col_idxs_non_agg(expr, out),
         Expr::IsBoolean { expr, .. } => collect_col_idxs_non_agg(expr, out),
@@ -493,6 +501,14 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
         Expr::Function { args, .. } => {
             for a in args {
                 collect_non_agg_col_idxs_in_expr(a, inside_agg, out);
+            }
+        }
+        Expr::Window { spec, .. } => {
+            for e in &spec.partition_by {
+                collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
+            }
+            for item in &spec.order_by {
+                collect_non_agg_col_idxs_in_expr(&item.expr, inside_agg, out);
             }
         }
         Expr::Cast { expr, .. } => collect_non_agg_col_idxs_in_expr(expr, inside_agg, out),

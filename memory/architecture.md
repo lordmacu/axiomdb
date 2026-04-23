@@ -1,5 +1,21 @@
 # Architecture Notes
 
+## 2026-04-23 - Window functions (13.2)
+
+- **The first window-function cut is a projection decoration pass, not a new
+  executor pipeline.** `Expr::Window` survives parsing/analyzer resolution, but
+  scalar `eval()` deliberately refuses to execute it; ranking values are
+  computed only inside `project_rows_with_window_support(...)` after the row
+  source has already been materialized.
+- **Analyzer guard rails are part of the architecture, not just UX.** The MVP
+  intentionally rejects joins, grouped queries, `DISTINCT`, nested windows, and
+  non-SELECT placements so the executor only has to reason about one stable
+  shape: top-level ranking expressions over ordinary row sets.
+- **Window ordering is separate from final query ordering.** The executor sorts
+  an internal `WindowEntry` stream by partition keys plus the window `ORDER BY`
+  spec, assigns ranking values, then later applies the query's own top-level
+  `ORDER BY`, matching SQL's two-phase semantics.
+
 ## 2026-04-22 - Materialized views (13.1)
 
 - **Materialized views are catalog-typed relations, not logical views.**

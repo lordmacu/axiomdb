@@ -221,6 +221,26 @@ fn resolve_expr_full(
             Ok(Expr::Function { name, args })
         }
 
+        Expr::Window { func, spec } => {
+            let partition_by = spec
+                .partition_by
+                .into_iter()
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut order_by = Vec::with_capacity(spec.order_by.len());
+            for mut item in spec.order_by {
+                item.expr = resolve_expr_full(item.expr, ctx, outer_scopes, state)?;
+                order_by.push(item);
+            }
+            Ok(Expr::Window {
+                func,
+                spec: crate::ast::WindowSpec {
+                    partition_by,
+                    order_by,
+                },
+            })
+        }
+
         Expr::Case {
             operand,
             when_thens,

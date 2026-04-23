@@ -68,10 +68,9 @@ fn execute_information_schema_select(
     combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
 
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
-    let mut rows = combined_rows
-        .iter()
-        .map(|v| project_row(&stmt.columns, v))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
+        eval(expr, row)
+    })?;
 
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);

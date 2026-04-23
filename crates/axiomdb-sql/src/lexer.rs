@@ -393,6 +393,10 @@ pub enum Token<'src> {
     /// `ONLY` — used in `READ ONLY`.
     #[token("ONLY", ignore(ascii_case))]
     Only,
+    #[token("OVER", ignore(ascii_case))]
+    Over,
+    #[token("PARTITION", ignore(ascii_case))]
+    Partition,
     /// `WRITE` — used in `READ WRITE` and `LOCK TABLES ... WRITE`.
     #[token("WRITE", ignore(ascii_case))]
     Write,

@@ -427,6 +427,15 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            Expr::Window { spec, .. } => {
+                for expr in &spec.partition_by {
+                    self.visit_expr(expr)?;
+                }
+                for item in &spec.order_by {
+                    self.visit_expr(&item.expr)?;
+                }
+                Ok(())
+            }
             Expr::In { expr, list, .. } => {
                 self.visit_expr(expr)?;
                 for e in list {

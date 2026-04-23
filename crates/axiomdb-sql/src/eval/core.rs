@@ -299,6 +299,9 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             };
             Ok(Value::Int(result))
         }
+        Expr::Window { .. } => Err(DbError::InvalidValue {
+            reason: "window function cannot be evaluated as a scalar expression".into(),
+        }),
     }
 }
 
@@ -710,6 +713,9 @@ pub fn eval_with<R: SubqueryRunner>(
             };
             Ok(Value::Int(result))
         }
+        Expr::Window { .. } => Err(DbError::InvalidValue {
+            reason: "window function cannot be evaluated as a scalar expression".into(),
+        }),
     }
 }
 

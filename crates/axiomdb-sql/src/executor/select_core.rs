@@ -24,16 +24,27 @@ fn execute_select(
         };
         let mut out_row: Row = Vec::new();
         let mut out_cols: Vec<ColumnMeta> = Vec::new();
+        let has_windows = select_items_have_window_functions(&stmt.columns);
         for item in &stmt.columns {
             match item {
                 SelectItem::Expr { expr, alias } => {
-                    let v = eval_with(expr, &[], &mut runner)?;
+                    let v = if has_windows {
+                        Value::Null
+                    } else {
+                        eval_with(expr, &[], &mut runner)?
+                    };
                     let name = alias
                         .clone()
                         .unwrap_or_else(|| expr_column_name(expr, None));
-                    let dt = datatype_of_value(&v);
+                    let dt = if has_windows {
+                        infer_expr_type(expr, &[]).0
+                    } else {
+                        datatype_of_value(&v)
+                    };
                     out_cols.push(ColumnMeta::computed(name, dt));
-                    out_row.push(v);
+                    if !has_windows {
+                        out_row.push(v);
+                    }
                 }
                 SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                     // SELECT * with no FROM → empty result (0 columns, 0 rows), MySQL-compatible.
@@ -44,10 +55,17 @@ fn execute_select(
                 }
             }
         }
-        let rows = if stmt.distinct {
-            apply_distinct_with_session(vec![out_row])
+        let rows = if has_windows {
+            project_rows_with_window_support(&stmt.columns, &[Vec::new()], |expr, row| {
+                eval_with(expr, row, &mut runner)
+            })?
         } else {
             vec![out_row]
+        };
+        let rows = if stmt.distinct {
+            apply_distinct_with_session(rows)
+        } else {
+            rows
         };
         return Ok(QueryResult::Rows {
             columns: out_cols,
@@ -365,11 +383,10 @@ fn execute_select(
         }
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-        let mut rows: Vec<Row> = Vec::with_capacity(combined_rows.len());
         let mut proj_cache: SubqueryCache = HashMap::new();
         let mut proj_in_set_cache: InSetCache = HashMap::new();
         let mut proj_corr_cache: CorrelatedCache = HashMap::new();
-        for v in &combined_rows {
+        let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, v| {
             let mut temp_ctx = SessionContext::new();
             let temp_bloom = crate::bloom::BloomRegistry::new();
             let mut runner = ExecSubqueryRunner {
@@ -383,8 +400,8 @@ fn execute_select(
                 correlated_cache: Some(&mut proj_corr_cache),
                 materialized: None,
             };
-            rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
-        }
+            eval_with(expr, v, &mut runner)
+        })?;
 
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);
@@ -480,10 +497,9 @@ fn execute_select_derived(
 
     // Build output columns from SELECT list against derived column metadata.
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
-    let mut rows = combined_rows
-        .iter()
-        .map(|v| project_row(&stmt.columns, v))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
+        eval(expr, row)
+    })?;
 
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);
@@ -607,10 +623,9 @@ fn execute_select_json_table_source(
 
     // Projection + distinct + limit/offset.
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
-    let mut rows = combined_rows
-        .iter()
-        .map(|v| project_row(&stmt.columns, v))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
+        eval(expr, row)
+    })?;
 
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);
@@ -715,10 +730,9 @@ fn execute_select_jsonb_srf_source(
     }
 
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
-    let mut rows = combined_rows
-        .iter()
-        .map(|v| project_row(&stmt.columns, v))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
+        eval(expr, row)
+    })?;
 
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);
@@ -811,10 +825,9 @@ fn execute_select_values_source(
     }
 
     let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
-    let mut rows = combined_rows
-        .iter()
-        .map(|v| project_row(&stmt.columns, v))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
+        eval(expr, row)
+    })?;
 
     if stmt.distinct {
         rows = apply_distinct_with_session(rows);

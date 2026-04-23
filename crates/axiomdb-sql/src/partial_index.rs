@@ -153,6 +153,9 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
                 .map(|e| resolve_predicate_columns(e, col_defs))
                 .collect::<Result<_, _>>()?,
         }),
+        Expr::Window { .. } => Err(DbError::NotImplemented {
+            feature: "partial index predicate: window function".into(),
+        }),
         Expr::IsBoolean {
             expr: inner,
             value,

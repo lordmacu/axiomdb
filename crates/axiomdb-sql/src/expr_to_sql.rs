@@ -198,6 +198,48 @@ fn expr_to_sql_inner(expr: &Expr, top_level: bool) -> String {
             // against the upper-cased representation.
             format!("{}({})", name.to_ascii_uppercase(), arg_str.join(", "))
         }
+        Expr::Window { func, spec } => {
+            let func_name = match func {
+                crate::expr::WindowFunc::RowNumber => "ROW_NUMBER",
+                crate::expr::WindowFunc::Rank => "RANK",
+                crate::expr::WindowFunc::DenseRank => "DENSE_RANK",
+            };
+            let mut parts = Vec::new();
+            if !spec.partition_by.is_empty() {
+                parts.push(format!(
+                    "PARTITION BY {}",
+                    spec.partition_by
+                        .iter()
+                        .map(|expr| expr_to_sql_inner(expr, true))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !spec.order_by.is_empty() {
+                parts.push(format!(
+                    "ORDER BY {}",
+                    spec.order_by
+                        .iter()
+                        .map(|item| {
+                            let mut s = expr_to_sql_inner(&item.expr, true);
+                            if item.order == crate::ast::SortOrder::Desc {
+                                s.push_str(" DESC");
+                            }
+                            if let Some(nulls) = item.nulls {
+                                s.push_str(" NULLS ");
+                                s.push_str(match nulls {
+                                    crate::ast::NullsOrder::First => "FIRST",
+                                    crate::ast::NullsOrder::Last => "LAST",
+                                });
+                            }
+                            s
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            format!("{func_name}() OVER ({})", parts.join(" "))
+        }
         Expr::Case {
             operand,
             when_thens,

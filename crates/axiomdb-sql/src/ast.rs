@@ -557,6 +557,13 @@ pub struct OrderByItem {
     pub nulls: Option<NullsOrder>,
 }
 
+/// Bounded SQL window specification for ranking functions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByItem>,
+}
+
 // ── SELECT statement ──────────────────────────────────────────────────────────
 
 /// A `SELECT` statement.

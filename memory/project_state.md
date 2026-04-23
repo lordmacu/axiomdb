@@ -1,19 +1,20 @@
 # Project State
 
-## Current (2026-04-22)
+## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.1 — `13.1` Materialized views closed.
-`CREATE MATERIALIZED VIEW ... AS SELECT ...`, `REFRESH MATERIALIZED VIEW`, and
-`DROP MATERIALIZED VIEW` now work as catalog-owned physical relations backed by
-ordinary table storage. `TableDef` persists `relation_kind` plus the defining
-query text, metadata surfaces show `MATERIALIZED VIEW` distinctly, and refresh
-rebuilds contents by materializing the stored query before truncating/reloading
-the relation root.
+**Active subphase:** Phase 13.2 — `13.2` Window functions closed.
+`ROW_NUMBER()`, `RANK()`, and `DENSE_RANK()` now support
+`OVER ( [PARTITION BY ...] ORDER BY ... )` as top-level `SELECT` expressions
+for the ranking MVP. The analyzer rejects out-of-scope placements and mixes
+(`WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `JOIN ON`, `DISTINCT`, nested
+windows, grouped/aggregate combinations, joined SELECTs), and the executor
+computes ranking values in a dedicated post-scan decoration pass over
+materialized rows.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_materialized_views --test integration_show_full`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_window_functions`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.2 Window functions.
+**Next:** Phase 13.3 Generated columns.
 
 ### Phase 21 subphase status
 

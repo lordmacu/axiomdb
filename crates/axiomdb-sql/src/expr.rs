@@ -8,7 +8,7 @@
 
 use axiomdb_types::Value;
 
-use crate::ast::SortOrder;
+use crate::ast::{SortOrder, WindowSpec};
 
 // ── Expr ──────────────────────────────────────────────────────────────────────
 
@@ -103,6 +103,17 @@ pub enum Expr {
     /// Function implementations are registered in Phase 4.19. Evaluating an
     /// unregistered function returns `DbError::NotImplemented`.
     Function { name: String, args: Vec<Expr> },
+
+    /// Bounded SQL window function support for ranking functions.
+    ///
+    /// Supported in Phase 13.2:
+    /// - `ROW_NUMBER() OVER (...)`
+    /// - `RANK() OVER (...)`
+    /// - `DENSE_RANK() OVER (...)`
+    ///
+    /// Execution happens in a dedicated post-scan decoration phase, not via
+    /// the scalar expression evaluator.
+    Window { func: WindowFunc, spec: WindowSpec },
 
     // ── CASE WHEN ─────────────────────────────────────────────────────────────
     /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`
@@ -297,6 +308,13 @@ pub enum Expr {
         /// Populated by the analyzer. `None` = pre-analysis or outside Sets context.
         universe_indices: Option<Vec<usize>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
 }
 
 // ── BinaryOp ──────────────────────────────────────────────────────────────────
