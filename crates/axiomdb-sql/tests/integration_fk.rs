@@ -762,3 +762,16 @@ fn test_on_update_set_null_no_change_when_key_unchanged() {
     let r = rows(db.ok("SELECT pid FROM child"));
     assert_eq!(r[0][0], Value::Int(1)); // Still 1, not NULL.
 }
+
+#[test]
+fn test_fk_child_insert_accepts_parent_unique_index_with_include_columns() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE parent (id INT, note TEXT)");
+    db.ok("CREATE UNIQUE INDEX uq_parent_id_cover ON parent (id) INCLUDE (note)");
+    db.ok("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))");
+    db.ok("INSERT INTO parent VALUES (1, 'parent row')");
+    db.ok("INSERT INTO child VALUES (10, 1)");
+
+    let r = rows(db.ok("SELECT pid FROM child"));
+    assert_eq!(r, vec![vec![Value::Int(1)]]);
+}

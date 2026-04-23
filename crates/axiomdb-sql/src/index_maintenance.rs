@@ -28,7 +28,12 @@ use axiomdb_index::page_layout::{encode_rid, MAX_KEY_LEN};
 
 use axiomdb_storage::heap_chain::HeapChain;
 
-use crate::{eval::eval, eval::is_truthy, expr::Expr, key_encoding::encode_index_key};
+use crate::{
+    eval::eval,
+    eval::is_truthy,
+    expr::Expr,
+    key_encoding::{decode_index_key, encode_index_key, MAX_INDEX_KEY},
+};
 
 // ── FK composite key helpers ──────────────────────────────────────────────────
 
@@ -396,42 +401,34 @@ pub fn insert_into_indexes_with_undo(
         if key_vals.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
+        let include_vals = index_include_values(idx, row);
 
-        // Key encoding:
-        // - FK auto-indexes and non-unique indexes: key || encode_rid(rid) (10 bytes).
-        //   Makes every B-Tree entry globally unique even when multiple rows share the
-        //   same indexed value (InnoDB approach — Phase 6.9 for FK; generalized here).
-        // - Unique indexes: plain encode_index_key (duplicate → UniqueViolation above).
-        let key = if idx.is_fk_index || !idx.is_unique {
-            let mut k = encode_index_key(&key_vals)?;
-            k.extend_from_slice(&encode_rid(rid));
-            k
-        } else {
-            encode_index_key(&key_vals)?
-        };
+        let key = encode_secondary_entry_key(idx, &key_vals, &include_vals, rid)?;
 
         // Uniqueness check — skip for FK auto-indexes (never unique by FK semantics).
         // Phase 7.3b: check heap visibility for existing entry — dead entries don't
         // count as duplicates (they'll be cleaned by vacuum).
         if idx.is_unique && !idx.is_fk_index {
-            // Check if a duplicate key exists in the B-Tree.
-            if let Some(existing_rid) = BTree::lookup_in(storage, current_root, &key)? {
-                // If the existing row is visible → real violation.
-                if HeapChain::is_slot_visible(
-                    storage,
-                    existing_rid.page_id,
-                    existing_rid.slot_id,
-                    snap.clone(),
-                )? {
-                    let dup_val = key_vals.first().map(|v| format!("{v}"));
-                    return Err(DbError::UniqueViolation {
-                        index_name: idx.name.clone(),
-                        value: dup_val,
-                    });
-                }
-                // Dead entry: remove it from B-Tree so insert_in won't reject.
+            let logical_key = encode_index_key(&key_vals)?;
+            let hi = logical_key_upper_bound(&logical_key);
+            let existing = BTree::range_in(storage, current_root, Some(&logical_key), Some(&hi))?;
+            if !existing.is_empty() {
                 let root_pid = AtomicU64::new(current_root);
-                let _ = BTree::delete_in(storage, &root_pid, &key);
+                for (existing_rid, existing_key) in existing {
+                    if HeapChain::is_slot_visible(
+                        storage,
+                        existing_rid.page_id,
+                        existing_rid.slot_id,
+                        snap.clone(),
+                    )? {
+                        let dup_val = key_vals.first().map(|v| format!("{v}"));
+                        return Err(DbError::UniqueViolation {
+                            index_name: idx.name.clone(),
+                            value: dup_val,
+                        });
+                    }
+                    let _ = BTree::delete_in(storage, &root_pid, &existing_key);
+                }
                 current_root = root_pid.load(Ordering::Acquire);
             }
         }
@@ -534,26 +531,21 @@ pub fn delete_from_indexes(
 
         // FK auto-indexes and non-unique indexes: key || encode_rid(rid).
         // Unique indexes: plain encode_index_key.
-        let key = if idx.is_fk_index || !idx.is_unique {
-            let base = match encode_index_key(&key_vals) {
-                Ok(k) => k,
-                Err(DbError::IndexKeyTooLong { .. }) => continue,
-                Err(e) => return Err(e),
-            };
-            let mut k = base;
-            k.extend_from_slice(&encode_rid(rid));
-            k
-        } else {
-            match encode_index_key(&key_vals) {
-                Ok(k) => k,
-                Err(DbError::IndexKeyTooLong { .. }) => continue,
-                Err(e) => return Err(e),
-            }
+        let include_vals = index_include_values(idx, row);
+        let key = match encode_secondary_entry_key(idx, &key_vals, &include_vals, rid) {
+            Ok(k) => k,
+            Err(DbError::IndexKeyTooLong { .. }) => continue,
+            Err(e) => return Err(e),
         };
 
         let root_pid = AtomicU64::new(idx.root_page_id);
         // Ignore NotFound (key may not exist if index was created after the row).
         let _ = BTree::delete_in(storage, &root_pid, &key)?;
+        if !idx.include_columns.is_empty() {
+            if let Ok(legacy_key) = encode_secondary_entry_key_legacy(idx, &key_vals, rid) {
+                let _ = BTree::delete_in(storage, &root_pid, &legacy_key)?;
+            }
+        }
         bloom.mark_dirty(idx.index_id);
         let new_root = root_pid.load(Ordering::Acquire);
         if new_root != idx.root_page_id {
@@ -596,23 +588,21 @@ pub fn collect_delete_keys_by_index(
             if key_vals.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
-            let key = if idx.is_fk_index || !idx.is_unique {
-                let base = match encode_index_key(&key_vals) {
+            let include_vals = index_include_values(idx, row);
+            let key = match encode_secondary_entry_key(idx, &key_vals, &include_vals, *rid) {
+                Ok(k) => k,
+                Err(DbError::IndexKeyTooLong { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            buckets[i].push(key);
+            if !idx.include_columns.is_empty() {
+                let legacy = match encode_secondary_entry_key_legacy(idx, &key_vals, *rid) {
                     Ok(k) => k,
                     Err(DbError::IndexKeyTooLong { .. }) => continue,
                     Err(e) => return Err(e),
                 };
-                let mut k = base;
-                k.extend_from_slice(&encode_rid(*rid));
-                k
-            } else {
-                match encode_index_key(&key_vals) {
-                    Ok(k) => k,
-                    Err(DbError::IndexKeyTooLong { .. }) => continue,
-                    Err(e) => return Err(e),
-                }
-            };
-            buckets[i].push(key);
+                buckets[i].push(legacy);
+            }
         }
         buckets[i].sort_unstable();
     }
@@ -676,6 +666,109 @@ pub(crate) fn index_key_values_if_indexed(
     Ok(Some(key_vals))
 }
 
+pub(crate) fn index_include_values(idx: &IndexDef, row: &[Value]) -> Vec<Value> {
+    idx.include_columns
+        .iter()
+        .map(|c| row.get(*c as usize).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+fn combine_encoded_index_bytes(
+    key_vals: &[Value],
+    include_vals: &[Value],
+    rid_suffix: Option<RecordId>,
+) -> Result<Vec<u8>, DbError> {
+    let mut key = encode_index_key(key_vals)?;
+    if !include_vals.is_empty() {
+        key.extend_from_slice(&encode_index_key(include_vals)?);
+    }
+    if let Some(rid) = rid_suffix {
+        key.extend_from_slice(&encode_rid(rid));
+    }
+    if key.len() > MAX_INDEX_KEY {
+        return Err(DbError::IndexKeyTooLong {
+            key_len: key.len(),
+            max: MAX_INDEX_KEY,
+        });
+    }
+    Ok(key)
+}
+
+pub(crate) fn encode_secondary_entry_key(
+    idx: &IndexDef,
+    key_vals: &[Value],
+    include_vals: &[Value],
+    rid: RecordId,
+) -> Result<Vec<u8>, DbError> {
+    combine_encoded_index_bytes(
+        key_vals,
+        include_vals,
+        if idx.is_fk_index || !idx.is_unique {
+            Some(rid)
+        } else {
+            None
+        },
+    )
+}
+
+pub(crate) fn encode_secondary_entry_key_legacy(
+    idx: &IndexDef,
+    key_vals: &[Value],
+    rid: RecordId,
+) -> Result<Vec<u8>, DbError> {
+    combine_encoded_index_bytes(
+        key_vals,
+        &[],
+        if idx.is_fk_index || !idx.is_unique {
+            Some(rid)
+        } else {
+            None
+        },
+    )
+}
+
+pub(crate) fn logical_key_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    if v.len() < MAX_INDEX_KEY {
+        v.resize(MAX_INDEX_KEY, 0xFF);
+    } else {
+        v.push(0xFF);
+    }
+    v
+}
+
+pub(crate) fn prefix_scan_secondary_entries(
+    storage: &dyn StorageEngine,
+    idx: &IndexDef,
+    logical_key: &[u8],
+) -> Result<Vec<(RecordId, Vec<u8>)>, DbError> {
+    let hi = logical_key_upper_bound(logical_key);
+    BTree::range_in(storage, idx.root_page_id, Some(logical_key), Some(&hi))
+}
+
+pub(crate) fn lookup_secondary_rids_by_logical_key(
+    storage: &dyn StorageEngine,
+    idx: &IndexDef,
+    logical_key: &[u8],
+) -> Result<Vec<RecordId>, DbError> {
+    Ok(prefix_scan_secondary_entries(storage, idx, logical_key)?
+        .into_iter()
+        .map(|(rid, _)| rid)
+        .collect())
+}
+
+pub(crate) fn decode_secondary_entry_values(
+    idx: &IndexDef,
+    key: &[u8],
+) -> Result<(Vec<Value>, Vec<Value>), DbError> {
+    let (key_vals, consumed) = decode_index_key(key, idx.columns.len())?;
+    if idx.include_columns.is_empty() {
+        return Ok((key_vals, vec![]));
+    }
+    let (include_vals, _) = decode_index_key(&key[consumed..], idx.include_columns.len())?;
+    Ok((key_vals, include_vals))
+}
+
 /// Extracts the key value for a single index column from a row.
 ///
 /// For expression columns: evaluates the compiled expression.
@@ -737,20 +830,6 @@ pub fn index_key_values_if_indexed_with_exprs(
     Ok(Some(key_vals))
 }
 
-pub(crate) fn encode_index_entry_key(
-    idx: &IndexDef,
-    key_vals: &[Value],
-    rid: RecordId,
-) -> Result<Vec<u8>, DbError> {
-    if idx.is_fk_index || !idx.is_unique {
-        let mut key = encode_index_key(key_vals)?;
-        key.extend_from_slice(&encode_rid(rid));
-        Ok(key)
-    } else {
-        encode_index_key(key_vals)
-    }
-}
-
 /// Returns `true` if updating `(old_row, old_rid)` to `(new_row, new_rid)` requires
 /// maintenance for `idx`.
 ///
@@ -772,6 +851,10 @@ pub fn update_affects_index(
     if old_rid != new_rid {
         return Ok(true);
     }
+    let include_changed = idx.include_columns.iter().any(|col_idx| {
+        old_row.get(*col_idx as usize).unwrap_or(&Value::Null)
+            != new_row.get(*col_idx as usize).unwrap_or(&Value::Null)
+    });
 
     // Phase 21.8: expression-aware key comparison.
     // When compiled expressions are available, use index_key_values_if_indexed_with_exprs.
@@ -782,7 +865,7 @@ pub fn update_affects_index(
             index_key_values_if_indexed_with_exprs(idx, new_row, compiled_pred, exprs)?;
         return Ok(match (old_key_vals, new_key_vals) {
             (None, None) => false,
-            (Some(old_vals), Some(new_vals)) => old_vals != new_vals,
+            (Some(old_vals), Some(new_vals)) => old_vals != new_vals || include_changed,
             _ => true,
         });
     }
@@ -792,7 +875,7 @@ pub fn update_affects_index(
     let new_key_vals = index_key_values_if_indexed(idx, new_row, compiled_pred)?;
     Ok(match (old_key_vals, new_key_vals) {
         (None, None) => false,
-        (Some(old_vals), Some(new_vals)) => old_vals != new_vals,
+        (Some(old_vals), Some(new_vals)) => old_vals != new_vals || include_changed,
         _ => true,
     })
 }
@@ -914,13 +997,8 @@ pub fn batch_insert_into_indexes(
                     .map(|c| row.get(c.col_idx as usize).cloned().unwrap_or(Value::Null))
                     .collect()
             };
-            let key = if idx.is_fk_index || !idx.is_unique {
-                let mut k = encode_index_key(&key_vals)?;
-                k.extend_from_slice(&encode_rid(*rid));
-                k
-            } else {
-                encode_index_key(&key_vals)?
-            };
+            let include_vals = index_include_values(idx, row);
+            let key = encode_secondary_entry_key(idx, &key_vals, &include_vals, *rid)?;
             pairs.push((key, *rid));
         }
 
@@ -950,22 +1028,27 @@ pub fn batch_insert_into_indexes(
         for (key, rid) in &pairs {
             if !skip_unique_check && idx.is_unique && !idx.is_fk_index {
                 let cur_root = root_pid.load(Ordering::Acquire);
-                if let Some(existing_rid) = BTree::lookup_in(storage, cur_root, key)? {
-                    if HeapChain::is_slot_visible(
-                        storage,
-                        existing_rid.page_id,
-                        existing_rid.slot_id,
-                        snap.clone(),
-                    )? {
-                        let dup_val = Some("(encoded)".to_string());
-                        return Err(DbError::UniqueViolation {
-                            index_name: idx.name.clone(),
-                            value: dup_val,
-                        });
-                    }
-                    // Dead entry: remove from B-Tree so insert_in won't reject.
+                let (logical_vals, _) = decode_index_key(key, idx.columns.len())?;
+                let logical_key = encode_index_key(&logical_vals)?;
+                let hi = logical_key_upper_bound(&logical_key);
+                let existing = BTree::range_in(storage, cur_root, Some(&logical_key), Some(&hi))?;
+                if !existing.is_empty() {
                     let del_pid = AtomicU64::new(cur_root);
-                    let _ = BTree::delete_in(storage, &del_pid, key);
+                    for (existing_rid, existing_key) in existing {
+                        if HeapChain::is_slot_visible(
+                            storage,
+                            existing_rid.page_id,
+                            existing_rid.slot_id,
+                            snap.clone(),
+                        )? {
+                            let dup_val = Some("(encoded)".to_string());
+                            return Err(DbError::UniqueViolation {
+                                index_name: idx.name.clone(),
+                                value: dup_val,
+                            });
+                        }
+                        let _ = BTree::delete_in(storage, &del_pid, &existing_key);
+                    }
                     let del_root = del_pid.load(Ordering::Acquire);
                     if del_root != cur_root {
                         root_pid.store(del_root, Ordering::Release);
@@ -1032,26 +1115,31 @@ pub fn insert_many_into_single_index(
             let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
                 continue;
             };
-            let key = encode_index_entry_key(idx, &key_vals, *rid)?;
+            let include_vals = index_include_values(idx, row);
+            let key = encode_secondary_entry_key(idx, &key_vals, &include_vals, *rid)?;
 
             if idx.is_unique && !idx.is_fk_index {
                 let cur_root = root_pid.load(Ordering::Acquire);
-                if let Some(existing_rid) = BTree::lookup_in(storage, cur_root, &key)? {
-                    if HeapChain::is_slot_visible(
-                        storage,
-                        existing_rid.page_id,
-                        existing_rid.slot_id,
-                        snap.clone(),
-                    )? {
-                        let dup_val = key_vals.first().map(|v| format!("{v}"));
-                        return Err(DbError::UniqueViolation {
-                            index_name: idx.name.clone(),
-                            value: dup_val,
-                        });
-                    }
-                    // Dead entry: remove from B-Tree so insert_in won't reject.
+                let logical_key = encode_index_key(&key_vals)?;
+                let hi = logical_key_upper_bound(&logical_key);
+                let existing = BTree::range_in(storage, cur_root, Some(&logical_key), Some(&hi))?;
+                if !existing.is_empty() {
                     let del_pid = AtomicU64::new(cur_root);
-                    let _ = BTree::delete_in(storage, &del_pid, &key);
+                    for (existing_rid, existing_key) in existing {
+                        if HeapChain::is_slot_visible(
+                            storage,
+                            existing_rid.page_id,
+                            existing_rid.slot_id,
+                            snap.clone(),
+                        )? {
+                            let dup_val = key_vals.first().map(|v| format!("{v}"));
+                            return Err(DbError::UniqueViolation {
+                                index_name: idx.name.clone(),
+                                value: dup_val,
+                            });
+                        }
+                        let _ = BTree::delete_in(storage, &del_pid, &existing_key);
+                    }
                     let del_root = del_pid.load(Ordering::Acquire);
                     if del_root != cur_root {
                         root_pid.store(del_root, Ordering::Release);
@@ -1108,25 +1196,30 @@ pub fn insert_into_single_index(
     let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
         return Ok(None);
     };
-    let key = encode_index_entry_key(idx, &key_vals, rid)?;
+    let include_vals = index_include_values(idx, row);
+    let key = encode_secondary_entry_key(idx, &key_vals, &include_vals, rid)?;
 
     if idx.is_unique && !idx.is_fk_index {
-        if let Some(existing_rid) = BTree::lookup_in(storage, idx.root_page_id, &key)? {
-            if HeapChain::is_slot_visible(
-                storage,
-                existing_rid.page_id,
-                existing_rid.slot_id,
-                snap,
-            )? {
-                let dup_val = key_vals.first().map(|v| format!("{v}"));
-                return Err(DbError::UniqueViolation {
-                    index_name: idx.name.clone(),
-                    value: dup_val,
-                });
-            }
-            // Dead entry: remove from B-Tree so insert_in won't reject.
+        let logical_key = encode_index_key(&key_vals)?;
+        let hi = logical_key_upper_bound(&logical_key);
+        let existing = BTree::range_in(storage, idx.root_page_id, Some(&logical_key), Some(&hi))?;
+        if !existing.is_empty() {
             let del_pid = AtomicU64::new(idx.root_page_id);
-            let _ = BTree::delete_in(storage, &del_pid, &key);
+            for (existing_rid, existing_key) in existing {
+                if HeapChain::is_slot_visible(
+                    storage,
+                    existing_rid.page_id,
+                    existing_rid.slot_id,
+                    snap.clone(),
+                )? {
+                    let dup_val = key_vals.first().map(|v| format!("{v}"));
+                    return Err(DbError::UniqueViolation {
+                        index_name: idx.name.clone(),
+                        value: dup_val,
+                    });
+                }
+                let _ = BTree::delete_in(storage, &del_pid, &existing_key);
+            }
             let del_root = del_pid.load(Ordering::Acquire);
             if del_root != idx.root_page_id {
                 idx.root_page_id = del_root;

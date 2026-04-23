@@ -19,7 +19,7 @@ use axiomdb_wal::TxnManager;
 use crate::{
     clustered_secondary::ClusteredSecondaryLayout,
     executor::{build_index_root_from_heap, collect_btree_pages, free_btree_pages},
-    index_maintenance::{encode_index_entry_key, index_key_values_if_indexed},
+    index_maintenance::index_key_values_if_indexed,
     partial_index::compile_index_predicates,
     TableEngine,
 };
@@ -312,8 +312,14 @@ fn expected_entries_for_index(
         let Some(key_vals) = index_key_values_if_indexed(idx, row, compiled_pred)? else {
             continue;
         };
+        let include_vals = crate::index_maintenance::index_include_values(idx, row);
 
-        let key = match encode_index_entry_key(idx, &key_vals, *rid) {
+        let key = match crate::index_maintenance::encode_secondary_entry_key(
+            idx,
+            &key_vals,
+            &include_vals,
+            *rid,
+        ) {
             Ok(key) => key,
             Err(DbError::IndexKeyTooLong { .. }) => continue,
             Err(err) => return Err(err),

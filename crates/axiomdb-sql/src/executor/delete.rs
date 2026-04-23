@@ -775,13 +775,17 @@ fn collect_delete_candidates(
         AccessMethod::IndexLookup { index_def, key } => {
             // Point lookup via B-Tree → batch heap read → WHERE recheck.
             let candidate_rids: Vec<RecordId> = if index_def.is_unique {
-                if index_def.is_unique && !bloom.might_exist(index_def.index_id, key) {
+                if index_def.is_unique
+                    && index_def.include_columns.is_empty()
+                    && !bloom.might_exist(index_def.index_id, key)
+                {
                     vec![]
                 } else {
-                    match BTree::lookup_in(storage, index_def.root_page_id, key)? {
-                        None => vec![],
-                        Some(rid) => vec![rid],
-                    }
+                    crate::index_maintenance::lookup_secondary_rids_by_logical_key(
+                        storage,
+                        index_def,
+                        key,
+                    )?
                 }
             } else {
                 // Non-unique: key||RID format — range [key||0..0, key||FF..FF].

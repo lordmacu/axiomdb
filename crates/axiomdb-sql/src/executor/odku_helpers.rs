@@ -130,7 +130,6 @@ fn apply_odku_heap(
     assignments_resolved: &[(usize, Expr)],
     proposed_row: &[Value],
 ) -> Result<OdkuOutcome, DbError> {
-    use axiomdb_index::BTree;
     use axiomdb_storage::heap_chain::HeapChain;
 
     let snap = txn.active_snapshot(&*conn_txn);
@@ -179,11 +178,17 @@ fn apply_odku_heap(
         }
 
         let key = crate::key_encoding::encode_index_key(&key_vals)?;
-        if !bloom.might_exist(idx.index_id, &key) {
+        if idx.include_columns.is_empty() && !bloom.might_exist(idx.index_id, &key) {
             continue;
         }
 
-        let Some(existing_rid) = BTree::lookup_in(storage, idx.root_page_id, &key)? else {
+        let Some(existing_rid) = crate::index_maintenance::lookup_secondary_rids_by_logical_key(
+            storage,
+            idx,
+            &key,
+        )?
+        .into_iter()
+        .next() else {
             continue;
         };
         if !HeapChain::is_slot_visible(

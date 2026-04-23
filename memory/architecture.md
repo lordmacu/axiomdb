@@ -1,5 +1,21 @@
 # Architecture Notes
 
+## 2026-04-23 - Covering indexes (13.5)
+
+- **Heap secondary leaves now have two logical layers: search key first, then
+  optional INCLUDE payload.** The on-disk entry format stays prefix-searchable
+  by the logical index key, but covered non-key columns are appended after that
+  key so `IndexOnlyScan` can decode them without reading the heap row.
+- **Logical-key probes must stop assuming exact B-Tree keys once INCLUDE
+  payloads exist.** Unique lookups, FK parent checks, and other point probes on
+  heap secondary indexes now scan by logical-key prefix instead of exact
+  `lookup_in(...)`, because the stored entry may have extra INCLUDE bytes (and,
+  for non-unique/FK indexes, a RID suffix) after the searchable key.
+- **Compatibility is handled in the write/read paths, not by catalog version
+  flags.** Old entries without INCLUDE payload remain removable/readable via
+  legacy delete fallback and heap-read fallback, so the catalog format does not
+  need an extra "index layout version" just for this slice.
+
 ## 2026-04-23 - LISTEN / NOTIFY (13.4)
 
 - **The first SQL notification slice is session-scoped runtime state, not a

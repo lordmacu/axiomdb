@@ -906,3 +906,96 @@ fn test_ctx_index_only_null_skipped() {
         assert_eq!(row[0], Value::Int(10), "rows={r:?}");
     }
 }
+
+// ── INCLUDE payloads cover non-key projections ──────────────────────────────
+
+#[test]
+fn test_ctx_index_only_include_columns_cover_projection() {
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE inv1 (id INT, sku TEXT, qty INT, price INT, note TEXT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE INDEX idx_sku_cover1 ON inv1 (sku) INCLUDE (qty, price)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO inv1 VALUES (1, 'sku-1', 8, 120, 'promo')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO inv1 VALUES (2, 'sku-2', 4, 90, 'clearance')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT sku, qty, price FROM inv1 WHERE sku = 'sku-1'",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("sku-1".into()),
+            Value::Int(8),
+            Value::Int(120)
+        ]]
+    );
+}
+
+#[test]
+fn test_ctx_index_only_include_columns_follow_updates() {
+    let (mut st, mut tx, mut bl, mut ctx) = setup_ctx();
+    rctx(
+        "CREATE TABLE inv2 (id INT, sku TEXT, qty INT, price INT, note TEXT)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "CREATE UNIQUE INDEX idx_sku_cover2 ON inv2 (sku) INCLUDE (qty, price)",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "INSERT INTO inv2 VALUES (1, 'sku-1', 8, 120, 'promo')",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+    rctx(
+        "UPDATE inv2 SET qty = 11, price = 135, note = 'updated' WHERE sku = 'sku-1'",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    );
+
+    let r = rrows(rctx(
+        "SELECT qty, price FROM inv2 WHERE sku = 'sku-1'",
+        &mut st,
+        &mut tx,
+        &mut bl,
+        &mut ctx,
+    ));
+    assert_eq!(r, vec![vec![Value::Int(11), Value::Int(135)]]);
+}

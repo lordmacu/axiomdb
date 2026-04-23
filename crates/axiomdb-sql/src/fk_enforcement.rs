@@ -43,6 +43,7 @@ use axiomdb_wal::{ClusteredRowImage, TxnManager};
 use crate::{
     bloom::BloomRegistry,
     clustered_secondary::ClusteredSecondaryLayout,
+    index_maintenance::lookup_secondary_rids_by_logical_key,
     key_encoding::encode_index_key,
     table::{column_data_types, TableEngine},
 };
@@ -236,7 +237,7 @@ pub fn check_fk_child_insert(
 
         // Find a parent PRIMARY KEY or UNIQUE index whose leading columns
         // match `fk.parent_col_idxs` in order.
-        let (parent_index_id, parent_index_root, parent_clustered_primary) = {
+        let (parent_idx, parent_clustered_primary) = {
             let mut reader = CatalogReader::new(storage, snap.clone())?;
             let parent_def = reader.get_table_by_id(fk.parent_table_id)?.ok_or(
                 DbError::CatalogTableNotFound {
@@ -264,8 +265,7 @@ pub fn check_fk_child_insert(
                     }
                 })?;
             (
-                parent_idx.index_id,
-                parent_idx.root_page_id,
+                parent_idx.clone(),
                 parent_def.is_clustered() && parent_idx.is_primary,
             )
         }; // reader dropped here
@@ -281,7 +281,10 @@ pub fn check_fk_child_insert(
         } else {
             encode_index_key(std::slice::from_ref(&owned_vals[0]))?
         };
-        if !bloom.might_exist(parent_index_id, &bloom_lookup_key) && fk.child_col_idxs.len() == 1 {
+        if fk.child_col_idxs.len() == 1
+            && parent_idx.include_columns.is_empty()
+            && !bloom.might_exist(parent_idx.index_id, &bloom_lookup_key)
+        {
             let (tname, cname) = resolve_names(storage, snap, fk.child_table_id, fk.child_col_idx);
             return Err(DbError::ForeignKeyViolation {
                 table: tname,
@@ -294,33 +297,25 @@ pub fn check_fk_child_insert(
         // references (e.g. FK on (a,b) against PK (a,b,c)), we need a range
         // scan over the key prefix rather than a point lookup. Otherwise an
         // exact-match lookup would never succeed.
-        let parent_idx_col_count = {
-            let mut reader = CatalogReader::new(storage, snap.clone())?;
-            reader
-                .list_indexes(fk.parent_table_id)?
-                .into_iter()
-                .find(|i| i.index_id == parent_index_id)
-                .map(|i| i.columns.len())
-                .unwrap_or(fk.parent_col_idxs.len())
-        };
+        let parent_idx_col_count = { parent_idx.columns.len() };
         let parent_exists = if parent_idx_col_count == fk.parent_col_idxs.len() {
             if parent_clustered_primary {
                 axiomdb_storage::clustered_tree::lookup(
                     storage,
-                    Some(parent_index_root),
+                    Some(parent_idx.root_page_id),
                     &key,
                     &snap,
                 )?
                 .is_some()
             } else {
-                BTree::lookup_in(storage, parent_index_root, &key)?.is_some()
+                !lookup_secondary_rids_by_logical_key(storage, &parent_idx, &key)?.is_empty()
             }
         } else {
             // Prefix scan: match any parent index entry whose leading bytes
             // equal `key`. `key` already encodes exactly the FK columns.
             let mut upper = key.clone();
             upper.push(0xff);
-            !BTree::range_in(storage, parent_index_root, Some(&key), Some(&upper))?.is_empty()
+            !BTree::range_in(storage, parent_idx.root_page_id, Some(&key), Some(&upper))?.is_empty()
         };
 
         if !parent_exists {
@@ -834,11 +829,25 @@ pub fn enforce_fk_on_parent_delete(
                                             idx, old_values, pred,
                                         )?
                                     {
+                                        let include_vals =
+                                            crate::index_maintenance::index_include_values(
+                                                idx, old_values,
+                                            );
                                         delete_keys.push(
-                                            crate::index_maintenance::encode_index_entry_key(
-                                                idx, &key_vals, *old_rid,
+                                            crate::index_maintenance::encode_secondary_entry_key(
+                                                idx,
+                                                &key_vals,
+                                                &include_vals,
+                                                *old_rid,
                                             )?,
                                         );
+                                        if !idx.include_columns.is_empty() {
+                                            delete_keys.push(
+                                                crate::index_maintenance::encode_secondary_entry_key_legacy(
+                                                    idx, &key_vals, *old_rid,
+                                                )?,
+                                            );
+                                        }
                                     }
                                     insert_rows.push((*new_rid, new_values));
                                 }
@@ -1186,9 +1195,21 @@ fn apply_fk_update_children(
                     if let Some(key_vals) = crate::index_maintenance::index_key_values_if_indexed(
                         idx, old_values, pred,
                     )? {
-                        delete_keys.push(crate::index_maintenance::encode_index_entry_key(
-                            idx, &key_vals, *old_rid,
+                        let include_vals =
+                            crate::index_maintenance::index_include_values(idx, old_values);
+                        delete_keys.push(crate::index_maintenance::encode_secondary_entry_key(
+                            idx,
+                            &key_vals,
+                            &include_vals,
+                            *old_rid,
                         )?);
+                        if !idx.include_columns.is_empty() {
+                            delete_keys.push(
+                                crate::index_maintenance::encode_secondary_entry_key_legacy(
+                                    idx, &key_vals, *old_rid,
+                                )?,
+                            );
+                        }
                     }
                     insert_rows.push((*new_rid, new_values));
                 }

@@ -200,27 +200,26 @@ fn execute_select(
                 clustered_secondary_rows_for_lookup(storage, &resolved, index_def, key, snap)?
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key } => {
-                // Point lookup: unique → exact match; non-unique → range with RID suffix.
                 if index_def.is_unique {
-                    match BTree::lookup_in(storage, index_def.root_page_id, key)? {
-                        None => vec![],
-                        Some(rid) => {
-                            // Phase 7.3b: visibility check for dead index entries.
-                            if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
-                                storage,
-                                rid.page_id,
-                                rid.slot_id,
-                                snap,
-                            )? {
-                                vec![]
-                            } else {
-                                match TableEngine::read_row(storage, &resolved.columns, rid)? {
-                                    None => vec![],
-                                    Some(values) => vec![(rid, values)],
-                                }
-                            }
+                    let lo = rid_lo(key);
+                    let hi = rid_hi(key);
+                    let pairs =
+                        BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
+                    let mut result = Vec::with_capacity(pairs.len());
+                    for (rid, _k) in pairs {
+                        if !axiomdb_storage::heap_chain::HeapChain::is_slot_visible(
+                            storage,
+                            rid.page_id,
+                            rid.slot_id,
+                            snap.clone(),
+                        )? {
+                            continue;
+                        }
+                        if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)? {
+                            result.push((rid, values));
                         }
                     }
+                    result
                 } else {
                     let lo = rid_lo(key);
                     let hi = rid_hi(key);

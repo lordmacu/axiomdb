@@ -1,5 +1,22 @@
 # Lessons Learned
 
+## 2026-04-23 - Phase 13.5
+
+- **Adding INCLUDE payloads changes more than the read path.** The obvious
+  work was `IndexOnlyScan`, but the real regressions appeared in update
+  maintenance and FK/unique lookup paths that still assumed the old exact
+  secondary-key encoding.
+- **A bloom filter can become a false negative when its caller changes key
+  semantics.** Parent-FK checks were still querying bloom with the logical key
+  while INCLUDE indexes were inserting the full physical entry key; the safe
+  fix was to bypass the bloom shortcut for INCLUDE-backed lookups.
+- **Use narrow regression tests to pin the real contract, then relax wire smoke
+  to stable observables.** The strongest guarantee for 13.5 lives in SQL tests
+  that verify covered non-key projections and update maintenance directly,
+  while MySQL `EXPLAIN` smoke should assert the chosen index/result behavior
+  rather than depend on an internal access-method name that the text protocol
+  does not expose.
+
 ## 2026-04-23 - Phase 13.4
 
 - **If a feature works in direct executor tests but fails over the wire, check

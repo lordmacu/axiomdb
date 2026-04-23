@@ -29,7 +29,6 @@ fn replace_displace_conflicts_heap(
     schema_cols: &[axiomdb_catalog::schema::ColumnDef],
     row_values: &[Value],
 ) -> Result<u64, DbError> {
-    use axiomdb_index::BTree;
     use axiomdb_storage::heap_chain::HeapChain;
 
     // MariaDB AI exhaustion rule — fire BEFORE any deletes so we never leave
@@ -117,11 +116,17 @@ fn replace_displace_conflicts_heap(
 
         // Bloom shortcut: if the filter says "definitely absent", skip the
         // B-tree probe entirely.
-        if !bloom.might_exist(idx.index_id, &key) {
+        if idx.include_columns.is_empty() && !bloom.might_exist(idx.index_id, &key) {
             continue;
         }
 
-        let Some(existing_rid) = BTree::lookup_in(storage, idx.root_page_id, &key)? else {
+        let Some(existing_rid) = crate::index_maintenance::lookup_secondary_rids_by_logical_key(
+            storage,
+            idx,
+            &key,
+        )?
+        .into_iter()
+        .next() else {
             continue;
         };
 
