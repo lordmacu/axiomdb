@@ -611,9 +611,9 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
             return parse_optional_pivot_clause(
                 p,
                 FromClause::Values(Box::new(crate::ast::ValuesClause {
-                rows,
-                alias,
-                column_names,
+                    rows,
+                    alias,
+                    column_names,
                 })),
             );
         }

@@ -233,9 +233,15 @@ fn execute_insert_ctx(
 
                 // FK validation: every non-NULL FK value must reference an existing parent row.
                 if !resolved.foreign_keys.is_empty() {
+                    let (immediate_fks, deferred_fk_ids) =
+                        crate::fk_enforcement::split_child_insert_foreign_keys(
+                            &full_values,
+                            &resolved.foreign_keys,
+                        );
+                    ctx.mark_deferred_fk_constraints(deferred_fk_ids);
                     match crate::fk_enforcement::check_fk_child_insert(
                         &full_values,
-                        &resolved.foreign_keys,
+                        &immediate_fks,
                         storage,
                         txn,
                         &*conn_txn,
@@ -459,9 +465,15 @@ fn execute_insert_ctx(
                 materialize_generated_columns(schema_cols, &mut full_values)?;
                 // FK validation (still per-row — FK check reads catalog).
                 if !resolved.foreign_keys.is_empty() {
+                    let (immediate_fks, deferred_fk_ids) =
+                        crate::fk_enforcement::split_child_insert_foreign_keys(
+                            &full_values,
+                            &resolved.foreign_keys,
+                        );
+                    ctx.mark_deferred_fk_constraints(deferred_fk_ids);
                     match crate::fk_enforcement::check_fk_child_insert(
                         &full_values,
-                        &resolved.foreign_keys,
+                        &immediate_fks,
                         storage,
                         txn,
                         &*conn_txn,
@@ -664,9 +676,15 @@ fn execute_insert_ctx(
                 &resolved.columns,
             )?;
             if !resolved.foreign_keys.is_empty() {
+                let (immediate_fks, deferred_fk_ids) =
+                    crate::fk_enforcement::split_child_insert_foreign_keys(
+                        &full_values,
+                        &resolved.foreign_keys,
+                    );
+                ctx.mark_deferred_fk_constraints(deferred_fk_ids);
                 crate::fk_enforcement::check_fk_child_insert(
                     &full_values,
-                    &resolved.foreign_keys,
+                    &immediate_fks,
                     storage,
                     txn,
                     &*conn_txn,

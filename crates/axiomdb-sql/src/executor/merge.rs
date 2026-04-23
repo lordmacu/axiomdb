@@ -424,7 +424,7 @@ fn execute_merge_matched_action(
             MergeActionKind::Delete => {
                 merge_mark_touched(touched_targets, target_rid)?;
                 apply_merge_delete_heap(
-                    resolved, target_rid, target_row, storage, txn, conn_txn, bloom,
+                    resolved, target_rid, target_row, storage, txn, conn_txn, bloom, ctx,
                 )?;
                 return Ok(Some(1));
             }
@@ -560,10 +560,17 @@ fn apply_merge_update_heap(
         &resolved.columns,
     )?;
     if !resolved.foreign_keys.is_empty() {
+        let (immediate_fks, deferred_fk_ids) =
+            crate::fk_enforcement::split_child_update_foreign_keys(
+                old_row,
+                &new_row,
+                &resolved.foreign_keys,
+            );
+        ctx.mark_deferred_fk_constraints(deferred_fk_ids);
         crate::fk_enforcement::check_fk_child_update(
             old_row,
             &new_row,
-            &resolved.foreign_keys,
+            &immediate_fks,
             storage,
             txn,
             conn_txn,
@@ -587,6 +594,7 @@ fn apply_merge_update_heap(
             txn,
             conn_txn,
             bloom,
+            Some(&mut ctx.deferred_fk_constraint_ids),
         )?;
     }
 
@@ -629,6 +637,7 @@ fn apply_merge_delete_heap(
     txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
     bloom: &crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
 ) -> Result<(), DbError> {
     let snap = txn.active_snapshot(&*conn_txn);
     let has_fk_references = {
@@ -646,6 +655,7 @@ fn apply_merge_delete_heap(
             conn_txn,
             bloom,
             0,
+            Some(&mut ctx.deferred_fk_constraint_ids),
         )?;
     }
     TableEngine::delete_rows_batch(storage, txn, conn_txn, &resolved.def, &[rid])?;
@@ -702,9 +712,15 @@ fn apply_merge_insert_heap(
         &resolved.columns,
     )?;
     if !resolved.foreign_keys.is_empty() {
+        let (immediate_fks, deferred_fk_ids) =
+            crate::fk_enforcement::split_child_insert_foreign_keys(
+                &full_values,
+                &resolved.foreign_keys,
+            );
+        ctx.mark_deferred_fk_constraints(deferred_fk_ids);
         crate::fk_enforcement::check_fk_child_insert(
             &full_values,
-            &resolved.foreign_keys,
+            &immediate_fks,
             storage,
             txn,
             &*conn_txn,

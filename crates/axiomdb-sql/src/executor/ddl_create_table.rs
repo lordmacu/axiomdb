@@ -401,9 +401,16 @@ fn execute_create_table(
                 column,
                 on_delete,
                 on_update,
+                deferrability,
             } = c
             {
-                Some((table.clone(), column.clone(), *on_delete, *on_update))
+                Some((
+                    table.clone(),
+                    column.clone(),
+                    *on_delete,
+                    *on_update,
+                    *deferrability,
+                ))
             } else {
                 None
             }
@@ -553,7 +560,11 @@ fn execute_create_table(
         }
     }
 
-    for (child_col_idx, child_col_name, (ref_table, ref_col, on_delete, on_update)) in
+    for (
+        child_col_idx,
+        child_col_name,
+        (ref_table, ref_col, on_delete, on_update, deferrability),
+    ) in
         inline_fk_specs
     {
         persist_fk_constraint(
@@ -566,6 +577,7 @@ fn execute_create_table(
             ref_col.as_deref(),
             ast_fk_action_to_catalog(on_delete),
             ast_fk_action_to_catalog(on_update),
+            deferrability,
             None,
             storage,
             txn,
@@ -627,6 +639,7 @@ fn execute_create_table(
             ref_columns,
             on_delete,
             on_update,
+            deferrability,
         } = tc
         {
             let snap = txn.active_snapshot(conn_txn);
@@ -658,6 +671,7 @@ fn execute_create_table(
                     ref_col,
                     ast_fk_action_to_catalog(*on_delete),
                     ast_fk_action_to_catalog(*on_update),
+                    *deferrability,
                     name.as_deref(),
                     storage,
                     txn,
@@ -674,6 +688,7 @@ fn execute_create_table(
                     ref_columns,
                     ast_fk_action_to_catalog(*on_delete),
                     ast_fk_action_to_catalog(*on_update),
+                    *deferrability,
                     name.as_deref(),
                     storage,
                     txn,
@@ -1153,6 +1168,7 @@ fn persist_fk_constraint(
     ref_col: Option<&str>,
     on_delete: axiomdb_catalog::FkAction,
     on_update: axiomdb_catalog::FkAction,
+    deferrability: crate::ast::ConstraintDeferrability,
     fk_name: Option<&str>,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
@@ -1352,6 +1368,11 @@ fn persist_fk_constraint(
         name: constraint_name,
         child_col_idxs: vec![child_col_idx],
         parent_col_idxs: vec![parent_col_idx],
+        deferrable: deferrability.deferrable,
+        initially_deferred: matches!(
+            deferrability.initially,
+            crate::ast::ConstraintTiming::Deferred
+        ),
     })?;
 
     Ok(())
@@ -1696,6 +1717,7 @@ fn persist_composite_fk_constraint(
     ref_columns: &[String],
     on_delete: axiomdb_catalog::FkAction,
     on_update: axiomdb_catalog::FkAction,
+    deferrability: crate::ast::ConstraintDeferrability,
     fk_name: Option<&str>,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
@@ -1850,6 +1872,11 @@ fn persist_composite_fk_constraint(
         name: constraint_name,
         child_col_idxs: child_col_idxs.to_vec(),
         parent_col_idxs,
+        deferrable: deferrability.deferrable,
+        initially_deferred: matches!(
+            deferrability.initially,
+            crate::ast::ConstraintTiming::Deferred
+        ),
     })?;
 
     Ok(())

@@ -434,22 +434,35 @@ pub struct FkDef {
     /// All parent column indices in order. Must have the same length as
     /// `child_col_idxs` (parallel arrays).
     pub parent_col_idxs: Vec<u16>,
+    /// Whether the FK is deferrable.
+    pub deferrable: bool,
+    /// Whether the FK starts each transaction deferred.
+    pub initially_deferred: bool,
 }
 
 /// Marker byte introducing the composite-FK extension trailer.
 const FK_COMPOSITE_EXT_MAGIC: u8 = 0xCF;
+/// Marker byte introducing the deferrability trailer.
+const FK_DEFERRABLE_EXT_MAGIC: u8 = 0xDF;
 
 impl FkDef {
     /// Serializes this definition to bytes for heap storage.
     pub fn to_bytes(&self) -> Vec<u8> {
         let name_bytes = self.name.as_bytes();
         let num_pairs = self.child_col_idxs.len();
-        let ext_bytes = if num_pairs > 1 {
+        let composite_ext_bytes = if num_pairs > 1 {
             2 + 4 * (num_pairs - 1)
         } else {
             0
         };
-        let mut buf = Vec::with_capacity(26 + name_bytes.len() + ext_bytes);
+        let deferrable_ext_bytes = if self.deferrable || self.initially_deferred {
+            2
+        } else {
+            0
+        };
+        let mut buf = Vec::with_capacity(
+            26 + name_bytes.len() + composite_ext_bytes + deferrable_ext_bytes,
+        );
         buf.extend_from_slice(&self.fk_id.to_le_bytes());
         buf.extend_from_slice(&self.child_table_id.to_le_bytes());
         buf.extend_from_slice(&self.child_col_idx.to_le_bytes());
@@ -471,6 +484,17 @@ impl FkDef {
             for idx in self.parent_col_idxs.iter().skip(1) {
                 buf.extend_from_slice(&idx.to_le_bytes());
             }
+        }
+        if self.deferrable || self.initially_deferred {
+            let mut flags = 0u8;
+            if self.deferrable {
+                flags |= 0x01;
+            }
+            if self.initially_deferred {
+                flags |= 0x02;
+            }
+            buf.push(FK_DEFERRABLE_EXT_MAGIC);
+            buf.push(flags);
         }
         buf
     }
@@ -519,43 +543,74 @@ impl FkDef {
         // Composite extension — appended after `name` when num_pairs > 1.
         let mut child_col_idxs = vec![child_col_idx];
         let mut parent_col_idxs = vec![parent_col_idx];
+        let mut deferrable = false;
+        let mut initially_deferred = false;
         let mut consumed = end;
-        if data.len() > end && data[end] == FK_COMPOSITE_EXT_MAGIC {
-            if data.len() < end + 2 {
-                return Err(DbError::ParseError {
-                    message: "FkDef composite extension truncated".into(),
-                    position: None,
-                });
+        while consumed < data.len() {
+            match data[consumed] {
+                FK_COMPOSITE_EXT_MAGIC => {
+                    if data.len() < consumed + 2 {
+                        return Err(DbError::ParseError {
+                            message: "FkDef composite extension truncated".into(),
+                            position: None,
+                        });
+                    }
+                    let num_pairs = data[consumed + 1] as usize;
+                    if num_pairs < 2 {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "FkDef composite num_pairs must be >= 2, got {num_pairs}"
+                            ),
+                            position: None,
+                        });
+                    }
+                    let extra = num_pairs - 1;
+                    let ext_data_end = consumed + 2 + 4 * extra;
+                    if data.len() < ext_data_end {
+                        return Err(DbError::ParseError {
+                            message: "FkDef composite extension columns truncated".into(),
+                            position: None,
+                        });
+                    }
+                    child_col_idxs.truncate(1);
+                    parent_col_idxs.truncate(1);
+                    let mut off = consumed + 2;
+                    for _ in 0..extra {
+                        child_col_idxs.push(u16::from_le_bytes(
+                            data[off..off + 2].try_into().unwrap_or_default(),
+                        ));
+                        off += 2;
+                    }
+                    for _ in 0..extra {
+                        parent_col_idxs.push(u16::from_le_bytes(
+                            data[off..off + 2].try_into().unwrap_or_default(),
+                        ));
+                        off += 2;
+                    }
+                    consumed = ext_data_end;
+                }
+                FK_DEFERRABLE_EXT_MAGIC => {
+                    if data.len() < consumed + 2 {
+                        return Err(DbError::ParseError {
+                            message: "FkDef deferrable extension truncated".into(),
+                            position: None,
+                        });
+                    }
+                    let flags = data[consumed + 1];
+                    deferrable = (flags & 0x01) != 0;
+                    initially_deferred = (flags & 0x02) != 0;
+                    consumed += 2;
+                }
+                other => {
+                    return Err(DbError::ParseError {
+                        message: format!(
+                            "FkDef trailing extension has unknown magic 0x{:02X}",
+                            other
+                        ),
+                        position: None,
+                    });
+                }
             }
-            let num_pairs = data[end + 1] as usize;
-            if num_pairs < 2 {
-                return Err(DbError::ParseError {
-                    message: format!("FkDef composite num_pairs must be >= 2, got {num_pairs}"),
-                    position: None,
-                });
-            }
-            let extra = num_pairs - 1;
-            let ext_data_end = end + 2 + 4 * extra;
-            if data.len() < ext_data_end {
-                return Err(DbError::ParseError {
-                    message: "FkDef composite extension columns truncated".into(),
-                    position: None,
-                });
-            }
-            let mut off = end + 2;
-            for _ in 0..extra {
-                child_col_idxs.push(u16::from_le_bytes(
-                    data[off..off + 2].try_into().unwrap_or_default(),
-                ));
-                off += 2;
-            }
-            for _ in 0..extra {
-                parent_col_idxs.push(u16::from_le_bytes(
-                    data[off..off + 2].try_into().unwrap_or_default(),
-                ));
-                off += 2;
-            }
-            consumed = ext_data_end;
         }
 
         Ok((
@@ -571,6 +626,8 @@ impl FkDef {
                 name,
                 child_col_idxs,
                 parent_col_idxs,
+                deferrable,
+                initially_deferred,
             },
             consumed,
         ))

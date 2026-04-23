@@ -226,10 +226,17 @@ fn apply_odku_heap(
         &resolved.columns,
     )?;
     if !resolved.foreign_keys.is_empty() {
+        let (immediate_fks, deferred_fk_ids) =
+            crate::fk_enforcement::split_child_update_foreign_keys(
+                &existing_row,
+                &new_row,
+                &resolved.foreign_keys,
+            );
+        ctx.mark_deferred_fk_constraints(deferred_fk_ids);
         crate::fk_enforcement::check_fk_child_update(
             &existing_row,
             &new_row,
-            &resolved.foreign_keys,
+            &immediate_fks,
             storage,
             txn,
             conn_txn,
@@ -254,6 +261,7 @@ fn apply_odku_heap(
             txn,
             conn_txn,
             bloom,
+            Some(&mut ctx.deferred_fk_constraint_ids),
         )?;
     }
 

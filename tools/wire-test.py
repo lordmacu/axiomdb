@@ -23,6 +23,7 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.5 (INSERT ON CONFLICT + MERGE smoke),
              21.5f (GENERATED ALWAYS AS STORED insert/update smoke),
              21.11 (query hints),
+             21.16 (deferrable FK smoke),
              21.10 (SQL cursors),
              21.20 (CHECKPOINT),
              21.23 (advanced SQL acceptance smoke),
@@ -3836,6 +3837,43 @@ except pymysql.MySQLError as e:
     ok("[21.20 checkpoint] active txn rejects CHECKPOINT", e.args[0] == 1213, e.args)
 finally:
     cur.execute("ROLLBACK")
+
+# ── Phase 21.16 — DEFERRABLE constraints ────────────────────────────────────
+
+print("\n[21.16 deferrable fk]")
+
+cur.execute("ROLLBACK")
+cur.execute("CREATE TABLE def16_parents (id INT PRIMARY KEY)")
+cur.execute(
+    "CREATE TABLE def16_children ("
+    "  id INT PRIMARY KEY,"
+    "  parent_id INT,"
+    "  CONSTRAINT fk_def16_parent FOREIGN KEY (parent_id) REFERENCES def16_parents(id) "
+    "    DEFERRABLE INITIALLY DEFERRED"
+    ")"
+)
+cur.execute("BEGIN")
+cur.execute("INSERT INTO def16_children VALUES (1, 10)")
+cur.execute("INSERT INTO def16_parents VALUES (10)")
+cur.execute("COMMIT")
+cur.execute("SELECT id, parent_id FROM def16_children ORDER BY id")
+rows = cur.fetchall()
+ok("[21.16 deferrable fk] deferred child-before-parent transaction commits once repaired",
+   rows == ((1, 10),),
+   rows)
+
+cur.execute("BEGIN")
+cur.execute("INSERT INTO def16_children VALUES (2, 99)")
+try:
+    cur.execute("COMMIT")
+    ok("[21.16 deferrable fk] COMMIT fails on unrepaired deferred violation", False, "commit unexpectedly succeeded")
+except pymysql.err.IntegrityError:
+    ok("[21.16 deferrable fk] COMMIT fails on unrepaired deferred violation", True)
+cur.execute("SELECT id FROM def16_children ORDER BY id")
+rows = cur.fetchall()
+ok("[21.16 deferrable fk] failed COMMIT rolls back transaction state",
+   rows == ((1,),),
+   rows)
 
 # ── Phase 21.23 — Advanced SQL acceptance smoke ─────────────────────────────
 

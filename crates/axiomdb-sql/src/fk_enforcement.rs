@@ -25,7 +25,10 @@
 //! to know children exist. For CASCADE / SET NULL, a full table scan is used
 //! to guarantee ALL matching children are found.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// `(pk_key_bytes, decoded_row)` pair returned by clustered-child scan helpers.
 type PkRowPair = (Vec<u8>, Vec<Value>);
@@ -43,6 +46,120 @@ use crate::{
     key_encoding::encode_index_key,
     table::{column_data_types, TableEngine},
 };
+
+pub fn is_initially_deferred_fk(fk: &FkDef) -> bool {
+    fk.deferrable && fk.initially_deferred
+}
+
+pub fn split_child_insert_foreign_keys(
+    row: &[Value],
+    foreign_keys: &[FkDef],
+) -> (Vec<FkDef>, Vec<u32>) {
+    let mut immediate = Vec::new();
+    let mut deferred = Vec::new();
+    for fk in foreign_keys {
+        let has_any_null = fk
+            .child_col_idxs
+            .iter()
+            .any(|idx| matches!(row.get(*idx as usize).unwrap_or(&Value::Null), Value::Null));
+        if is_initially_deferred_fk(fk) {
+            if !has_any_null {
+                deferred.push(fk.fk_id);
+            }
+        } else {
+            immediate.push(fk.clone());
+        }
+    }
+    (immediate, deferred)
+}
+
+pub fn split_child_update_foreign_keys(
+    old_row: &[Value],
+    new_row: &[Value],
+    foreign_keys: &[FkDef],
+) -> (Vec<FkDef>, Vec<u32>) {
+    let mut immediate = Vec::new();
+    let mut deferred = Vec::new();
+    for fk in foreign_keys {
+        let changed = fk.child_col_idxs.iter().any(|idx| {
+            old_row.get(*idx as usize).unwrap_or(&Value::Null)
+                != new_row.get(*idx as usize).unwrap_or(&Value::Null)
+        });
+        if !changed {
+            continue;
+        }
+        let has_any_null = fk.child_col_idxs.iter().any(|idx| {
+            matches!(
+                new_row.get(*idx as usize).unwrap_or(&Value::Null),
+                Value::Null
+            )
+        });
+        if is_initially_deferred_fk(fk) {
+            if !has_any_null {
+                deferred.push(fk.fk_id);
+            }
+        } else {
+            immediate.push(fk.clone());
+        }
+    }
+    (immediate, deferred)
+}
+
+pub fn validate_deferred_foreign_keys(
+    dirty_fk_ids: &[u32],
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
+    bloom: &BloomRegistry,
+) -> Result<(), DbError> {
+    if dirty_fk_ids.is_empty() {
+        return Ok(());
+    }
+    let snap = txn.active_snapshot(conn_txn);
+    let unique_fk_ids: HashSet<u32> = dirty_fk_ids.iter().copied().collect();
+    for fk_id in unique_fk_ids {
+        let fk = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            match reader.get_fk_by_id(fk_id)? {
+                Some(fk) => fk,
+                None => continue,
+            }
+        };
+        let child_table_def = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            reader
+                .get_table_by_id(fk.child_table_id)?
+                .ok_or(DbError::CatalogTableNotFound {
+                    table_id: fk.child_table_id,
+                })?
+        };
+        let child_cols = {
+            let mut reader = CatalogReader::new(storage, snap.clone())?;
+            reader.list_columns(fk.child_table_id)?
+        };
+        let rows = if child_table_def.is_clustered() {
+            crate::table::scan_clustered_table(
+                storage,
+                &child_table_def,
+                &child_cols,
+                snap.clone(),
+            )?
+        } else {
+            TableEngine::scan_table(storage, &child_table_def, &child_cols, snap.clone(), None)?
+        };
+        for (_, row) in rows {
+            check_fk_child_insert(
+                &row,
+                std::slice::from_ref(&fk),
+                storage,
+                txn,
+                conn_txn,
+                bloom,
+            )?;
+        }
+    }
+    Ok(())
+}
 
 /// Maximum ON DELETE CASCADE recursion depth.
 /// Matches InnoDB's `FK_MAX_CASCADE_DEL`. Prevents infinite loops in circular graphs.
@@ -273,6 +390,7 @@ pub fn enforce_fk_on_parent_delete(
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     bloom: &BloomRegistry,
     depth: u32,
+    deferred_fk_ids: Option<&mut Vec<u32>>,
 ) -> Result<(), DbError> {
     if deleted_rows.is_empty() {
         return Ok(());
@@ -294,7 +412,14 @@ pub fn enforce_fk_on_parent_delete(
         return Ok(());
     }
 
+    let mut deferred_fk_ids = deferred_fk_ids;
     for fk in &fk_list {
+        if is_initially_deferred_fk(fk) {
+            if let Some(ids) = deferred_fk_ids.as_deref_mut() {
+                ids.push(fk.fk_id);
+                continue;
+            }
+        }
         // Load child table metadata.
         let child_table_def = {
             let mut reader = CatalogReader::new(storage, snap.clone())?;
@@ -431,6 +556,7 @@ pub fn enforce_fk_on_parent_delete(
                             conn_txn,
                             bloom,
                             depth + 1,
+                            None,
                         )?;
 
                         // Delete-mark all matching clustered rows.
@@ -502,6 +628,7 @@ pub fn enforce_fk_on_parent_delete(
                             conn_txn,
                             bloom,
                             depth + 1,
+                            None,
                         )?;
 
                         // Batch-delete children from the heap.
@@ -772,6 +899,7 @@ pub fn enforce_fk_on_parent_update(
     txn: &TxnManager,
     conn_txn: &mut axiomdb_wal::ConnectionTxn,
     bloom: &crate::BloomRegistry,
+    deferred_fk_ids: Option<&mut Vec<u32>>,
 ) -> Result<(), DbError> {
     if old_rows.is_empty() {
         return Ok(());
@@ -786,7 +914,14 @@ pub fn enforce_fk_on_parent_update(
         return Ok(());
     }
 
+    let mut deferred_fk_ids = deferred_fk_ids;
     for fk in &fk_list {
+        if is_initially_deferred_fk(fk) {
+            if let Some(ids) = deferred_fk_ids.as_deref_mut() {
+                ids.push(fk.fk_id);
+                continue;
+            }
+        }
         let child_table_def = {
             let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader

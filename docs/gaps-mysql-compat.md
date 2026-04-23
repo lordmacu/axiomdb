@@ -694,11 +694,10 @@ Status: implemented in the wire/intercept layer and covered by existing tests.
 
 ### Remaining ORM tier-2 blockers
 
-The main remaining ORM-visible blockers are now larger deferred features, not
-missing metadata probes:
+The main remaining ORM-visible blockers are now larger type/identity features,
+not missing metadata probes:
 
 - `GENERATED ALWAYS AS IDENTITY` — tracked by `24.1c`
-- `DEFERRABLE INITIALLY DEFERRED/IMMEDIATE` foreign keys — tracked by `21.16`
 
 ### Multi-column foreign keys
 

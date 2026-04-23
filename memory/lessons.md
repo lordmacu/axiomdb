@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 21.16
+
+- **The right deferred-constraint MVP was FK-only, not "generic SQL standard".**
+  Reaching for deferred CHECK, exclusion, and `SET CONSTRAINTS` together would
+  have multiplied executor and transaction risk without unlocking the main user
+  problem.
+- **Commit-time revalidation by touched constraint is a better cut than row-image buffering.**
+  Marking deferred `fk_id`s dirty and scanning final child-table state at
+  `COMMIT` covered child inserts, parent deletes, and parent key updates with
+  far less machinery than storing per-row pending violations.
+- **Savepoint correctness extends beyond undo logs.** Once a feature keeps
+  session-side deferred state, `ROLLBACK TO SAVEPOINT` must truncate that state
+  alongside heap/index undo or commit-time validation will observe rolled-back
+  work.
+
 ## 2026-04-22 - Phase 21.25
 
 - **If a roadmap says "dynamic" but the binder requires stable schemas, cut the

@@ -1,5 +1,19 @@
 # Architecture Notes
 
+## 2026-04-22 - DEFERRABLE constraints (21.16)
+
+- **Deferral is tracked by touched FK definition, not by row image.** Instead
+  of buffering full before/after rows, the engine records dirty deferred
+  `fk_id`s in `SessionContext` and revalidates each touched FK against the
+  final transaction-visible child-table state on `COMMIT`.
+- **Savepoints need to snapshot deferred-validation state too.** The WAL
+  savepoint alone was not enough; `ROLLBACK TO SAVEPOINT` also has to truncate
+  the deferred-FK queue length or a later `COMMIT` can validate rows that were
+  already rolled back.
+- **Catalog compatibility belongs in the FK row format, not in migration code.**
+  `FkDef` now appends a tiny deferrability trailer while leaving legacy rows
+  readable as `NOT DEFERRABLE`, so old databases do not need a rewrite pass.
+
 ## 2026-04-22 - PIVOT dynamic (21.25)
 
 - **`PIVOT` is analyzer-lowered, not executor-native.** The parser introduces

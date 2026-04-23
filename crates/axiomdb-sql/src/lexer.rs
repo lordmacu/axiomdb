@@ -172,6 +172,14 @@ pub enum Token<'src> {
     AutoIncrement,
     #[token("SERIAL", ignore(ascii_case))]
     Serial,
+    #[token("DEFERRABLE", ignore(ascii_case))]
+    Deferrable,
+    #[token("INITIALLY", ignore(ascii_case))]
+    Initially,
+    #[token("DEFERRED", ignore(ascii_case))]
+    Deferred,
+    #[token("IMMEDIATE", ignore(ascii_case))]
+    Immediate,
     #[token("CASCADE", ignore(ascii_case))]
     Cascade,
     #[token("RESTRICT", ignore(ascii_case))]

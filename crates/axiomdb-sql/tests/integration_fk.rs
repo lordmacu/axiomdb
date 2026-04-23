@@ -631,6 +631,8 @@ fn test_fk_def_roundtrip() {
         name: "fk_orders_user".to_string(),
         child_col_idxs: vec![2],
         parent_col_idxs: vec![0],
+        deferrable: false,
+        initially_deferred: false,
     };
 
     let bytes = original.to_bytes();

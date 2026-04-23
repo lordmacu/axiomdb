@@ -126,6 +126,12 @@ pub struct SessionCursor {
     pub pos: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SessionSavepoint {
+    pub wal: axiomdb_wal::Savepoint,
+    pub deferred_fk_len: usize,
+}
+
 // ── OnErrorMode ───────────────────────────────────────────────────────────────
 
 /// Per-session policy that controls how a statement error affects the current
@@ -615,7 +621,7 @@ pub struct SessionContext {
     /// Pushed by `SAVEPOINT name`, searched by name on `ROLLBACK TO` / `RELEASE`.
     /// Stack is truncated on rollback/release (later savepoints destroyed).
     /// Cleared entirely on `COMMIT` / `ROLLBACK`.
-    pub savepoints: Vec<(String, axiomdb_wal::Savepoint)>,
+    pub savepoints: Vec<(String, SessionSavepoint)>,
     /// Active per-connection transaction state (Phase 40.4b).
     ///
     /// `Some` when a transaction is open (explicit or autocommit-implicit).
@@ -628,6 +634,8 @@ pub struct SessionContext {
     /// `Some(txn_id)`. Consumed by the network layer to drive the fsync
     /// pipeline. `None` for read-only or immediate commits.
     pub pending_deferred_txn_id: Option<axiomdb_core::TxnId>,
+    /// Deferred foreign keys touched in the current transaction.
+    pub deferred_fk_constraint_ids: Vec<u32>,
     /// Session-local SQL cursors declared via `DECLARE ... CURSOR`.
     ///
     /// Keyed by normalized lowercase cursor name. Cleared on transaction end
@@ -667,6 +675,7 @@ impl SessionContext {
             savepoints: Vec::new(),
             conn_txn: None,
             pending_deferred_txn_id: None,
+            deferred_fk_constraint_ids: Vec::new(),
             cursors: HashMap::new(),
         }
     }
@@ -743,6 +752,21 @@ impl SessionContext {
 
     pub fn close_all_cursors(&mut self) {
         self.cursors.clear();
+    }
+
+    pub fn mark_deferred_fk_constraints<I>(&mut self, fk_ids: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.deferred_fk_constraint_ids.extend(fk_ids);
+    }
+
+    pub fn truncate_deferred_fk_constraints(&mut self, len: usize) {
+        self.deferred_fk_constraint_ids.truncate(len);
+    }
+
+    pub fn clear_deferred_fk_constraints(&mut self) {
+        self.deferred_fk_constraint_ids.clear();
     }
 
     // ── Collation / compat ────────────────────────────────────────────────────
