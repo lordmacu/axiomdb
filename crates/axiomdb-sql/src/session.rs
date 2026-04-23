@@ -1,8 +1,11 @@
 //! Session context — per-connection state including the schema cache and warnings.
 
 use std::{
-    collections::{HashMap, HashSet},
-    sync::atomic::{AtomicU64, Ordering},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 use axiomdb_catalog::{
@@ -115,6 +118,104 @@ pub fn session_collation_name(c: SessionCollation) -> &'static str {
 }
 
 static TEMP_SCHEMA_SEQ: AtomicU64 = AtomicU64::new(1);
+static NOTIFICATION_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+// ── LISTEN / NOTIFY runtime ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNotification {
+    pub channel: String,
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingNotification {
+    pub channel: String,
+    pub payload: String,
+}
+
+#[derive(Default)]
+struct NotificationBroker {
+    subscriptions: HashMap<String, HashSet<u64>>,
+    queues: HashMap<u64, VecDeque<SessionNotification>>,
+}
+
+impl NotificationBroker {
+    fn listen(&mut self, session_id: u64, channel: &str) {
+        self.subscriptions
+            .entry(channel.to_string())
+            .or_default()
+            .insert(session_id);
+        self.queues.entry(session_id).or_default();
+    }
+
+    fn unlisten(&mut self, session_id: u64, channel: &str) {
+        if let Some(sessions) = self.subscriptions.get_mut(channel) {
+            sessions.remove(&session_id);
+            if sessions.is_empty() {
+                self.subscriptions.remove(channel);
+            }
+        }
+    }
+
+    fn unlisten_all(&mut self, session_id: u64) {
+        self.subscriptions.retain(|_, sessions| {
+            sessions.remove(&session_id);
+            !sessions.is_empty()
+        });
+    }
+
+    fn publish(&mut self, emitter_session_id: u64, channel: &str, payload: &str) {
+        let Some(listeners) = self.subscriptions.get(channel).cloned() else {
+            return;
+        };
+        for session_id in listeners {
+            if session_id == emitter_session_id {
+                continue;
+            }
+            self.queues
+                .entry(session_id)
+                .or_default()
+                .push_back(SessionNotification {
+                    channel: channel.to_string(),
+                    payload: payload.to_string(),
+                });
+        }
+    }
+
+    fn drain(&mut self, session_id: u64) -> Vec<SessionNotification> {
+        self.queues
+            .entry(session_id)
+            .or_default()
+            .drain(..)
+            .collect()
+    }
+
+    fn unregister(&mut self, session_id: u64) {
+        self.unlisten_all(session_id);
+        self.queues.remove(&session_id);
+    }
+}
+
+fn notification_broker() -> &'static Mutex<NotificationBroker> {
+    static BROKER: OnceLock<Mutex<NotificationBroker>> = OnceLock::new();
+    BROKER.get_or_init(|| Mutex::new(NotificationBroker::default()))
+}
+
+pub fn normalize_notification_channel(name: &str) -> Result<String, DbError> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: "notification channel name cannot be empty".into(),
+        });
+    }
+    if normalized.len() > 64 {
+        return Err(DbError::InvalidValue {
+            reason: format!("notification channel '{name}' exceeds 64 characters"),
+        });
+    }
+    Ok(normalized)
+}
 
 // ── SQL cursors ───────────────────────────────────────────────────────────────
 
@@ -130,6 +231,7 @@ pub struct SessionCursor {
 pub struct SessionSavepoint {
     pub wal: axiomdb_wal::Savepoint,
     pub deferred_fk_len: usize,
+    pub pending_notify_len: usize,
 }
 
 // ── OnErrorMode ───────────────────────────────────────────────────────────────
@@ -520,6 +622,8 @@ pub struct ClusteredInsertBatch {
 /// Per-connection state: schema cache + session variables visible to the executor.
 #[derive(Debug)]
 pub struct SessionContext {
+    /// Stable per-session id used by the in-process LISTEN / NOTIFY broker.
+    pub session_id: u64,
     /// Cached table schemas keyed by `"database.schema.table"`.
     cache: HashMap<String, ResolvedTable>,
     /// Per-table heap-tail hint cache (Phase 5.18).
@@ -636,6 +740,8 @@ pub struct SessionContext {
     pub pending_deferred_txn_id: Option<axiomdb_core::TxnId>,
     /// Deferred foreign keys touched in the current transaction.
     pub deferred_fk_constraint_ids: Vec<u32>,
+    /// Notifications emitted inside the current transaction but not yet committed.
+    pub pending_notifications: Vec<PendingNotification>,
     /// Session-local SQL cursors declared via `DECLARE ... CURSOR`.
     ///
     /// Keyed by normalized lowercase cursor name. Cleared on transaction end
@@ -649,10 +755,17 @@ impl Default for SessionContext {
     }
 }
 
+impl Drop for SessionContext {
+    fn drop(&mut self) {
+        self.cleanup_notification_runtime();
+    }
+}
+
 impl SessionContext {
     /// Creates an empty session context with autocommit enabled (MySQL default).
     pub fn new() -> Self {
         Self {
+            session_id: NOTIFICATION_SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             cache: HashMap::new(),
             heap_tail: HashMap::new(),
             autocommit: true,
@@ -676,6 +789,7 @@ impl SessionContext {
             conn_txn: None,
             pending_deferred_txn_id: None,
             deferred_fk_constraint_ids: Vec::new(),
+            pending_notifications: Vec::new(),
             cursors: HashMap::new(),
         }
     }
@@ -767,6 +881,84 @@ impl SessionContext {
 
     pub fn clear_deferred_fk_constraints(&mut self) {
         self.deferred_fk_constraint_ids.clear();
+    }
+
+    pub fn pending_notification_len(&self) -> usize {
+        self.pending_notifications.len()
+    }
+
+    pub fn truncate_pending_notifications(&mut self, len: usize) {
+        self.pending_notifications.truncate(len);
+    }
+
+    pub fn clear_pending_notifications(&mut self) {
+        self.pending_notifications.clear();
+    }
+
+    pub fn listen_channel(&mut self, channel: &str) -> Result<(), DbError> {
+        let channel = normalize_notification_channel(channel)?;
+        notification_broker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .listen(self.session_id, &channel);
+        Ok(())
+    }
+
+    pub fn unlisten_channel(&mut self, channel: &str) -> Result<(), DbError> {
+        let channel = normalize_notification_channel(channel)?;
+        notification_broker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unlisten(self.session_id, &channel);
+        Ok(())
+    }
+
+    pub fn unlisten_all_channels(&mut self) {
+        notification_broker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unlisten_all(self.session_id);
+    }
+
+    pub fn enqueue_notification(
+        &mut self,
+        channel: &str,
+        payload: impl Into<String>,
+    ) -> Result<(), DbError> {
+        let channel = normalize_notification_channel(channel)?;
+        self.pending_notifications.push(PendingNotification {
+            channel,
+            payload: payload.into(),
+        });
+        Ok(())
+    }
+
+    pub fn flush_pending_notifications(&mut self) {
+        if self.pending_notifications.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_notifications);
+        let mut broker = notification_broker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for notif in pending {
+            broker.publish(self.session_id, &notif.channel, &notif.payload);
+        }
+    }
+
+    pub fn drain_notifications(&mut self) -> Vec<SessionNotification> {
+        notification_broker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(self.session_id)
+    }
+
+    pub fn cleanup_notification_runtime(&mut self) {
+        self.pending_notifications.clear();
+        notification_broker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unregister(self.session_id);
     }
 
     // ── Collation / compat ────────────────────────────────────────────────────

@@ -57,6 +57,66 @@ Fuera de alcance en este corte:
 - `cargo test --workspace` - paso.
 - `cargo clippy --workspace -- -D warnings` - paso.
 
+## 13.4 LISTEN / NOTIFY - cerrada 2026-04-23
+
+La subfase 13.4 cierra el primer corte real de pub-sub SQL en AxiomDB sin
+forzar server-push sobre el wire MySQL. El recorte elegido fue
+pull-based y transaccionalmente seguro: las sesiones pueden suscribirse con
+`LISTEN`, emitir eventos con `NOTIFY`, limpiar suscripciones con `UNLISTEN`, y
+consumir su cola con `SHOW NOTIFICATIONS`.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `LISTEN channel`
+- `UNLISTEN channel`
+- `UNLISTEN *`
+- `NOTIFY channel`
+- `NOTIFY channel, 'payload'`
+- `SHOW NOTIFICATIONS`
+
+Fuera de alcance en este corte:
+
+- server-push asincrono hacia clientes idle
+- frames o protocolo estilo PostgreSQL
+- `pg_notify(...)`
+- filtros/predicados de notificacion (`13.15`)
+- persistencia de suscripciones o colas a traves de restart
+
+### Ajustes tecnicos de cierre
+
+- Lexer/parser/AST: nuevos statements `LISTEN`, `UNLISTEN`, `NOTIFY` y
+  `SHOW NOTIFICATIONS`.
+- Runtime SQL: `SessionContext` ahora mantiene un `session_id` estable, una
+  cola FIFO de notificaciones pendientes y el buffer transaccional de `NOTIFY`
+  aun no committeados.
+- Broker: nuevo broker in-process compartido, indexado por canal normalizado,
+  que enruta eventos entre sesiones activas sin persistencia en disco.
+- Semantica transaccional: `NOTIFY` se encola dentro de la transaccion actual y
+  solo se publica tras `COMMIT`; `ROLLBACK` y `ROLLBACK TO SAVEPOINT` descartan
+  eventos pendientes posteriores al punto revertido.
+- Lifecycle wire: `COM_RESET_CONNECTION`, `COM_CHANGE_USER` y disconnect
+  limpian suscripciones, cola visible y pendientes transaccionales.
+- Read path: `SHOW NOTIFICATIONS` drena la cola real tambien en la ruta
+  read-only compartida del handler MySQL; el fix final de la subfase fue
+  corregir ese path para que no devolviera filas vacias hardcodeadas.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_listen_notify.rs`
+- `crates/axiomdb-network/tests/integration_listen_notify.rs`
+- bloque wire `[13.4 listen notify]` en `tools/wire-test.py`
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_listen_notify` - paso.
+- `cargo test -p axiomdb-network --test integration_listen_notify` - paso.
+- `python3 tools/wire-test.py` - paso, 451/451 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 13.2 Window functions - cerrada 2026-04-23
 
 La subfase 13.2 cierra el primer corte real de window functions en AxiomDB con

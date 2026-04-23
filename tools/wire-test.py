@@ -32,7 +32,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.25 (PIVOT smoke),
              13.1 (materialized views smoke),
              13.2 (window functions smoke),
-             13.3 (generated columns closeout smoke)
+             13.3 (generated columns closeout smoke),
+             13.4 (LISTEN / NOTIFY pull-based smoke)
 """
 import os
 import signal
@@ -4106,6 +4107,43 @@ except pymysql.MySQLError as e:
     ok("[13.3 generated columns] VIRTUAL remains explicitly deferred",
        "virtual generated columns" in str(e).lower(),
        str(e))
+
+# ── Phase 13.4 — LISTEN / NOTIFY ─────────────────────────────────────────────
+
+print("\n[13.4 listen notify]")
+
+conn_134_listen = connect()
+cur_134_listen = conn_134_listen.cursor()
+conn_134_emit = connect()
+cur_134_emit = conn_134_emit.cursor()
+
+cur_134_listen.execute("BEGIN")
+cur_134_listen.execute("LISTEN wire_jobs_134")
+cur_134_listen.execute("COMMIT")
+
+cur_134_emit.execute("BEGIN")
+cur_134_emit.execute("NOTIFY wire_jobs_134, 'queued'")
+cur_134_listen.execute("SHOW NOTIFICATIONS")
+rows = cur_134_listen.fetchall()
+ok("[13.4 listen notify] uncommitted NOTIFY is not visible yet",
+   rows == (),
+   rows)
+
+cur_134_emit.execute("COMMIT")
+cur_134_listen.execute("SHOW NOTIFICATIONS")
+rows = cur_134_listen.fetchall()
+ok("[13.4 listen notify] committed NOTIFY is delivered to listening session",
+   rows == (("wire_jobs_134", "queued"),),
+   rows)
+
+cur_134_listen.execute("SHOW NOTIFICATIONS")
+rows = cur_134_listen.fetchall()
+ok("[13.4 listen notify] SHOW NOTIFICATIONS drains the session queue",
+   rows == (),
+   rows)
+
+conn_134_emit.close()
+conn_134_listen.close()
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

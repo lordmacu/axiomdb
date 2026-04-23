@@ -546,6 +546,10 @@ impl<'src> Parser<'src> {
                         };
                         Ok(Stmt::ShowWarnings { limit })
                     }
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("notifications") => {
+                        self.advance();
+                        Ok(Stmt::ShowNotifications)
+                    }
                     Token::Ident(kw) if kw.eq_ignore_ascii_case("errors") => {
                         self.advance();
                         let limit = if self.eat(&Token::Limit) {
@@ -682,6 +686,30 @@ impl<'src> Parser<'src> {
                 self.advance();
                 Ok(Stmt::Commit)
             }
+            Token::Listen => {
+                self.advance();
+                let channel = self.parse_identifier()?;
+                Ok(Stmt::Listen(crate::ast::ListenStmt { channel }))
+            }
+            Token::Unlisten => {
+                self.advance();
+                let channel = if self.eat(&Token::Star) {
+                    None
+                } else {
+                    Some(self.parse_identifier()?)
+                };
+                Ok(Stmt::Unlisten(crate::ast::UnlistenStmt { channel }))
+            }
+            Token::Notify => {
+                self.advance();
+                let channel = self.parse_identifier()?;
+                let payload = if self.eat(&Token::Comma) {
+                    Some(expr::parse_expr(self)?)
+                } else {
+                    None
+                };
+                Ok(Stmt::Notify(crate::ast::NotifyStmt { channel, payload }))
+            }
             Token::Rollback => {
                 self.advance();
                 // ROLLBACK TO [SAVEPOINT] name — rollback to named savepoint
@@ -794,7 +822,7 @@ impl<'src> Parser<'src> {
             }),
             other => Err(DbError::ParseError {
                 message: format!(
-                    "unexpected token {:?} — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK",
+                    "unexpected token {:?} — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, ROLLBACK, LISTEN, UNLISTEN, or NOTIFY",
                     other,
                 ),
                 position: Some(self.current_pos()),

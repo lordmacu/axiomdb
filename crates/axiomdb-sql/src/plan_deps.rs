@@ -212,12 +212,16 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::ShowVariables
             | Stmt::ShowStatus
             | Stmt::ShowWarnings { .. }
+            | Stmt::ShowNotifications
             | Stmt::ShowErrors { .. }
             | Stmt::RenameTable(_) => Ok(()),
             // Transaction control — no deps.
             Stmt::Begin
             | Stmt::Commit
             | Stmt::Rollback
+            | Stmt::Listen(_)
+            | Stmt::Unlisten(_)
+            | Stmt::Notify(_)
             | Stmt::FetchCursor(_)
             | Stmt::CloseCursor(_)
             | Stmt::Savepoint(_)

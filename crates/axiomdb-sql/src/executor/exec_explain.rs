@@ -146,9 +146,15 @@ fn dispatch(
                 feature: "SAVEPOINT requires session context — use execute_with_ctx".into(),
             })
         }
-        Stmt::DeclareCursor(_) | Stmt::FetchCursor(_) | Stmt::CloseCursor(_) => {
+        Stmt::Listen(_)
+        | Stmt::Unlisten(_)
+        | Stmt::Notify(_)
+        | Stmt::DeclareCursor(_)
+        | Stmt::FetchCursor(_)
+        | Stmt::CloseCursor(_) => {
             Err(DbError::NotImplemented {
-                feature: "SQL cursors require session context — use execute_with_ctx".into(),
+                feature: "session-scoped statements require session context — use execute_with_ctx"
+                    .into(),
             })
         }
         Stmt::Noop => Ok(QueryResult::Empty),
@@ -179,7 +185,9 @@ fn dispatch(
             rows: vec![],
         }),
         // SHOW WARNINGS / SHOW ERRORS — no session context, return empty result set (5.9e)
-        Stmt::ShowWarnings { .. } | Stmt::ShowErrors { .. } => Ok(show_warnings_result(&[])),
+        Stmt::ShowWarnings { .. } | Stmt::ShowNotifications | Stmt::ShowErrors { .. } => {
+            Ok(show_warnings_result(&[]))
+        }
     }
 }
 
