@@ -1,5 +1,16 @@
 # Architecture Notes
 
+## 2026-04-23 - Generated columns (13.3 closeout)
+
+- **Phase closeout can point at an existing implementation when the contract is
+  already real.** `13.3` does not introduce a second generated-columns engine;
+  it explicitly adopts the `21.5f` machinery (`generated_expr`,
+  `generated_stored`, write-time recomputation) as the Phase-13 contract.
+- **Keep unsupported surface explicit in the same subsystem that supports the
+  happy path.** `VIRTUAL` generated columns and `ALTER TABLE ... GENERATED`
+  remain rejected at the normal DDL/write boundaries, which is preferable to a
+  roadmap line that accidentally implies read-time synthesis already exists.
+
 ## 2026-04-23 - Window functions (13.2)
 
 - **The first window-function cut is a projection decoration pass, not a new

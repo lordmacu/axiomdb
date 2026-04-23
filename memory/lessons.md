@@ -1,5 +1,16 @@
 # Lessons Learned
 
+## 2026-04-23 - Phase 13.3
+
+- **Do not re-implement a feature just because it reappears in another phase.**
+  `13.3` looked like fresh feature work until the repo audit showed `21.5f`
+  had already delivered the real generated-columns slice. The right move was a
+  truthful closeout, not a duplicate implementation sprint.
+- **Roadmap wording must separate “implemented bounded slice” from “full SQL
+  surface”.** If docs say `STORED/VIRTUAL` but the engine still rejects
+  `VIRTUAL`, the closeout must call that out directly instead of letting users
+  infer parity that does not exist.
+
 ## 2026-04-23 - Phase 13.2
 
 - **A real MVP for window functions starts with ranking, not with the full SQL

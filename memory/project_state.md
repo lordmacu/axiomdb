@@ -3,18 +3,16 @@
 ## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.2 — `13.2` Window functions closed.
-`ROW_NUMBER()`, `RANK()`, and `DENSE_RANK()` now support
-`OVER ( [PARTITION BY ...] ORDER BY ... )` as top-level `SELECT` expressions
-for the ranking MVP. The analyzer rejects out-of-scope placements and mixes
-(`WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `JOIN ON`, `DISTINCT`, nested
-windows, grouped/aggregate combinations, joined SELECTs), and the executor
-computes ranking values in a dedicated post-scan decoration pass over
-materialized rows.
+**Active subphase:** Phase 13.3 — `13.3` Generated columns closed.
+Phase 13 now closes over the real generated-columns contract already shipped in
+`21.5f`: `CREATE TABLE ... GENERATED ALWAYS AS (expr) STORED` persists catalog
+metadata and recomputes on write across the supported DML paths. `VIRTUAL`
+generated columns and `ALTER TABLE ... GENERATED` remain explicit deferred
+follow-ups and are documented as such instead of implied support.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_window_functions`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_generated_columns`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.3 Generated columns.
+**Next:** Phase 13.4 LISTEN / NOTIFY.
 
 ### Phase 21 subphase status
 

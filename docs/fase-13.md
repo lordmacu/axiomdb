@@ -109,3 +109,54 @@ Fuera de alcance en este corte:
 - `python3 tools/wire-test.py` - paso, 446/446 assertions.
 - `cargo test --workspace` - paso.
 - `cargo clippy --workspace -- -D warnings` - paso.
+
+## 13.3 Generated columns - cerrada 2026-04-23
+
+La subfase 13.3 no requirio una segunda implementacion grande: el repo ya
+tenia el slice real de generated columns por `21.5f`. El cierre correcto fue
+alinear Fase 13 con ese contrato real y dejar de sugerir una paridad mas amplia
+de la que hoy existe en codigo.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `CREATE TABLE ... col TYPE GENERATED ALWAYS AS (expr) STORED`
+- persistencia de metadata en catalogo (`generated_expr`, `generated_stored`)
+- recomputacion en write-paths ya soportados (`INSERT`, `UPDATE`, `ON
+  CONFLICT`, ODKU, `MERGE`, y variantes ya cubiertas por la suite existente)
+- rechazo explicito de escrituras directas salvo `DEFAULT`
+
+Fuera de alcance en este corte:
+
+- `VIRTUAL` generated columns
+- `ALTER TABLE ... ADD/ALTER COLUMN ... GENERATED`
+- expresiones con subqueries, windows o aggregates en generated columns
+- `GENERATED ALWAYS AS IDENTITY` (sigue en `24.1c`)
+
+### Ajustes tecnicos de cierre
+
+- El cierre de `13.3` se apoya en la implementacion ya existente en
+  `executor/ddl_create_table.rs`, `executor/insert_helpers.rs` y la metadata de
+  `axiom_columns`; no hizo falta abrir un segundo path semantico.
+- El smoke wire de Fase 13 ya prueba tanto el happy path de una columna
+  `STORED` que se materializa/recomputa como el rechazo explicito de
+  `VIRTUAL`, para que el contrato visible de la subfase quede fijado sin
+  depender solo del hito `21.5f`.
+- La documentacion del roadmap ahora distingue claramente entre soporte real y
+  follow-ups deferidos, en vez de mezclar `STORED` implementado con `VIRTUAL`
+  aun no soportado.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_generated_columns.rs`
+- bloque wire `[13.3 generated columns]` en `tools/wire-test.py`
+- notas de arquitectura y lessons alineadas con el cierre de Fase 13
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_generated_columns` - paso.
+- `python3 tools/wire-test.py` - paso, 448/448 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.

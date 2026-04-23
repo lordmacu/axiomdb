@@ -31,7 +31,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.24 (ORM compatibility tier 2 smoke),
              21.25 (PIVOT smoke),
              13.1 (materialized views smoke),
-             13.2 (window functions smoke)
+             13.2 (window functions smoke),
+             13.3 (generated columns closeout smoke)
 """
 import os
 import signal
@@ -4073,6 +4074,38 @@ rows = cur.fetchall()
 ok("[13.2 window functions] ranking windows materialize with independent final ORDER BY",
    rows == ((1, 1, 1, 1), (2, 2, 1, 1), (3, 4, 3, 2), (4, 3, 1, 1)),
    rows)
+
+# ── Phase 13.3 — Generated columns ───────────────────────────────────────────
+
+print("\n[13.3 generated columns]")
+
+cur.execute(
+    "CREATE TABLE gc13_posts ("
+    "  id INT PRIMARY KEY,"
+    "  title TEXT,"
+    "  slug TEXT GENERATED ALWAYS AS (LOWER(title)) STORED"
+    ")"
+)
+cur.execute("INSERT INTO gc13_posts (id, title) VALUES (1, 'Hello World')")
+cur.execute("UPDATE gc13_posts SET title = 'Phase Thirteen' WHERE id = 1")
+cur.execute("SELECT slug FROM gc13_posts WHERE id = 1")
+rows = cur.fetchall()
+ok("[13.3 generated columns] STORED generated columns materialize and recompute",
+   rows == (("phase thirteen",),),
+   rows)
+
+try:
+    cur.execute(
+        "CREATE TABLE gc13_virtual ("
+        "  base INT,"
+        "  doubled INT GENERATED ALWAYS AS (base * 2) VIRTUAL"
+        ")"
+    )
+    ok("[13.3 generated columns] VIRTUAL remains explicitly deferred", False, "no error raised")
+except pymysql.MySQLError as e:
+    ok("[13.3 generated columns] VIRTUAL remains explicitly deferred",
+       "virtual generated columns" in str(e).lower(),
+       str(e))
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
