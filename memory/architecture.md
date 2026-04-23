@@ -1,5 +1,21 @@
 # Architecture Notes
 
+## 2026-04-23 - Non-blocking ALTER TABLE (13.6)
+
+- **The first non-blocking ALTER cut is a two-phase heap rewrite, not generic
+  online DDL.** The engine now prepares a `NonBlockingHeapAlterPlan` that
+  builds a shadow heap root plus rebuilt secondary indexes before any catalog
+  publish, then performs one short final metadata swap.
+- **Reader liveness and writer exclusion are enforced in different layers.**
+  The handler/shared-db path keeps the long copy under `catalog_lock.read()`
+  so unrelated readers keep flowing, while a dedicated `table_rewrites`
+  registry rejects mutating statements on the target table with `LockTimeout`.
+- **Autocommit DDL semantics still need an explicit commit path outside the
+  normal executor wrapper.** Because the special ALTER route bypasses
+  `execute_with_ctx_locked(...)`, `SharedDatabase` has to start/commit/rollback
+  its own implicit transaction or the cutover remains invisible outside the
+  altering session.
+
 ## 2026-04-23 - Covering indexes (13.5)
 
 - **Heap secondary leaves now have two logical layers: search key first, then

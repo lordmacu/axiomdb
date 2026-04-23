@@ -29,9 +29,10 @@
 //! diverges from `schema_version`, the cached plan is stale and must be
 //! re-analyzed before execution.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
 
@@ -40,9 +41,10 @@ use axiomdb_core::error::DbError;
 use axiomdb_core::TxnId;
 use axiomdb_sql::{
     analyze_cached_with_defaults,
-    ast::Stmt,
+    ast::{AlterTableOp, Stmt, TableRef},
     bloom::BloomRegistry,
-    execute_read_only_with_ctx, execute_with_ctx_locked, parse_with_sql_mode,
+    cleanup_nonblocking_heap_alter_plan, commit_nonblocking_heap_alter, execute_read_only_with_ctx,
+    execute_with_ctx_locked, parse_with_sql_mode, prepare_nonblocking_heap_alter,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
     truncate_table_unchecked_on_open, verify_and_repair_indexes_on_open, SchemaCache,
@@ -118,6 +120,12 @@ pub struct SharedDatabase {
     /// `RwLock<HashMap>` is sufficient — registrations are rare and
     /// PROCESSLIST reads are brief.
     pub connection_registry: Arc<std::sync::RwLock<std::collections::HashMap<u32, ConnectionInfo>>>,
+    /// Heap-table rewrite registry for bounded non-blocking ALTER TABLE (13.6).
+    ///
+    /// Holds table IDs currently in the shadow-copy / cutover window so normal
+    /// writes against those tables fail fast instead of mutating the live heap
+    /// during the copy.
+    pub table_rewrites: Arc<Mutex<HashSet<u32>>>,
 }
 
 /// Snapshot of a live connection's state — displayed by `SHOW PROCESSLIST`.
@@ -199,6 +207,7 @@ impl SharedDatabase {
             catalog_lock: RwLock::new(()),
             lock_mgr: axiomdb_lock::LockManager::new(),
             connection_registry: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            table_rewrites: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -283,6 +292,7 @@ impl SharedDatabase {
             Ok(s) => s,
             Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
         };
+        self.reject_stmt_if_table_under_rewrite(&stmt, session.effective_database())?;
         let is_ddl = is_schema_changing(&stmt);
 
         // ── analyze ───────────────────────────────────────────────────────────
@@ -508,6 +518,7 @@ impl SharedDatabase {
             });
         }
         let is_ddl = is_schema_changing(&stmt);
+        self.reject_stmt_if_table_under_rewrite(&stmt, session.effective_database())?;
 
         // Fresh snapshot (same as execute_query — PostgreSQL model).
         let snap = if let Some(ref ct) = session.conn_txn {
@@ -571,6 +582,7 @@ impl SharedDatabase {
             });
         }
         let is_ddl = is_schema_changing(&stmt);
+        self.reject_stmt_if_table_under_rewrite(&stmt, session.effective_database())?;
         let result = execute_with_ctx_locked(
             stmt,
             &self.storage,
@@ -743,6 +755,308 @@ impl SharedDatabase {
                 Some(rx)
             }
         }
+    }
+
+    pub fn is_nonblocking_alter_candidate(
+        &self,
+        stmt: &Stmt,
+        database: &str,
+    ) -> Result<bool, DbError> {
+        let Stmt::AlterTable(alter) = stmt else {
+            return Ok(false);
+        };
+        if alter.operations.len() != 1 {
+            return Ok(false);
+        }
+        if !matches!(
+            alter.operations[0],
+            AlterTableOp::AddColumn(_)
+                | AlterTableOp::DropColumn { .. }
+                | AlterTableOp::ModifyColumn(_)
+        ) {
+            return Ok(false);
+        }
+        let Some(table_id) = self.resolve_table_id(&alter.table, database)? else {
+            return Ok(false);
+        };
+        let snap = self.txn.snapshot();
+        let mut reader = CatalogReader::new(&self.storage, snap)?;
+        let Some(table) = reader.get_table_by_id(table_id)? else {
+            return Ok(false);
+        };
+        Ok(table.is_heap())
+    }
+
+    pub fn execute_nonblocking_alter_query(
+        &self,
+        sql: &str,
+        session: &mut SessionContext,
+        _schema_cache: &mut SchemaCache,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
+        self.execute_nonblocking_alter_stmt(stmt, session)
+    }
+
+    pub async fn execute_nonblocking_alter_query_async(
+        &self,
+        sql: &str,
+        session: &mut SessionContext,
+        _schema_cache: &mut SchemaCache,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
+        self.execute_nonblocking_alter_stmt_async(stmt, session).await
+    }
+
+    pub fn execute_nonblocking_alter_stmt(
+        &self,
+        stmt: Stmt,
+        session: &mut SessionContext,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        let Stmt::AlterTable(alter) = stmt else {
+            return Err(DbError::NotImplemented {
+                feature: "execute_nonblocking_alter_stmt requires ALTER TABLE".into(),
+            });
+        };
+        let database = session.effective_database().to_string();
+        let table_id = self
+            .resolve_table_id(&alter.table, &database)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: alter.table.name.clone(),
+            })?;
+        let _rewrite_guard = self.register_table_rewrite(table_id)?;
+        let started_implicit_txn = session.conn_txn.is_none();
+
+        let plan = {
+            let _catalog_guard = self.catalog_lock.blocking_read();
+            prepare_nonblocking_heap_alter(
+                alter.clone(),
+                &self.storage,
+                &self.txn,
+                ensure_session_txn(&self.txn, session)?,
+                &database,
+            )
+        };
+
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(err) => {
+                if started_implicit_txn {
+                    rollback_implicit_txn(&self.txn, &self.storage, session);
+                }
+                return self.apply_on_error_pipeline_failure("", session, err);
+            }
+        };
+
+        let result = {
+            let _catalog_guard = self.catalog_lock.blocking_write();
+            commit_nonblocking_heap_alter(
+                &self.storage,
+                &self.txn,
+                ensure_session_txn(&self.txn, session)?,
+                plan.clone(),
+            )
+        };
+
+        let result = match result {
+            Ok(qr) => qr,
+            Err(err) => {
+                cleanup_nonblocking_heap_alter_plan(&self.storage, &plan);
+                if started_implicit_txn {
+                    rollback_implicit_txn(&self.txn, &self.storage, session);
+                }
+                return self.apply_on_error_pipeline_failure("", session, err);
+            }
+        };
+
+        self.schema_version.fetch_add(1, Ordering::Release);
+        if started_implicit_txn {
+            let conn = session.conn_txn.take().ok_or_else(|| {
+                DbError::Other("missing implicit transaction during ALTER TABLE".into())
+            })?;
+            session.pending_deferred_txn_id = self.txn.commit(conn)?;
+        }
+        let pending = session.pending_deferred_txn_id.take();
+        Ok((result, self.take_commit_rx(pending)))
+    }
+
+    pub async fn execute_nonblocking_alter_stmt_async(
+        &self,
+        stmt: Stmt,
+        session: &mut SessionContext,
+    ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
+        let Stmt::AlterTable(alter) = stmt else {
+            return Err(DbError::NotImplemented {
+                feature: "execute_nonblocking_alter_stmt_async requires ALTER TABLE".into(),
+            });
+        };
+        let database = session.effective_database().to_string();
+        let table_id = self
+            .resolve_table_id(&alter.table, &database)?
+            .ok_or_else(|| DbError::TableNotFound {
+                name: alter.table.name.clone(),
+            })?;
+        let _rewrite_guard = self.register_table_rewrite(table_id)?;
+        let started_implicit_txn = session.conn_txn.is_none();
+
+        let plan = {
+            let _catalog_guard = self.catalog_lock.read().await;
+            prepare_nonblocking_heap_alter(
+                alter.clone(),
+                &self.storage,
+                &self.txn,
+                ensure_session_txn(&self.txn, session)?,
+                &database,
+            )
+        };
+
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(err) => {
+                if started_implicit_txn {
+                    rollback_implicit_txn(&self.txn, &self.storage, session);
+                }
+                return self.apply_on_error_pipeline_failure("", session, err);
+            }
+        };
+
+        let result = {
+            let _catalog_guard = self.catalog_lock.write().await;
+            commit_nonblocking_heap_alter(
+                &self.storage,
+                &self.txn,
+                ensure_session_txn(&self.txn, session)?,
+                plan.clone(),
+            )
+        };
+
+        let result = match result {
+            Ok(qr) => qr,
+            Err(err) => {
+                cleanup_nonblocking_heap_alter_plan(&self.storage, &plan);
+                if started_implicit_txn {
+                    rollback_implicit_txn(&self.txn, &self.storage, session);
+                }
+                return self.apply_on_error_pipeline_failure("", session, err);
+            }
+        };
+
+        self.schema_version.fetch_add(1, Ordering::Release);
+        if started_implicit_txn {
+            let conn = session.conn_txn.take().ok_or_else(|| {
+                DbError::Other("missing implicit transaction during ALTER TABLE".into())
+            })?;
+            session.pending_deferred_txn_id = self.txn.commit(conn)?;
+        }
+        let pending = session.pending_deferred_txn_id.take();
+        Ok((result, self.take_commit_rx(pending)))
+    }
+
+    fn resolve_table_id(
+        &self,
+        table_ref: &TableRef,
+        database: &str,
+    ) -> Result<Option<u32>, DbError> {
+        let schema = table_ref.schema.as_deref().unwrap_or("public");
+        let snap = self.txn.snapshot();
+        let mut reader = CatalogReader::new(&self.storage, snap)?;
+        Ok(reader
+            .get_table_in_database(database, schema, &table_ref.name)?
+            .map(|d| d.id))
+    }
+
+    fn register_table_rewrite(&self, table_id: u32) -> Result<TableRewriteGuard<'_>, DbError> {
+        let mut rewrites = self
+            .table_rewrites
+            .lock()
+            .map_err(|_| DbError::Other("table rewrite registry poisoned".into()))?;
+        if !rewrites.insert(table_id) {
+            return Err(DbError::LockTimeout);
+        }
+        Ok(TableRewriteGuard { db: self, table_id })
+    }
+
+    fn unregister_table_rewrite(&self, table_id: u32) {
+        if let Ok(mut rewrites) = self.table_rewrites.lock() {
+            rewrites.remove(&table_id);
+        }
+    }
+
+    fn reject_stmt_if_table_under_rewrite(
+        &self,
+        stmt: &Stmt,
+        database: &str,
+    ) -> Result<(), DbError> {
+        let Some(table_id) = self.primary_mutating_table_id(stmt, database)? else {
+            return Ok(());
+        };
+        let rewrites = self
+            .table_rewrites
+            .lock()
+            .map_err(|_| DbError::Other("table rewrite registry poisoned".into()))?;
+        if rewrites.contains(&table_id) {
+            return Err(DbError::LockTimeout);
+        }
+        Ok(())
+    }
+
+    fn primary_mutating_table_id(
+        &self,
+        stmt: &Stmt,
+        database: &str,
+    ) -> Result<Option<u32>, DbError> {
+        let table_ref = match stmt {
+            Stmt::Insert(s) => Some(&s.table),
+            Stmt::Update(s) => Some(&s.table),
+            Stmt::Delete(s) => Some(&s.table),
+            Stmt::Merge(s) => Some(&s.target),
+            Stmt::AlterTable(s) => Some(&s.table),
+            Stmt::TruncateTable(s) => Some(&s.table),
+            Stmt::CreateIndex(s) => Some(&s.table),
+            Stmt::DropIndex(s) => s.table.as_ref(),
+            Stmt::RefreshMaterializedView(s) => Some(&s.view),
+            Stmt::DropMaterializedView(s) => s.views.first(),
+            Stmt::DropTable(s) => s.tables.first(),
+            _ => None,
+        };
+        match table_ref {
+            Some(table_ref) => self.resolve_table_id(table_ref, database),
+            None => Ok(None),
+        }
+    }
+}
+
+struct TableRewriteGuard<'a> {
+    db: &'a SharedDatabase,
+    table_id: u32,
+}
+
+impl Drop for TableRewriteGuard<'_> {
+    fn drop(&mut self) {
+        self.db.unregister_table_rewrite(self.table_id);
+    }
+}
+
+fn ensure_session_txn<'a>(
+    txn: &TxnManager,
+    session: &'a mut SessionContext,
+) -> Result<&'a mut axiomdb_wal::ConnectionTxn, DbError> {
+    if session.conn_txn.is_none() {
+        session.conn_txn = Some(txn.begin()?);
+        session.in_explicit_txn = false;
+    }
+    session
+        .conn_txn
+        .as_mut()
+        .ok_or_else(|| DbError::Other("missing connection transaction".into()))
+}
+
+fn rollback_implicit_txn(
+    txn: &TxnManager,
+    storage: &dyn axiomdb_storage::StorageEngine,
+    session: &mut SessionContext,
+) {
+    if let Some(conn) = session.conn_txn.take() {
+        let _ = txn.rollback(conn, storage);
     }
 }
 

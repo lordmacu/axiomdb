@@ -1,5 +1,66 @@
 # Fase 13 - Advanced PostgreSQL
 
+## 13.6 Non-blocking ALTER TABLE - cerrada 2026-04-23
+
+La subfase 13.6 cierra el primer corte real de `ALTER TABLE` no bloqueante en
+AxiomDB sin intentar online DDL completo con replay de writes. El recorte
+entregado es **shadow heap rebuild + atomic cutover** para operaciones de
+reescritura de una sola columna sobre heap tables: `ADD COLUMN`, `DROP COLUMN`
+y `MODIFY COLUMN`.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `ALTER TABLE heap_table ADD COLUMN ...`
+- `ALTER TABLE heap_table DROP COLUMN ...`
+- `ALTER TABLE heap_table MODIFY COLUMN ...`
+- copy largo sobre shadow heap root con lecturas concurrentes todavia vivas
+- cutover atomico de root + columnas + indexes en una ventana exclusiva corta
+- rechazo de writes concurrentes a la tabla objetivo via `LockTimeout`
+
+Fuera de alcance en este corte:
+
+- replay WAL-delta para permitir writers concurrentes
+- ALTERs multi-operacion en la ruta no bloqueante
+- heap rebuild no bloqueante para `ADD PRIMARY KEY`
+- tablas clustered
+- jobs async de migracion o progress reporting
+
+### Ajustes tecnicos de cierre
+
+- Ejecutor SQL: nuevo plan `NonBlockingHeapAlterPlan` que deriva el esquema
+  destino, materializa filas en un shadow heap root y reconstruye los indexes
+  secundarios necesarios antes del publish final.
+- Handler/shared DB: `SharedDatabase` ahora mantiene un registro
+  `table_rewrites` por `table_id`. Mientras una tabla esta en rewrite, DML y
+  DDL mutantes sobre esa tabla fallan temprano con `LockTimeout`.
+- Coordinacion: el path especial del handler MySQL usa `catalog_lock.read()`
+  durante la copia larga y `catalog_lock.write()` solo para el swap final,
+  evitando que los lectores normales queden serializados detras de todo el
+  rewrite.
+- Cutover: el swap actualiza root de tabla, filas de columnas y definiciones de
+  indice/FK segun la operacion, y manda las paginas viejas a deferred free solo
+  despues del publish exitoso.
+- Semantica autocommit: la ruta especial replica el commit/rollback implicito
+  del executor normal para que el resultado sea visible por wire inmediatamente
+  tras un `ALTER TABLE` exitoso.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_executor_ddl.rs`
+- `crates/axiomdb-network/tests/integration_concurrency.rs`
+- bloque wire `[13.6 non-blocking alter table]` en `tools/wire-test.py`
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_executor_ddl` - paso.
+- `cargo test -p axiomdb-network --test integration_concurrency` - paso.
+- `python3 tools/wire-test.py` - paso, 457/457 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 13.5 Covering indexes - cerrada 2026-04-23
 
 La subfase 13.5 cierra el soporte real de covering indexes sobre heap tables.

@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use axiomdb_core::error::DbError;
 use axiomdb_network::mysql::SharedDatabase;
 use axiomdb_sql::{SchemaCache, SessionContext};
 
@@ -61,6 +62,15 @@ fn exec_in_session(
 ) {
     db.execute_query(sql, session, cache)
         .unwrap_or_else(|e| panic!("SQL failed: {sql}: {e}"));
+}
+
+fn exec_result_in_session(
+    db: &SharedDatabase,
+    sql: &str,
+    session: &mut SessionContext,
+    cache: &mut SchemaCache,
+) -> Result<(), DbError> {
+    db.execute_query(sql, session, cache).map(|_| ())
 }
 
 // ── Test: multiple concurrent readers ────────────────────────────────────────
@@ -277,6 +287,85 @@ async fn test_savepoint_within_transaction() {
     // After commit: only row 1 should exist.
     let count = count_rows(&db, "SELECT id FROM sp_test");
     assert_eq!(count, 1, "only row 1 should survive savepoint rollback");
+}
+
+#[tokio::test]
+async fn test_nonblocking_alter_keeps_reads_alive_and_blocks_writes() {
+    let (_dir, db) = open_test_db_no_fsync();
+    exec(&db, "CREATE TABLE nb_alter (id INT, payload TEXT)");
+
+    let payload = "x".repeat(2048);
+    for i in 1..=3000 {
+        exec(
+            &db,
+            &format!("INSERT INTO nb_alter VALUES ({i}, '{payload}')"),
+        );
+    }
+
+    let alter_db = Arc::clone(&db);
+    let alter = tokio::task::spawn_blocking(move || {
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::new();
+        alter_db
+            .execute_nonblocking_alter_query(
+                "ALTER TABLE nb_alter ADD COLUMN extra INT DEFAULT 7",
+                &mut session,
+                &mut cache,
+            )
+            .expect("non-blocking alter should succeed");
+    });
+
+    let mut saw_write_block = false;
+    for _ in 0..400 {
+        let count = count_rows(&db, "SELECT id FROM nb_alter WHERE id <= 10");
+        assert_eq!(count, 10, "reads should stay available during shadow copy");
+
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::new();
+        match exec_result_in_session(
+            &db,
+            "INSERT INTO nb_alter VALUES (999999, 'blocked')",
+            &mut session,
+            &mut cache,
+        ) {
+            Err(DbError::LockTimeout) => {
+                saw_write_block = true;
+                break;
+            }
+            Err(DbError::ColumnCountMismatch { .. }) => {}
+            Err(e) => panic!("unexpected write result during non-blocking alter: {e}"),
+            Ok(()) => {
+                exec(&db, "DELETE FROM nb_alter WHERE id = 999999");
+            }
+        }
+
+        if alter.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    alter.await.expect("alter task should finish");
+    assert!(
+        saw_write_block,
+        "writer should be rejected while shadow copy is active"
+    );
+
+    let mut session = SessionContext::new();
+    let mut cache = SchemaCache::new();
+    let (result, _) = db
+        .execute_query(
+            "SELECT extra FROM nb_alter WHERE id = 1",
+            &mut session,
+            &mut cache,
+        )
+        .expect("select after alter");
+    match result {
+        axiomdb_sql::result::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0][0], axiomdb_types::Value::Int(7));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
 }
 
 // ── Test: concurrent insert + select consistency ─────────────────────────────
