@@ -3245,6 +3245,31 @@ ok("[11.18c] #>> extracts scalar text over wire", row[1] == "hello", row)
 ok("[11.18c] #- deletes nested array index over wire", row[2] == b'{"xs":[10,30]}', row)
 conn_jpath.close()
 
+# ── Phase 11.21h — JSONPath planner pushdown ────────────────────────────────
+
+print("\n[11.21h JSONPath planner pushdown]")
+conn_jpush = connect()
+cjpush = conn_jpush.cursor()
+cjpush.execute("CREATE TABLE wt_jsonpath_gin (id INT PRIMARY KEY, doc JSONB)")
+cjpush.execute("CREATE INDEX idx_wt_jsonpath_gin ON wt_jsonpath_gin USING GIN (doc)")
+cjpush.execute(
+    "INSERT INTO wt_jsonpath_gin VALUES "
+    "(1, CAST('{\"k\":1,\"flag\":true}' AS JSONB)), "
+    "(2, CAST('{\"flag\":false}' AS JSONB)), "
+    "(3, CAST('{\"other\":1}' AS JSONB))"
+)
+cjpush.execute("SELECT id FROM wt_jsonpath_gin WHERE doc @? '$.k' ORDER BY id")
+rows = cjpush.fetchall()
+ok("[11.21h] @? simple key uses GIN-backed path and returns matching row only",
+   rows == ((1,),) or rows == [(1,)],
+   rows)
+cjpush.execute("EXPLAIN SELECT id FROM wt_jsonpath_gin WHERE doc @? '$.k'")
+row = cjpush.fetchone()
+ok("[11.21h] EXPLAIN reports gin access for simple JSONPath key probe",
+   row is not None and row[3] == "gin" and row[5] == "idx_wt_jsonpath_gin",
+   row)
+conn_jpush.close()
+
 # ── Phase 11.20d1 — WRAPPER / QUOTES / PASSING ────────────────────────────────
 
 print("\n[11.20d1 JSON_TABLE wrapper/quotes/passing]")

@@ -1,5 +1,17 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 11.21h
+
+- **The right first JSONPath pushdown is "simple key probes with recheck", not
+  "full JSONPath indexing".** Reusing the existing `jsonb_ops` GIN path closed
+  a real planner gap without opening catalog/storage work in the same slice.
+- **Planner and evaluator should not share the same complexity budget.** The
+  JSONPath executor supports far richer paths than the planner can safely
+  extract; keeping planner extraction deliberately smaller is the safer cut.
+- **`@@` proves why GIN candidate filtering and semantic truth are different.**
+  Key presence is enough to accelerate lookup, but not enough to prove a match,
+  so tests need to pin the executor recheck behavior explicitly.
+
 ## 2026-04-22 - Phase 11.18c
 
 - **A subphase can be “implemented” in code and still not be truly closed.**
