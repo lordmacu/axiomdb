@@ -807,6 +807,122 @@ pub async fn handle_connection_with_timeouts(
 
                     bump_statement_counters(&status, &mut conn_state.session_status, class);
 
+                    let parsed_nonblocking_alter = axiomdb_sql::parse_with_sql_mode(
+                        stmt_sql,
+                        None,
+                        engine.session.sql_mode_flags(),
+                    )
+                    .ok()
+                    .filter(|stmt| {
+                        db.is_nonblocking_alter_candidate(
+                            stmt,
+                            engine.session.effective_database(),
+                        )
+                        .unwrap_or(false)
+                    });
+
+                    if let Some(Stmt::AlterTable(_)) = parsed_nonblocking_alter {
+                        let exec_result = db.execute_nonblocking_alter_query_async(
+                            stmt_sql,
+                            &mut engine.session,
+                            &mut engine.schema_cache,
+                        )
+                        .await;
+                        match exec_result {
+                            Ok((qr, commit_rx)) => {
+                                engine.sync_database_to_wire(&mut conn_state);
+                                if let Err(e) = await_commit_rx(commit_rx).await {
+                                    let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                                    let err_bytes = pkt.len() as u64 + 4;
+                                    if send_execute_packet(
+                                        &mut writer,
+                                        &lifecycle,
+                                        &conn_state,
+                                        seq,
+                                        pkt.as_slice(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        connection_broken = true;
+                                    } else {
+                                        bump_bytes_sent(
+                                            err_bytes,
+                                            &status,
+                                            &mut conn_state.session_status,
+                                        );
+                                    }
+                                    break 'stmts;
+                                }
+                                let packets = match serialize_query_result_multi_warn(
+                                    qr,
+                                    seq,
+                                    !is_last,
+                                    engine.session.warning_count(),
+                                    conn_state.results_collation(),
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                                        let err_bytes = pkt.len() as u64 + 4;
+                                        if send_execute_packet(
+                                            &mut writer,
+                                            &lifecycle,
+                                            &conn_state,
+                                            seq,
+                                            pkt.as_slice(),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            connection_broken = true;
+                                        } else {
+                                            bump_bytes_sent(
+                                                err_bytes,
+                                                &status,
+                                                &mut conn_state.session_status,
+                                            );
+                                        }
+                                        break 'stmts;
+                                    }
+                                };
+                                let nbytes = wire_size(&packets);
+                                if send_packet_batch(&mut writer, &lifecycle, &conn_state, &packets)
+                                    .await
+                                    .is_err()
+                                {
+                                    connection_broken = true;
+                                    break 'stmts;
+                                }
+                                bump_bytes_sent(nbytes, &status, &mut conn_state.session_status);
+                                seq = packets
+                                    .last()
+                                    .map(|(s, _)| s.wrapping_add(1))
+                                    .unwrap_or(seq);
+                                continue 'stmts;
+                            }
+                            Err(e) => {
+                                let pkt = build_query_err_packet(&e, stmt_sql, &conn_state);
+                                let err_bytes = pkt.len() as u64 + 4;
+                                if send_execute_packet(
+                                    &mut writer,
+                                    &lifecycle,
+                                    &conn_state,
+                                    seq,
+                                    pkt.as_slice(),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    connection_broken = true;
+                                } else {
+                                    bump_bytes_sent(err_bytes, &status, &mut conn_state.session_status);
+                                }
+                                break 'stmts;
+                            }
+                        }
+                    }
+
                     // Phase 7.4 / 40.10: route statements through the shared database.
                     // Read-only queries hold a catalog read lock plus snapshot registration.
                     // DML also uses the catalog read lock; DDL upgrades to the write lock.
@@ -1293,7 +1409,19 @@ pub async fn handle_connection_with_timeouts(
                                 debug!(conn_id, stmt_id, "COM_STMT_EXECUTE (plan cache hit)");
                                 match substitute_params_in_ast(cached, &exec.params) {
                                     Ok(ready_stmt) => {
-                                        if stmt_changes_schema(&ready_stmt) {
+                                        if db
+                                            .is_nonblocking_alter_candidate(
+                                                &ready_stmt,
+                                                engine.session.effective_database(),
+                                            )
+                                            .unwrap_or(false)
+                                        {
+                                            db.execute_nonblocking_alter_stmt_async(
+                                                ready_stmt,
+                                                &mut engine.session,
+                                            )
+                                            .await
+                                        } else if stmt_changes_schema(&ready_stmt) {
                                             let _catalog_guard = db.catalog_lock.write().await;
                                             db.execute_stmt(ready_stmt, &mut engine.session)
                                         } else {
@@ -1312,7 +1440,30 @@ pub async fn handle_connection_with_timeouts(
                                 ) {
                                     Ok(final_sql) => {
                                         debug!(conn_id, sql = %final_sql, "COM_STMT_EXECUTE (no cache)");
-                                        if sql_changes_schema(&final_sql) {
+                                        let parsed_stmt = axiomdb_sql::parse_with_sql_mode(
+                                            &final_sql,
+                                            None,
+                                            engine.session.sql_mode_flags(),
+                                        )
+                                        .ok();
+                                        if parsed_stmt
+                                            .as_ref()
+                                            .and_then(|stmt| {
+                                                db.is_nonblocking_alter_candidate(
+                                                    stmt,
+                                                    engine.session.effective_database(),
+                                                )
+                                                .ok()
+                                            })
+                                            .unwrap_or(false)
+                                        {
+                                            db.execute_nonblocking_alter_query_async(
+                                                &final_sql,
+                                                &mut engine.session,
+                                                &mut engine.schema_cache,
+                                            )
+                                            .await
+                                        } else if sql_changes_schema(&final_sql) {
                                             let _catalog_guard = db.catalog_lock.write().await;
                                             db.execute_query(
                                                 &final_sql,

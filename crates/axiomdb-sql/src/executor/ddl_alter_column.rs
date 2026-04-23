@@ -350,6 +350,621 @@ fn cleanup_rebuilt_index_roots(storage: &dyn StorageEngine, roots: &[u64]) {
     }
 }
 
+#[derive(Debug, Clone)]
+enum NonBlockingHeapAlterOp {
+    Add,
+    Drop {
+        dropped_indexes: Vec<axiomdb_catalog::schema::IndexDef>,
+        updated_child_fks: Vec<axiomdb_catalog::schema::FkDef>,
+        updated_parent_fks: Vec<axiomdb_catalog::schema::FkDef>,
+    },
+    Modify,
+}
+
+#[derive(Debug, Clone)]
+pub struct NonBlockingHeapAlterPlan {
+    table_id: u32,
+    old_columns: Vec<axiomdb_catalog::schema::ColumnDef>,
+    new_columns: Vec<axiomdb_catalog::schema::ColumnDef>,
+    old_indexes: Vec<axiomdb_catalog::schema::IndexDef>,
+    new_indexes: Vec<axiomdb_catalog::schema::IndexDef>,
+    shadow_root_page_id: u64,
+    old_pages_to_defer: Vec<u64>,
+    op: NonBlockingHeapAlterOp,
+}
+
+fn cleanup_nonblocking_heap_artifacts(
+    storage: &dyn StorageEngine,
+    shadow_root_page_id: u64,
+    index_roots: &[u64],
+) {
+    let _ = free_heap_chain_pages(storage, shadow_root_page_id);
+    cleanup_rebuilt_index_roots(storage, index_roots);
+}
+
+fn free_heap_chain_pages(storage: &dyn StorageEngine, root_page_id: u64) -> Result<(), DbError> {
+    let pages = collect_heap_chain_pages(storage, root_page_id)?;
+    for pid in pages {
+        storage.free_page(pid)?;
+    }
+    Ok(())
+}
+
+fn build_shadow_heap_rows(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    old_columns: &[axiomdb_catalog::schema::ColumnDef],
+    new_columns: &[axiomdb_catalog::schema::ColumnDef],
+    transform: &dyn Fn(Row) -> Result<Row, DbError>,
+) -> Result<u64, DbError> {
+    table_def.ensure_heap_runtime("non-blocking ALTER TABLE on clustered table")?;
+    let shadow_root_page_id = alloc_empty_heap_root(storage)?;
+    let mut shadow_table_def = table_def.clone();
+    shadow_table_def.root_page_id = shadow_root_page_id;
+
+    let snap = txn.active_snapshot(conn_txn);
+    let rows = TableEngine::scan_table(storage, table_def, old_columns, snap, None)?;
+    for (_rid, old_values) in rows {
+        let new_values = transform(old_values)?;
+        TableEngine::insert_row(
+            storage,
+            txn,
+            conn_txn,
+            &shadow_table_def,
+            new_columns,
+            new_values,
+        )?;
+    }
+
+    Ok(shadow_root_page_id)
+}
+
+fn collect_old_heap_and_index_pages(
+    storage: &dyn StorageEngine,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    indexes: &[axiomdb_catalog::schema::IndexDef],
+) -> Result<Vec<u64>, DbError> {
+    let mut pages = collect_heap_chain_pages(storage, table_def.root_page_id)?;
+    for idx in indexes {
+        pages.extend(collect_btree_pages(storage, idx.root_page_id)?);
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    Ok(pages)
+}
+
+fn validate_nonblocking_alter_table_stmt(
+    table_def: &axiomdb_catalog::schema::TableDef,
+    stmt: &AlterTableStmt,
+) -> Result<AlterTableOp, DbError> {
+    table_def.ensure_heap_runtime("non-blocking ALTER TABLE on clustered table")?;
+    if stmt.operations.len() != 1 {
+        return Err(DbError::NotImplemented {
+            feature: "non-blocking ALTER TABLE with multiple operations".into(),
+        });
+    }
+
+    match &stmt.operations[0] {
+        AlterTableOp::AddColumn(_)
+        | AlterTableOp::DropColumn { .. }
+        | AlterTableOp::ModifyColumn(_) => Ok(stmt.operations[0].clone()),
+        _ => Err(DbError::NotImplemented {
+            feature: "non-blocking ALTER TABLE for this operation".into(),
+        }),
+    }
+}
+
+pub fn prepare_nonblocking_heap_alter(
+    stmt: AlterTableStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    database: &str,
+) -> Result<NonBlockingHeapAlterPlan, DbError> {
+    let table_def = {
+        let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
+        resolver.resolve_table(stmt.table.schema.as_deref(), &stmt.table.name)?
+    };
+    let op = validate_nonblocking_alter_table_stmt(&table_def.def, &stmt)?;
+    let columns = table_def.columns.clone();
+    let indexes = table_def.indexes.clone();
+
+    match op {
+        AlterTableOp::AddColumn(col_def) => {
+            if generated_column_constraint(&col_def)?.is_some() {
+                return Err(DbError::NotImplemented {
+                    feature: "ALTER TABLE generated columns".into(),
+                });
+            }
+            if columns.iter().any(|c| c.name == col_def.name) {
+                return Err(DbError::ColumnAlreadyExists {
+                    name: col_def.name.clone(),
+                    table: table_def.def.table_name.clone(),
+                });
+            }
+
+            let default_value = col_def
+                .constraints
+                .iter()
+                .find_map(|c| match c {
+                    crate::ast::ColumnConstraint::Default(expr) => {
+                        Some(eval(expr, &[]).unwrap_or(Value::Null))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Value::Null);
+
+            let new_col_idx = columns
+                .iter()
+                .map(|c| c.col_idx)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            let new_catalog_col = CatalogColumnDef {
+                table_id: table_def.def.id,
+                col_idx: new_col_idx,
+                name: col_def.name.clone(),
+                col_type: datatype_to_column_type(&col_def.data_type)?,
+                nullable: !col_def
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::ast::ColumnConstraint::NotNull)),
+                auto_increment: col_def
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::ast::ColumnConstraint::AutoIncrement)),
+                type_len: col_def.type_len,
+                is_fixed_len: col_def.is_char,
+                default_expr: col_def.constraints.iter().find_map(|c| match c {
+                    crate::ast::ColumnConstraint::Default(expr) => {
+                        Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                    }
+                    _ => None,
+                }),
+                on_update_expr: col_def.constraints.iter().find_map(|c| match c {
+                    crate::ast::ColumnConstraint::OnUpdate(expr) => {
+                        Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                    }
+                    _ => None,
+                }),
+                generated_expr: None,
+                generated_stored: false,
+            };
+            let mut new_columns = columns.clone();
+            new_columns.push(new_catalog_col);
+
+            let dv = default_value;
+            let shadow_root_page_id = build_shadow_heap_rows(
+                storage,
+                txn,
+                conn_txn,
+                &table_def.def,
+                &columns,
+                &new_columns,
+                &|mut row| {
+                    row.push(dv.clone());
+                    Ok(row)
+                },
+            )?;
+            let mut shadow_table_def = table_def.def.clone();
+            shadow_table_def.root_page_id = shadow_root_page_id;
+            let snap = txn.active_snapshot(conn_txn);
+            let mut new_indexes = Vec::with_capacity(indexes.len());
+            let mut built_roots = Vec::new();
+            for idx in &indexes {
+                let mut updated = idx.clone();
+                let build = match build_index_root_from_existing_def(
+                    storage,
+                    &shadow_table_def,
+                    &new_columns,
+                    &updated,
+                    snap.clone(),
+                ) {
+                    Ok(build) => build,
+                    Err(err) => {
+                        cleanup_nonblocking_heap_artifacts(
+                            storage,
+                            shadow_root_page_id,
+                            &built_roots,
+                        );
+                        return Err(err);
+                    }
+                };
+                updated.root_page_id = build.root_page_id;
+                built_roots.push(build.root_page_id);
+                new_indexes.push(updated);
+            }
+            Ok(NonBlockingHeapAlterPlan {
+                table_id: table_def.def.id,
+                old_columns: columns,
+                new_columns,
+                old_indexes: indexes.clone(),
+                new_indexes,
+                shadow_root_page_id,
+                old_pages_to_defer: collect_old_heap_and_index_pages(
+                    storage,
+                    &table_def.def,
+                    &indexes,
+                )?,
+                op: NonBlockingHeapAlterOp::Add,
+            })
+        }
+        AlterTableOp::DropColumn { name, if_exists } => {
+            let drop_pos = match columns.iter().position(|c| c.name == name) {
+                Some(pos) => pos,
+                None if if_exists => {
+                    return Ok(NonBlockingHeapAlterPlan {
+                        table_id: table_def.def.id,
+                        old_columns: columns.clone(),
+                        new_columns: columns,
+                        old_indexes: indexes.clone(),
+                        new_indexes: indexes,
+                        shadow_root_page_id: 0,
+                        old_pages_to_defer: Vec::new(),
+                        op: NonBlockingHeapAlterOp::Drop {
+                            dropped_indexes: Vec::new(),
+                            updated_child_fks: Vec::new(),
+                            updated_parent_fks: Vec::new(),
+                        },
+                    })
+                }
+                None => {
+                    return Err(DbError::ColumnNotFound {
+                        name,
+                        table: table_def.def.table_name.clone(),
+                    })
+                }
+            };
+
+            let dropped_col = columns[drop_pos].clone();
+            let dropped_col_idx = dropped_col.col_idx;
+            let dropped_col_name = dropped_col.name.clone();
+            let (_loaded_indexes, constraints, child_fks, parent_fks) =
+                load_alter_metadata(storage, txn, conn_txn, table_def.def.id)?;
+
+            if indexes
+                .iter()
+                .any(|idx| idx.is_primary && idx.columns.iter().any(|c| c.col_idx == dropped_col_idx))
+            {
+                return Err(DbError::InvalidValue {
+                    reason: format!("PRIMARY KEY column '{}' cannot be dropped", dropped_col_name),
+                });
+            }
+            if let Some(fk) = child_fks.iter().find(|fk| fk.child_col_idx == dropped_col_idx) {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "Cannot drop column '{}': it is referenced by foreign key '{}'",
+                        dropped_col_name, fk.name
+                    ),
+                });
+            }
+            if let Some(fk) = parent_fks.iter().find(|fk| fk.parent_col_idx == dropped_col_idx) {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "Cannot drop column '{}': it is referenced by foreign key '{}'",
+                        dropped_col_name, fk.name
+                    ),
+                });
+            }
+            for constraint in &constraints {
+                if !constraint.check_expr.is_empty()
+                    && stored_expr_mentions_column_name(&constraint.check_expr, &dropped_col_name)?
+                {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "Cannot drop column '{}': it is referenced by CHECK constraint '{}'",
+                            dropped_col_name, constraint.name
+                        ),
+                    });
+                }
+            }
+
+            let mut new_columns = columns.clone();
+            new_columns.remove(drop_pos);
+            for (new_pos, col) in new_columns.iter_mut().enumerate() {
+                col.col_idx = new_pos as u16;
+            }
+
+            let mut dropped_indexes = Vec::new();
+            let mut surviving_indexes = Vec::new();
+            for idx in &indexes {
+                if index_depends_on_column(idx, &dropped_col_name, dropped_col_idx)? {
+                    dropped_indexes.push(idx.clone());
+                } else {
+                    surviving_indexes.push(remap_index_after_drop(idx, dropped_col_idx));
+                }
+            }
+            let updated_child_fks: Vec<_> = child_fks
+                .iter()
+                .filter_map(|fk| remap_child_fk_after_drop(fk, dropped_col_idx))
+                .collect();
+            let updated_parent_fks: Vec<_> = parent_fks
+                .iter()
+                .filter_map(|fk| remap_parent_fk_after_drop(fk, dropped_col_idx))
+                .collect();
+
+            let shadow_root_page_id = build_shadow_heap_rows(
+                storage,
+                txn,
+                conn_txn,
+                &table_def.def,
+                &columns,
+                &new_columns,
+                &move |mut row| {
+                    if drop_pos < row.len() {
+                        row.remove(drop_pos);
+                    }
+                    Ok(row)
+                },
+            )?;
+            let mut shadow_table_def = table_def.def.clone();
+            shadow_table_def.root_page_id = shadow_root_page_id;
+            let snap = txn.active_snapshot(conn_txn);
+            let mut new_indexes = Vec::with_capacity(surviving_indexes.len());
+            let mut built_roots = Vec::new();
+            for idx in surviving_indexes {
+                let mut updated = idx.clone();
+                let build = match build_index_root_from_existing_def(
+                    storage,
+                    &shadow_table_def,
+                    &new_columns,
+                    &updated,
+                    snap.clone(),
+                ) {
+                    Ok(build) => build,
+                    Err(err) => {
+                        cleanup_nonblocking_heap_artifacts(
+                            storage,
+                            shadow_root_page_id,
+                            &built_roots,
+                        );
+                        return Err(err);
+                    }
+                };
+                updated.root_page_id = build.root_page_id;
+                built_roots.push(build.root_page_id);
+                new_indexes.push(updated);
+            }
+
+            Ok(NonBlockingHeapAlterPlan {
+                table_id: table_def.def.id,
+                old_columns: columns,
+                new_columns,
+                old_indexes: indexes,
+                new_indexes,
+                shadow_root_page_id,
+                old_pages_to_defer: collect_old_heap_and_index_pages(
+                    storage,
+                    &table_def.def,
+                    &table_def.indexes,
+                )?,
+                op: NonBlockingHeapAlterOp::Drop {
+                    dropped_indexes,
+                    updated_child_fks,
+                    updated_parent_fks,
+                },
+            })
+        }
+        AlterTableOp::ModifyColumn(col_def) => {
+            use axiomdb_types::coerce::{coerce, CoercionMode};
+
+            if generated_column_constraint(&col_def)?.is_some() {
+                return Err(DbError::NotImplemented {
+                    feature: "ALTER TABLE generated columns".into(),
+                });
+            }
+
+            let col_pos = columns
+                .iter()
+                .position(|c| c.name == col_def.name)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    name: col_def.name.clone(),
+                    table: table_def.def.table_name.clone(),
+                })?;
+            let old_col = &columns[col_pos];
+            let col_idx = old_col.col_idx;
+            let (_loaded_indexes, constraints, child_fks, parent_fks) =
+                load_alter_metadata(storage, txn, conn_txn, table_def.def.id)?;
+            let is_pk_col = indexes
+                .iter()
+                .find(|i| i.is_primary)
+                .map(|pk| pk.columns.iter().any(|c| c.col_idx == col_idx))
+                .unwrap_or(false);
+            if is_pk_col {
+                return Err(DbError::InvalidValue {
+                    reason: format!("PRIMARY KEY column '{}' cannot be modified", col_def.name),
+                });
+            }
+            if let Some(fk) = child_fks.iter().find(|fk| fk.child_col_idx == col_idx) {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "Cannot modify column '{}': it is referenced by foreign key '{}'",
+                        col_def.name, fk.name
+                    ),
+                });
+            }
+            if let Some(fk) = parent_fks.iter().find(|fk| fk.parent_col_idx == col_idx) {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "Cannot modify column '{}': it is referenced by foreign key '{}'",
+                        col_def.name, fk.name
+                    ),
+                });
+            }
+            for constraint in &constraints {
+                if !constraint.check_expr.is_empty()
+                    && stored_expr_mentions_column_name(&constraint.check_expr, &col_def.name)?
+                {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "Cannot modify column '{}': it is referenced by CHECK constraint '{}'",
+                            col_def.name, constraint.name
+                        ),
+                    });
+                }
+            }
+
+            let new_col_type = datatype_to_column_type(&col_def.data_type)?;
+            let new_nullable = !col_def
+                .constraints
+                .iter()
+                .any(|c| matches!(c, crate::ast::ColumnConstraint::NotNull));
+            let new_data_type = crate::table::column_type_to_data_type(new_col_type);
+
+            let old_columns = columns.clone();
+            let mut new_columns = columns.clone();
+            new_columns[col_pos].col_type = new_col_type;
+            new_columns[col_pos].nullable = new_nullable;
+            new_columns[col_pos].type_len = col_def.type_len;
+            new_columns[col_pos].is_fixed_len = col_def.is_char;
+            new_columns[col_pos].default_expr = col_def
+                .constraints
+                .iter()
+                .find_map(|c| match c {
+                    crate::ast::ColumnConstraint::Default(expr) => {
+                        Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                    }
+                    _ => None,
+                })
+                .or_else(|| old_columns[col_pos].default_expr.clone());
+            new_columns[col_pos].on_update_expr = col_def
+                .constraints
+                .iter()
+                .find_map(|c| match c {
+                    crate::ast::ColumnConstraint::OnUpdate(expr) => {
+                        Some(crate::expr_to_sql::expr_to_sql_string(expr))
+                    }
+                    _ => None,
+                })
+                .or_else(|| old_columns[col_pos].on_update_expr.clone());
+
+            let shadow_root_page_id = build_shadow_heap_rows(
+                storage,
+                txn,
+                conn_txn,
+                &table_def.def,
+                &old_columns,
+                &new_columns,
+                &move |mut row| {
+                    if let Some(val) = row.get_mut(col_pos) {
+                        *val = coerce(val.clone(), new_data_type, CoercionMode::Strict)?;
+                    }
+                    Ok(row)
+                },
+            )?;
+            let mut shadow_table_def = table_def.def.clone();
+            shadow_table_def.root_page_id = shadow_root_page_id;
+            let snap = txn.active_snapshot(conn_txn);
+            let mut new_indexes = Vec::with_capacity(indexes.len());
+            let mut built_roots = Vec::new();
+            for idx in &indexes {
+                let mut updated = idx.clone();
+                let build = match build_index_root_from_existing_def(
+                    storage,
+                    &shadow_table_def,
+                    &new_columns,
+                    &updated,
+                    snap.clone(),
+                ) {
+                    Ok(build) => build,
+                    Err(err) => {
+                        cleanup_nonblocking_heap_artifacts(
+                            storage,
+                            shadow_root_page_id,
+                            &built_roots,
+                        );
+                        return Err(err);
+                    }
+                };
+                updated.root_page_id = build.root_page_id;
+                built_roots.push(build.root_page_id);
+                new_indexes.push(updated);
+            }
+
+            Ok(NonBlockingHeapAlterPlan {
+                table_id: table_def.def.id,
+                old_columns,
+                new_columns,
+                old_indexes: indexes,
+                new_indexes,
+                shadow_root_page_id,
+                old_pages_to_defer: collect_old_heap_and_index_pages(
+                    storage,
+                    &table_def.def,
+                    &table_def.indexes,
+                )?,
+                op: NonBlockingHeapAlterOp::Modify,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+pub fn cleanup_nonblocking_heap_alter_plan(
+    storage: &dyn StorageEngine,
+    plan: &NonBlockingHeapAlterPlan,
+) {
+    let index_roots: Vec<u64> = plan.new_indexes.iter().map(|idx| idx.root_page_id).collect();
+    cleanup_nonblocking_heap_artifacts(storage, plan.shadow_root_page_id, &index_roots);
+}
+
+pub fn commit_nonblocking_heap_alter(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    plan: NonBlockingHeapAlterPlan,
+) -> Result<QueryResult, DbError> {
+    if plan.old_pages_to_defer.is_empty() {
+        return Ok(QueryResult::Empty);
+    }
+
+    let NonBlockingHeapAlterPlan {
+        table_id,
+        old_columns,
+        new_columns,
+        old_indexes: _old_indexes,
+        new_indexes,
+        shadow_root_page_id,
+        old_pages_to_defer,
+        op,
+    } = plan;
+
+    CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_id, shadow_root_page_id)?;
+    replace_table_columns(storage, txn, conn_txn, table_id, &old_columns, &new_columns)?;
+
+    match op {
+        NonBlockingHeapAlterOp::Add | NonBlockingHeapAlterOp::Modify => {
+            for idx in new_indexes {
+                CatalogWriter::new(storage, txn, conn_txn)?.replace_index_def(idx)?;
+            }
+        }
+        NonBlockingHeapAlterOp::Drop {
+            dropped_indexes,
+            updated_child_fks,
+            updated_parent_fks,
+        } => {
+            for fk in updated_child_fks {
+                CatalogWriter::new(storage, txn, conn_txn)?.replace_foreign_key(fk)?;
+            }
+            for fk in updated_parent_fks {
+                CatalogWriter::new(storage, txn, conn_txn)?.replace_foreign_key(fk)?;
+            }
+            for idx in dropped_indexes {
+                CatalogWriter::new(storage, txn, conn_txn)?.delete_index(idx.index_id)?;
+            }
+            for idx in new_indexes {
+                CatalogWriter::new(storage, txn, conn_txn)?.replace_index_def(idx)?;
+            }
+        }
+    }
+
+    txn.defer_free_pages(conn_txn, old_pages_to_defer);
+    let _ = CatalogWriter::new(storage, txn, conn_txn)?.bump_table_schema_version(table_id);
+    Ok(QueryResult::Empty)
+}
+
 fn execute_alter_table(
     stmt: AlterTableStmt,
     storage: &dyn StorageEngine,

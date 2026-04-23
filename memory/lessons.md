@@ -1,5 +1,21 @@
 # Lessons Learned
 
+## 2026-04-23 - Phase 13.6
+
+- **The first bug in a “non-blocking” DDL slice is usually lifecycle, not row
+  copy.** The shadow rebuild logic worked quickly in SQL tests, but the first
+  real regression over wire came from forgetting that the special path had
+  bypassed the executor's normal implicit commit behavior.
+- **Async handlers and blocking lock APIs do not mix cleanly.** The first
+  server crash came from using `blocking_read/write()` inside the MySQL handler;
+  the fix was to keep separate async and sync entrypoints for the same ALTER
+  orchestration instead of forcing one lock style everywhere.
+- **Keep the strongest concurrency guarantee in Rust integration tests, and let
+  wire smoke assert stable observables.** `integration_concurrency.rs` is where
+  the lock-timeout-on-writer guarantee is pinned deterministically; the MySQL
+  smoke only needs to prove readers stay alive and the cutover publishes the
+  new schema atomically.
+
 ## 2026-04-23 - Phase 13.5
 
 - **Adding INCLUDE payloads changes more than the read path.** The obvious

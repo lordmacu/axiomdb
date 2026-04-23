@@ -3,19 +3,19 @@
 ## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.5 — `13.5` Covering indexes closed.
-Heap secondary indexes now persist `INCLUDE (...)` payload values directly in
-their leaf entries, so covering reads can project non-key columns from the
-index-only path instead of falling back to heap row fetches. The planner's
-coverage check now treats `include_columns` as real coverage, update/delete
-maintenance rewrites INCLUDE payloads correctly, and logical-key probes were
-adjusted so FK checks and other unique-index lookups do not rely on the old
-exact-key layout. Legacy pre-13.5 entries remain compatible via delete/read
-fallbacks that tolerate keys without INCLUDE payload bytes.
+**Active subphase:** Phase 13.6 — `13.6` Non-blocking ALTER TABLE closed.
+Heap `ALTER TABLE` with a single rewrite-heavy column operation
+(`ADD COLUMN`, `DROP COLUMN`, `MODIFY COLUMN`) now has a bounded non-blocking
+path: the executor copies rows into a shadow heap root under a shared catalog
+lock, swaps root/column/index metadata only in a short final exclusive window,
+keeps concurrent readers alive during the copy phase, and rejects writes to the
+target table with `LockTimeout` while the rewrite is in progress. The cut is
+explicitly narrower than full WAL-delta online DDL: clustered tables,
+multi-operation ALTERs, and concurrent writer replay stay deferred.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_index_only --test integration_fk --test integration_executor_ddl`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_executor_ddl`; `cargo test -p axiomdb-network --test integration_concurrency`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.6 Non-blocking ALTER TABLE.
+**Next:** Phase 13.7 / 13.8 remain superseded by Phase 40 lock-manager work; the next actionable Phase 13 subphase is 13.12 Statement-level triggers.
 
 ### Phase 21 subphase status
 

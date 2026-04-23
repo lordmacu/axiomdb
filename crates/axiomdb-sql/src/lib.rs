@@ -61,8 +61,9 @@ pub use eval::{
 };
 pub use exec_ctx::ExecutionContext;
 pub use executor::{
-    execute, execute_read_only_with_ctx, execute_snapshot, execute_with_ctx,
-    execute_with_ctx_locked, truncate_table_unchecked_on_open,
+    cleanup_nonblocking_heap_alter_plan, commit_nonblocking_heap_alter, execute,
+    execute_read_only_with_ctx, execute_snapshot, execute_with_ctx, execute_with_ctx_locked,
+    prepare_nonblocking_heap_alter, truncate_table_unchecked_on_open, NonBlockingHeapAlterPlan,
 };
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, tokenize_with_sql_mode, Span, SpannedToken, Token};

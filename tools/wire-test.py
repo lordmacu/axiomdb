@@ -34,7 +34,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              13.2 (window functions smoke),
              13.3 (generated columns closeout smoke),
              13.4 (LISTEN / NOTIFY pull-based smoke),
-             13.5 (covering indexes smoke)
+             13.5 (covering indexes smoke),
+             13.6 (non-blocking ALTER TABLE smoke)
 """
 import os
 import signal
@@ -43,6 +44,7 @@ import sys
 import tempfile
 import time
 import struct as _struct
+import threading
 
 import pymysql
 import pymysql.constants.COMMAND as _CMD
@@ -4166,6 +4168,79 @@ cur.execute("SELECT qty, price FROM cover13_items WHERE sku = 'sku-1'")
 rows = cur.fetchall()
 ok("[13.5 covering indexes] INCLUDE payload serves non-key projection after update",
    rows == ((11, 135),),
+   rows)
+
+# ── Phase 13.6 — Non-blocking ALTER TABLE ────────────────────────────────────
+
+print("\n[13.6 non-blocking alter table]")
+
+cur.execute("CREATE TABLE nb13_wire (id INT, payload TEXT)")
+big_payload = "x" * 2048
+for i in range(1, 3001):
+    cur.execute("INSERT INTO nb13_wire VALUES (%s, %s)", (i, big_payload))
+conn.commit()
+
+alter_conn = connect()
+alter_cur = alter_conn.cursor()
+writer_conn = connect()
+writer_cur = writer_conn.cursor()
+alter_result = {"ok": False, "err": None}
+
+
+def _run_alter():
+    try:
+        alter_cur.execute("ALTER TABLE nb13_wire ADD COLUMN extra INT DEFAULT 9")
+        alter_conn.commit()
+        alter_result["ok"] = True
+    except Exception as e:
+        alter_result["err"] = e
+    finally:
+        alter_cur.close()
+        alter_conn.close()
+
+
+alter_thread = threading.Thread(target=_run_alter)
+alter_thread.start()
+
+reader_ok = True
+writer_blocked = False
+for _ in range(400):
+    cur.execute("SELECT COUNT(*) FROM nb13_wire WHERE id <= 10")
+    row = cur.fetchone()
+    if row != (10,):
+        reader_ok = False
+        break
+    try:
+        writer_cur.execute("INSERT INTO nb13_wire VALUES (999999, 'blocked')")
+        writer_conn.rollback()
+    except Exception as e:
+        if "lock timeout" in str(e).lower():
+            writer_blocked = True
+            writer_conn.rollback()
+            break
+        raise
+    if not alter_thread.is_alive():
+        break
+    time.sleep(0.005)
+
+alter_thread.join()
+writer_cur.close()
+writer_conn.close()
+
+ok("[13.6 non-blocking alter table] concurrent readers stay available during shadow copy",
+   reader_ok,
+   reader_ok)
+ok("[13.6 non-blocking alter table] writer path stays safe while rewrite runs",
+   writer_blocked or alter_result["ok"],
+   {"writer_blocked": writer_blocked, "alter_result": alter_result})
+ok("[13.6 non-blocking alter table] ALTER TABLE finishes successfully",
+   alter_result["ok"] and alter_result["err"] is None,
+   alter_result)
+
+cur.execute("SELECT extra FROM nb13_wire WHERE id = 1")
+rows = cur.fetchall()
+ok("[13.6 non-blocking alter table] cutover publishes new column atomically",
+   rows == ((9,),),
    rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────
