@@ -1,5 +1,19 @@
 # Lessons Learned
 
+## 2026-04-22 - Phase 11.18c
+
+- **A subphase can be “implemented” in code and still not be truly closed.**
+  `11.18c` already had lexer/parser/eval/test coverage, but without its own
+  spec/plan pair and with stale roadmap wording, the project state still
+  treated it as open.
+- **When PostgreSQL parity collides with missing type-system work, document the
+  bounded divergence instead of inventing a fake blocker.** Here the honest cut
+  was “JSONB-array RHS is the supported contract today”, not “waiting on
+  `TEXT[]`” forever.
+- **Wire coverage matters even for existing features during closeout.**
+  Re-validating `#>`, `#>>`, and `#-` over the MySQL protocol protects the
+  lexer/tokenization edge that unit tests alone do not exercise.
+
 ## 2026-04-22 - Phase 21.16
 
 - **The right deferred-constraint MVP was FK-only, not "generic SQL standard".**

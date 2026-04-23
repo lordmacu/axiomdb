@@ -15,6 +15,7 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              4.11b (Subquery in JOIN),
              11.2d (refcounted TOAST/BLOB chain roundtrip), 11.4 (native JSON type + JSON_EXTRACT / ->>),
              11.16 (binary JSONB + JSONPath: -> operator, JSON_MERGE_PATCH, JSON_CONTAINS, JSON_PATH_EXISTS, TO_JSONB),
+             11.18c (JSONB path operators: #>, #>>, #-),
              11.25b (JSON aggregates: jsonb_agg, json_agg, JSON_ARRAYAGG, jsonb_object_agg,
                       json_object_agg, JSON_OBJECTAGG; constructors: JSON_ARRAY, JSON_OBJECT,
                       jsonb_build_object/array, to_json, JSON_MERGE_PRESERVE, JSON_CONTAINS_PATH),
@@ -3226,6 +3227,23 @@ cleaned = [tuple(str(x) if x is not None else None for x in r) for r in rows]
 ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
    cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
    f"got {cleaned}")
+
+# ── Phase 11.18c — JSONB path operators ─────────────────────────────────────
+
+print("\n[11.18c JSONB path operators]")
+conn_jpath = connect()
+cjpath = conn_jpath.cursor()
+cjpath.execute(
+    "SELECT "
+    "CAST('{\"a\":{\"b\":1},\"xs\":[10,20,30]}' AS JSONB) #> CAST('[\"a\"]' AS JSONB), "
+    "CAST('{\"a\":\"hello\"}' AS JSONB) #>> CAST('[\"a\"]' AS JSONB), "
+    "CAST('{\"xs\":[10,20,30]}' AS JSONB) #- CAST('[\"xs\",1]' AS JSONB)"
+)
+row = cjpath.fetchone()
+ok("[11.18c] #> extracts subtree as JSON text over wire", row[0] == b'{"b":1}', row)
+ok("[11.18c] #>> extracts scalar text over wire", row[1] == "hello", row)
+ok("[11.18c] #- deletes nested array index over wire", row[2] == b'{"xs":[10,30]}', row)
+conn_jpath.close()
 
 # ── Phase 11.20d1 — WRAPPER / QUOTES / PASSING ────────────────────────────────
 

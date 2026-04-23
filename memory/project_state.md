@@ -3,17 +3,16 @@
 ## Current (2026-04-22)
 
 **Active phase:** Phase 11 — Advanced Types
-**Active subphase:** Phase 21 COMPLETE — DEFERRABLE foreign keys closed.
-Phase 21 now closes with deferred foreign-key enforcement: FK declarations
-accept `DEFERRABLE` / `INITIALLY DEFERRED|IMMEDIATE`, catalog rows persist the
-flags compatibly, `DEFERRABLE INITIALLY DEFERRED` constraints are revalidated
-on `COMMIT`, and failed commit-time validation rolls the whole transaction
-back. Savepoints also truncate pending deferred-FK validation state, and the
-MySQL wire smoke now covers both repaired and failing commit flows.
+**Active subphase:** Phase 11 active — `11.18c` JSONB path operators closed.
+`#>`, `#>>`, and `#-` are now recorded as a closed follow-up with the real
+AxiomDB contract: RHS uses a JSONB string/number array path instead of native
+PostgreSQL `TEXT[]`. The closeout aligns docs/specs around that divergence,
+keeps the lexer `#` comment rule compatible with the operators, and leaves
+`11.21h` as the next JSON follow-up.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_fk --test integration_deferrable_fk`; `cargo test -p axiomdb-sql`; `python3 tools/wire-test.py` (437/437); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_jsonb_path_ops`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 11.18c JSONB operators follow-up.
+**Next:** Phase 11.21h JSONPath planner pushdown.
 
 ### Phase 21 subphase status
 
@@ -48,7 +47,7 @@ MySQL wire smoke now covers both repaired and failing commit flows.
 | 11.9 + 11.10 Prefetch + Write Combining | ✅ closed |
 | 11.16 Binary JSONB + JSONPath | ✅ closed |
 | 11.17 GIN index for JSONB | ✅ closed |
-| 11.18a / 11.18b (partial) JSONB operators | ✅ closed — 11.18c deferred (needs `TEXT[]`) |
+| 11.18a / 11.18b / 11.18c JSONB operators | ✅ closed — path/delete parity uses documented JSONB-array RHS divergence |
 | 11.19a / 11.19b / 11.19c SQL/JSON query functions | ✅ closed |
 | 11.20a `JSON_TABLE` flat | ✅ closed |
 | 11.20b `JSON_TABLE` single-level NESTED | ✅ closed |

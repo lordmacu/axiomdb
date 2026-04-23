@@ -1,5 +1,20 @@
 # Architecture Notes
 
+## 2026-04-22 - JSONB path operators (11.18c)
+
+- **`11.18c` closes on JSONB-array paths, not native SQL arrays.** The engine
+  already models RHS paths for `#>`, `#>>`, and `#-` as JSONB arrays of string
+  keys / numeric indexes, so the correct architectural contract is a
+  documented PostgreSQL divergence rather than a hidden dependency on `TEXT[]`.
+- **`#` comment handling must be lexer-aware of operator tokens.** Supporting
+  `#>`, `#>>`, and `#-` safely required limiting `#` line comments to real
+  line starts; generic stripping would silently destroy valid operator tokens
+  and JSON string contents.
+- **The path operators reuse the JSONB mutation/extraction helpers, not a
+  second path runtime.** `eval_jsonb_path_extract` and `eval_jsonb_path_delete`
+  piggyback on the shared path-segment descent/prune helpers, keeping the
+  operator surface aligned with the JSONB function semantics.
+
 ## 2026-04-22 - DEFERRABLE constraints (21.16)
 
 - **Deferral is tracked by touched FK definition, not by row image.** Instead
