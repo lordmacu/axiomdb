@@ -1,5 +1,49 @@
 # Fase 11 - Robustness and indexes
 
+## 11.18c JSONB path operators - cerrada 2026-04-22
+
+La subfase 11.18c queda cerrada como follow-up de paridad PostgreSQL para los
+operadores JSONB `#>`, `#>>` y `#-`, pero con el contrato real que ya existe en
+el repo: AxiomDB acepta una ruta RHS como **array JSONB** (`CAST('["a",1]' AS
+JSONB)`) en vez del `text[]` nativo de PostgreSQL. El cierre no mete arrays al
+type-system; documenta y valida explicitamente esa divergencia.
+
+Comportamiento cerrado:
+
+- `doc #> path_jsonb` extrae un subtree/valor JSONB y devuelve `NULL` si la
+  ruta no existe.
+- `doc #>> path_jsonb` extrae el valor y lo renderiza como texto SQL, quitando
+  comillas externas para strings JSON.
+- `doc #- path_jsonb` elimina una clave/indice/rama anidada; una ruta ausente
+  es no-op.
+- `NULL` a izquierda o derecha propaga `NULL`.
+
+Componentes relevantes:
+
+- Lexer: `Token::JsonPathExtract`, `JsonPathExtractText`, `JsonPathDelete` en
+  `crates/axiomdb-sql/src/lexer.rs`.
+- Parser: precedencia/parseo infix en
+  `crates/axiomdb-sql/src/parser/expr.rs`.
+- Evaluador: `eval_jsonb_path_extract` / `eval_jsonb_path_delete` en
+  `crates/axiomdb-sql/src/eval/ops.rs`.
+- Cobertura: `crates/axiomdb-sql/tests/integration_jsonb_path_ops.rs`.
+
+Punto importante del cierre:
+
+- El stripping de comentarios `#` queda acotado a inicio de linea para no
+  romper los operadores `#>`, `#>>`, `#-` ni los literales JSON que contienen
+  `#`.
+- La dependencia historica de `TEXT[]` se elimina de la documentacion de
+  roadmap para esta subfase; el contrato aceptado es JSONB-array RHS.
+
+Validacion de cierre:
+
+- `cargo test -p axiomdb-sql --test integration_jsonb_path_ops` - paso, 10/10.
+- `tools/wire-test.py` - paso.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+- `cargo fmt --check` - paso.
+
 ## 11.2d BLOB reference tracking - cerrada 2026-04-10
 
 La subfase 11.2d agrega un formato versionado para cadenas TOAST/BLOB
@@ -258,8 +302,7 @@ PASSING sobre la row-path (11.20d).
 ### Validacion
 
 - `cargo test -p axiomdb-sql --test integration_json_table` — 16/16 OK.
-- `cargo test -p axiomdb-sql` — sin regresion (los 8 failures de
-  `integration_jsonb_path_ops` son gap 11.18c pre-existente).
+- `cargo test -p axiomdb-sql` — sin regresion.
 - `cargo clippy -p axiomdb-sql --lib -- -D warnings` — limpio.
 - `cargo fmt --check` — limpio.
 - `tools/wire-test.py` — 367/367 OK (incluye 6 nuevas aserciones JSON_TABLE).
