@@ -746,6 +746,13 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
             expr_has_outer_column_refs(left) || expr_has_outer_column_refs(right)
         }
         Expr::Function { args, .. } => args.iter().any(expr_has_outer_column_refs),
+        Expr::Window { spec, .. } => {
+            spec.partition_by.iter().any(expr_has_outer_column_refs)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| expr_has_outer_column_refs(&item.expr))
+        }
         Expr::Case {
             operand,
             when_thens,
@@ -827,6 +834,16 @@ pub fn outer_column_idx(expr: &crate::expr::Expr) -> Option<usize> {
             outer_column_idx(left).or_else(|| outer_column_idx(right))
         }
         Expr::Function { args, .. } => args.iter().find_map(outer_column_idx),
+        Expr::Window { spec, .. } => {
+            spec.partition_by
+                .iter()
+                .find_map(outer_column_idx)
+                .or_else(|| {
+                    spec.order_by
+                        .iter()
+                        .find_map(|item| outer_column_idx(&item.expr))
+                })
+        }
         Expr::Case {
             operand,
             when_thens,
@@ -942,6 +959,13 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
             doc_has_column_refs(left) || doc_has_column_refs(right)
         }
         Expr::Function { args, .. } => args.iter().any(doc_has_column_refs),
+        Expr::Window { spec, .. } => {
+            spec.partition_by.iter().any(doc_has_column_refs)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| doc_has_column_refs(&item.expr))
+        }
         Expr::Case {
             operand,
             when_thens,

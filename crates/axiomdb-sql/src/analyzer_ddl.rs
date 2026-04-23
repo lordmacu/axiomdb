@@ -746,6 +746,9 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
         Expr::Grouping { .. } => Err(DbError::NotImplemented {
             feature: "GROUPING() is not allowed in index expression".into(),
         }),
+        Expr::Window { .. } => Err(DbError::NotImplemented {
+            feature: "window function is not allowed in index expression".into(),
+        }),
         Expr::Param { .. } => Err(DbError::NotImplemented {
             feature: "prepared parameter is not allowed in index expression".into(),
         }),

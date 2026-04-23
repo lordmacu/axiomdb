@@ -553,6 +553,8 @@ fn analyze_select_with_outer(
     }
     s.columns = resolved_cols;
 
+    validate_window_usage(&s)?;
+
     // Post-pass: populate universe_indices on every GROUPING() call in HAVING,
     // SELECT list, and ORDER BY — all resolved now.
     if let GroupByClause::Sets { ref universe, .. } = s.group_by {
@@ -624,6 +626,334 @@ fn expr_column_idx(expr: &Expr) -> Option<usize> {
     }
 }
 
+fn validate_window_usage(stmt: &SelectStmt) -> Result<(), DbError> {
+    let any_windows = stmt.columns.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => expr_contains_window(expr),
+        _ => false,
+    }) || stmt
+        .where_clause
+        .as_ref()
+        .map(expr_contains_window)
+        .unwrap_or(false)
+        || stmt.group_by.exprs().iter().any(expr_contains_window)
+        || stmt
+            .having
+            .as_ref()
+            .map(expr_contains_window)
+            .unwrap_or(false)
+        || stmt.order_by.iter().any(|item| expr_contains_window(&item.expr))
+        || stmt.distinct_on.iter().any(expr_contains_window)
+        || stmt.joins.iter().any(|join| match &join.condition {
+            JoinCondition::On(expr) => expr_contains_window(expr),
+            JoinCondition::Using(_) => false,
+        });
+
+    if !any_windows {
+        return Ok(());
+    }
+
+    if stmt.distinct || !stmt.distinct_on.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "window functions with DISTINCT/DISTINCT ON".into(),
+        });
+    }
+
+    if !stmt.joins.is_empty() {
+        return Err(DbError::NotImplemented {
+            feature: "window functions on joined SELECTs".into(),
+        });
+    }
+
+    if !stmt.group_by.is_empty() || stmt.having.is_some() {
+        return Err(DbError::NotImplemented {
+            feature: "window functions with GROUP BY/HAVING".into(),
+        });
+    }
+
+    if let Some(expr) = &stmt.where_clause {
+        if expr_contains_window(expr) {
+            return Err(DbError::NotImplemented {
+                feature: "window functions in WHERE".into(),
+            });
+        }
+    }
+    for expr in stmt.group_by.exprs() {
+        if expr_contains_window(expr) {
+            return Err(DbError::NotImplemented {
+                feature: "window functions in GROUP BY".into(),
+            });
+        }
+    }
+    if let Some(expr) = &stmt.having {
+        if expr_contains_window(expr) {
+            return Err(DbError::NotImplemented {
+                feature: "window functions in HAVING".into(),
+            });
+        }
+    }
+    for item in &stmt.order_by {
+        if expr_contains_window(&item.expr) {
+            return Err(DbError::NotImplemented {
+                feature: "window functions in ORDER BY".into(),
+            });
+        }
+    }
+    for expr in &stmt.distinct_on {
+        if expr_contains_window(expr) {
+            return Err(DbError::NotImplemented {
+                feature: "window functions in DISTINCT ON".into(),
+            });
+        }
+    }
+    for join in &stmt.joins {
+        if let JoinCondition::On(expr) = &join.condition {
+            if expr_contains_window(expr) {
+                return Err(DbError::NotImplemented {
+                    feature: "window functions in JOIN conditions".into(),
+                });
+            }
+        }
+    }
+
+    for item in &stmt.columns {
+        let SelectItem::Expr { expr, .. } = item else {
+            continue;
+        };
+        match expr {
+            Expr::Window { spec, .. } => validate_window_spec(spec)?,
+            other if expr_contains_window(other) => {
+                return Err(DbError::NotImplemented {
+                    feature: "window functions nested inside other SELECT expressions".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_window_spec(spec: &crate::ast::WindowSpec) -> Result<(), DbError> {
+    for expr in &spec.partition_by {
+        if expr_contains_window(expr) {
+            return Err(DbError::NotImplemented {
+                feature: "nested window functions in PARTITION BY".into(),
+            });
+        }
+        if expr_contains_aggregate(expr) {
+            return Err(DbError::NotImplemented {
+                feature: "aggregate expressions in PARTITION BY".into(),
+            });
+        }
+    }
+    for item in &spec.order_by {
+        if expr_contains_window(&item.expr) {
+            return Err(DbError::NotImplemented {
+                feature: "nested window functions in window ORDER BY".into(),
+            });
+        }
+        if expr_contains_aggregate(&item.expr) {
+            return Err(DbError::NotImplemented {
+                feature: "aggregate expressions in window ORDER BY".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn expr_contains_window(expr: &Expr) -> bool {
+    match expr {
+        Expr::Window { .. } => true,
+        Expr::UnaryOp { operand, .. }
+        | Expr::IsNull { expr: operand, .. }
+        | Expr::IsBoolean { expr: operand, .. }
+        | Expr::Cast { expr: operand, .. } => expr_contains_window(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_window(left) || expr_contains_window(right)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_contains_window(expr)
+                || expr_contains_window(low)
+                || expr_contains_window(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_window(expr)
+                || expr_contains_window(pattern)
+                || escape
+                    .as_deref()
+                    .map(expr_contains_window)
+                    .unwrap_or(false)
+        }
+        Expr::In { expr, list, .. } => {
+            expr_contains_window(expr) || list.iter().any(expr_contains_window)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_window),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .map(expr_contains_window)
+                .unwrap_or(false)
+                || when_thens
+                    .iter()
+                    .any(|(when, then)| expr_contains_window(when) || expr_contains_window(then))
+                || else_result
+                    .as_deref()
+                    .map(expr_contains_window)
+                    .unwrap_or(false)
+        }
+        Expr::GroupConcat { expr, order_by, .. } => {
+            expr_contains_window(expr)
+                || order_by.iter().any(|(expr, _)| expr_contains_window(expr))
+        }
+        Expr::Grouping { args, .. } => args.iter().any(expr_contains_window),
+        Expr::SqlJsonQuery {
+            doc,
+            passing,
+            on_empty,
+            on_error,
+            ..
+        } => {
+            expr_contains_window(doc)
+                || passing.iter().any(|(expr, _)| expr_contains_window(expr))
+                || on_behavior_contains_window(on_empty)
+                || on_behavior_contains_window(on_error)
+        }
+        Expr::InSubquery { expr, .. } => expr_contains_window(expr),
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
+        | Expr::Default
+        | Expr::Param { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists { .. } => false,
+    }
+}
+
+fn on_behavior_contains_window(behavior: &crate::expr::SqlJsonOnBehavior) -> bool {
+    match behavior {
+        crate::expr::SqlJsonOnBehavior::Default(expr) => expr_contains_window(expr),
+        _ => false,
+    }
+}
+
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::GroupConcat { .. } => true,
+        Expr::Function { name, .. } if is_aggregate_name(name) => true,
+        Expr::UnaryOp { operand, .. }
+        | Expr::IsNull { expr: operand, .. }
+        | Expr::IsBoolean { expr: operand, .. }
+        | Expr::Cast { expr: operand, .. } => expr_contains_aggregate(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_contains_aggregate(expr)
+                || expr_contains_aggregate(low)
+                || expr_contains_aggregate(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_aggregate(expr)
+                || expr_contains_aggregate(pattern)
+                || escape
+                    .as_deref()
+                    .map(expr_contains_aggregate)
+                    .unwrap_or(false)
+        }
+        Expr::In { expr, list, .. } => {
+            expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_aggregate),
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .map(expr_contains_aggregate)
+                .unwrap_or(false)
+                || when_thens.iter().any(|(when, then)| {
+                    expr_contains_aggregate(when) || expr_contains_aggregate(then)
+                })
+                || else_result
+                    .as_deref()
+                    .map(expr_contains_aggregate)
+                    .unwrap_or(false)
+        }
+        Expr::Window { spec, .. } => {
+            spec.partition_by.iter().any(expr_contains_aggregate)
+                || spec.order_by.iter().any(|item| expr_contains_aggregate(&item.expr))
+        }
+        Expr::Grouping { .. } => false,
+        Expr::SqlJsonQuery {
+            doc,
+            passing,
+            on_empty,
+            on_error,
+            ..
+        } => {
+            expr_contains_aggregate(doc)
+                || passing.iter().any(|(expr, _)| expr_contains_aggregate(expr))
+                || on_behavior_contains_aggregate(on_empty)
+                || on_behavior_contains_aggregate(on_error)
+        }
+        Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
+        | Expr::Default
+        | Expr::Param { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists { .. } => false,
+    }
+}
+
+fn on_behavior_contains_aggregate(behavior: &crate::expr::SqlJsonOnBehavior) -> bool {
+    match behavior {
+        crate::expr::SqlJsonOnBehavior::Default(expr) => expr_contains_aggregate(expr),
+        _ => false,
+    }
+}
+
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count"
+            | "sum"
+            | "min"
+            | "max"
+            | "avg"
+            | "count_distinct"
+            | "sum_distinct"
+            | "avg_distinct"
+            | "jsonb_agg"
+            | "json_agg"
+            | "json_arrayagg"
+            | "jsonb_object_agg"
+            | "json_object_agg"
+            | "json_objectagg"
+    )
+}
+
 /// Recursively walks `expr` and fills in `universe_indices` on every
 /// `Expr::Grouping` node by matching each argument against the `universe`
 /// list from `GroupByClause::Sets`.
@@ -667,6 +997,14 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         }
         Expr::Function { args, .. } => {
             for a in args { populate_grouping_indices(a, universe); }
+        }
+        Expr::Window { spec, .. } => {
+            for e in &mut spec.partition_by {
+                populate_grouping_indices(e, universe);
+            }
+            for item in &mut spec.order_by {
+                populate_grouping_indices(&mut item.expr, universe);
+            }
         }
         Expr::Case { operand, when_thens, else_result } => {
             if let Some(op) = operand { populate_grouping_indices(op, universe); }

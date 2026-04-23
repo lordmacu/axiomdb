@@ -36,10 +36,10 @@ use axiomdb_core::error::DbError;
 use axiomdb_types::{DataType, Value};
 
 use crate::{
-    ast::SortOrder,
+    ast::{OrderByItem, SortOrder, WindowSpec},
     expr::{
         BinaryOp, Expr, SqlJsonOnBehavior, SqlJsonPathMode, SqlJsonQueryKind, SqlJsonQuotes,
-        SqlJsonWrapper, UnaryOp,
+        SqlJsonWrapper, UnaryOp, WindowFunc,
     },
     lexer::Token,
 };
@@ -948,14 +948,134 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             }
         }
         p.expect(&Token::RParen)?;
-        return Ok(Expr::Function {
+        let function_expr = Expr::Function {
             name: name.to_ascii_lowercase(),
             args,
-        });
+        };
+        if p.eat(&Token::Over) {
+            return parse_window_call(p, function_expr);
+        }
+        return Ok(function_expr);
     }
 
     // Plain column reference
     Ok(Expr::Column { col_idx: 0, name })
+}
+
+fn parse_window_call(p: &mut Parser, function_expr: Expr) -> Result<Expr, DbError> {
+    let (func, func_name) = match function_expr {
+        Expr::Function { ref name, ref args } if name.eq_ignore_ascii_case("row_number") => {
+            if !args.is_empty() {
+                return Err(DbError::ParseError {
+                    message: "ROW_NUMBER() does not take arguments".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            (WindowFunc::RowNumber, "ROW_NUMBER")
+        }
+        Expr::Function { ref name, ref args } if name.eq_ignore_ascii_case("rank") => {
+            if !args.is_empty() {
+                return Err(DbError::ParseError {
+                    message: "RANK() does not take arguments".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            (WindowFunc::Rank, "RANK")
+        }
+        Expr::Function { ref name, ref args } if name.eq_ignore_ascii_case("dense_rank") => {
+            if !args.is_empty() {
+                return Err(DbError::ParseError {
+                    message: "DENSE_RANK() does not take arguments".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            (WindowFunc::DenseRank, "DENSE_RANK")
+        }
+        Expr::Function { name, .. } => {
+            return Err(DbError::NotImplemented {
+                feature: format!("window function `{name}` — ranking MVP only"),
+            });
+        }
+        _ => {
+            return Err(DbError::ParseError {
+                message: "OVER can only follow a function call".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+    };
+
+    p.expect(&Token::LParen)?;
+
+    let mut partition_by = Vec::new();
+    if p.eat(&Token::Partition) {
+        p.expect(&Token::By)?;
+        loop {
+            partition_by.push(parse_expr(p)?);
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+    }
+
+    let mut order_by = Vec::new();
+    if p.eat(&Token::Order) {
+        p.expect(&Token::By)?;
+        order_by.push(parse_window_order_item(p)?);
+        while p.eat(&Token::Comma) {
+            order_by.push(parse_window_order_item(p)?);
+        }
+    }
+
+    if order_by.is_empty() {
+        return Err(DbError::ParseError {
+            message: format!("{func_name}() OVER (...) requires ORDER BY"),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    if matches!(p.peek(), Token::Rows)
+        || matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("RANGE") || s.eq_ignore_ascii_case("GROUPS"))
+    {
+        return Err(DbError::NotImplemented {
+            feature: "window frame clauses — ranking MVP only".into(),
+        });
+    }
+
+    p.expect(&Token::RParen)?;
+
+    Ok(Expr::Window {
+        func,
+        spec: WindowSpec {
+            partition_by,
+            order_by,
+        },
+    })
+}
+
+fn parse_window_order_item(p: &mut Parser) -> Result<OrderByItem, DbError> {
+    let expr = parse_expr(p)?;
+    let order = if p.eat(&Token::Asc) {
+        SortOrder::Asc
+    } else if p.eat(&Token::Desc) {
+        SortOrder::Desc
+    } else {
+        SortOrder::Asc
+    };
+    let nulls = if p.eat(&Token::Nulls) {
+        if p.eat(&Token::First) {
+            Some(crate::ast::NullsOrder::First)
+        } else if p.eat(&Token::Last) {
+            Some(crate::ast::NullsOrder::Last)
+        } else {
+            return Err(DbError::ParseError {
+                message: "expected FIRST or LAST after NULLS".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+    } else {
+        None
+    };
+    Ok(OrderByItem { expr, order, nulls })
 }
 
 /// Parses the type argument for `CONVERT(expr, type)` — MySQL-specific type names

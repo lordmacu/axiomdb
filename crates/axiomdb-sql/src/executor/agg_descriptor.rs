@@ -38,6 +38,10 @@ fn contains_aggregate(expr: &Expr) -> bool {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
         Expr::Function { args, .. } => args.iter().any(contains_aggregate),
+        Expr::Window { spec, .. } => {
+            spec.partition_by.iter().any(contains_aggregate)
+                || spec.order_by.iter().any(|item| contains_aggregate(&item.expr))
+        }
         Expr::Case {
             operand,
             when_thens,
@@ -305,6 +309,14 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         Expr::Function { args, .. } => {
             for a in args {
                 collect_agg_exprs_from(a, result);
+            }
+        }
+        Expr::Window { spec, .. } => {
+            for e in &spec.partition_by {
+                collect_agg_exprs_from(e, result);
+            }
+            for item in &spec.order_by {
+                collect_agg_exprs_from(&item.expr, result);
             }
         }
         Expr::Case {

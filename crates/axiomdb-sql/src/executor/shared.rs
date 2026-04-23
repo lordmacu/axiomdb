@@ -234,6 +234,14 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 collect_column_refs(a, mask);
             }
         }
+        Expr::Window { spec, .. } => {
+            for e in &spec.partition_by {
+                collect_column_refs(e, mask);
+            }
+            for item in &spec.order_by {
+                collect_column_refs(&item.expr, mask);
+            }
+        }
         Expr::Case {
             operand,
             when_thens,
@@ -356,6 +364,7 @@ fn infer_expr_type(expr: &Expr, columns: &[CatalogColumnDef]) -> (DataType, bool
                 (DataType::Text, true)
             }
         }
+        Expr::Window { .. } => (DataType::BigInt, false),
         _ => (DataType::Text, true),
     }
 }
@@ -367,7 +376,183 @@ fn expr_column_name(expr: &Expr, alias: Option<&str>) -> String {
     }
     match expr {
         Expr::Column { name, .. } => name.clone(),
+        Expr::Window { func, .. } => match func {
+            crate::expr::WindowFunc::RowNumber => "row_number".into(),
+            crate::expr::WindowFunc::Rank => "rank".into(),
+            crate::expr::WindowFunc::DenseRank => "dense_rank".into(),
+        },
         _ => "?column?".to_string(),
+    }
+}
+
+fn select_items_have_window_functions(items: &[SelectItem]) -> bool {
+    items.iter().any(|item| matches!(
+        item,
+        SelectItem::Expr {
+            expr: Expr::Window { .. },
+            ..
+        }
+    ))
+}
+
+fn project_rows_with_window_support<E>(
+    items: &[SelectItem],
+    combined_rows: &[Row],
+    mut eval_expr: E,
+) -> Result<Vec<Row>, DbError>
+where
+    E: FnMut(&Expr, &[Value]) -> Result<Value, DbError>,
+{
+    let mut window_values: Vec<Option<Vec<Value>>> = vec![None; items.len()];
+    for (idx, item) in items.iter().enumerate() {
+        let SelectItem::Expr {
+            expr: Expr::Window { func, spec },
+            ..
+        } = item
+        else {
+            continue;
+        };
+        window_values[idx] = Some(compute_window_values(*func, spec, combined_rows, &mut eval_expr)?);
+    }
+
+    let mut rows = Vec::with_capacity(combined_rows.len());
+    for (row_idx, values) in combined_rows.iter().enumerate() {
+        let mut out = Vec::new();
+        for (item_idx, item) in items.iter().enumerate() {
+            match item {
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => out.extend_from_slice(values),
+                SelectItem::Expr { expr, .. } => {
+                    if let Some(cache) = &window_values[item_idx] {
+                        out.push(cache[row_idx].clone());
+                    } else {
+                        out.push(eval_expr(expr, values)?);
+                    }
+                }
+            }
+        }
+        rows.push(out);
+    }
+
+    Ok(rows)
+}
+
+#[derive(Clone)]
+struct WindowEntry {
+    row_idx: usize,
+    partition_keys: Vec<Value>,
+    order_keys: Vec<Value>,
+}
+
+fn compute_window_values<E>(
+    func: crate::expr::WindowFunc,
+    spec: &crate::ast::WindowSpec,
+    combined_rows: &[Row],
+    eval_expr: &mut E,
+) -> Result<Vec<Value>, DbError>
+where
+    E: FnMut(&Expr, &[Value]) -> Result<Value, DbError>,
+{
+    let mut entries = Vec::with_capacity(combined_rows.len());
+    for (row_idx, row) in combined_rows.iter().enumerate() {
+        let mut partition_keys = Vec::with_capacity(spec.partition_by.len());
+        for expr in &spec.partition_by {
+            partition_keys.push(eval_expr(expr, row)?);
+        }
+        let mut order_keys = Vec::with_capacity(spec.order_by.len());
+        for item in &spec.order_by {
+            order_keys.push(eval_expr(&item.expr, row)?);
+        }
+        entries.push(WindowEntry {
+            row_idx,
+            partition_keys,
+            order_keys,
+        });
+    }
+
+    entries.sort_by(|a, b| compare_window_entries(a, b, spec));
+
+    let mut out = vec![Value::Null; combined_rows.len()];
+    let mut partition_start = 0usize;
+    while partition_start < entries.len() {
+        let mut partition_end = partition_start + 1;
+        while partition_end < entries.len()
+            && partition_keys_equal(
+                &entries[partition_start].partition_keys,
+                &entries[partition_end].partition_keys,
+            )
+        {
+            partition_end += 1;
+        }
+
+        let mut dense_rank = 1i64;
+        let mut previous_order_keys: Option<&[Value]> = None;
+        let mut current_rank = 1i64;
+        for (offset, entry) in entries[partition_start..partition_end].iter().enumerate() {
+            let row_number = (offset + 1) as i64;
+            let order_changed = previous_order_keys
+                .map(|prev| !partition_keys_equal(prev, &entry.order_keys))
+                .unwrap_or(true);
+            if order_changed {
+                current_rank = row_number;
+                if previous_order_keys.is_some() {
+                    dense_rank += 1;
+                }
+                previous_order_keys = Some(&entry.order_keys);
+            }
+
+            let value = match func {
+                crate::expr::WindowFunc::RowNumber => row_number,
+                crate::expr::WindowFunc::Rank => current_rank,
+                crate::expr::WindowFunc::DenseRank => dense_rank,
+            };
+            out[entry.row_idx] = Value::BigInt(value);
+        }
+
+        partition_start = partition_end;
+    }
+
+    Ok(out)
+}
+
+fn compare_window_entries(
+    left: &WindowEntry,
+    right: &WindowEntry,
+    spec: &crate::ast::WindowSpec,
+) -> std::cmp::Ordering {
+    for (a, b) in left.partition_keys.iter().zip(&right.partition_keys) {
+        let ord = compare_partition_values(a, b);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    for ((a, b), item) in left
+        .order_keys
+        .iter()
+        .zip(&right.order_keys)
+        .zip(&spec.order_by)
+    {
+        let ord = compare_sort_values(a, b, item.order, item.nulls);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    left.row_idx.cmp(&right.row_idx)
+}
+
+fn partition_keys_equal(left: &[Value], right: &[Value]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| compare_partition_values(a, b) == std::cmp::Ordering::Equal)
+}
+
+fn compare_partition_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        _ => compare_non_null_for_sort(left, right),
     }
 }
 
@@ -406,6 +591,7 @@ fn build_select_column_meta(
 }
 
 /// Projects a row through a SELECT item list (no subquery support).
+#[allow(dead_code)]
 fn project_row(items: &[SelectItem], values: &[Value]) -> Result<Row, DbError> {
     project_row_with(items, values, &mut crate::eval::NoSubquery)
 }
@@ -416,6 +602,7 @@ fn project_row(items: &[SelectItem], values: &[Value]) -> Result<Row, DbError> {
 /// (e.g., `(SELECT COUNT(*) FROM orders WHERE user_id = u.id)`) are executed
 /// via `sq`. Performance identical to `project_row` when using [`NoSubquery`]
 /// due to monomorphization.
+#[allow(dead_code)]
 fn project_row_with<R: SubqueryRunner>(
     items: &[SelectItem],
     values: &[Value],

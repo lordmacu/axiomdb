@@ -185,6 +185,14 @@ fn execute_select_ctx(
                         collect_expr_columns(arg, mask);
                     }
                 }
+                crate::expr::Expr::Window { spec, .. } => {
+                    for expr in &spec.partition_by {
+                        collect_expr_columns(expr, mask);
+                    }
+                    for item in &spec.order_by {
+                        collect_expr_columns(&item.expr, mask);
+                    }
+                }
                 // GROUP_CONCAT has its own expression + ORDER BY expressions inside it.
                 // These must be included in the mask so the referenced columns are decoded.
                 crate::expr::Expr::GroupConcat { expr, order_by, .. } => {
@@ -734,8 +742,7 @@ fn execute_select_ctx(
         let mut proj_in_set_ctx: InSetCache = HashMap::new();
         let mut proj_corr_ctx: CorrelatedCache = HashMap::new();
         let mut proj_mat_ctx: MaterializedCache = HashMap::new();
-        let mut rows: Vec<Row> = Vec::with_capacity(combined_rows.len());
-        for v in &combined_rows {
+        let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, v| {
             let mut runner = ExecSubqueryRunner {
                 storage: exec_ctx.storage(),
                 txn: exec_ctx.coord(),
@@ -747,8 +754,8 @@ fn execute_select_ctx(
                 correlated_cache: Some(&mut proj_corr_ctx),
                 materialized: Some(&mut proj_mat_ctx),
             };
-            rows.push(project_row_with(&stmt.columns, v, &mut runner)?);
-        }
+            eval_with(expr, v, &mut runner)
+        })?;
 
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);

@@ -1,5 +1,21 @@
 # Lessons Learned
 
+## 2026-04-23 - Phase 13.2
+
+- **A real MVP for window functions starts with ranking, not with the full SQL
+  catalog.** `ROW_NUMBER` / `RANK` / `DENSE_RANK` unlock useful behavior while
+  keeping the executor shape tractable; adding `LAG`, `LEAD`, frames, and
+  aggregate windows in the same cut would have forced a much broader pipeline
+  redesign.
+- **Window semantics leak into analyzer boundaries immediately.** If the
+  analyzer does not reject windows in `WHERE`, `HAVING`, nested expressions, or
+  grouped queries, those cases silently fall through to scalar `eval()` and
+  fail in confusing ways later.
+- **Final query sort order and window sort order must be tested separately.**
+  The easiest incorrect implementation is to reuse the final `ORDER BY` for the
+  window ranking pass; dedicated tests that keep `OVER (...) ORDER BY ...` and
+  the outer `ORDER BY` different catch that bug fast.
+
 ## 2026-04-22 - Phase 13.1
 
 - **Do not wait for regular views if the roadmap item is physically

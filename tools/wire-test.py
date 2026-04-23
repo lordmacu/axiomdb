@@ -30,7 +30,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              21.23 (advanced SQL acceptance smoke),
              21.24 (ORM compatibility tier 2 smoke),
              21.25 (PIVOT smoke),
-             13.1 (materialized views smoke)
+             13.1 (materialized views smoke),
+             13.2 (window functions smoke)
 """
 import os
 import signal
@@ -4045,6 +4046,32 @@ cur.execute("SHOW FULL TABLES")
 rows = cur.fetchall()
 ok("[13.1 materialized views] SHOW FULL TABLES exposes MATERIALIZED VIEW type",
    any(row[0] == "mv13_region_totals" and row[1] == "MATERIALIZED VIEW" for row in rows),
+   rows)
+
+# ── Phase 13.2 — Window functions ────────────────────────────────────────────
+
+print("\n[13.2 window functions]")
+
+cur.execute("CREATE TABLE wf13_scores (id INT PRIMARY KEY, team TEXT, points INT)")
+cur.execute(
+    "INSERT INTO wf13_scores VALUES "
+    "(1, 'a', 10), "
+    "(2, 'a', 10), "
+    "(3, 'a', 5), "
+    "(4, 'b', 7)"
+)
+conn.commit()
+
+cur.execute(
+    "SELECT id, "
+    "ROW_NUMBER() OVER (ORDER BY points DESC) AS rn, "
+    "RANK() OVER (PARTITION BY team ORDER BY points DESC) AS rk, "
+    "DENSE_RANK() OVER (PARTITION BY team ORDER BY points DESC) AS dr "
+    "FROM wf13_scores ORDER BY id"
+)
+rows = cur.fetchall()
+ok("[13.2 window functions] ranking windows materialize with independent final ORDER BY",
+   rows == ((1, 1, 1, 1), (2, 2, 1, 1), (3, 4, 3, 2), (4, 3, 1, 1)),
    rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────

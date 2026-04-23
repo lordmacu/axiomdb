@@ -232,6 +232,15 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
         Expr::Function { args, .. } => args
             .iter()
             .any(|e| expr_mentions_column_name(e, target_name)),
+        Expr::Window { spec, .. } => {
+            spec.partition_by
+                .iter()
+                .any(|e| expr_mentions_column_name(e, target_name))
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| expr_mentions_column_name(&item.expr, target_name))
+        }
         Expr::Case {
             operand,
             when_thens,

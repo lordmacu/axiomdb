@@ -230,6 +230,9 @@ fn validate_generated_expr_refs(
             }
             Ok(())
         }
+        Expr::Window { .. } => Err(DbError::NotImplemented {
+            feature: "window functions in generated columns".into(),
+        }),
         Expr::Case {
             operand,
             when_thens,
