@@ -2,17 +2,17 @@
 
 ## Current (2026-04-22)
 
-**Active phase:** Phase 11 — Advanced Types
-**Active subphase:** Phase 11 active — `11.18c` JSONB path operators closed.
-`#>`, `#>>`, and `#-` are now recorded as a closed follow-up with the real
-AxiomDB contract: RHS uses a JSONB string/number array path instead of native
-PostgreSQL `TEXT[]`. The closeout aligns docs/specs around that divergence,
-keeps the lexer `#` comment rule compatible with the operators, and leaves
-`11.21h` as the next JSON follow-up.
+**Active phase:** Phase 13 — Advanced PostgreSQL
+**Active subphase:** Phase 11 complete — `11.21h` JSONPath planner pushdown closed.
+Simple JSONPath predicates on JSONB columns (`doc @? '$.k'`, `doc @@ '$.flag'`)
+now plan as `GinScan` against the existing `jsonb_ops`-style GIN index when a
+matching index exists, while keeping full predicate recheck in the executor.
+This closes the remaining Phase 11 parity follow-up; `jsonb_path_ops` remains
+explicitly deferred as future index work, not part of the 11.21h cut.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_jsonb_path_ops`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_jsonpath_planner_pushdown`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 11.21h JSONPath planner pushdown.
+**Next:** Phase 13.1 Materialized views.
 
 ### Phase 21 subphase status
 
@@ -56,10 +56,10 @@ keeps the lexer `#` comment rule compatible with the operators, and leaves
 | 11.20d2 `JSON_TABLE` first FROM + CROSS/OUTER APPLY | ✅ closed |
 | 11.20d3 `JSON_TABLE` LATERAL-correlated doc + PASSING | ✅ closed |
 | **11.20d4** `JSON_TABLE` as UPDATE/DELETE source | ✅ closed — **Phase 11.20 COMPLETE** |
-| 11.21a–g JSONPath parity | ✅ closed (through path arithmetic in filters) — 11.21h pending planner pushdown |
+| 11.21a–h JSONPath parity + planner pushdown | ✅ closed — simple `@?` / `@@` key probes now use GIN with executor recheck |
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
-| 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c catalog persistence pending |
-| 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed — 11.24c dot-notation pending |
+| 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c moved to `features-roadmap.md` (Oracle-only DDL) |
+| 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed — 11.24c moved to `features-roadmap.md` (Oracle-only dot notation) |
 | **11.25** JSON SRF + aggregates + construction helpers (PG streaming parity) | ✅ complete — 11.25a ✅ 11.25b ✅ 11.25c ✅ 11.25d ✅ |
 
 ### 11.20 follow-ups

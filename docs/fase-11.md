@@ -1,5 +1,54 @@
 # Fase 11 - Robustness and indexes
 
+## 11.21h JSONPath planner pushdown - cerrada 2026-04-22
+
+La subfase 11.21h cierra el ultimo follow-up real de paridad JSON de la Fase
+11: el planner ahora sabe reutilizar el GIN JSONB ya existente para un corte
+acotado de predicados JSONPath, en vez de forzar full scan siempre que aparecia
+`@?` o `@@`.
+
+Comportamiento cerrado:
+
+- `doc @? '$.k'` usa `GinScan` cuando existe un indice `USING GIN (doc)` y la
+  ruta es un literal simple de clave top-level.
+- `doc @@ '$.flag'` usa el mismo probe por clave top-level, pero mantiene
+  recheck completo del predicado original, asi que `{"flag":false}` no se
+  cuela aunque el indice si devuelva el candidato por presencia de la clave.
+- `EXPLAIN` reporta `type = gin` y `Using GIN index; Using where` para esos
+  casos simples.
+- Rutas mas ricas siguen fuera del pushdown en esta subfase: `$.a.b`,
+  arrays, filtros, accessors `.size()` / `.type()`, aritmetica, PASSING y
+  formas `jsonb_path_exists(...)` / `jsonb_path_match(...)`.
+
+Componentes relevantes:
+
+- Planner: `crates/axiomdb-sql/src/planner_select.rs`.
+- Cobertura dedicada:
+  `crates/axiomdb-sql/tests/integration_jsonpath_planner_pushdown.rs`.
+- Smoke wire:
+  `tools/wire-test.py` (`[11.21h JSONPath planner pushdown]`).
+
+Punto importante del cierre:
+
+- El recorte correcto fue extender el `jsonb_ops` GIN existente, no abrir en
+  esta subfase una opclass nueva `jsonb_path_ops`.
+- La correccion semantica sigue descansando en el recheck del executor. El
+  planner solo extrae el probe por clave (`gin_key_term`) para rutas literales
+  `$.key` simples.
+
+Validacion de cierre:
+
+- `cargo test -p axiomdb-sql --test integration_jsonpath_planner_pushdown` -
+  paso, 5/5.
+- `tools/wire-test.py` - paso, 442/442.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+- `cargo fmt --check` - paso.
+
+Con esto queda cerrada la Fase 11 en la ruta MySQL+PG. Lo que sigue en
+`11.23c` y `11.24c` ya no bloquea esa paridad porque se movio a
+`features-roadmap.md` como superficie Oracle-only.
+
 ## 11.18c JSONB path operators - cerrada 2026-04-22
 
 La subfase 11.18c queda cerrada como follow-up de paridad PostgreSQL para los

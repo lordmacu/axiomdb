@@ -1,5 +1,19 @@
 # Architecture Notes
 
+## 2026-04-22 - JSONPath planner pushdown (11.21h)
+
+- **Planner extraction is intentionally narrower than JSONPath execution.**
+  `plan_gin_scan` now recognizes only literal top-level `$.key` probes from
+  `@?` / `@@`; everything richer keeps the existing scan path. False negatives
+  are acceptable here, false positives without recheck are not.
+- **`@@` can reuse the same GIN key probe only because executor recheck stays
+  mandatory.** A row like `{"flag":false}` still contains the key term
+  `"flag"`, so the planner may use GIN to find candidates, but the original
+  JSONPath predicate must still run on each row to preserve semantics.
+- **`11.21h` extends `jsonb_ops`; it does not add `jsonb_path_ops`.** The
+  delivered cut reuses the existing key-term encoding and GIN access method
+  rather than changing index opclasses, catalog metadata, or on-disk storage.
+
 ## 2026-04-22 - JSONB path operators (11.18c)
 
 - **`11.18c` closes on JSONB-array paths, not native SQL arrays.** The engine

@@ -203,6 +203,8 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
     enum GinProbe {
         Contains,
         Exists,
+        JsonPathExists,
+        JsonPathMatch,
     }
 
     let (probe, col_name, literal) = match expr {
@@ -220,6 +222,26 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
             right,
         } => match (left.as_ref(), right.as_ref()) {
             (Expr::Column { name, .. }, Expr::Literal(v)) => (GinProbe::Exists, name.as_str(), v),
+            _ => return None,
+        },
+        Expr::BinaryOp {
+            op: BinaryOp::JsonbPathExists,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { name, .. }, Expr::Literal(v)) => {
+                (GinProbe::JsonPathExists, name.as_str(), v)
+            }
+            _ => return None,
+        },
+        Expr::BinaryOp {
+            op: BinaryOp::JsonbPathMatch,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { name, .. }, Expr::Literal(v)) => {
+                (GinProbe::JsonPathMatch, name.as_str(), v)
+            }
             _ => return None,
         },
         _ => return None,
@@ -248,6 +270,10 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
             Value::Text(s) | Value::Json(s) => vec![axiomdb_types::jsonb::gin_key_term(s)],
             _ => return None,
         },
+        GinProbe::JsonPathExists | GinProbe::JsonPathMatch => {
+            let key = extract_simple_jsonpath_key(literal)?;
+            vec![axiomdb_types::jsonb::gin_key_term(&key)]
+        }
     };
 
     // An empty query (`col @> '{}'`) is always true — no index help possible.
@@ -259,6 +285,24 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
         index_def: gin_idx.clone(),
         query_terms,
     })
+}
+
+fn extract_simple_jsonpath_key(literal: &Value) -> Option<String> {
+    let path = match literal {
+        Value::Text(s) | Value::Json(s) => s.trim(),
+        _ => return None,
+    };
+    let key = path.strip_prefix("$.")?;
+    if key.is_empty() {
+        return None;
+    }
+    if key
+        .chars()
+        .any(|ch| matches!(ch, '.' | '[' | ']' | '(' | ')' | '*' | '?' | ' ' | '\t' | '\n' | '\r'))
+    {
+        return None;
+    }
+    Some(key.to_string())
 }
 
 // ── Index-only scan coverage (Phase 6.13) ────────────────────────────────────
