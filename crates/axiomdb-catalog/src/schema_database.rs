@@ -61,19 +61,25 @@ pub const DEFAULT_DATABASE_NAME: &str = "axiomdb";
 /// Metadata for a logical database — one row in `axiom_databases`.
 ///
 /// ## On-disk format
-/// `[name_len:1][name UTF-8]`
+/// v0: `[name_len:1][name UTF-8]`
+/// v1: v0 + `[collation_len:1][collation UTF-8]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseDef {
     pub name: String,
+    pub default_collation: Option<String>,
 }
 
 impl DatabaseDef {
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
+        let collation = self.default_collation.as_deref().unwrap_or("").as_bytes();
         debug_assert!(name.len() <= 255, "database name too long");
-        let mut buf = Vec::with_capacity(1 + name.len());
+        debug_assert!(collation.len() <= 255, "database collation too long");
+        let mut buf = Vec::with_capacity(2 + name.len() + collation.len());
         buf.push(name.len() as u8);
         buf.extend_from_slice(name);
+        buf.push(collation.len() as u8);
+        buf.extend_from_slice(collation);
         buf
     }
 
@@ -95,7 +101,31 @@ impl DatabaseDef {
                 position: None,
             })?
             .to_string();
-        Ok((Self { name }, 1 + len))
+        let mut consumed = 1 + len;
+        let default_collation = if bytes.len() > consumed {
+            let coll_len = bytes[consumed] as usize;
+            consumed += 1;
+            if bytes.len() < consumed + coll_len {
+                return Err(err());
+            }
+            let value = std::str::from_utf8(&bytes[consumed..consumed + coll_len])
+                .map_err(|_| DbError::ParseError {
+                    message: "invalid UTF-8 in database collation".into(),
+                    position: None,
+                })?
+                .to_string();
+            consumed += coll_len;
+            if value.is_empty() { None } else { Some(value) }
+        } else {
+            None
+        };
+        Ok((
+            Self {
+                name,
+                default_collation,
+            },
+            consumed,
+        ))
     }
 }
 

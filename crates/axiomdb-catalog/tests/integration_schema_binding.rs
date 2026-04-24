@@ -117,6 +117,7 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             })
             .unwrap();
@@ -214,7 +215,7 @@ fn test_database_binding_separates_same_table_name_across_databases() {
     let mut conn_txn = txn.begin().unwrap();
     let (default_table_id, analytics_table_id) = {
         let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
-        w.create_database("analytics").unwrap();
+        w.create_database("analytics", None).unwrap();
         let default_tid = w.create_table("public", "events").unwrap();
         let analytics_tid = w.create_table("public", "events").unwrap();
         w.bind_table_to_database(analytics_tid, "analytics")
@@ -269,6 +270,7 @@ fn test_resolve_column_found() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();
@@ -284,6 +286,7 @@ fn test_resolve_column_found() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();
@@ -321,6 +324,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();

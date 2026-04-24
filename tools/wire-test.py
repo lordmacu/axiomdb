@@ -36,7 +36,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              13.4 (LISTEN / NOTIFY pull-based smoke),
              13.5 (covering indexes smoke),
              13.6 (non-blocking ALTER TABLE smoke),
-             13.12 (statement-level triggers smoke)
+             13.12 (statement-level triggers smoke),
+             13.13 (collation system smoke)
 """
 import os
 import signal
@@ -4287,6 +4288,38 @@ row = cur.fetchone()
 ok("[13.12 statement triggers] SHOW CREATE TRIGGER reconstructs trigger DDL",
    row is not None and "FOR EACH STATEMENT" in row[1],
    row)
+
+# ── Phase 13.13 — Collation system ──────────────────────────────────────────
+
+print("\n[13.13 collation system]")
+
+cur.execute(
+    "CREATE TABLE coll13_users (name TEXT COLLATE utf8mb4_bin) COLLATE utf8mb4_unicode_ci"
+)
+cur.execute("INSERT INTO coll13_users VALUES ('Jos\\u00e9')")
+conn.commit()
+
+cur.execute("SHOW CREATE TABLE coll13_users")
+row = cur.fetchone()
+ok("[13.13 collation system] SHOW CREATE TABLE emits persisted table/column collations",
+   row is not None
+   and "COLLATE utf8mb4_bin" in row[1]
+   and "ENGINE=InnoDB COLLATE=utf8mb4_general_ci" in row[1],
+   row)
+
+cur.execute("SHOW FULL COLUMNS FROM coll13_users")
+rows = cur.fetchall()
+ok("[13.13 collation system] SHOW FULL COLUMNS reports effective column collation",
+   rows == (("name", "TEXT", "YES", "", None, "", "utf8mb4_bin", "select,insert,update,references", ""),),
+   rows)
+
+cur.execute(
+    "SELECT TABLE_COLLATION FROM information_schema.tables WHERE TABLE_NAME = 'coll13_users'"
+)
+rows = cur.fetchall()
+ok("[13.13 collation system] information_schema reports effective table collation",
+   rows == (("utf8mb4_general_ci",),),
+   rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

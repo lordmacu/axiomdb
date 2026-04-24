@@ -94,17 +94,54 @@ pub enum SessionCollation {
 ///
 /// Returns `Ok(None)` for `DEFAULT` (resets to compat-derived default).
 pub fn parse_session_collation_setting(raw: &str) -> Result<Option<SessionCollation>, DbError> {
+    let s = raw.trim().trim_matches('\'').trim_matches('"');
+    if s.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    match normalize_collation_name(s)?.as_str() {
+        "binary" => Ok(Some(SessionCollation::Binary)),
+        "es" => Ok(Some(SessionCollation::Es)),
+        "default" => Ok(None),
+        _ => Err(DbError::InvalidValue {
+            reason: format!("invalid collation value '{raw}'; expected binary | es | DEFAULT"),
+        }),
+    }
+}
+
+/// Returns the canonical persisted name for a supported collation.
+///
+/// Supported canonical names:
+/// - `binary`
+/// - `es`
+///
+/// Supported aliases:
+/// - `C`, `utf8mb4_bin` -> `binary`
+/// - `utf8mb4_0900_ai_ci`, `utf8mb4_general_ci`, `utf8mb4_unicode_ci` -> `es`
+pub fn normalize_collation_name(raw: &str) -> Result<String, DbError> {
     let s = raw
         .trim()
         .trim_matches('\'')
         .trim_matches('"')
         .to_ascii_lowercase();
     match s.as_str() {
-        "binary" => Ok(Some(SessionCollation::Binary)),
-        "es" => Ok(Some(SessionCollation::Es)),
-        "default" => Ok(None),
+        "binary" | "c" | "utf8mb4_bin" => Ok("binary".into()),
+        "es" | "utf8mb4_0900_ai_ci" | "utf8mb4_general_ci" | "utf8mb4_unicode_ci" => {
+            Ok("es".into())
+        }
         _ => Err(DbError::InvalidValue {
-            reason: format!("invalid collation value '{raw}'; expected binary | es | DEFAULT"),
+            reason: format!(
+                "invalid collation value '{raw}'; expected binary | es or a supported alias"
+            ),
+        }),
+    }
+}
+
+pub fn session_collation_from_name(raw: &str) -> Result<SessionCollation, DbError> {
+    match normalize_collation_name(raw)?.as_str() {
+        "binary" => Ok(SessionCollation::Binary),
+        "es" => Ok(SessionCollation::Es),
+        _ => Err(DbError::InvalidValue {
+            reason: format!("invalid collation value '{raw}'"),
         }),
     }
 }

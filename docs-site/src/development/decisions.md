@@ -268,18 +268,21 @@ and DFA is the optimal algorithm for it.
 
 | Aspect | Decision |
 |--------|----------|
-| **Chosen** | Unicode Collation Algorithm (UCA) root for string comparison |
-| **Alternatives** | ASCII byte order; locale-specific collation; C locale (PostgreSQL default) |
-| **Phase** | Phase 4 (Types) |
+| **Chosen** | Two canonical runtime collations plus layered overrides: `binary` and `es` |
+| **Alternatives** | Immediate full ICU/UCA integration; ASCII byte order only; locale-specific tailoring first |
+| **Phase** | Phase 13.13 |
 
-**Why UCA root:**
-- ASCII byte order (`strcmp`) gives incorrect ordering for most non-English text:
-  'ä' sorts after 'z' in ASCII, but should sort near 'a'.
-- UCA root is locale-neutral (deterministic across any server environment) while still
-  correct for most languages.
-- MySQL's default collation (utf8mb4_general_ci) is not standards-compliant.
-- UCA root is implemented by the `icu` crate — same algorithm used by modern browsers
-  for `Intl.Collator`.
+**Why this cut:**
+- The immediate gap in the engine was not “more comparison algorithms”; it was
+  lack of persisted precedence across database, table, column, and query scope.
+- `binary` and `es` were already real runtime behaviors, so Phase 13.13 could
+  close a useful cross-compatible system without dragging ICU and locale
+  tailoring into catalog/planner work at the same time.
+- MySQL-facing aliases such as `utf8mb4_unicode_ci` / `utf8mb4_general_ci` and
+  `utf8mb4_bin` now normalize onto those canonical runtime modes, which keeps
+  dumps and ORM metadata round-trippable.
+- Full ICU/UCA collation remains valuable, but it belongs on top of this
+  layered contract rather than underneath stale metadata.
 
 ---
 
@@ -345,4 +348,3 @@ An alternative design would reconstruct which slots to undo by scanning the heap
 - The BLOB store is append-only with immutable entries — no locking on BLOB reads.
 - Deletion is handled by reference counting: when the last row referencing a BLOB
   is deleted, the BLOB can be garbage collected.
-

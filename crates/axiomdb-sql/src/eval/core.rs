@@ -10,7 +10,7 @@ use axiomdb_types::{
 use crate::{
     expr::{BinaryOp, Expr},
     result::QueryResult,
-    session::SessionCollation,
+    session::{session_collation_from_name, SessionCollation},
     text_semantics::like_match_collated,
 };
 
@@ -22,6 +22,17 @@ use super::{
         eval_unary, eval_xor, is_truthy, like_match_with_escape,
     },
 };
+
+fn explicit_expr_collation(expr: &Expr) -> Option<SessionCollation> {
+    match expr {
+        Expr::Collate { collation, .. } => session_collation_from_name(collation).ok(),
+        _ => None,
+    }
+}
+
+fn explicit_collation_from_exprs(exprs: &[&Expr]) -> Option<SessionCollation> {
+    exprs.iter().find_map(|expr| explicit_expr_collation(expr))
+}
 
 /// Evaluates `expr` against `row` and returns the resulting [`Value`].
 ///
@@ -70,6 +81,8 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             eval_unary(*op, v)
         }
 
+        Expr::Collate { expr, .. } => eval(expr, row),
+
         // AND and OR short-circuit BEFORE evaluating the right operand.
         Expr::BinaryOp {
             op: BinaryOp::And,
@@ -90,6 +103,7 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         } => eval_xor(left, right, row),
 
         Expr::BinaryOp { op, left, right } => {
+            let _guard = explicit_collation_from_exprs(&[left, right]).map(CollationGuard::new);
             let l = eval(left, row)?;
             let r = eval(right, row)?;
             eval_binary(*op, l, r)
@@ -107,6 +121,7 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             high,
             negated,
         } => {
+            let _guard = explicit_collation_from_exprs(&[expr, low, high]).map(CollationGuard::new);
             let v = eval(expr, row)?;
             let lo = eval(low, row)?;
             let hi = eval(high, row)?;
@@ -123,6 +138,9 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             negated,
             escape,
         } => {
+            let _guard =
+                explicit_collation_from_exprs(&[expr, pattern, escape.as_deref().unwrap_or(expr)])
+                    .map(CollationGuard::new);
             let v = eval(expr, row)?;
             let p = eval(pattern, row)?;
             match (v, p) {
@@ -171,6 +189,9 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             list,
             negated,
         } => {
+            let _guard = explicit_expr_collation(expr)
+                .or_else(|| list.iter().find_map(explicit_expr_collation))
+                .map(CollationGuard::new);
             let v = eval(expr, row)?;
             let result = eval_in(v, list, row)?;
             Ok(if *negated { apply_not(result) } else { result })
@@ -486,6 +507,8 @@ pub fn eval_with<R: SubqueryRunner>(
             eval_unary(*op, v)
         }
 
+        Expr::Collate { expr, .. } => eval_with(expr, row, sq),
+
         Expr::BinaryOp {
             op: BinaryOp::And,
             left,
@@ -505,6 +528,7 @@ pub fn eval_with<R: SubqueryRunner>(
         } => eval_xor_with(left, right, row, sq),
 
         Expr::BinaryOp { op, left, right } => {
+            let _guard = explicit_collation_from_exprs(&[left, right]).map(CollationGuard::new);
             let l = eval_with(left, row, sq)?;
             let r = eval_with(right, row, sq)?;
             eval_binary(*op, l, r)
@@ -522,6 +546,7 @@ pub fn eval_with<R: SubqueryRunner>(
             high,
             negated,
         } => {
+            let _guard = explicit_collation_from_exprs(&[expr, low, high]).map(CollationGuard::new);
             let v = eval_with(expr, row, sq)?;
             let lo = eval_with(low, row, sq)?;
             let hi = eval_with(high, row, sq)?;
@@ -537,6 +562,9 @@ pub fn eval_with<R: SubqueryRunner>(
             negated,
             escape,
         } => {
+            let _guard =
+                explicit_collation_from_exprs(&[expr, pattern, escape.as_deref().unwrap_or(expr)])
+                    .map(CollationGuard::new);
             let v = eval_with(expr, row, sq)?;
             let p = eval_with(pattern, row, sq)?;
             match (v, p) {
@@ -585,6 +613,9 @@ pub fn eval_with<R: SubqueryRunner>(
             list,
             negated,
         } => {
+            let _guard = explicit_expr_collation(expr)
+                .or_else(|| list.iter().find_map(explicit_expr_collation))
+                .map(CollationGuard::new);
             let v = eval_with(expr, row, sq)?;
             let result = eval_in_with(v, list, row, sq)?;
             Ok(if *negated { apply_not(result) } else { result })

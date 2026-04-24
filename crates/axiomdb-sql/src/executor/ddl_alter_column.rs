@@ -196,6 +196,7 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
         | Expr::ExcludedValue { name, .. } => name.eq_ignore_ascii_case(target_name),
         Expr::Literal(_) | Expr::Param { .. } | Expr::Default | Expr::SqlJsonQuery { .. } => false,
         Expr::UnaryOp { operand, .. }
+        | Expr::Collate { expr: operand, .. }
         | Expr::IsNull { expr: operand, .. }
         | Expr::IsBoolean { expr: operand, .. }
         | Expr::Cast { expr: operand, .. } => expr_mentions_column_name(operand, target_name),
@@ -530,6 +531,7 @@ pub fn prepare_nonblocking_heap_alter(
                     _ => None,
                 }),
                 generated_expr: None,
+                collation: col_def.collation.clone(),
                 generated_stored: false,
             };
             let mut new_columns = columns.clone();
@@ -1265,6 +1267,7 @@ fn alter_add_column(
             _ => None,
         }),
         generated_expr: None,
+        collation: col_def.collation.clone(),
         generated_stored: false,
     };
 
@@ -1656,6 +1659,10 @@ fn alter_modify_column(
             })
             .or_else(|| old_columns[col_pos].on_update_expr.clone()),
         generated_expr: old_columns[col_pos].generated_expr.clone(),
+        collation: col_def
+            .collation
+            .clone()
+            .or_else(|| old_columns[col_pos].collation.clone()),
         generated_stored: old_columns[col_pos].generated_stored,
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;

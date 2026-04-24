@@ -56,6 +56,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         }
     }
@@ -73,6 +74,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         }
     }
@@ -90,6 +92,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         }
     }

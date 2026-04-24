@@ -1,5 +1,20 @@
 # Lessons Learned
 
+## 2026-04-23 - Phase 13.13
+
+- **Do not start collation work by chasing ICU first if metadata precedence is
+  still fake.** The valuable bug here was that parser/runtime/docs already
+  spoke about collations, but database/table/column declarations were still
+  being discarded before catalog persistence.
+- **A wrapper AST node is the cheapest way to thread query-level collation
+  through an existing evaluator.** `Expr::Collate` let us reuse the current
+  `binary` / `es` comparison machinery instead of inventing a second text
+  operator stack just to honor `... COLLATE ...`.
+- **Test the observable metadata and the runtime separately.** SHOW /
+  INFORMATION_SCHEMA round-trips can be green while query behavior is still
+  wrong, and runtime collation assertions can hide metadata drift if they do
+  not also pin `SHOW CREATE TABLE` / `SHOW FULL COLUMNS`.
+
 ## 2026-04-23 - Phase 13.6
 
 - **The first bug in a “non-blocking” DDL slice is usually lifecycle, not row

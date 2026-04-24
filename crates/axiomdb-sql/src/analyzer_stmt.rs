@@ -768,6 +768,7 @@ fn expr_contains_window(expr: &Expr) -> bool {
     match expr {
         Expr::Window { .. } => true,
         Expr::UnaryOp { operand, .. }
+        | Expr::Collate { expr: operand, .. }
         | Expr::IsNull { expr: operand, .. }
         | Expr::IsBoolean { expr: operand, .. }
         | Expr::Cast { expr: operand, .. } => expr_contains_window(operand),
@@ -855,6 +856,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::GroupConcat { .. } => true,
         Expr::Function { name, .. } if is_aggregate_name(name) => true,
         Expr::UnaryOp { operand, .. }
+        | Expr::Collate { expr: operand, .. }
         | Expr::IsNull { expr: operand, .. }
         | Expr::IsBoolean { expr: operand, .. }
         | Expr::Cast { expr: operand, .. } => expr_contains_aggregate(operand),
@@ -982,6 +984,7 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
             populate_grouping_indices(right, universe);
         }
         Expr::UnaryOp { operand, .. } => populate_grouping_indices(operand, universe),
+        Expr::Collate { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::IsNull { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::IsBoolean { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::Between { expr, low, high, .. } => {

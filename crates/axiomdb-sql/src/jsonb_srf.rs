@@ -90,6 +90,7 @@ pub fn column_defs_for_srf(kind: JsonbSrfKind) -> Vec<ColumnDef> {
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             }
         })

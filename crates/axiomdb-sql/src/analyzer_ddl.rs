@@ -760,6 +760,7 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
             reject_disallowed_in_index_expr(right)
         }
         Expr::UnaryOp { operand, .. } => reject_disallowed_in_index_expr(operand),
+        Expr::Collate { expr, .. } => reject_disallowed_in_index_expr(expr),
         Expr::IsNull { expr, .. } => reject_disallowed_in_index_expr(expr),
         Expr::IsBoolean { expr, .. } => reject_disallowed_in_index_expr(expr),
         Expr::Between {

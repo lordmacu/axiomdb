@@ -107,8 +107,15 @@ fn resolve_expr_full(
         Expr::Column { col_idx: _, name } => {
             // 1. Try the inner (current) scope first.
             if !ctx.tables.is_empty() {
-                if let Ok(idx) = ctx.resolve_column(&name) {
-                    return Ok(Expr::Column { col_idx: idx, name });
+                if let Ok((idx, col)) = ctx.resolve_column_with_def(&name) {
+                    let resolved = Expr::Column { col_idx: idx, name };
+                    return Ok(match col.collation.as_deref() {
+                        Some(collation) => Expr::Collate {
+                            expr: Box::new(resolved),
+                            collation: collation.to_string(),
+                        },
+                        None => resolved,
+                    });
                 }
             }
             // 2. Try outer scopes — emit OuterColumn if found.
@@ -147,6 +154,11 @@ fn resolve_expr_full(
         Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
             op,
             operand: Box::new(resolve_expr_full(*operand, ctx, outer_scopes, state)?),
+        }),
+
+        Expr::Collate { expr, collation } => Ok(Expr::Collate {
+            expr: Box::new(resolve_expr_full(*expr, ctx, outer_scopes, state)?),
+            collation,
         }),
 
         Expr::BinaryOp { op, left, right } => Ok(Expr::BinaryOp {

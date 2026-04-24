@@ -42,6 +42,7 @@ use crate::{
         SqlJsonWrapper, UnaryOp, WindowFunc,
     },
     lexer::Token,
+    session::normalize_collation_name,
 };
 
 // Helper: build a BinaryOp node.
@@ -206,7 +207,8 @@ fn parse_is_null(p: &mut Parser) -> Result<Expr, DbError> {
 // ── Predicate: BETWEEN, LIKE, REGEXP, IN, <=>, comparison ────────────────────
 
 fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
-    let left = parse_bitor(p)?;
+    let left_expr = parse_bitor(p)?;
+    let left = parse_collate_suffix(p, left_expr)?;
 
     // Check for optional NOT before BETWEEN/LIKE/IN/REGEXP.
     let negated = if matches!(
@@ -376,6 +378,17 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
         }
         _ => Ok(left),
     }
+}
+
+fn parse_collate_suffix(p: &mut Parser, mut expr: Expr) -> Result<Expr, DbError> {
+    while p.eat_ident_ci("collate") {
+        let name = p.parse_identifier()?;
+        expr = Expr::Collate {
+            expr: Box::new(expr),
+            collation: normalize_collation_name(&name)?,
+        };
+    }
+    Ok(expr)
 }
 
 // ── Bitwise OR: | ─────────────────────────────────────────────────────────────

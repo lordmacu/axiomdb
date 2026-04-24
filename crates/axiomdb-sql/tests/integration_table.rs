@@ -28,6 +28,7 @@ fn col(idx: u16, name: &str, col_type: ColumnType) -> ColumnDef {
         default_expr: None,
         on_update_expr: None,
         generated_expr: None,
+        collation: None,
         generated_stored: false,
     }
 }
@@ -558,6 +559,7 @@ fn create_table_helper(
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             })
             .unwrap();

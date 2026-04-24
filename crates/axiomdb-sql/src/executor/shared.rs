@@ -206,6 +206,7 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
         | Expr::SqlJsonQuery { .. }
         | Expr::Param { .. } => {}
         Expr::UnaryOp { operand, .. } => collect_column_refs(operand, mask),
+        Expr::Collate { expr, .. } => collect_column_refs(expr, mask),
         Expr::BinaryOp { left, right, .. } => {
             collect_column_refs(left, mask);
             collect_column_refs(right, mask);

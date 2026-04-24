@@ -130,6 +130,30 @@ fn show_full_columns_has_extra_columns() {
     assert_eq!(id_row[6], Value::Null);
 }
 
+#[test]
+fn show_full_columns_uses_effective_table_and_column_collations() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE emp (id INT, name TEXT, nick TEXT COLLATE utf8mb4_bin) COLLATE utf8mb4_unicode_ci",
+        &mut storage,
+        &mut txn,
+    );
+    let result = run("SHOW FULL COLUMNS FROM emp", &mut storage, &mut txn);
+    let (_, data) = full_result(result);
+
+    let name_row = data
+        .iter()
+        .find(|r| r[0] == Value::Text("name".into()))
+        .unwrap();
+    assert_eq!(name_row[6], Value::Text("utf8mb4_general_ci".into()));
+
+    let nick_row = data
+        .iter()
+        .find(|r| r[0] == Value::Text("nick".into()))
+        .unwrap();
+    assert_eq!(nick_row[6], Value::Text("utf8mb4_bin".into()));
+}
+
 // ── 5.9f: SHOW TABLE STATUS ───────────────────────────────────────────────────
 
 #[test]
@@ -146,6 +170,44 @@ fn show_table_status_returns_18_columns() {
     assert_eq!(data[0][0], Value::Text("orders".into()));
     assert_eq!(data[0][1], Value::Text("InnoDB".into()));
     assert_eq!(data[0][14], Value::Text("utf8mb4_general_ci".into()));
+}
+
+#[test]
+fn information_schema_reports_effective_collations() {
+    let (mut storage, mut txn) = setup();
+    run(
+        "CREATE TABLE emp (id INT, name TEXT, nick TEXT COLLATE utf8mb4_bin) COLLATE utf8mb4_unicode_ci",
+        &mut storage,
+        &mut txn,
+    );
+    let result = run(
+        "SELECT TABLE_COLLATION FROM information_schema.tables WHERE TABLE_NAME = 'emp'",
+        &mut storage,
+        &mut txn,
+    );
+    let (_, rows) = full_result(result);
+    assert_eq!(rows, vec![vec![Value::Text("utf8mb4_general_ci".into())]]);
+
+    let result = run(
+        "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns WHERE TABLE_NAME = 'emp' ORDER BY COLUMN_NAME",
+        &mut storage,
+        &mut txn,
+    );
+    let (_, rows) = full_result(result);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("id".into()), Value::Null],
+            vec![
+                Value::Text("name".into()),
+                Value::Text("utf8mb4_general_ci".into())
+            ],
+            vec![
+                Value::Text("nick".into()),
+                Value::Text("utf8mb4_bin".into())
+            ],
+        ]
+    );
 }
 
 #[test]

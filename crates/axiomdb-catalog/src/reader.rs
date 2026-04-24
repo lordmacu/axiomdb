@@ -150,6 +150,7 @@ impl<'a> CatalogReader<'a> {
             return if name == DEFAULT_DATABASE_NAME {
                 Ok(Some(DatabaseDef {
                     name: DEFAULT_DATABASE_NAME.to_string(),
+                    default_collation: None,
                 }))
             } else {
                 Ok(None)
@@ -171,6 +172,7 @@ impl<'a> CatalogReader<'a> {
         if root == 0 {
             return Ok(vec![DatabaseDef {
                 name: DEFAULT_DATABASE_NAME.to_string(),
+                default_collation: None,
             }]);
         }
         let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;

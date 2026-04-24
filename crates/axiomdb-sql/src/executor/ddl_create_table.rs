@@ -118,6 +118,13 @@ fn validate_generated_expr_refs(
             base_cols,
             generated_cols,
         ),
+        Expr::Collate { expr, .. } => validate_generated_expr_refs(
+            expr,
+            table_name,
+            generated_name,
+            base_cols,
+            generated_cols,
+        ),
         Expr::BinaryOp { left, right, .. } => {
             validate_generated_expr_refs(
                 left,
@@ -376,6 +383,7 @@ fn execute_create_table(
         storage_layout,
         stmt.immutable,
         stmt.persistence,
+        stmt.collation.clone(),
     )?;
     let table_id = table_def.id;
     if database != DEFAULT_DATABASE_NAME {
@@ -447,6 +455,7 @@ fn execute_create_table(
             default_expr,
             on_update_expr,
             generated_expr,
+            collation: col_def.collation.clone(),
             generated_stored,
         })?;
     }
@@ -1451,6 +1460,7 @@ fn execute_create_table_like(
             source.def.storage_layout,
             false,
             stmt.persistence,
+            source.def.default_collation.clone(),
         )?;
         if database != DEFAULT_DATABASE_NAME {
             writer.bind_table_to_database(def.id, database)?;
@@ -1473,6 +1483,7 @@ fn execute_create_table_like(
             default_expr: col.default_expr.clone(),
             on_update_expr: col.on_update_expr.clone(),
             generated_expr: col.generated_expr.clone(),
+            collation: col.collation.clone(),
             generated_stored: col.generated_stored,
         })?;
     }
@@ -1644,6 +1655,7 @@ fn create_relation_as_select(
             persistence,
             relation_kind,
             defining_query,
+            None,
         )?;
         if database != DEFAULT_DATABASE_NAME {
             writer.bind_table_to_database(def.id, &database)?;
@@ -1666,6 +1678,7 @@ fn create_relation_as_select(
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })?;
     }
@@ -1687,6 +1700,7 @@ fn create_relation_as_select(
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .collect();

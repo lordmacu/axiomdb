@@ -1,5 +1,21 @@
 # Architecture Notes
 
+## 2026-04-23 - Collation system (13.13)
+
+- **Collation metadata now lives in catalog rows, not only in session state.**
+  `DatabaseDef`, `TableDef`, and catalog `ColumnDef` now persist optional
+  canonical collation names so DDL/default precedence survives restarts and
+  round-trips through SHOW / INFORMATION_SCHEMA.
+- **The layered precedence is implemented by binding resolved text columns with
+  their effective inherited collation.** During semantic binding, unqualified
+  text columns absorb explicit column collation first, then table default, then
+  database default, so later evaluator paths can treat them as annotated
+  expressions instead of re-querying catalog metadata.
+- **`expr COLLATE ...` is a runtime wrapper, not a third comparison engine.**
+  Query-level overrides normalize onto the same two canonical runtime modes
+  (`binary` / `es`) and temporarily swap the thread-local evaluator collation
+  only around the affected subtree.
+
 ## 2026-04-23 - Non-blocking ALTER TABLE (13.6)
 
 - **The first non-blocking ALTER cut is a two-phase heap rewrite, not generic

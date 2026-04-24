@@ -1,5 +1,72 @@
 # Fase 13 - Advanced PostgreSQL
 
+## 13.13 Collation system - cerrada 2026-04-23
+
+La subfase 13.13 cierra el primer sistema de collations realmente
+**estratificado** en AxiomDB sin intentar todavia ICU/UCA completa. El recorte
+entregado fija el contrato util y honesto: dos semanticas runtime canonicas
+(`binary` y `es`), alias compatibles de MySQL, metadata persistida en catalogo,
+precedencia database/table/column/query y visibilidad correcta por SHOW /
+INFORMATION_SCHEMA.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `CREATE DATABASE ... COLLATE ...`
+- `CREATE TABLE ... COLLATE ...`
+- columnas `TEXT/VARCHAR/CHAR ... COLLATE ...`
+- `expr COLLATE ...` en rutas collation-aware del evaluator
+- aliases MySQL normalizados (`utf8mb4_unicode_ci`, `utf8mb4_general_ci`,
+  `utf8mb4_0900_ai_ci`, `utf8mb4_bin`, `C`)
+- `SHOW CREATE TABLE`, `SHOW FULL COLUMNS`, `SHOW TABLE STATUS`,
+  `information_schema.TABLES` e `information_schema.COLUMNS` reflejando
+  collations efectivas
+
+Fuera de alcance en este corte:
+
+- ICU/UCA root real y tailoring por locale
+- registry amplio tipo `axiom_collations`
+- deteccion automatica por script / `COLLATE 'auto'`
+- promesa fuerte de que **todas** las rutas de comparacion/sort del engine ya
+  respetan metadata per-column; el MVP queda acotado a los paths
+  collation-aware existentes
+
+### Ajustes tecnicos de cierre
+
+- Catalogo: `DatabaseDef`, `TableDef` y `ColumnDef` ahora persisten
+  collations opcionales en formatos backward-compatible; filas legacy siguen
+  leyendo como `None`.
+- Parser/AST: `CREATE DATABASE`, `CREATE TABLE`, columnas DDL y expresiones
+  soportan `COLLATE`; los aliases aceptados se normalizan al contrato canonico
+  `binary` / `es`.
+- Binder: las columnas de texto absorbidas desde catalogo heredan collation
+  efectiva (column > table > database) y se materializan como `Expr::Collate`
+  para que el evaluator pueda respetarlas sin reconsultar metadata.
+- Evaluator: `Expr::Collate` aplica override temporal de la collation activa
+  sobre comparaciones/LIKE/IN/BETWEEN en los paths actuales.
+- Metadata visible: `SHOW CREATE TABLE`, `SHOW FULL COLUMNS`,
+  `SHOW TABLE STATUS`, `information_schema.TABLES` y
+  `information_schema.COLUMNS` ya no reportan collations hardcodeadas.
+- Docs-site: se corrigio el texto stale que todavia afirmaba UCA root/ICU como
+  contrato actual.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_mysql_compat.rs`
+- `crates/axiomdb-sql/tests/integration_g9_ddl.rs`
+- `crates/axiomdb-sql/tests/integration_show_full.rs`
+- `crates/axiomdb-sql/tests/integration_collation_system.rs`
+
+### Validacion
+
+- `cargo test -p axiomdb-sql --test integration_ddl_parser` - paso.
+- `cargo test -p axiomdb-sql --test integration_mysql_compat --test integration_g9_ddl --test integration_show_full --test integration_collation_system` - paso.
+- `cargo test -p axiomdb-network --test integration_protocol --test integration_connection_lifecycle` - paso.
+- `python3 tools/wire-test.py` - paso (`464/464`).
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 13.12 Statement-level triggers - cerrada 2026-04-23
 
 La subfase 13.12 cierra el primer corte real de triggers SQL en AxiomDB, pero
