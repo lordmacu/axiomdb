@@ -239,6 +239,9 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<ColumnConstraint>,
+    /// Optional explicit column collation (`... COLLATE name`).
+    /// `None` = inherit from table/database/session scope.
+    pub collation: Option<String>,
     /// Maximum character length for `VARCHAR(N)` / `CHAR(N)` columns.
     /// `0` means unbounded (no length constraint). Mirrors `CatalogColumnDef::type_len`.
     pub type_len: u16,
@@ -888,6 +891,8 @@ pub struct CreateTableStmt {
     pub table: TableRef,
     pub columns: Vec<ColumnDef>,
     pub table_constraints: Vec<TableConstraint>,
+    /// Optional table default collation (`CREATE TABLE ... ) COLLATE name`).
+    pub collation: Option<String>,
     /// `CREATE TABLE ... IMMUTABLE` (Phase 13.9) — rejects any UPDATE/DELETE.
     pub immutable: bool,
     pub persistence: TablePersistence,
@@ -1120,6 +1125,8 @@ pub struct SetStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDatabaseStmt {
     pub name: String,
+    /// Optional database default collation.
+    pub collation: Option<String>,
 }
 
 /// `DROP DATABASE [IF EXISTS] name`
@@ -1439,6 +1446,7 @@ mod tests {
                         ColumnConstraint::PrimaryKey,
                         ColumnConstraint::AutoIncrement,
                     ],
+                    collation: None,
                     type_len: 0,
                     is_char: false,
                 },
@@ -1446,6 +1454,7 @@ mod tests {
                     name: "email".into(),
                     data_type: DataType::Text,
                     constraints: vec![ColumnConstraint::NotNull, ColumnConstraint::Unique],
+                    collation: None,
                     type_len: 0,
                     is_char: false,
                 },
@@ -1453,11 +1462,13 @@ mod tests {
                     name: "age".into(),
                     data_type: DataType::Int,
                     constraints: vec![ColumnConstraint::Default(Expr::int(0))],
+                    collation: None,
                     type_len: 0,
                     is_char: false,
                 },
             ],
             table_constraints: vec![],
+            collation: None,
             immutable: false,
             persistence: TablePersistence::Permanent,
         });
@@ -1474,6 +1485,7 @@ mod tests {
                     name: "id".into(),
                     data_type: DataType::BigInt,
                     constraints: vec![ColumnConstraint::NotNull],
+                    collation: None,
                     type_len: 0,
                     is_char: false,
                 },
@@ -1481,6 +1493,7 @@ mod tests {
                     name: "user_id".into(),
                     data_type: DataType::BigInt,
                     constraints: vec![ColumnConstraint::NotNull],
+                    collation: None,
                     type_len: 0,
                     is_char: false,
                 },
@@ -1500,6 +1513,7 @@ mod tests {
                     deferrability: ConstraintDeferrability::default(),
                 },
             ],
+            collation: None,
             immutable: false,
             persistence: TablePersistence::Permanent,
         });
@@ -1640,6 +1654,7 @@ mod tests {
                     name: "phone".into(),
                     data_type: DataType::Text,
                     constraints: vec![ColumnConstraint::Null],
+                    collation: None,
                     type_len: 0,
                     is_char: false,
                 }),
@@ -1749,6 +1764,7 @@ mod tests {
                 op: UnaryOp::Neg,
                 operand: Box::new(Expr::int(1)),
             })],
+            collation: None,
             type_len: 0,
             is_char: false,
         };

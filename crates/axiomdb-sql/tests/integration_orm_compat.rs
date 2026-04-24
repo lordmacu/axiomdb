@@ -136,7 +136,11 @@ fn orm_connect_and_metadata_probe_baseline() {
             assert!(ddl.contains("CREATE TABLE"), "unexpected DDL: {ddl}");
             assert!(ddl.contains("AUTO_INCREMENT"), "unexpected DDL: {ddl}");
             assert!(
-                ddl.contains("`email` TEXT NOT NULL"),
+                ddl.contains("`email` TEXT COLLATE utf8mb4_general_ci NOT NULL"),
+                "unexpected DDL: {ddl}"
+            );
+            assert!(
+                ddl.contains("ENGINE=InnoDB COLLATE=utf8mb4_general_ci"),
                 "unexpected DDL: {ddl}"
             );
         }

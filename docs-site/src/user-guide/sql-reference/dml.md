@@ -1272,7 +1272,16 @@ index lookups to full table scans for correctness. Binary-ordered B-Tree keys do
 > `@@collation_connection` is the **transport charset** (set during handshake or via `SET NAMES`).
 > `@@collation` is the **executor-visible text-comparison behavior** added by `AXIOM_COMPAT`.
 
-Full layered collation (per-database, per-column, ICU locale) is planned for Phase 13.13.
+Layered collation is now partially implemented:
+
+- `CREATE DATABASE ... COLLATE ...`
+- `CREATE TABLE ... COLLATE ...`
+- column-level `... TEXT COLLATE ...`
+- query-level `expr COLLATE ...`
+
+These scopes normalize onto the current runtime collations (`binary` / `es`)
+and participate in precedence over the session default. Full ICU locale
+tailoring is still deferred.
 
 ### ON_ERROR
 

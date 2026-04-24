@@ -141,6 +141,7 @@ pub fn execute_read_only_with_ctx(
                 })?
             };
             let columns = reader.list_columns(table_def.id)?;
+            let database_collation = reader.get_database(&db)?.and_then(|db| db.default_collation);
             let base_cols = vec![
                 ColumnMeta::computed("Field", DataType::Text),
                 ColumnMeta::computed("Type", DataType::Text),
@@ -177,12 +178,13 @@ pub fn execute_read_only_with_ctx(
                         Value::Text(extra.into()),
                     ];
                     if s.full {
-                        let coll = match c.col_type {
-                            ColumnType::Text | ColumnType::Bytes => {
-                                Value::Text("utf8mb4_general_ci".into())
-                            }
-                            _ => Value::Null,
-                        };
+                        let coll = effective_column_collation(
+                            c,
+                            &table_def,
+                            database_collation.as_deref(),
+                        )
+                            .map(|name| Value::Text(name.to_string()))
+                            .unwrap_or(Value::Null);
                         row.push(coll);
                         row.push(Value::Text("select,insert,update,references".into()));
                         row.push(Value::Text("".into()));
@@ -313,6 +315,7 @@ pub fn execute_read_only_with_ctx(
             };
             let columns = reader.list_columns(table_def.id)?;
             let indexes = reader.list_indexes(table_def.id)?;
+            let database_collation = reader.get_database(&db)?.and_then(|db| db.default_collation);
             if table_def.is_materialized_view() {
                 let defining_query =
                     table_def
@@ -353,9 +356,16 @@ pub fn execute_read_only_with_ctx(
                 } else {
                     ""
                 };
+                let collate = effective_column_collation(
+                    col,
+                    &table_def,
+                    database_collation.as_deref(),
+                )
+                .map(|name| format!(" COLLATE {name}"))
+                .unwrap_or_default();
                 ddl.push_str(&format!(
-                    "  `{}` {}{}{},\n",
-                    col.name, type_str, null_str, extra
+                    "  `{}` {}{}{}{},\n",
+                    col.name, type_str, collate, null_str, extra
                 ));
             }
             if let Some(pk) = indexes.iter().find(|i| i.is_primary) {
@@ -390,7 +400,10 @@ pub fn execute_read_only_with_ctx(
                 ddl.truncate(ddl.len() - 2);
                 ddl.push('\n');
             }
-            ddl.push_str(") ENGINE=InnoDB");
+            ddl.push_str(&format!(
+                ") ENGINE=InnoDB COLLATE={}",
+                effective_table_collation(&table_def, database_collation.as_deref())
+            ));
             Ok(QueryResult::Rows {
                 columns: vec![
                     ColumnMeta::computed("Table", DataType::Text),

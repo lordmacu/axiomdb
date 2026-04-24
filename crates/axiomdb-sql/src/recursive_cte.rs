@@ -59,6 +59,7 @@ pub fn column_defs_for_recursive(rc: &RecursiveCteClause) -> Vec<ColumnDef> {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .collect()

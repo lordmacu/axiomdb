@@ -228,6 +228,9 @@ pub struct TableDef {
     pub relation_kind: RelationKind,
     /// Defining query for materialized views. `None` for ordinary tables.
     pub defining_query: Option<String>,
+    /// Default collation declared on the table. `None` = inherit from
+    /// database/session defaults.
+    pub default_collation: Option<String>,
     /// Statement-level triggers owned by this table.
     pub triggers: Vec<TriggerDef>,
 }
@@ -254,7 +257,7 @@ impl TableDef {
         Ok(())
     }
 
-    /// Serializes to binary row format (v6).
+    /// Serializes to binary row format (v7).
     ///
     /// Format:
     /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1][schema_version:8 LE]`
@@ -265,15 +268,19 @@ impl TableDef {
         let schema = self.schema_name.as_bytes();
         let name = self.table_name.as_bytes();
         let query = self.defining_query.as_deref().unwrap_or("").as_bytes();
+        let collation = self.default_collation.as_deref().unwrap_or("").as_bytes();
         let trigger_bytes: Vec<Vec<u8>> = self.triggers.iter().map(TriggerDef::to_bytes).collect();
         let triggers_len: usize = trigger_bytes.iter().map(Vec::len).sum();
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
         debug_assert!(query.len() <= u16::MAX as usize, "defining_query too long");
+        debug_assert!(collation.len() <= u16::MAX as usize, "default_collation too long");
         debug_assert!(self.triggers.len() <= u16::MAX as usize, "too many triggers");
 
         let mut buf = Vec::with_capacity(
             4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1 + 1 + 1 + 2 + query.len() + 2
+                + collation.len()
+                + 2
                 + triggers_len,
         );
         buf.extend_from_slice(&self.id.to_le_bytes());
@@ -295,7 +302,9 @@ impl TableDef {
         buf.push(self.relation_kind.into());
         buf.extend_from_slice(&(query.len() as u16).to_le_bytes());
         buf.extend_from_slice(query);
-        // v6 trailer: trigger count + trigger bytes.
+        // v7 trailer: default collation + trigger count + trigger bytes.
+        buf.extend_from_slice(&(collation.len() as u16).to_le_bytes());
+        buf.extend_from_slice(collation);
         buf.extend_from_slice(&(self.triggers.len() as u16).to_le_bytes());
         for trig in trigger_bytes {
             buf.extend_from_slice(&trig);
@@ -358,14 +367,25 @@ impl TableDef {
         //   v4 (11 trailing): v3 + 1-byte persistence flag (Phase 21.7)
         //   v5 (>=14 trailing): v4 + relation kind + defining query bytes
         //   v6 (v5 + trailing bytes after query): trigger count + trigger bytes
+        //   v7 (v5 + collation_len + collation bytes + trigger count + trigger bytes)
         let remaining = bytes.len() - consumed;
-        let (storage_layout, schema_version, immutable, persistence, relation_kind, defining_query, triggers) = match remaining {
+        let (
+            storage_layout,
+            schema_version,
+            immutable,
+            persistence,
+            relation_kind,
+            defining_query,
+            default_collation,
+            triggers,
+        ) = match remaining {
             0 => (
                 TableStorageLayout::Heap,
                 1u64,
                 false,
                 TablePersistence::Permanent,
                 RelationKind::Table,
+                None,
                 None,
                 Vec::new(),
             ),
@@ -378,6 +398,7 @@ impl TableDef {
                     false,
                     TablePersistence::Permanent,
                     RelationKind::Table,
+                    None,
                     None,
                     Vec::new(),
                 )
@@ -397,6 +418,7 @@ impl TableDef {
                     false,
                     TablePersistence::Permanent,
                     RelationKind::Table,
+                    None,
                     None,
                     Vec::new(),
                 )
@@ -418,6 +440,7 @@ impl TableDef {
                     imm,
                     TablePersistence::Permanent,
                     RelationKind::Table,
+                    None,
                     None,
                     Vec::new(),
                 )
@@ -441,6 +464,7 @@ impl TableDef {
                     imm,
                     persistence,
                     RelationKind::Table,
+                    None,
                     None,
                     Vec::new(),
                 )
@@ -482,23 +506,58 @@ impl TableDef {
                     )
                 };
                 consumed += query_len;
-                let mut triggers = Vec::new();
-                if bytes.len() > consumed {
+                let (default_collation, triggers) = if bytes.len() > consumed {
                     if bytes.len() < consumed + 2 {
                         return Err(err());
                     }
-                    let trigger_count = u16::from_le_bytes(
+                    let first_u16 = u16::from_le_bytes(
                         bytes[consumed..consumed + 2]
                             .try_into()
                             .expect("slice is exactly 2 bytes"),
                     ) as usize;
-                    consumed += 2;
-                    for _ in 0..trigger_count {
-                        let (trigger, used) = TriggerDef::from_bytes(&bytes[consumed..])?;
-                        consumed += used;
-                        triggers.push(trigger);
+                    if bytes.len() >= consumed + 2 + first_u16 + 2 {
+                        let coll_start = consumed + 2;
+                        let coll_end = coll_start + first_u16;
+                        let collation = if first_u16 == 0 {
+                            None
+                        } else {
+                            Some(
+                                std::str::from_utf8(&bytes[coll_start..coll_end])
+                                    .map_err(|_| DbError::ParseError {
+                                        message: "invalid UTF-8 in default_collation".into(),
+                                        position: None,
+                                    })?
+                                    .to_string(),
+                            )
+                        };
+                        consumed = coll_end;
+                        let trigger_count = u16::from_le_bytes(
+                            bytes[consumed..consumed + 2]
+                                .try_into()
+                                .expect("slice is exactly 2 bytes"),
+                        ) as usize;
+                        consumed += 2;
+                        let mut triggers = Vec::with_capacity(trigger_count);
+                        for _ in 0..trigger_count {
+                            let (trigger, used) = TriggerDef::from_bytes(&bytes[consumed..])?;
+                            consumed += used;
+                            triggers.push(trigger);
+                        }
+                        (collation, triggers)
+                    } else {
+                        let trigger_count = first_u16;
+                        consumed += 2;
+                        let mut triggers = Vec::with_capacity(trigger_count);
+                        for _ in 0..trigger_count {
+                            let (trigger, used) = TriggerDef::from_bytes(&bytes[consumed..])?;
+                            consumed += used;
+                            triggers.push(trigger);
+                        }
+                        (None, triggers)
                     }
-                }
+                } else {
+                    (None, Vec::new())
+                };
                 (
                     layout,
                     v,
@@ -506,6 +565,7 @@ impl TableDef {
                     persistence,
                     relation_kind,
                     defining_query,
+                    default_collation,
                     triggers,
                 )
             }
@@ -529,6 +589,7 @@ impl TableDef {
                 persistence,
                 relation_kind,
                 defining_query,
+                default_collation,
                 triggers,
             },
             consumed,
@@ -574,6 +635,10 @@ pub struct ColumnDef {
     /// `None` means this is a normal base column. Stored after
     /// `on_update_expr` when `flags bit6` is set — old rows read as `None`.
     pub generated_expr: Option<String>,
+    /// Explicit column collation. `None` means inherit table/database default.
+    /// Stored as an optional trailing `[u16 len][utf8 bytes]` after
+    /// `generated_expr` — old rows stop earlier and read as `None`.
+    pub collation: Option<String>,
     /// `true` for STORED generated columns, `false` for VIRTUAL generated
     /// columns. Only meaningful when `generated_expr` is `Some`.
     /// Stored in `flags bit7` as inverted virtual marker: 0 = STORED,
@@ -604,6 +669,7 @@ impl ColumnDef {
         let has_on_update = on_update_bytes.is_some();
         let generated_bytes = self.generated_expr.as_deref().map(|s| s.as_bytes());
         let has_generated = generated_bytes.is_some();
+        let collation_bytes = self.collation.as_deref().map(|s| s.as_bytes());
 
         let mut flags: u8 = 0;
         if self.nullable {
@@ -630,11 +696,11 @@ impl ColumnDef {
                 flags |= 0x80; // bit7: virtual generated column
             }
         }
-
         let extra = if has_type_len { 2 } else { 0 }
             + default_bytes.map_or(0, |b| 2 + b.len())
             + on_update_bytes.map_or(0, |b| 2 + b.len())
-            + generated_bytes.map_or(0, |b| 2 + b.len());
+            + generated_bytes.map_or(0, |b| 2 + b.len())
+            + collation_bytes.map_or(0, |b| 2 + b.len());
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + extra);
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
@@ -656,6 +722,10 @@ impl ColumnDef {
         if let Some(gb) = generated_bytes {
             buf.extend_from_slice(&(gb.len() as u16).to_le_bytes());
             buf.extend_from_slice(gb);
+        }
+        if let Some(cb) = collation_bytes {
+            buf.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(cb);
         }
         buf
     }
@@ -777,6 +847,27 @@ impl ColumnDef {
             None
         };
 
+        let collation = if bytes.len() > consumed {
+            if bytes.len() < consumed + 2 {
+                return Err(err());
+            }
+            let clen = u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+            consumed += 2;
+            if bytes.len() < consumed + clen {
+                return Err(err());
+            }
+            let s = std::str::from_utf8(&bytes[consumed..consumed + clen])
+                .map_err(|_| DbError::ParseError {
+                    message: "invalid UTF-8 in column collation".into(),
+                    position: None,
+                })?
+                .to_string();
+            consumed += clen;
+            Some(s)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 table_id,
@@ -790,6 +881,7 @@ impl ColumnDef {
                 default_expr,
                 on_update_expr,
                 generated_expr,
+                collation,
                 generated_stored,
             },
             consumed,

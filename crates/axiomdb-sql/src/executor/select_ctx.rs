@@ -180,6 +180,9 @@ fn execute_select_ctx(
                 crate::expr::Expr::UnaryOp { operand, .. } => {
                     collect_expr_columns(operand, mask);
                 }
+                crate::expr::Expr::Collate { expr, .. } => {
+                    collect_expr_columns(expr, mask);
+                }
                 crate::expr::Expr::Function { args, .. } => {
                     for arg in args {
                         collect_expr_columns(arg, mask);

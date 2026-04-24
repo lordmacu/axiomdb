@@ -116,6 +116,10 @@ impl BindContext {
 
     /// Resolve a qualified `table.column` or unqualified `column` reference.
     fn resolve_column(&self, name: &str) -> Result<usize, DbError> {
+        self.resolve_column_with_def(name).map(|(idx, _)| idx)
+    }
+
+    fn resolve_column_with_def(&self, name: &str) -> Result<(usize, &ColumnDef), DbError> {
         let (qualifier, field) = split_name(name);
 
         if let Some(q) = qualifier {
@@ -123,8 +127,8 @@ impl BindContext {
             let table = self.find_table(q).ok_or_else(|| DbError::TableNotFound {
                 name: format!("{q}.{field}"),
             })?;
-            let (pos, _) = find_col_in_table(table, field, q)?;
-            Ok(table.col_offset + pos)
+            let (pos, col) = find_col_in_table(table, field, q)?;
+            Ok((table.col_offset + pos, col))
         } else {
             // Unqualified: search all tables
             let matches = self.find_column_all(field);
@@ -147,7 +151,12 @@ impl BindContext {
                         table: format!("\"{}\" (available: {})", table_names, available),
                     })
                 }
-                1 => Ok(matches[0].1),
+                1 => {
+                    let (ti, idx, _) = matches[0];
+                    let table = &self.tables[ti];
+                    let local_idx = idx - table.col_offset;
+                    Ok((idx, &table.columns[local_idx]))
+                }
                 _ => {
                     let table_list = matches
                         .iter()
@@ -197,6 +206,21 @@ fn find_col_in_table<'a>(
                 table: format!("\"{context}\" (available: {available})"),
             }
         })
+}
+
+fn effective_bound_collation(
+    column: &ColumnDef,
+    table_default_collation: Option<&str>,
+    database_default_collation: Option<&str>,
+) -> Option<String> {
+    match column.col_type {
+        axiomdb_catalog::ColumnType::Text => column
+            .collation
+            .clone()
+            .or_else(|| table_default_collation.map(ToOwned::to_owned))
+            .or_else(|| database_default_collation.map(ToOwned::to_owned)),
+        _ => None,
+    }
 }
 
 /// Levenshtein distance — O(|a|*|b|), both strings ≤ 64 chars (Phase 4.3d).
@@ -498,7 +522,21 @@ fn bound_table_ref(
         name: table_ref.name.clone(),
     })?;
 
-    let columns = reader.list_columns(table_def.id)?;
+    let database_default_collation = reader
+        .get_database(database)?
+        .and_then(|db| db.default_collation);
+    let columns = reader
+        .list_columns(table_def.id)?
+        .into_iter()
+        .map(|mut col| {
+            col.collation = effective_bound_collation(
+                &col,
+                table_def.default_collation.as_deref(),
+                database_default_collation.as_deref(),
+            );
+            col
+        })
+        .collect::<Vec<_>>();
     let n = columns.len();
     let bound = BoundTable {
         alias: table_ref.alias.clone(),
@@ -576,8 +614,9 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
                 is_fixed_len: false,
                 default_expr: None,
                 on_update_expr: None,
-            generated_expr: None,
-            generated_stored: false,
+                generated_expr: None,
+                collation: None,
+                generated_stored: false,
             }
         })
         .collect()

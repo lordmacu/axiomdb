@@ -107,6 +107,10 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
             op,
             operand: Box::new(resolve_predicate_columns(*operand, col_defs)?),
         }),
+        Expr::Collate { expr, collation } => Ok(Expr::Collate {
+            expr: Box::new(resolve_predicate_columns(*expr, col_defs)?),
+            collation,
+        }),
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
             left: Box::new(resolve_predicate_columns(*left, col_defs)?),
             op,

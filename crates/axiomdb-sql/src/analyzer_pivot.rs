@@ -89,6 +89,7 @@ fn build_pivot_virtual_columns(
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         });
     }

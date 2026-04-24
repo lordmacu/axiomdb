@@ -73,6 +73,7 @@ mod tests {
     fn test_database_def_roundtrip() {
         let def = DatabaseDef {
             name: "ventas".into(),
+            default_collation: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = DatabaseDef::from_bytes(&bytes).unwrap();
@@ -107,6 +108,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            default_collation: None,
             triggers: vec![],
         };
         let bytes = def.to_bytes();
@@ -130,6 +132,7 @@ mod tests {
                 persistence: TablePersistence::Permanent,
                 relation_kind: RelationKind::Table,
                 defining_query: None,
+                default_collation: None,
                 triggers: vec![],
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
@@ -150,6 +153,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            default_collation: None,
             triggers: vec![],
         };
         let bytes = def.to_bytes();
@@ -170,6 +174,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            default_collation: None,
             triggers: vec![],
         };
         let bytes = def.to_bytes();
@@ -192,6 +197,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            default_collation: None,
             triggers: vec![],
         };
         let bytes = def.to_bytes();
@@ -235,6 +241,7 @@ mod tests {
             persistence: TablePersistence::Unlogged,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            default_collation: None,
             triggers: vec![],
         };
         let bytes = def.to_bytes();
@@ -256,6 +263,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::MaterializedView,
             defining_query: Some("SELECT region, SUM(total) FROM sales GROUP BY region".into()),
+            default_collation: Some("es".into()),
             triggers: vec![],
         };
         let bytes = def.to_bytes();
@@ -281,6 +289,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: Some("es".into()),
             generated_stored: false,
         };
         let bytes = def.to_bytes();
@@ -303,6 +312,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         };
         let bytes = def.to_bytes();
@@ -325,6 +335,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         };
         let bytes = def.to_bytes();
@@ -345,6 +356,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: Some("price * qty".into()),
+            collation: None,
             generated_stored: true,
         };
         let bytes = def.to_bytes();

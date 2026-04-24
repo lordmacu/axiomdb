@@ -145,6 +145,7 @@ fn test_create_column_fires_no_event() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();

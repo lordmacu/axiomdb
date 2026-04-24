@@ -302,8 +302,32 @@ fn test_column_unsigned_parses() {
 #[test]
 fn test_column_collate_parses() {
     match parse_ok("CREATE TABLE t (s VARCHAR(100) COLLATE utf8mb4_unicode_ci)") {
-        Stmt::CreateTable(ct) => assert_eq!(ct.columns[0].name, "s"),
+        Stmt::CreateTable(ct) => {
+            assert_eq!(ct.columns[0].name, "s");
+            assert_eq!(ct.columns[0].collation.as_deref(), Some("es"));
+        }
         other => panic!("expected CreateTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_create_database_and_table_collate_parse_to_canonical_names() {
+    match parse_ok("CREATE DATABASE appdb DEFAULT COLLATE utf8mb4_bin") {
+        Stmt::CreateDatabase(db) => assert_eq!(db.collation.as_deref(), Some("binary")),
+        other => panic!("expected CreateDatabase, got {other:?}"),
+    }
+
+    match parse_ok("CREATE TABLE t (s TEXT) COLLATE utf8mb4_unicode_ci") {
+        Stmt::CreateTable(ct) => assert_eq!(ct.collation.as_deref(), Some("es")),
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_expr_collate_parses() {
+    match parse_ok("SELECT * FROM t WHERE name COLLATE utf8mb4_bin LIKE 'jose'") {
+        Stmt::Select(sel) => assert!(sel.where_clause.is_some()),
+        other => panic!("expected Select, got {other:?}"),
     }
 }
 

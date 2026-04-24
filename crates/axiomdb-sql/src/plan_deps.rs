@@ -428,6 +428,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 self.visit_expr(right)
             }
             Expr::UnaryOp { operand, .. } => self.visit_expr(operand),
+            Expr::Collate { expr, .. } => self.visit_expr(expr),
             Expr::Function { args, .. } => {
                 for arg in args {
                     self.visit_expr(arg)?;

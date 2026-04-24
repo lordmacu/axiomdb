@@ -91,7 +91,12 @@ though write-side row locking is still a future phase.
 
 ### 3. Smart collation out of the box
 
-Most databases require explicit `COLLATE` declarations for correct Unicode sorting. AxiomDB defaults to **UCA root collation** (language-neutral Unicode ordering) and can be configured to behave like MySQL or PostgreSQL for migrations.
+AxiomDB ships a practical layered collation system today: session defaults via
+`AXIOM_COMPAT` / `SET collation`, persisted defaults on databases / tables /
+columns, and query-level `expr COLLATE ...` overrides. The current engine keeps
+two runtime semantics intentionally small and explicit: `binary` (exact byte
+order) and `es` (case-insensitive + accent-insensitive fold for migration
+workloads). Full ICU locale tailoring stays deferred to later phases.
 
 ### 4. Strict mode always on
 

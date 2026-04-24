@@ -15,6 +15,7 @@ use crate::{
     },
     expr::Expr,
     lexer::Token,
+    session::normalize_collation_name,
 };
 
 use super::{expr::parse_expr, Parser};
@@ -27,9 +28,10 @@ pub(crate) fn parse_create_database(p: &mut Parser) -> Result<Stmt, DbError> {
     let name = p.parse_identifier()?;
     // Consume optional CHARACTER SET / COLLATE / DEFAULT modifiers.
     // mysqldump generates: CREATE DATABASE IF NOT EXISTS `db` DEFAULT CHARACTER SET utf8mb4
-    skip_create_database_options(p);
+    let collation = parse_create_database_options(p)?;
     Ok(Stmt::CreateDatabase(crate::ast::CreateDatabaseStmt {
         name,
+        collation,
     }))
 }
 
@@ -86,7 +88,8 @@ pub(crate) fn parse_create_trigger(p: &mut Parser) -> Result<Stmt, DbError> {
 }
 
 /// Consume optional CHARACTER SET / COLLATE / DEFAULT clauses after a database name.
-fn skip_create_database_options(p: &mut Parser) {
+fn parse_create_database_options(p: &mut Parser) -> Result<Option<String>, DbError> {
+    let mut collation = None;
     loop {
         match p.peek().clone() {
             // DEFAULT keyword before CHARACTER SET / COLLATE
@@ -106,9 +109,9 @@ fn skip_create_database_options(p: &mut Parser) {
             // COLLATE collation_name
             Token::Ident(s) if s.eq_ignore_ascii_case("collate") => {
                 p.advance(); // COLLATE
-                let _ = p.parse_identifier();
+                collation = Some(normalize_collation_name(&p.parse_identifier()?)?);
             }
-            _ => break,
+            _ => break Ok(collation),
         }
     }
 }
@@ -179,7 +182,7 @@ pub(crate) fn parse_create_table(
 
     // Consume optional MySQL table options after the closing `)`.
     // mysqldump output always includes: ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 etc.
-    skip_table_options(p);
+    let collation = parse_table_options(p)?;
 
     // Phase 13.9: `IMMUTABLE` table option. Accepted either as a bare
     // keyword after the column list or as `WITH (IMMUTABLE)`.
@@ -199,6 +202,7 @@ pub(crate) fn parse_create_table(
         table,
         columns,
         table_constraints,
+        collation,
         immutable,
         persistence,
     }))
@@ -226,7 +230,8 @@ pub(crate) fn parse_create_materialized_view(p: &mut Parser) -> Result<Stmt, DbE
 ///
 /// These are all silently discarded — AxiomDB doesn't use them but must not
 /// fail to parse valid MySQL schema dumps.
-fn skip_table_options(p: &mut Parser) {
+fn parse_table_options(p: &mut Parser) -> Result<Option<String>, DbError> {
+    let mut collation = None;
     loop {
         // Optional DEFAULT before CHARSET / CHARACTER SET / COLLATE
         let had_default = p.eat(&Token::Default);
@@ -236,7 +241,6 @@ fn skip_table_options(p: &mut Parser) {
             Token::Ident(s)
                 if s.eq_ignore_ascii_case("engine")
                     || s.eq_ignore_ascii_case("charset")
-                    || s.eq_ignore_ascii_case("collate")
                     || s.eq_ignore_ascii_case("auto_increment")
                     || s.eq_ignore_ascii_case("comment")
                     || s.eq_ignore_ascii_case("row_format")
@@ -259,6 +263,11 @@ fn skip_table_options(p: &mut Parser) {
                     skip_table_option_value(p);
                 }
             }
+            Token::Ident(s) if s.eq_ignore_ascii_case("collate") => {
+                p.advance();
+                p.eat(&Token::Eq);
+                collation = Some(normalize_collation_name(&parse_option_identifier(p)?)?);
+            }
             // AUTO_INCREMENT may be lexed as a keyword token rather than Ident
             Token::AutoIncrement => {
                 p.advance();
@@ -276,8 +285,8 @@ fn skip_table_options(p: &mut Parser) {
                 skip_table_option_value(p);
             }
             // DEFAULT keyword was consumed but nothing followed — stop.
-            _ if had_default => break,
-            _ => break,
+            _ if had_default => break Ok(collation),
+            _ => break Ok(collation),
         }
     }
 }
@@ -296,6 +305,20 @@ fn skip_table_option_value(p: &mut Parser) {
             p.advance();
         }
         _ => {}
+    }
+}
+
+fn parse_option_identifier(p: &mut Parser) -> Result<String, DbError> {
+    match p.peek().clone() {
+        Token::Ident(_) | Token::QuotedIdent(_) | Token::DqIdent(_) => p.parse_identifier(),
+        Token::StringLit(s) => {
+            p.advance();
+            Ok(s)
+        }
+        _ => Err(DbError::ParseError {
+            message: "expected option value".into(),
+            position: Some(p.current_pos()),
+        }),
     }
 }
 
@@ -319,6 +342,7 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
     let (data_type, type_len, is_char) = parse_data_type(p)?;
     let mut constraints = Vec::new();
+    let mut collation = None;
 
     loop {
         match p.peek() {
@@ -380,7 +404,7 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
             // COLLATE collation_name
             Token::Ident(s) if s.eq_ignore_ascii_case("collate") => {
                 p.advance();
-                let _ = p.parse_identifier()?;
+                collation = Some(normalize_collation_name(&p.parse_identifier()?)?);
             }
             // CHARACTER SET charset_name
             Token::Ident(s) if s.eq_ignore_ascii_case("character") => {
@@ -427,6 +451,7 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         name,
         data_type,
         constraints,
+        collation,
         type_len,
         is_char,
     })

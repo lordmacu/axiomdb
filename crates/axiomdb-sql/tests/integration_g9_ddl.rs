@@ -106,6 +106,27 @@ fn test_show_create_table_with_pk() {
 }
 
 #[test]
+fn test_show_create_table_emits_persisted_collations() {
+    let mut db = Db::new();
+    db.exec(
+        "CREATE TABLE users (id INT, name TEXT COLLATE utf8mb4_bin) COLLATE utf8mb4_unicode_ci",
+    );
+    let rows = db.rows("SHOW CREATE TABLE users");
+    let ddl = match &rows[0][1] {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text, got {other:?}"),
+    };
+    assert!(
+        ddl.contains("`name` TEXT COLLATE utf8mb4_bin"),
+        "DDL must emit column collation: {ddl}"
+    );
+    assert!(
+        ddl.contains("ENGINE=InnoDB COLLATE=utf8mb4_general_ci"),
+        "DDL must emit table collation: {ddl}"
+    );
+}
+
+#[test]
 fn test_show_create_table_not_found() {
     let mut db = Db::new();
     let err = db.run("SHOW CREATE TABLE nonexistent").unwrap_err();

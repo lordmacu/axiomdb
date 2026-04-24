@@ -818,6 +818,7 @@ mod tests {
             persistence: axiomdb_catalog::schema::TablePersistence::Permanent,
             relation_kind: axiomdb_catalog::schema::RelationKind::Table,
             defining_query: None,
+            default_collation: None,
             triggers: vec![],
         }
     }
@@ -835,6 +836,7 @@ mod tests {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         }
     }
@@ -904,6 +906,7 @@ mod tests {
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             },
             ColumnDef {
@@ -918,6 +921,7 @@ mod tests {
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             },
         ];
@@ -974,6 +978,7 @@ mod tests {
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             },
             ColumnDef {
@@ -988,6 +993,7 @@ mod tests {
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             },
         ];

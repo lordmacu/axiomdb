@@ -43,6 +43,9 @@ fn expr_to_sql_inner(expr: &Expr, top_level: bool) -> String {
             _ => format!("{v}"),
         },
         Expr::Column { name, .. } => name.clone(),
+        Expr::Collate { expr, collation } => {
+            format!("{} COLLATE {}", expr_to_sql_inner(expr, false), collation)
+        }
         Expr::BinaryOp { left, op, right } => {
             let op_str = match op {
                 BinaryOp::Eq => "=",

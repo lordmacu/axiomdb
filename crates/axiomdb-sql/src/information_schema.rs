@@ -179,6 +179,7 @@ pub fn make_is_catalog_columns(
                 default_expr: None,
                 on_update_expr: None,
                 generated_expr: None,
+                collation: None,
                 generated_stored: false,
             })
             .collect(),

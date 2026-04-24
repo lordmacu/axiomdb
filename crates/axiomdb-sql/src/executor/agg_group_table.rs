@@ -421,6 +421,7 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
             collect_col_idxs_non_agg(right, out);
         }
         Expr::UnaryOp { operand, .. } => collect_col_idxs_non_agg(operand, out),
+        Expr::Collate { expr, .. } => collect_col_idxs_non_agg(expr, out),
         Expr::Function { args, .. } => {
             for a in args {
                 collect_col_idxs_non_agg(a, out);
@@ -498,6 +499,7 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
             collect_non_agg_col_idxs_in_expr(right, inside_agg, out);
         }
         Expr::UnaryOp { operand, .. } => collect_non_agg_col_idxs_in_expr(operand, inside_agg, out),
+        Expr::Collate { expr, .. } => collect_non_agg_col_idxs_in_expr(expr, inside_agg, out),
         Expr::Function { args, .. } => {
             for a in args {
                 collect_non_agg_col_idxs_in_expr(a, inside_agg, out);

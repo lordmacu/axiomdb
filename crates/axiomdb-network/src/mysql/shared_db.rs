@@ -336,6 +336,7 @@ impl SharedDatabase {
             }
         };
         if is_ddl {
+            schema_cache.invalidate();
             self.schema_version.fetch_add(1, Ordering::Release);
         }
         let pending = session.pending_deferred_txn_id.take();
@@ -559,6 +560,7 @@ impl SharedDatabase {
             Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
         };
         if is_ddl {
+            schema_cache.invalidate();
             self.schema_version.fetch_add(1, Ordering::Release);
         }
         let pending = session.pending_deferred_txn_id.take();
@@ -791,21 +793,26 @@ impl SharedDatabase {
         &self,
         sql: &str,
         session: &mut SessionContext,
-        _schema_cache: &mut SchemaCache,
+        schema_cache: &mut SchemaCache,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
         let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
-        self.execute_nonblocking_alter_stmt(stmt, session)
+        let result = self.execute_nonblocking_alter_stmt(stmt, session)?;
+        schema_cache.invalidate();
+        Ok(result)
     }
 
     pub async fn execute_nonblocking_alter_query_async(
         &self,
         sql: &str,
         session: &mut SessionContext,
-        _schema_cache: &mut SchemaCache,
+        schema_cache: &mut SchemaCache,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
         let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
-        self.execute_nonblocking_alter_stmt_async(stmt, session)
-            .await
+        let result = self
+            .execute_nonblocking_alter_stmt_async(stmt, session)
+            .await?;
+        schema_cache.invalidate();
+        Ok(result)
     }
 
     pub fn execute_nonblocking_alter_stmt(

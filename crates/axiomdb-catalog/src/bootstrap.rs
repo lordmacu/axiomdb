@@ -158,6 +158,7 @@ impl CatalogBootstrap {
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
             name: DEFAULT_DATABASE_NAME.to_string(),
+            default_collation: None,
         };
         let _ = HeapChain::insert(storage, databases_root, &default_db.to_bytes(), 0, None)?;
 
@@ -233,6 +234,7 @@ impl CatalogBootstrap {
 
             let default_db = DatabaseDef {
                 name: DEFAULT_DATABASE_NAME.to_string(),
+                default_collation: None,
             };
             let _ = HeapChain::insert(storage, root, &default_db.to_bytes(), 0, None)?;
             ids.databases = root;

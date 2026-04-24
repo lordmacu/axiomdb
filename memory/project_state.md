@@ -3,19 +3,19 @@
 ## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.12 — `13.12` Statement-level triggers closed.
-AxiomDB now supports a bounded statement-trigger MVP for base tables:
-`CREATE TRIGGER ... AFTER INSERT|UPDATE|DELETE ... FOR EACH STATEMENT AS
-SELECT ...`, `DROP TRIGGER ... ON table`, and `SHOW CREATE TRIGGER`. Trigger
-definitions persist in table catalog metadata, fire once after top-level DML,
-and abort the outer statement when the validation `SELECT` returns rows. The
-MVP is intentionally narrower than full trigger support: `BEFORE`, `FOR EACH
-ROW`, `WHEN`, `SIGNAL`, transition tables, recursive triggers, and procedural
-bodies remain deferred to Phase 16.
+**Active subphase:** Phase 13.13 — layered collation system closed.
+AxiomDB now persists collation defaults on databases, tables, and columns;
+normalizes MySQL-facing aliases onto canonical runtime modes (`binary` / `es`);
+reconstructs that metadata through `SHOW CREATE TABLE`, `SHOW FULL COLUMNS`,
+`SHOW TABLE STATUS`, and `information_schema`; and supports query-level
+`expr COLLATE ...` overrides for the current collation-aware evaluator paths.
+The delivered cut is intentionally narrower than full ICU/UCA integration:
+runtime semantics are still the existing `binary` and `es` modes, while locale
+tailoring and larger collation registries remain deferred.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_statement_triggers`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_mysql_compat --test integration_g9_ddl --test integration_show_full --test integration_collation_system`; `cargo test -p axiomdb-network --test integration_protocol --test integration_connection_lifecycle`; `python3 tools/wire-test.py` (`464/464`); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.7 / 13.8 remain superseded by Phase 40 lock-manager work; the next actionable Phase 13 subphase is 13.13 Collation system.
+**Next:** Phase 13.7 / 13.8 remain superseded by Phase 40 lock-manager work; the next actionable new Phase 13 subphase after 13.13 is 13.14 Custom aggregate functions.
 
 ### Phase 21 subphase status
 

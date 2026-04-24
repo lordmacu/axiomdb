@@ -154,6 +154,43 @@ fn visible_is_tables_for_session(
         .collect())
 }
 
+fn is_collation_display_name(canonical: Option<&str>) -> &'static str {
+    match canonical.unwrap_or("es") {
+        "binary" => "utf8mb4_bin",
+        "es" => "utf8mb4_general_ci",
+        _ => "utf8mb4_general_ci",
+    }
+}
+
+fn is_effective_table_collation(
+    table: &axiomdb_catalog::TableDef,
+    database_default_collation: Option<&str>,
+) -> &'static str {
+    is_collation_display_name(
+        table
+            .default_collation
+            .as_deref()
+            .or(database_default_collation),
+    )
+}
+
+fn is_effective_column_collation(
+    column: &axiomdb_catalog::ColumnDef,
+    table: &axiomdb_catalog::TableDef,
+    database_default_collation: Option<&str>,
+) -> Option<&'static str> {
+    match column.col_type {
+        ColumnType::Text => Some(is_collation_display_name(
+            column
+                .collation
+                .as_deref()
+                .or(table.default_collation.as_deref())
+                .or(database_default_collation),
+        )),
+        _ => None,
+    }
+}
+
 // ── Row generators ────────────────────────────────────────────────────────────
 
 /// `information_schema.TABLES` — one row per user table.
@@ -188,7 +225,9 @@ fn generate_is_tables_rows(
                 Value::Null,                              // CREATE_TIME
                 Value::Null,                              // UPDATE_TIME
                 Value::Null,                              // CHECK_TIME
-                Value::Text("utf8mb4_0900_ai_ci".into()), // TABLE_COLLATION
+                Value::Text(
+                    is_effective_table_collation(&t, db.default_collation.as_deref()).into(),
+                ), // TABLE_COLLATION
                 Value::Null,                              // CHECKSUM
                 Value::Text("".into()),                   // CREATE_OPTIONS
                 Value::Text("".into()),                   // TABLE_COMMENT
@@ -247,8 +286,12 @@ fn generate_is_columns_rows(
                     num_prec,                         // NUMERIC_PRECISION
                     Value::Null,                      // NUMERIC_SCALE
                     Value::Null,                      // DATETIME_PRECISION
-                    Value::Null,                      // CHARACTER_SET_NAME
-                    Value::Null,                      // COLLATION_NAME
+                    is_effective_column_collation(col, &t, db.default_collation.as_deref())
+                        .map(|_| Value::Text("utf8mb4".into()))
+                        .unwrap_or(Value::Null), // CHARACTER_SET_NAME
+                    is_effective_column_collation(col, &t, db.default_collation.as_deref())
+                        .map(|name| Value::Text(name.into()))
+                        .unwrap_or(Value::Null), // COLLATION_NAME
                     Value::Text(col_type_str.into()), // COLUMN_TYPE
                     Value::Text("".into()),           // COLUMN_KEY
                     Value::Text(extra.into()),        // EXTRA

@@ -1080,9 +1080,10 @@ SHOW COLLATION;
 <span class="callout-icon">💡</span>
 <div class="callout-body">
 <span class="callout-label">Tip</span>
-These commands are read-only and have no effect on query behavior. AxiomDB
-always stores strings as UTF-8 internally; the charset/collation metadata
-exists solely for client compatibility.
+These commands are read-only. AxiomDB still stores strings as UTF-8 internally,
+but collation metadata is no longer purely decorative: session / database /
+table / column / query overrides normalize onto the engine's current runtime
+collations (`binary` / `es`) and do affect text comparison behavior.
 </div>
 </div>
 

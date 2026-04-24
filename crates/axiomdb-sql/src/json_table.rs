@@ -301,6 +301,7 @@ fn flatten_defs_recursive(
                     default_expr: None,
                     on_update_expr: None,
                     generated_expr: None,
+                    collation: None,
                     generated_stored: false,
                 });
             }
@@ -319,6 +320,7 @@ fn flatten_defs_recursive(
                     default_expr: None,
                     on_update_expr: None,
                     generated_expr: None,
+                    collation: None,
                     generated_stored: false,
                 });
             }
@@ -335,6 +337,7 @@ fn flatten_defs_recursive(
                     default_expr: None,
                     on_update_expr: None,
                     generated_expr: None,
+                    collation: None,
                     generated_stored: false,
                 });
             }
@@ -741,7 +744,9 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
         | Expr::Param { .. }
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. } => false,
-        Expr::UnaryOp { operand, .. } => expr_has_outer_column_refs(operand),
+        Expr::UnaryOp { operand, .. } | Expr::Collate { expr: operand, .. } => {
+            expr_has_outer_column_refs(operand)
+        }
         Expr::BinaryOp { left, right, .. } => {
             expr_has_outer_column_refs(left) || expr_has_outer_column_refs(right)
         }
@@ -954,7 +959,9 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. } => true,
         Expr::Literal(_) | Expr::Default | Expr::Param { .. } => false,
-        Expr::UnaryOp { operand, .. } => doc_has_column_refs(operand),
+        Expr::UnaryOp { operand, .. } | Expr::Collate { expr: operand, .. } => {
+            doc_has_column_refs(operand)
+        }
         Expr::BinaryOp { left, right, .. } => {
             doc_has_column_refs(left) || doc_has_column_refs(right)
         }

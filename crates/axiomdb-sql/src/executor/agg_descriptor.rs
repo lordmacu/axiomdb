@@ -28,6 +28,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Function { name, .. } if is_aggregate(name.as_str()) => true,
         Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::UnaryOp { operand, .. } => contains_aggregate(operand),
+        Expr::Collate { expr, .. } => contains_aggregate(expr),
         Expr::IsNull { expr, .. } => contains_aggregate(expr),
         Expr::IsBoolean { expr, .. } => contains_aggregate(expr),
         Expr::Between {
@@ -291,6 +292,7 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             collect_agg_exprs_from(right, result);
         }
         Expr::UnaryOp { operand, .. } => collect_agg_exprs_from(operand, result),
+        Expr::Collate { expr, .. } => collect_agg_exprs_from(expr, result),
         Expr::IsNull { expr, .. } => collect_agg_exprs_from(expr, result),
         Expr::IsBoolean { expr, .. } => collect_agg_exprs_from(expr, result),
         Expr::Between {

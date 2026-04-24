@@ -49,7 +49,7 @@ fn execute_create_database(
         return Err(DbError::DatabaseAlreadyExists { name: stmt.name });
     }
     let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
-    writer.create_database(&stmt.name)?;
+    writer.create_database(&stmt.name, stmt.collation.clone())?;
     // Every new database gets a `public` schema.
     writer.create_schema(&stmt.name, "public")?;
     Ok(QueryResult::Affected {
@@ -201,6 +201,43 @@ fn show_table_type_name(table: &axiomdb_catalog::TableDef) -> &'static str {
     }
 }
 
+pub(crate) fn collation_display_name(canonical: Option<&str>) -> &'static str {
+    match canonical.unwrap_or("es") {
+        "binary" => "utf8mb4_bin",
+        "es" => "utf8mb4_general_ci",
+        _ => "utf8mb4_general_ci",
+    }
+}
+
+pub(crate) fn effective_table_collation(
+    table: &axiomdb_catalog::TableDef,
+    database_default_collation: Option<&str>,
+) -> &'static str {
+    collation_display_name(
+        table
+            .default_collation
+            .as_deref()
+            .or(database_default_collation),
+    )
+}
+
+pub(crate) fn effective_column_collation(
+    column: &axiomdb_catalog::ColumnDef,
+    table: &axiomdb_catalog::TableDef,
+    database_default_collation: Option<&str>,
+) -> Option<&'static str> {
+    match column.col_type {
+        ColumnType::Text => Some(collation_display_name(
+            column
+                .collation
+                .as_deref()
+                .or(table.default_collation.as_deref())
+                .or(database_default_collation),
+        )),
+        _ => None,
+    }
+}
+
 fn execute_show_columns(
     stmt: crate::ast::ShowColumnsStmt,
     storage: &dyn StorageEngine,
@@ -236,6 +273,9 @@ fn execute_show_columns(
             })?
     };
     let columns = reader.list_columns(table_def.id)?;
+    let database_collation = reader
+        .get_database(database)?
+        .and_then(|db| db.default_collation);
 
     let base_cols = vec![
         ColumnMeta::computed("Field", DataType::Text),
@@ -275,13 +315,9 @@ fn execute_show_columns(
                 Value::Text(extra.into()),
             ];
             if stmt.full {
-                // Collation: text types get utf8mb4_general_ci, others NULL.
-                let coll = match c.col_type {
-                    ColumnType::Text | ColumnType::Bytes => {
-                        Value::Text("utf8mb4_general_ci".into())
-                    }
-                    _ => Value::Null,
-                };
+                let coll = effective_column_collation(c, &table_def, database_collation.as_deref())
+                    .map(|name| Value::Text(name.into()))
+                    .unwrap_or(Value::Null);
                 row.push(coll);
                 row.push(Value::Text("select,insert,update,references".into()));
                 row.push(Value::Text("".into())); // Comment
@@ -452,6 +488,9 @@ fn execute_show_create_table(
 
     let columns = reader.list_columns(table_def.id)?;
     let indexes = reader.list_indexes(table_def.id)?;
+    let database_collation = reader
+        .get_database(database)?
+        .and_then(|db| db.default_collation);
     if table_def.is_materialized_view() {
         let defining_query = table_def
             .defining_query
@@ -494,9 +533,12 @@ fn execute_show_create_table(
         } else {
             ""
         };
+        let collate = effective_column_collation(col, &table_def, database_collation.as_deref())
+            .map(|name| format!(" COLLATE {name}"))
+            .unwrap_or_default();
         ddl.push_str(&format!(
-            "  `{}` {}{}{},\n",
-            col.name, type_str, null_str, extra
+            "  `{}` {}{}{}{},\n",
+            col.name, type_str, collate, null_str, extra
         ));
     }
 
@@ -539,7 +581,11 @@ fn execute_show_create_table(
     }
 
     let engine = "InnoDB";
-    ddl.push_str(&format!(") ENGINE={}", engine));
+    ddl.push_str(&format!(
+        ") ENGINE={} COLLATE={}",
+        engine,
+        effective_table_collation(&table_def, database_collation.as_deref())
+    ));
 
     let out_cols = vec![
         ColumnMeta::computed("Table", DataType::Text),
@@ -653,9 +699,15 @@ fn execute_show_table_status(
         // Look up approximate row count from stats.
         let stats = reader.list_stats(table.id).unwrap_or_default();
         let row_count = stats.first().map(|s| s.row_count).unwrap_or(0) as i64;
+        let database_collation = reader
+            .get_database(database)?
+            .and_then(|db| db.default_collation);
+        let table_collation =
+            effective_table_collation(&table, database_collation.as_deref()).to_string();
+        let table_name = table.table_name.clone();
 
         rows.push(vec![
-            Value::Text(table.table_name),
+            Value::Text(table_name),
             Value::Text("InnoDB".into()),
             Value::Int(10),
             Value::Text("Dynamic".into()),
@@ -669,7 +721,7 @@ fn execute_show_table_status(
             Value::Null, // Create_time
             Value::Null, // Update_time
             Value::Null, // Check_time
-            Value::Text("utf8mb4_general_ci".into()),
+            Value::Text(table_collation),
             Value::Null, // Checksum
             Value::Text("".into()),
             Value::Text("".into()),

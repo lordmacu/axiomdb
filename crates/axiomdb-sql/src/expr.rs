@@ -33,6 +33,13 @@ pub enum Expr {
     /// A unary operator applied to one operand.
     UnaryOp { op: UnaryOp, operand: Box<Expr> },
 
+    /// `expr COLLATE name`
+    ///
+    /// Uses the named collation for the wrapped subtree when the executor
+    /// performs text comparisons, LIKE matching, or other collation-aware
+    /// operations.
+    Collate { expr: Box<Expr>, collation: String },
+
     // ── Binary operators ──────────────────────────────────────────────────────
     /// A binary operator applied to two operands.
     ///

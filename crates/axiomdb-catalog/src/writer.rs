@@ -147,9 +147,14 @@ impl<'a> CatalogWriter<'a> {
     // ── Database operations ──────────────────────────────────────────────────
 
     /// Inserts a database definition row into `axiom_databases`.
-    pub fn create_database(&mut self, name: &str) -> Result<(), DbError> {
+    pub fn create_database(
+        &mut self,
+        name: &str,
+        default_collation: Option<String>,
+    ) -> Result<(), DbError> {
         let data = DatabaseDef {
             name: name.to_string(),
+            default_collation,
         }
         .to_bytes();
         let txn_id = self.conn.txn_id;
@@ -363,6 +368,7 @@ impl<'a> CatalogWriter<'a> {
             TablePersistence::Permanent,
             RelationKind::Table,
             None,
+            None,
         )
     }
 
@@ -377,6 +383,7 @@ impl<'a> CatalogWriter<'a> {
         storage_layout: TableStorageLayout,
         immutable: bool,
         persistence: TablePersistence,
+        default_collation: Option<String>,
     ) -> Result<TableDef, DbError> {
         self.create_relation_with_options(
             schema,
@@ -386,10 +393,12 @@ impl<'a> CatalogWriter<'a> {
             persistence,
             RelationKind::Table,
             None,
+            default_collation,
         )
     }
 
     /// Allocates a new relation with full option control.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_relation_with_options(
         &mut self,
         schema: &str,
@@ -399,6 +408,7 @@ impl<'a> CatalogWriter<'a> {
         persistence: TablePersistence,
         relation_kind: RelationKind,
         defining_query: Option<String>,
+        default_collation: Option<String>,
     ) -> Result<TableDef, DbError> {
         let table_id = alloc_table_id(self.storage)?;
         let root_page_id = self.allocate_table_root(storage_layout)?;
@@ -414,6 +424,7 @@ impl<'a> CatalogWriter<'a> {
             persistence,
             relation_kind,
             defining_query,
+            default_collation,
             triggers: vec![],
         };
         let data = def.to_bytes();

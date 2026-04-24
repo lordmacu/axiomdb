@@ -157,6 +157,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();
@@ -172,6 +173,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();
@@ -187,6 +189,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();
@@ -380,6 +383,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
             default_expr: None,
             on_update_expr: None,
             generated_expr: None,
+            collation: None,
             generated_stored: false,
         })
         .unwrap();
