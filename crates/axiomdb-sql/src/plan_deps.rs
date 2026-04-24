@@ -190,10 +190,12 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::CreateDatabase(_)
             | Stmt::CreateSchema(_)
             | Stmt::CreateIndex(_)
+            | Stmt::CreateTrigger(_)
             | Stmt::DropTable(_)
             | Stmt::DropMaterializedView(_)
             | Stmt::DropDatabase(_)
             | Stmt::DropIndex(_)
+            | Stmt::DropTrigger(_)
             | Stmt::RefreshMaterializedView(_)
             | Stmt::TruncateTable(_)
             | Stmt::AlterTable(_)
@@ -205,6 +207,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::ShowColumns(_)
             | Stmt::ShowIndex(_)
             | Stmt::ShowCreateTable(_)
+            | Stmt::ShowCreateTrigger(_)
             | Stmt::ShowTableStatus(_)
             | Stmt::ShowEngines
             | Stmt::ShowCharset

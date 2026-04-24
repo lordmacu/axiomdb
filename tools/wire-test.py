@@ -35,7 +35,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              13.3 (generated columns closeout smoke),
              13.4 (LISTEN / NOTIFY pull-based smoke),
              13.5 (covering indexes smoke),
-             13.6 (non-blocking ALTER TABLE smoke)
+             13.6 (non-blocking ALTER TABLE smoke),
+             13.12 (statement-level triggers smoke)
 """
 import os
 import signal
@@ -4214,7 +4215,7 @@ for _ in range(400):
         writer_cur.execute("INSERT INTO nb13_wire VALUES (999999, 'blocked')")
         writer_conn.rollback()
     except Exception as e:
-        if "lock timeout" in str(e).lower():
+        if "lock timeout" in str(e).lower() or "lock wait timeout" in str(e).lower():
             writer_blocked = True
             writer_conn.rollback()
             break
@@ -4237,11 +4238,55 @@ ok("[13.6 non-blocking alter table] ALTER TABLE finishes successfully",
    alter_result["ok"] and alter_result["err"] is None,
    alter_result)
 
-cur.execute("SELECT extra FROM nb13_wire WHERE id = 1")
-rows = cur.fetchall()
+post_alter_conn = connect()
+post_alter_cur = post_alter_conn.cursor()
+post_alter_cur.execute("SELECT extra FROM nb13_wire WHERE id = 1")
+rows = post_alter_cur.fetchall()
+post_alter_cur.close()
+post_alter_conn.close()
 ok("[13.6 non-blocking alter table] cutover publishes new column atomically",
    rows == ((9,),),
    rows)
+
+# ── Phase 13.12 — Statement-level triggers ──────────────────────────────────
+
+print("\n[13.12 statement triggers]")
+
+cur.execute("CREATE TABLE trig13_journal (id INT, debit INT, credit INT)")
+cur.execute(
+    "CREATE TRIGGER trig13_balanced AFTER INSERT ON trig13_journal FOR EACH STATEMENT AS "
+    "SELECT 'journal not balanced' FROM trig13_journal GROUP BY 1 HAVING SUM(debit) <> SUM(credit)"
+)
+
+cur.execute(
+    "INSERT INTO trig13_journal VALUES (1, 10, 0), (2, 0, 10)"
+)
+conn.commit()
+ok("[13.12 statement triggers] balanced batch insert succeeds",
+   conn.affected_rows() == 2,
+   conn.affected_rows())
+
+try:
+    cur.execute(
+        "INSERT INTO trig13_journal VALUES (3, 7, 0), (4, 0, 6)"
+    )
+    conn.commit()
+    ok("[13.12 statement triggers] unbalanced batch is rejected", False, "statement unexpectedly succeeded")
+except Exception:
+    conn.rollback()
+    ok("[13.12 statement triggers] unbalanced batch is rejected", True)
+
+cur.execute("SELECT id, debit, credit FROM trig13_journal ORDER BY id")
+rows = cur.fetchall()
+ok("[13.12 statement triggers] failed batch leaves prior committed rows intact",
+   rows == ((1, 10, 0), (2, 0, 10)),
+   rows)
+
+cur.execute("SHOW CREATE TRIGGER trig13_balanced ON trig13_journal")
+row = cur.fetchone()
+ok("[13.12 statement triggers] SHOW CREATE TRIGGER reconstructs trigger DDL",
+   row is not None and "FOR EACH STATEMENT" in row[1],
+   row)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

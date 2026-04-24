@@ -82,6 +82,118 @@ impl TryFrom<u8> for RelationKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl From<TriggerEvent> for u8 {
+    fn from(value: TriggerEvent) -> Self {
+        match value {
+            TriggerEvent::Insert => 1,
+            TriggerEvent::Update => 2,
+            TriggerEvent::Delete => 3,
+        }
+    }
+}
+
+impl TryFrom<u8> for TriggerEvent {
+    type Error = DbError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Insert),
+            2 => Ok(Self::Update),
+            3 => Ok(Self::Delete),
+            other => Err(DbError::ParseError {
+                message: format!("invalid trigger event byte {other}"),
+                position: None,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerDef {
+    pub name: String,
+    pub event: TriggerEvent,
+    pub body_sql: String,
+    pub ordinal: u32,
+}
+
+impl TriggerDef {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let name = self.name.as_bytes();
+        let body = self.body_sql.as_bytes();
+        debug_assert!(name.len() <= 255, "trigger name too long");
+        debug_assert!(body.len() <= u16::MAX as usize, "trigger body too long");
+        let mut buf = Vec::with_capacity(1 + name.len() + 1 + 2 + body.len() + 4);
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.push(self.event.into());
+        buf.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        buf.extend_from_slice(body);
+        buf.extend_from_slice(&self.ordinal.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), DbError> {
+        let err = || DbError::ParseError {
+            message: "truncated TriggerDef bytes".into(),
+            position: None,
+        };
+        if bytes.is_empty() {
+            return Err(err());
+        }
+        let name_len = bytes[0] as usize;
+        if bytes.len() < 1 + name_len + 1 + 2 + 4 {
+            return Err(err());
+        }
+        let name = std::str::from_utf8(&bytes[1..1 + name_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in trigger name".into(),
+                position: None,
+            })?
+            .to_string();
+        let mut consumed = 1 + name_len;
+        let event = TriggerEvent::try_from(bytes[consumed])?;
+        consumed += 1;
+        let body_len = u16::from_le_bytes(
+            bytes[consumed..consumed + 2]
+                .try_into()
+                .expect("slice is exactly 2 bytes"),
+        ) as usize;
+        consumed += 2;
+        if bytes.len() < consumed + body_len + 4 {
+            return Err(err());
+        }
+        let body_sql = std::str::from_utf8(&bytes[consumed..consumed + body_len])
+            .map_err(|_| DbError::ParseError {
+                message: "invalid UTF-8 in trigger body".into(),
+                position: None,
+            })?
+            .to_string();
+        consumed += body_len;
+        let ordinal = u32::from_le_bytes(
+            bytes[consumed..consumed + 4]
+                .try_into()
+                .expect("slice is exactly 4 bytes"),
+        );
+        consumed += 4;
+        Ok((
+            Self {
+                name,
+                event,
+                body_sql,
+                ordinal,
+            },
+            consumed,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
     pub id: TableId,
@@ -116,6 +228,8 @@ pub struct TableDef {
     pub relation_kind: RelationKind,
     /// Defining query for materialized views. `None` for ordinary tables.
     pub defining_query: Option<String>,
+    /// Statement-level triggers owned by this table.
+    pub triggers: Vec<TriggerDef>,
 }
 
 impl TableDef {
@@ -140,7 +254,7 @@ impl TableDef {
         Ok(())
     }
 
-    /// Serializes to binary row format (v5).
+    /// Serializes to binary row format (v6).
     ///
     /// Format:
     /// `[table_id:4][root_page_id:8][schema_len:1][schema bytes][name_len:1][name bytes][layout:1][schema_version:8 LE]`
@@ -151,12 +265,16 @@ impl TableDef {
         let schema = self.schema_name.as_bytes();
         let name = self.table_name.as_bytes();
         let query = self.defining_query.as_deref().unwrap_or("").as_bytes();
+        let trigger_bytes: Vec<Vec<u8>> = self.triggers.iter().map(TriggerDef::to_bytes).collect();
+        let triggers_len: usize = trigger_bytes.iter().map(Vec::len).sum();
         debug_assert!(schema.len() <= 255, "schema_name too long");
         debug_assert!(name.len() <= 255, "table_name too long");
         debug_assert!(query.len() <= u16::MAX as usize, "defining_query too long");
+        debug_assert!(self.triggers.len() <= u16::MAX as usize, "too many triggers");
 
         let mut buf = Vec::with_capacity(
-            4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1 + 1 + 1 + 2 + query.len(),
+            4 + 8 + 1 + schema.len() + 1 + name.len() + 1 + 8 + 1 + 1 + 1 + 2 + query.len() + 2
+                + triggers_len,
         );
         buf.extend_from_slice(&self.id.to_le_bytes());
         buf.extend_from_slice(&self.root_page_id.to_le_bytes());
@@ -177,6 +295,11 @@ impl TableDef {
         buf.push(self.relation_kind.into());
         buf.extend_from_slice(&(query.len() as u16).to_le_bytes());
         buf.extend_from_slice(query);
+        // v6 trailer: trigger count + trigger bytes.
+        buf.extend_from_slice(&(self.triggers.len() as u16).to_le_bytes());
+        for trig in trigger_bytes {
+            buf.extend_from_slice(&trig);
+        }
         buf
     }
 
@@ -234,8 +357,9 @@ impl TableDef {
         //   v3 (10 trailing): v2 + 1-byte immutable flag (Phase 13.9), persistence = Permanent
         //   v4 (11 trailing): v3 + 1-byte persistence flag (Phase 21.7)
         //   v5 (>=14 trailing): v4 + relation kind + defining query bytes
+        //   v6 (v5 + trailing bytes after query): trigger count + trigger bytes
         let remaining = bytes.len() - consumed;
-        let (storage_layout, schema_version, immutable, persistence, relation_kind, defining_query) = match remaining {
+        let (storage_layout, schema_version, immutable, persistence, relation_kind, defining_query, triggers) = match remaining {
             0 => (
                 TableStorageLayout::Heap,
                 1u64,
@@ -243,6 +367,7 @@ impl TableDef {
                 TablePersistence::Permanent,
                 RelationKind::Table,
                 None,
+                Vec::new(),
             ),
             1 => {
                 let layout = TableStorageLayout::try_from(bytes[consumed])?;
@@ -254,6 +379,7 @@ impl TableDef {
                     TablePersistence::Permanent,
                     RelationKind::Table,
                     None,
+                    Vec::new(),
                 )
             }
             9 => {
@@ -272,6 +398,7 @@ impl TableDef {
                     TablePersistence::Permanent,
                     RelationKind::Table,
                     None,
+                    Vec::new(),
                 )
             }
             10 => {
@@ -292,6 +419,7 @@ impl TableDef {
                     TablePersistence::Permanent,
                     RelationKind::Table,
                     None,
+                    Vec::new(),
                 )
             }
             11 => {
@@ -314,6 +442,7 @@ impl TableDef {
                     persistence,
                     RelationKind::Table,
                     None,
+                    Vec::new(),
                 )
             }
             n if n >= 14 => {
@@ -353,6 +482,23 @@ impl TableDef {
                     )
                 };
                 consumed += query_len;
+                let mut triggers = Vec::new();
+                if bytes.len() > consumed {
+                    if bytes.len() < consumed + 2 {
+                        return Err(err());
+                    }
+                    let trigger_count = u16::from_le_bytes(
+                        bytes[consumed..consumed + 2]
+                            .try_into()
+                            .expect("slice is exactly 2 bytes"),
+                    ) as usize;
+                    consumed += 2;
+                    for _ in 0..trigger_count {
+                        let (trigger, used) = TriggerDef::from_bytes(&bytes[consumed..])?;
+                        consumed += used;
+                        triggers.push(trigger);
+                    }
+                }
                 (
                     layout,
                     v,
@@ -360,6 +506,7 @@ impl TableDef {
                     persistence,
                     relation_kind,
                     defining_query,
+                    triggers,
                 )
             }
             _ => {
@@ -382,6 +529,7 @@ impl TableDef {
                 persistence,
                 relation_kind,
                 defining_query,
+                triggers,
             },
             consumed,
         ))

@@ -53,6 +53,9 @@ pub enum DbError {
     #[error("index '{name}' not found")]
     IndexNotFound { name: String },
 
+    #[error("trigger '{name}' not found on table '{table}'")]
+    TriggerNotFound { name: String, table: String },
+
     /// `CREATE TABLE ... IMMUTABLE` rejects any modification (Phase 13.9).
     #[error("{operation} rejected: table '{table}' is IMMUTABLE")]
     ImmutableTable { table: String, operation: String },
@@ -107,6 +110,13 @@ pub enum DbError {
 
     #[error("EXCLUDE constraint violation on {table}.{constraint}")]
     ExclusionViolation { table: String, constraint: String },
+
+    #[error("statement trigger '{trigger}' validation failed on table '{table}': {message}")]
+    TriggerValidationFailed {
+        trigger: String,
+        table: String,
+        message: String,
+    },
 
     #[error("column count doesn't match value count at row {row}: expected {expected}, got {got}")]
     ColumnCountMismatch {
@@ -284,6 +294,10 @@ pub enum DbError {
     /// SQLSTATE 42P07 — duplicate_table (reused for objects)
     #[error("index '{name}' already exists on table '{table}'")]
     IndexAlreadyExists { name: String, table: String },
+
+    /// A trigger with this name already exists on the table.
+    #[error("trigger '{name}' already exists on table '{table}'")]
+    TriggerAlreadyExists { name: String, table: String },
 
     /// An index key exceeds the maximum allowed byte length.
     /// SQLSTATE 54000 — program_limit_exceeded

@@ -547,6 +547,24 @@
 - `data->>'field'` lowers to `JSON_EXTRACT(data, '$.field')` (no new BinaryOp)
 - Wire: JSON exposed as string-compatible payload on MySQL wire
 
+## 2026-04-23 — Statement-level triggers (13.12)
+
+- `axiomdb-catalog::TableDef` now owns `triggers: Vec<TriggerDef>`; on-disk
+  table rows move to v6 but still decode older rows with empty trigger lists.
+- Trigger MVP is table-local metadata only: event + body SQL + creation order.
+  No global trigger catalog or procedure object exists yet.
+- Executor boundary is post-statement, not per-row: `INSERT` / `UPDATE` /
+  `DELETE` run trigger dispatch once after the outer DML result is known.
+- Trigger bodies are reparsed `SELECT`s executed in the same transaction.
+  Returning any row means validation failure and reuses existing
+  statement-rollback semantics.
+- Trigger context is intentionally narrow: `@@trigger_name`,
+  `@@trigger_table`, `@@trigger_event`, `@@trigger_row_count` are provided via
+  bounded SQL-text substitution before parsing the body.
+- `SHOW CREATE TRIGGER` must exist in both the regular executor path and the
+  read-only MySQL handler path; otherwise wire execution falls through to the
+  generic read-only `NotImplemented`.
+
 ## 2026-04-09 — ALTER TABLE + ANSI quote mode hardening
 
 - `ddl_alter_constraint.rs`: `ALTER TABLE ... ADD PRIMARY KEY` → staged heap→clustered migration

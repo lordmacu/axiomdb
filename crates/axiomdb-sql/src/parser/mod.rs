@@ -498,9 +498,28 @@ impl<'src> Parser<'src> {
                     // SHOW CREATE TABLE t
                     Token::Create => {
                         self.advance();
-                        self.expect(&Token::Table)?;
-                        let table = self.parse_table_ref()?;
-                        Ok(Stmt::ShowCreateTable(crate::ast::ShowCreateTableStmt { table }))
+                        match self.peek() {
+                            Token::Table => {
+                                self.advance();
+                                let table = self.parse_table_ref()?;
+                                Ok(Stmt::ShowCreateTable(crate::ast::ShowCreateTableStmt { table }))
+                            }
+                            Token::Trigger => {
+                                self.advance();
+                                let name = self.parse_identifier()?;
+                                self.expect(&Token::On)?;
+                                let table = self.parse_table_ref()?;
+                                Ok(Stmt::ShowCreateTrigger(
+                                    crate::ast::ShowCreateTriggerStmt { name, table },
+                                ))
+                            }
+                            other => Err(DbError::ParseError {
+                                message: format!(
+                                    "expected TABLE or TRIGGER after SHOW CREATE, found {other:?}"
+                                ),
+                                position: Some(self.current_pos()),
+                            }),
+                        }
                     }
                     // COLUMNS / FIELDS are not reserved keywords — they tokenize as Ident.
                     Token::Ident(kw) | Token::QuotedIdent(kw)
@@ -948,6 +967,10 @@ impl<'src> Parser<'src> {
                 self.expect(&Token::View)?;
                 ddl::parse_create_materialized_view(self)
             }
+            Token::Trigger => {
+                self.advance();
+                ddl::parse_create_trigger(self)
+            }
             Token::Unique => {
                 self.advance();
                 self.expect(&Token::Index)?;
@@ -959,7 +982,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE, MATERIALIZED VIEW or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE, MATERIALIZED VIEW, TRIGGER or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -986,9 +1009,13 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_index(self)
             }
+            Token::Trigger => {
+                self.advance();
+                ddl::parse_drop_trigger(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, MATERIALIZED VIEW or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, MATERIALIZED VIEW, TRIGGER or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1235,6 +1262,7 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         Token::Kill => "kill".into(),
         Token::Query => "query".into(),
         Token::Connection => "connection".into(),
+        Token::For => "for".into(),
         // Expression operator keywords usable as identifiers
         Token::Regexp => "regexp".into(),
         Token::Rlike => "rlike".into(),

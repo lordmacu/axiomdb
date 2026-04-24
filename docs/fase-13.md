@@ -1,5 +1,68 @@
 # Fase 13 - Advanced PostgreSQL
 
+## 13.12 Statement-level triggers - cerrada 2026-04-23
+
+La subfase 13.12 cierra el primer corte real de triggers SQL en AxiomDB, pero
+deliberadamente como **validation-trigger MVP** y no como sistema general de
+triggers. El recorte entregado sirve para validacion por sentencia, sobre todo
+en el caso contable de batch inserts que deben revisarse una sola vez despues
+del DML completo.
+
+### Superficie SQL cerrada
+
+Soportado:
+
+- `CREATE TRIGGER trg AFTER INSERT|UPDATE|DELETE ON tabla FOR EACH STATEMENT AS SELECT ...`
+- `DROP TRIGGER trg ON tabla`
+- `SHOW CREATE TRIGGER trg ON tabla`
+- triggers `AFTER` sobre tablas base
+- firing una sola vez por sentencia DML tope (`INSERT`, `UPDATE`, `DELETE`)
+- rollback de la sentencia outer cuando el `SELECT` de validacion devuelve filas
+
+Fuera de alcance en este corte:
+
+- `BEFORE`
+- `FOR EACH ROW`
+- `WHEN`, `SIGNAL`, transition tables `OLD/NEW TABLE`
+- cuerpos multi-statement o procedurales
+- triggers sobre views o materialized views
+- recursion o disparo desde DML interno de mantenimiento
+
+### Ajustes tecnicos de cierre
+
+- Catalogo: `TableDef` ahora persiste `triggers: Vec<TriggerDef>` con nombre,
+  evento, SQL cuerpo y ordinal de creacion; el formato on-disk de tabla sube a
+  v6 conservando lectura compatible de filas viejas sin triggers.
+- Parser/AST: se agregan `CREATE TRIGGER`, `DROP TRIGGER` y
+  `SHOW CREATE TRIGGER`; `BEFORE` y `FOR EACH ROW` quedan rechazados
+  explicitamente como `NotImplemented`.
+- Ejecutor DDL: create/drop trigger actualizan la metadata owned-by-table y
+  bump de `schema_version`.
+- Ejecutor DML: `INSERT`, `UPDATE` y `DELETE` corren dispatch compartido post
+  sentencia; si el body `SELECT` devuelve filas, la sentencia outer falla con
+  `TriggerValidationFailed` y se deshace bajo el rollback por sentencia ya
+  existente.
+- Contexto trigger: el body almacenado se reparsea al disparar y recibe
+  `@@trigger_name`, `@@trigger_table`, `@@trigger_event` y
+  `@@trigger_row_count` via sustitucion SQL acotada.
+- Wire/read-only path: `SHOW CREATE TRIGGER` quedo soportado tambien por la
+  ruta read-only del handler MySQL para no caer en el viejo fallback
+  `NotSupported`.
+
+### Cobertura agregada
+
+- `crates/axiomdb-sql/tests/integration_statement_triggers.rs`
+- `crates/axiomdb-sql/tests/integration_ddl_parser.rs`
+- bloque wire `[13.12 statement triggers]` en `tools/wire-test.py`
+
+### Validacion
+
+- `cargo fmt --check` - paso.
+- `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_statement_triggers` - paso.
+- `python3 tools/wire-test.py` - paso, 461/461 assertions.
+- `cargo test --workspace` - paso.
+- `cargo clippy --workspace -- -D warnings` - paso.
+
 ## 13.6 Non-blocking ALTER TABLE - cerrada 2026-04-23
 
 La subfase 13.6 cierra el primer corte real de `ALTER TABLE` no bloqueante en

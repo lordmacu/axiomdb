@@ -1184,6 +1184,36 @@ pub struct NotifyStmt {
     pub payload: Option<Expr>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// `CREATE TRIGGER name AFTER event ON table FOR EACH STATEMENT AS SELECT ...`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerStmt {
+    pub name: String,
+    pub event: TriggerEvent,
+    pub table: TableRef,
+    pub body_sql: String,
+}
+
+/// `DROP TRIGGER name ON table`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTriggerStmt {
+    pub name: String,
+    pub table: TableRef,
+}
+
+/// `SHOW CREATE TRIGGER name ON table`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowCreateTriggerStmt {
+    pub name: String,
+    pub table: TableRef,
+}
+
 /// `CLOSE name` or `CLOSE ALL`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseCursorStmt {
@@ -1237,6 +1267,7 @@ pub enum Stmt {
     CreateTableAsSelect(CreateTableAsSelectStmt),
     /// `CREATE MATERIALIZED VIEW name AS SELECT ...`.
     CreateMaterializedView(CreateMaterializedViewStmt),
+    CreateTrigger(CreateTriggerStmt),
     CreateDatabase(CreateDatabaseStmt),
     CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
@@ -1244,6 +1275,7 @@ pub enum Stmt {
     DropMaterializedView(DropMaterializedViewStmt),
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
+    DropTrigger(DropTriggerStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
@@ -1256,6 +1288,7 @@ pub enum Stmt {
     ShowIndex(ShowIndexStmt),
     /// `SHOW CREATE TABLE t` — reconstruct DDL (4.20b).
     ShowCreateTable(ShowCreateTableStmt),
+    ShowCreateTrigger(ShowCreateTriggerStmt),
     /// `SHOW TABLE STATUS [FROM db] [LIKE pattern]` (5.9f).
     ShowTableStatus(ShowTableStatusStmt),
     /// `SHOW ENGINES` — static engine list (5.9g).

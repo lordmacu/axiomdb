@@ -414,6 +414,7 @@ impl<'a> CatalogWriter<'a> {
             persistence,
             relation_kind,
             defining_query,
+            triggers: vec![],
         };
         let data = def.to_bytes();
 
@@ -891,6 +892,55 @@ impl<'a> CatalogWriter<'a> {
         Err(DbError::Internal {
             message: format!(
                 "bump_table_schema_version: table_id={table_id} not found in axiom_tables"
+            ),
+        })
+    }
+
+    /// Replaces the trigger list of a table in `axiom_tables`.
+    pub fn update_table_triggers(
+        &mut self,
+        table_id: TableId,
+        new_triggers: Vec<crate::schema::TriggerDef>,
+    ) -> Result<(), DbError> {
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = table_id.to_le_bytes();
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+
+                let new_def = TableDef {
+                    triggers: new_triggers,
+                    ..def
+                };
+                let new_data = new_def.to_bytes();
+                let (pg2, sl2) =
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id, None)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &new_data,
+                    pg2,
+                    sl2,
+                )?;
+                return Ok(());
+            }
+        }
+        Err(DbError::Internal {
+            message: format!(
+                "update_table_triggers: table_id={table_id} not found in axiom_tables"
             ),
         })
     }
