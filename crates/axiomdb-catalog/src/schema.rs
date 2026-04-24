@@ -107,6 +107,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            triggers: vec![],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -129,6 +130,7 @@ mod tests {
                 persistence: TablePersistence::Permanent,
                 relation_kind: RelationKind::Table,
                 defining_query: None,
+                triggers: vec![],
             };
             let (back, _) = TableDef::from_bytes(&def.to_bytes()).unwrap();
             assert_eq!(back.root_page_id, root);
@@ -148,6 +150,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            triggers: vec![],
         };
         let bytes = def.to_bytes();
         let (back, _) = TableDef::from_bytes(&bytes).unwrap();
@@ -167,6 +170,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            triggers: vec![],
         };
         let bytes = def.to_bytes();
         // Minimum is 14 bytes; truncate to 10 (has id+root but no schema_len).
@@ -188,6 +192,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            triggers: vec![],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -230,6 +235,7 @@ mod tests {
             persistence: TablePersistence::Unlogged,
             relation_kind: RelationKind::Table,
             defining_query: None,
+            triggers: vec![],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();
@@ -250,6 +256,7 @@ mod tests {
             persistence: TablePersistence::Permanent,
             relation_kind: RelationKind::MaterializedView,
             defining_query: Some("SELECT region, SUM(total) FROM sales GROUP BY region".into()),
+            triggers: vec![],
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDef::from_bytes(&bytes).unwrap();

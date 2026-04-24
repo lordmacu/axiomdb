@@ -21,7 +21,7 @@ pub use schema::{
     ColumnDef, ColumnType, ConstraintDef, ConstraintKind, ConstraintOperator, DatabaseDef,
     ExclusionElementDef, FkAction, FkDef, IndexColumnDef, IndexDef, RelationKind, SchemaDef,
     SortOrder, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
-    DEFAULT_DATABASE_NAME,
+    TriggerDef, TriggerEvent, DEFAULT_DATABASE_NAME,
 };
 pub use writer::{
     CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_DATABASES,

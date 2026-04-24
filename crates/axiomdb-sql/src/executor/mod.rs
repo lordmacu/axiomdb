@@ -56,12 +56,13 @@ use crate::exec_ctx::ExecutionContext;
 use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, CreateDatabaseStmt,
-        CreateIndexStmt, CreateTableStmt, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
-        DropTableStmt, FromClause, GeneratedColumnKind, GroupByClause, InsertSource, InsertStmt,
-        JoinClause, JoinCondition, JoinType, LockMode, MergeActionCondition, MergeActionKind,
-        MergeStmt, NullsOrder, OnConflictAction, OrderByItem, SelectItem, SelectStmt, SetOpKind,
-        SetOpTail, SetStmt, SetValue, ShowDatabasesStmt, SortOrder, Stmt, TableRef, UpdateStmt,
-        UseDatabaseStmt,
+        CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropDatabaseStmt,
+        DropIndexStmt, DropTableStmt, DropTriggerStmt, FromClause, GeneratedColumnKind,
+        GroupByClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, LockMode,
+        MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder, OnConflictAction,
+        OrderByItem, SelectItem, SelectStmt, SetOpKind, SetOpTail, SetStmt, SetValue,
+        ShowCreateTriggerStmt, ShowDatabasesStmt, SortOrder, Stmt, TableRef, TriggerEvent,
+        UpdateStmt, UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, InSubquerySet, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -117,6 +118,7 @@ include!("delete.rs");
 include!("returning.rs");
 include!("recursive_cte_exec.rs");
 include!("ddl_create_table.rs");
+include!("trigger.rs");
 include!("ddl_drop_table.rs");
 include!("ddl_create_index.rs");
 include!("ddl_drop_index.rs");

@@ -818,6 +818,7 @@ mod tests {
             persistence: axiomdb_catalog::schema::TablePersistence::Permanent,
             relation_kind: axiomdb_catalog::schema::RelationKind::Table,
             defining_query: None,
+            triggers: vec![],
         }
     }
 

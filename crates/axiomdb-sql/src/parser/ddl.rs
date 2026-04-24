@@ -8,10 +8,10 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
         ConstraintTiming, CreateIndexStmt, CreateMaterializedViewStmt, CreateTableAsSelectStmt,
-        CreateTableLikeStmt, CreateTableStmt, DropIndexStmt, DropMaterializedViewStmt,
-        DropTableStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
-        ForeignKeyAction, GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, SortOrder,
-        Stmt, TableConstraint,
+        CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt, DropIndexStmt,
+        DropMaterializedViewStmt, DropTableStmt, DropTriggerStmt, ExclusionElement,
+        ExclusionElementTarget, ExclusionOperator, ForeignKeyAction, GeneratedColumnKind,
+        IndexColumn, RefreshMaterializedViewStmt, SortOrder, Stmt, TableConstraint, TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -30,6 +30,58 @@ pub(crate) fn parse_create_database(p: &mut Parser) -> Result<Stmt, DbError> {
     skip_create_database_options(p);
     Ok(Stmt::CreateDatabase(crate::ast::CreateDatabaseStmt {
         name,
+    }))
+}
+
+pub(crate) fn parse_create_trigger(p: &mut Parser) -> Result<Stmt, DbError> {
+    let name = p.parse_identifier()?;
+    if p.eat(&Token::Before) {
+        return Err(DbError::NotImplemented {
+            feature: "BEFORE triggers — deferred to Phase 16".into(),
+        });
+    }
+    p.expect(&Token::After)?;
+    let event = match p.peek() {
+        Token::Insert => {
+            p.advance();
+            TriggerEvent::Insert
+        }
+        Token::Update => {
+            p.advance();
+            TriggerEvent::Update
+        }
+        Token::Delete => {
+            p.advance();
+            TriggerEvent::Delete
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected INSERT, UPDATE, or DELETE after AFTER, found {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+    p.expect(&Token::On)?;
+    let table = p.parse_table_ref()?;
+    p.expect(&Token::For)?;
+    p.expect(&Token::Each)?;
+    if p.eat(&Token::Row) {
+        return Err(DbError::NotImplemented {
+            feature: "FOR EACH ROW triggers — deferred to Phase 16".into(),
+        });
+    }
+    p.expect(&Token::Statement)?;
+    p.expect(&Token::As)?;
+    let start = p.current_pos();
+    p.expect(&Token::Select)?;
+    p.skip_until_statement_end();
+    let end = p.previous_end();
+    let body_sql = p.slice_sql(start, end);
+    Ok(Stmt::CreateTrigger(CreateTriggerStmt {
+        name,
+        event,
+        table,
+        body_sql,
     }))
 }
 
@@ -1195,6 +1247,13 @@ pub(crate) fn parse_drop_table(p: &mut Parser) -> Result<Stmt, DbError> {
         tables,
         cascade,
     }))
+}
+
+pub(crate) fn parse_drop_trigger(p: &mut Parser) -> Result<Stmt, DbError> {
+    let name = p.parse_identifier()?;
+    p.expect(&Token::On)?;
+    let table = p.parse_table_ref()?;
+    Ok(Stmt::DropTrigger(DropTriggerStmt { name, table }))
 }
 
 pub(crate) fn parse_drop_materialized_view(p: &mut Parser) -> Result<Stmt, DbError> {

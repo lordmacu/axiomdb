@@ -311,6 +311,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::DatabaseNotFound { .. }
         | DbError::ColumnNotFound { .. }
         | DbError::IndexNotFound { .. }
+        | DbError::TriggerNotFound { .. }
         | DbError::ImmutableTable { .. }
         | DbError::AmbiguousColumn { .. }
         | DbError::UniqueViolation { .. }
@@ -323,6 +324,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::NotNullViolation { .. }
         | DbError::CheckViolation { .. }
         | DbError::ExclusionViolation { .. }
+        | DbError::TriggerValidationFailed { .. }
         | DbError::ColumnCountMismatch { .. }
         | DbError::TypeMismatch { .. }
         | DbError::InvalidValue { .. }
@@ -340,6 +342,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::SchemaAlreadyExists { .. }
         | DbError::SchemaNotFound { .. }
         | DbError::IndexAlreadyExists { .. }
+        | DbError::TriggerAlreadyExists { .. }
         | DbError::IndexKeyTooLong { .. }
         | DbError::ActiveDatabaseDrop { .. }
         | DbError::NotImplemented { .. } => true,

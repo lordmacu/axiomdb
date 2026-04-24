@@ -320,6 +320,36 @@ validation. The same DDL validation pass also rejects self-reference, generated
 dependencies, unknown columns, subqueries, and aggregates inside the generated
 expression.
 
+### Statement trigger DDL (Phase 13.12)
+
+The parser now recognizes a narrow trigger grammar:
+
+```text
+create_trigger_stmt →
+  CREATE TRIGGER ident
+  AFTER (INSERT | UPDATE | DELETE)
+  ON ident
+  FOR EACH STATEMENT
+  AS select_stmt
+
+drop_trigger_stmt →
+  DROP TRIGGER ident ON ident
+
+show_create_trigger_stmt →
+  SHOW CREATE TRIGGER ident ON ident
+```
+
+This cut is intentionally narrow:
+
+- `BEFORE` parses only to return `NotImplemented`
+- `FOR EACH ROW` is rejected explicitly
+- the body must begin with `SELECT`
+- the parser stores the original body SQL text and defers full reparse to
+  trigger execution time
+
+That last point keeps trigger bodies compatible with the MVP trigger-context
+variables (`@@trigger_*`) without adding a separate stored-procedure grammar.
+
 ### SHOW / DESCRIBE Parsing
 
 `SHOW` is a dedicated keyword (`Token::Show`). After consuming it, the parser

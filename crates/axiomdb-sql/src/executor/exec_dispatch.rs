@@ -40,7 +40,15 @@ fn dispatch_ctx(
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_insert_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))
+            let result =
+                r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))?;
+            run_statement_triggers_for_result(
+                TriggerEvent::Insert,
+                &table_ref,
+                result,
+                exec_ctx,
+                ctx,
+            )
         }
         Stmt::Merge(s) => {
             let table_ref = s.target.clone();
@@ -54,13 +62,29 @@ fn dispatch_ctx(
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_update_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))
+            let result =
+                r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))?;
+            run_statement_triggers_for_result(
+                TriggerEvent::Update,
+                &table_ref,
+                result,
+                exec_ctx,
+                ctx,
+            )
         }
         Stmt::Delete(s) => {
+            let table_ref = s.table.clone();
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_delete_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r
+            let result = r?;
+            run_statement_triggers_for_result(
+                TriggerEvent::Delete,
+                &table_ref,
+                result,
+                exec_ctx,
+                ctx,
+            )
         }
         Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
@@ -263,6 +287,18 @@ fn dispatch_ctx(
                 &db,
             )
         }
+        Stmt::ShowCreateTrigger(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            execute_show_create_trigger(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
+        }
         Stmt::RenameTable(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
@@ -340,6 +376,19 @@ fn dispatch_ctx(
             }
             execute_create_materialized_view(s, exec_ctx, ctx)
         }
+        Stmt::CreateTrigger(s) => {
+            ctx.invalidate_all();
+            let db = ddl_database(&s.table.database, ctx);
+            execute_create_trigger(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
+        }
         Stmt::DropMaterializedView(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
@@ -358,6 +407,19 @@ fn dispatch_ctx(
         Stmt::RefreshMaterializedView(s) => {
             ctx.invalidate_all();
             execute_refresh_materialized_view(s, exec_ctx, ctx)
+        }
+        Stmt::DropTrigger(s) => {
+            ctx.invalidate_all();
+            let db = ddl_database(&s.table.database, ctx);
+            execute_drop_trigger(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
         }
         // 5.9f: SHOW TABLE STATUS — needs database context
         Stmt::ShowTableStatus(s) => {

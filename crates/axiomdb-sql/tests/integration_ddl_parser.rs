@@ -7,7 +7,7 @@ use axiomdb_sql::{
     ast::{
         AlterTableOp, ColumnConstraint, ConstraintDeferrability, ConstraintTiming,
         ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction, SortOrder,
-        Stmt, TableConstraint,
+        Stmt, TableConstraint, TriggerEvent,
     },
     parse,
 };
@@ -39,6 +39,38 @@ fn test_checkpoint_parses() {
         parse("CHECKPOINT", None).unwrap(),
         Stmt::Checkpoint
     ));
+}
+
+#[test]
+fn test_create_trigger_parses() {
+    let stmt = parse(
+        "CREATE TRIGGER trg AFTER INSERT ON journal FOR EACH STATEMENT AS \
+         SELECT 'bad' WHERE @@trigger_row_count > 10",
+        None,
+    )
+    .unwrap();
+    match stmt {
+        Stmt::CreateTrigger(trg) => {
+            assert_eq!(trg.name, "trg");
+            assert_eq!(trg.event, TriggerEvent::Insert);
+            assert_eq!(trg.table.name, "journal");
+            assert!(trg.body_sql.starts_with("SELECT"));
+            assert!(trg.body_sql.contains("@@trigger_row_count"));
+        }
+        other => panic!("expected CreateTrigger, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_drop_trigger_parses() {
+    let stmt = parse("DROP TRIGGER trg ON journal", None).unwrap();
+    assert!(matches!(stmt, Stmt::DropTrigger(_)));
+}
+
+#[test]
+fn test_show_create_trigger_parses() {
+    let stmt = parse("SHOW CREATE TRIGGER trg ON journal", None).unwrap();
+    assert!(matches!(stmt, Stmt::ShowCreateTrigger(_)));
 }
 
 // ── Basic CREATE TABLE ────────────────────────────────────────────────────────

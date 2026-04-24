@@ -298,6 +298,16 @@ pub enum Token<'src> {
     Unlisten,
     #[token("NOTIFY", ignore(ascii_case))]
     Notify,
+    #[token("TRIGGER", ignore(ascii_case))]
+    Trigger,
+    #[token("AFTER", ignore(ascii_case))]
+    After,
+    #[token("BEFORE", ignore(ascii_case))]
+    Before,
+    #[token("EACH", ignore(ascii_case))]
+    Each,
+    #[token("STATEMENT", ignore(ascii_case))]
+    Statement,
     #[token("START", ignore(ascii_case))]
     Start,
     #[token("TRANSACTION", ignore(ascii_case))]

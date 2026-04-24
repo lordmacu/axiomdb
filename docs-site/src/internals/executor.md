@@ -175,6 +175,37 @@ write paths.
 `VIRTUAL` generated columns are rejected at DDL execution time, so the executor
 does not yet carry a read-time synthesized-column path.
 
+## Statement-level triggers (Phase 13.12)
+
+The trigger MVP is implemented as post-statement validation, not as a generic
+trigger program engine.
+
+Execution shape:
+
+1. run outer `INSERT` / `UPDATE` / `DELETE`
+2. collect the final affected-row count
+3. find matching table-owned triggers for that event
+4. reparse each stored body SQL as a `SELECT`
+5. substitute the bounded trigger context variables:
+   - `@@trigger_name`
+   - `@@trigger_table`
+   - `@@trigger_event`
+   - `@@trigger_row_count`
+6. execute the validation query inside the same transaction
+7. if any row is returned, raise `TriggerValidationFailed` and let the existing
+   statement-rollback machinery undo the outer statement
+
+Important limits:
+
+- only `AFTER ... FOR EACH STATEMENT`
+- body is one read-only `SELECT`
+- no trigger recursion
+- no row transition tables
+
+`SHOW CREATE TRIGGER` is supported both in the normal executor and in the
+read-only execution path used by the MySQL handler, because wire-visible `SHOW`
+statements can bypass the ordinary DDL executor surface.
+
 ## Transactional INSERT staging (Phase 5.21)
 
 `5.21` adds a statement-boundary staging path for consecutive

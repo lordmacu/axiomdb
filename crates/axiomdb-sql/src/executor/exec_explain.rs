@@ -54,6 +54,9 @@ fn dispatch(
             feature: "CREATE MATERIALIZED VIEW requires session context — use execute_with_ctx"
                 .into(),
         }),
+        Stmt::CreateTrigger(_) => Err(DbError::NotImplemented {
+            feature: "CREATE TRIGGER requires session context — use execute_with_ctx".into(),
+        }),
         Stmt::DropTable(s) => {
             execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
@@ -62,6 +65,9 @@ fn dispatch(
         }
         Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
             feature: "DROP DATABASE requires session context".into(),
+        }),
+        Stmt::DropTrigger(_) => Err(DbError::NotImplemented {
+            feature: "DROP TRIGGER requires session context — use execute_with_ctx".into(),
         }),
         Stmt::CreateIndex(s) => {
             let noop_bloom = crate::bloom::BloomRegistry::new();
@@ -127,6 +133,9 @@ fn dispatch(
             None,
             DEFAULT_DATABASE_NAME,
         ),
+        Stmt::ShowCreateTrigger(_) => Err(DbError::NotImplemented {
+            feature: "SHOW CREATE TRIGGER requires session context — use execute_with_ctx".into(),
+        }),
         Stmt::RenameTable(s) => execute_rename_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),

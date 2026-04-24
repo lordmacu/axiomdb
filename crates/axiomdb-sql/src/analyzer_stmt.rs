@@ -50,6 +50,7 @@ fn analyze_stmt(
             )?;
             Ok(Stmt::CreateMaterializedView(s))
         }
+        Stmt::CreateTrigger(_) | Stmt::DropTrigger(_) | Stmt::ShowCreateTrigger(_) => Ok(stmt),
         Stmt::DropTable(s) => {
             analyze_drop_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::DropTable)
@@ -146,8 +147,10 @@ fn analyze_stmt_cached(
         | Stmt::CreateTableLike(_)
         | Stmt::CreateTableAsSelect(_)
         | Stmt::CreateMaterializedView(_)
+        | Stmt::CreateTrigger(_)
         | Stmt::DropTable(_)
         | Stmt::DropMaterializedView(_)
+        | Stmt::DropTrigger(_)
         | Stmt::AlterTable(_) => {
             cache.invalidate();
             analyze_stmt(stmt, storage, snapshot, default_database, default_schema)

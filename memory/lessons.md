@@ -314,6 +314,18 @@
   `PathStepOwned` (pure data, `Clone`). Keeps the module self-contained and
   lets `JsonTableSpec` live in executor memory without borrowing the AST.
 
+## 2026-04-23 — Phase 13.12
+
+- **Wire-visible `SHOW ...` features need both executor surfaces.** Adding
+  `SHOW CREATE TRIGGER` only to the normal executor was not enough; the MySQL
+  handler routed it through `execute_read_query`, so the read-only executor
+  needed its own arm too or the wire smoke failed with the generic
+  `read-only executor does not handle this statement type`.
+- **For this executor, validation triggers are safer as `SELECT ... FROM ... HAVING ...` than `SELECT literal WHERE ...` without `FROM`.** The latter was brittle in tests; the former matched real aggregate-validation use cases and produced deterministic trigger failures.
+- **Table-owned metadata was the right cut for MVP triggers.** Reusing
+  `TableDef` avoided inventing a separate trigger catalog before Phase 16 and
+  kept create/drop firing order local to the table.
+
 ## 2026-04-10 — Phase 11.x
 
 - **TOAST refcounts belong on the owned BLOB chain, not clustered overflow.** Use versioned `ABOB` header only for TOAST/BLOB-owned chains; clustered row overflow stays non-refcounted so Phase 39 physical descriptors remain stable.

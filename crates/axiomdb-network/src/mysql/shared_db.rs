@@ -804,7 +804,8 @@ impl SharedDatabase {
         _schema_cache: &mut SchemaCache,
     ) -> Result<(QueryResult, Option<CommitRx>), DbError> {
         let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
-        self.execute_nonblocking_alter_stmt_async(stmt, session).await
+        self.execute_nonblocking_alter_stmt_async(stmt, session)
+            .await
     }
 
     pub fn execute_nonblocking_alter_stmt(

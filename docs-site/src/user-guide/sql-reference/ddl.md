@@ -149,6 +149,50 @@ Rules:
   `NotImplemented`.
 - `ALTER TABLE ... GENERATED` is deferred to a later rewrite/backfill subphase.
 
+#### Statement-level triggers
+
+AxiomDB supports a bounded validation-trigger MVP for base tables:
+
+```sql
+CREATE TRIGGER journal_balanced
+AFTER INSERT ON journal
+FOR EACH STATEMENT
+AS
+SELECT 'journal not balanced'
+FROM journal
+GROUP BY 1
+HAVING SUM(debit) <> SUM(credit);
+```
+
+Supported DDL:
+
+```sql
+CREATE TRIGGER trg_name
+AFTER INSERT|UPDATE|DELETE
+ON table_name
+FOR EACH STATEMENT
+AS SELECT ...;
+
+DROP TRIGGER trg_name ON table_name;
+SHOW CREATE TRIGGER trg_name ON table_name;
+```
+
+Behavior:
+
+- The trigger fires once after the whole DML statement, not once per row.
+- The trigger body must be a single read-only `SELECT`.
+- If that `SELECT` returns any row, the outer statement fails and is rolled
+  back under normal statement-rollback semantics.
+- Trigger bodies may use `@@trigger_name`, `@@trigger_table`,
+  `@@trigger_event`, and `@@trigger_row_count`.
+
+Current limits:
+
+- Only `AFTER ... FOR EACH STATEMENT` is implemented.
+- `BEFORE`, `FOR EACH ROW`, `WHEN`, `SIGNAL`, transition tables, recursive
+  triggers, and procedural bodies are deferred.
+- Triggers are supported only on base tables, not views or materialized views.
+
 #### PRIMARY KEY
 
 Declares a column (or set of columns) as the primary key. A primary key:

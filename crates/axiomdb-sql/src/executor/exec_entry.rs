@@ -402,6 +402,59 @@ pub fn execute_read_only_with_ctx(
                 ]],
             })
         }
+        Stmt::ShowCreateTrigger(s) => {
+            let db = ddl_database(&s.table.database, ctx);
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let table_def = if let Some(schema) = s.table.schema.as_deref() {
+                reader
+                    .get_table_in_database(&db, schema, &s.table.name)?
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: s.table.name.clone(),
+                    })?
+            } else {
+                let mut found = None;
+                for schema in &ctx.search_path {
+                    if let Some(def) = reader.get_table_in_database(&db, schema, &s.table.name)? {
+                        found = Some(def);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| DbError::TableNotFound {
+                    name: s.table.name.clone(),
+                })?
+            };
+            let trigger = table_def
+                .triggers
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&s.name))
+                .ok_or_else(|| DbError::TriggerNotFound {
+                    name: s.name.clone(),
+                    table: table_def.table_name.clone(),
+                })?;
+            let event = match trigger.event {
+                axiomdb_catalog::TriggerEvent::Insert => "INSERT",
+                axiomdb_catalog::TriggerEvent::Update => "UPDATE",
+                axiomdb_catalog::TriggerEvent::Delete => "DELETE",
+            };
+            Ok(QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta::computed("Trigger", DataType::Text),
+                    ColumnMeta::computed("SQL Original Statement", DataType::Text),
+                ],
+                rows: vec![vec![
+                    Value::Text(trigger.name.clone()),
+                    Value::Text(format!(
+                        "CREATE TRIGGER {} AFTER {} ON {} FOR EACH STATEMENT AS {}",
+                        trigger.name, event, table_def.table_name, trigger.body_sql
+                    )),
+                ]],
+            })
+        }
         Stmt::ShowTableStatus(s) => {
             let db = ctx.effective_database().to_string();
             let snap = ctx

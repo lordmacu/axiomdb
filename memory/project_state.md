@@ -3,19 +3,19 @@
 ## Current (2026-04-23)
 
 **Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.6 — `13.6` Non-blocking ALTER TABLE closed.
-Heap `ALTER TABLE` with a single rewrite-heavy column operation
-(`ADD COLUMN`, `DROP COLUMN`, `MODIFY COLUMN`) now has a bounded non-blocking
-path: the executor copies rows into a shadow heap root under a shared catalog
-lock, swaps root/column/index metadata only in a short final exclusive window,
-keeps concurrent readers alive during the copy phase, and rejects writes to the
-target table with `LockTimeout` while the rewrite is in progress. The cut is
-explicitly narrower than full WAL-delta online DDL: clustered tables,
-multi-operation ALTERs, and concurrent writer replay stay deferred.
+**Active subphase:** Phase 13.12 — `13.12` Statement-level triggers closed.
+AxiomDB now supports a bounded statement-trigger MVP for base tables:
+`CREATE TRIGGER ... AFTER INSERT|UPDATE|DELETE ... FOR EACH STATEMENT AS
+SELECT ...`, `DROP TRIGGER ... ON table`, and `SHOW CREATE TRIGGER`. Trigger
+definitions persist in table catalog metadata, fire once after top-level DML,
+and abort the outer statement when the validation `SELECT` returns rows. The
+MVP is intentionally narrower than full trigger support: `BEFORE`, `FOR EACH
+ROW`, `WHEN`, `SIGNAL`, transition tables, recursive triggers, and procedural
+bodies remain deferred to Phase 16.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_executor_ddl`; `cargo test -p axiomdb-network --test integration_concurrency`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_statement_triggers`; `python3 tools/wire-test.py`; `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
 
-**Next:** Phase 13.7 / 13.8 remain superseded by Phase 40 lock-manager work; the next actionable Phase 13 subphase is 13.12 Statement-level triggers.
+**Next:** Phase 13.7 / 13.8 remain superseded by Phase 40 lock-manager work; the next actionable Phase 13 subphase is 13.13 Collation system.
 
 ### Phase 21 subphase status
 
