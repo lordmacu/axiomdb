@@ -1204,3 +1204,123 @@ Removes the aggregate from the catalog. Built-in aggregates (`SUM`, `COUNT`, etc
 ```sql
 DROP AGGREGATE median(FLOAT);
 ```
+
+---
+
+## CREATE VIEW
+
+Creates a named view — a stored query that can be referenced like a table.
+
+### Syntax
+
+```sql
+CREATE [OR REPLACE] VIEW view_name AS select_statement;
+```
+
+### Examples
+
+```sql
+CREATE TABLE orders (id INT, user_id INT, amount INT, status TEXT);
+INSERT INTO orders VALUES (1, 10, 100, 'active'), (2, 10, 200, 'active'), (3, 11, 50, 'cancelled');
+
+-- Simple filtered view
+CREATE VIEW active_orders AS
+    SELECT id, user_id, amount FROM orders WHERE status = 'active';
+
+-- Query through the view
+SELECT id, amount FROM active_orders ORDER BY id;
+-- 1  100
+-- 2  200
+
+-- Aggregating view
+CREATE VIEW user_totals AS
+    SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id;
+
+SELECT user_id, total FROM user_totals ORDER BY user_id;
+-- 10  300
+-- 11  50
+```
+
+Views expand transparently at query time — no physical rows are stored.
+
+### OR REPLACE
+
+```sql
+CREATE OR REPLACE VIEW active_orders AS
+    SELECT id, user_id, amount FROM orders WHERE status = 'active' ORDER BY amount;
+```
+
+Replaces the existing view definition without changing its catalog identity. Fails if the name belongs to a base table rather than a view.
+
+### Views in JOIN
+
+Views can be used in `JOIN` clauses just like base tables:
+
+```sql
+CREATE TABLE users (id INT, name TEXT);
+CREATE VIEW alice_orders AS SELECT id, amount FROM orders WHERE user_id = 10;
+
+SELECT u.name, o.amount
+FROM alice_orders o
+JOIN users u ON u.id = 10
+ORDER BY o.amount;
+```
+
+### Nested views
+
+Views can reference other views. Circular references are detected and return an error.
+
+```sql
+CREATE VIEW base_v AS SELECT id FROM orders WHERE status = 'active';
+CREATE VIEW nested_v AS SELECT id FROM base_v WHERE id > 1;
+
+SELECT id FROM nested_v;
+```
+
+### Limitations (Phase 20.1)
+
+- **Read-only** — views are not updatable (INSERT/UPDATE/DELETE through a view is not yet supported).
+- `WITH CHECK OPTION` is accepted syntactically but not enforced.
+- Column-alias list `CREATE VIEW v (a, b) AS SELECT ...` is stored but column renaming is not applied at query time yet.
+
+---
+
+## DROP VIEW
+
+Removes one or more views from the catalog.
+
+### Syntax
+
+```sql
+DROP VIEW [IF EXISTS] view_name [, view_name, ...];
+```
+
+### Examples
+
+```sql
+DROP VIEW active_orders;
+
+-- Multiple views at once
+DROP VIEW active_orders, user_totals;
+
+-- No error if the view does not exist
+DROP VIEW IF EXISTS unknown_view;
+```
+
+`DROP VIEW` fails if the name refers to a base table rather than a view.
+
+---
+
+## SHOW CREATE VIEW
+
+Returns the DDL statement that recreates a view.
+
+```sql
+SHOW CREATE VIEW active_orders;
+```
+
+| View | Create View |
+|------|-------------|
+| active_orders | CREATE VIEW \`active_orders\` AS SELECT id, user_id, amount FROM orders WHERE status = 'active' |
+
+`SHOW CREATE VIEW` fails if the name refers to a base table rather than a view.

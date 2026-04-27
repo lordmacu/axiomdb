@@ -299,6 +299,20 @@ fn dispatch_ctx(
                 &db,
             )
         }
+        Stmt::ShowCreateView(s) => {
+            let db = ddl_database(&s.view.database, ctx);
+            let search_path = ctx.search_path.clone();
+            execute_show_create_view(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
+                &db,
+            )
+        }
         Stmt::RenameTable(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
@@ -376,6 +390,24 @@ fn dispatch_ctx(
             }
             execute_create_materialized_view(s, exec_ctx, ctx)
         }
+        Stmt::CreateView(mut s) => {
+            ctx.invalidate_all();
+            if s.view.schema.is_none() {
+                s.view.schema = Some(ctx.default_create_schema().to_string());
+            }
+            let db = ddl_database(&s.view.database, ctx);
+            let search_path = ctx.search_path.clone();
+            execute_create_view(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
+                &db,
+            )
+        }
         Stmt::CreateTrigger(s) => {
             ctx.invalidate_all();
             let db = ddl_database(&s.table.database, ctx);
@@ -407,6 +439,21 @@ fn dispatch_ctx(
             let db = ctx.effective_database().to_string();
             let search_path = ctx.search_path.clone();
             execute_drop_materialized_view(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                Some(search_path.as_slice()),
+                &db,
+            )
+        }
+        Stmt::DropView(s) => {
+            ctx.invalidate_all();
+            let db = ctx.effective_database().to_string();
+            let search_path = ctx.search_path.clone();
+            execute_drop_view(
                 s,
                 storage,
                 txn,

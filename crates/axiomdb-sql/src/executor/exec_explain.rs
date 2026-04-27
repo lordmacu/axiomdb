@@ -54,6 +54,9 @@ fn dispatch(
             feature: "CREATE MATERIALIZED VIEW requires session context — use execute_with_ctx"
                 .into(),
         }),
+        Stmt::CreateView(_) => Err(DbError::NotImplemented {
+            feature: "CREATE VIEW requires session context — use execute_with_ctx".into(),
+        }),
         Stmt::CreateTrigger(_) => Err(DbError::NotImplemented {
             feature: "CREATE TRIGGER requires session context — use execute_with_ctx".into(),
         }),
@@ -65,6 +68,12 @@ fn dispatch(
         }
         Stmt::DropMaterializedView(s) => {
             execute_drop_materialized_view(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
+        }
+        Stmt::DropView(s) => {
+            execute_drop_view(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
+        }
+        Stmt::ShowCreateView(s) => {
+            execute_show_create_view(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
         Stmt::DropDatabase(_) => Err(DbError::NotImplemented {
             feature: "DROP DATABASE requires session context".into(),

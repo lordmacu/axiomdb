@@ -461,3 +461,62 @@ time.
 in the registry are accepted. This keeps the executor simple: at runtime the
 only decision is which `AggregateHelperKind` accumulator to instantiate — no
 arbitrary function dispatch is needed.
+
+---
+
+## Regular Views Catalog (Phase 20.1)
+
+### `RelationKind::View`
+
+`TableDef.relation_kind` gains a third variant:
+
+```rust
+pub enum RelationKind {
+    Table,            // tag 0 — physical heap or clustered table
+    MaterializedView, // tag 1 — heap with defining_query
+    View,             // tag 2 — NO physical pages; defining_query stores raw SQL
+}
+```
+
+A `View` entry always has `root_page_id = 0`. The catalog never allocates B+Tree or heap pages for it.
+
+### On-disk format (`axiom_tables`)
+
+`TableDef` serialization extended with optional `relation_kind` and `defining_query` trailer (backward-compatible with older rows that omit the trailer):
+
+```text
+[base fields: table_id, root_page_id, schema_len, schema, name_len, name]
+[optional flags byte:
+  bit0-1 = StorageLayout (0=Heap, 1=Clustered)
+  bit2 = defining_query present
+  bit3 = relation_kind present (tag follows)
+  bit4 = triggers present
+  bit5 = collation_name present
+]
+[schema_version: 8 bytes LE]   -- present when flags byte is present
+[defining_query: len:2 LE + utf8 bytes]  -- when bit2 set
+[relation_kind: u8]            -- 0=Table, 1=MatView, 2=View; when bit3 set
+...
+```
+
+Old rows that predate Phase 20.1 decode `relation_kind` as `Table` by default.
+
+### Catalog APIs
+
+| Function | Description |
+|---|---|
+| `CatalogWriter::create_view(schema, name, query)` | Creates a `RelationKind::View` entry with `root_page_id=0` |
+| `CatalogWriter::replace_view_query(table_id, query)` | Updates the stored SQL for `CREATE OR REPLACE VIEW` |
+| `TableDef::is_view()` | Returns `true` when `relation_kind == View` |
+
+### View expansion in the analyzer
+
+Views are expanded at analysis time, not execution time. In `analyzer_stmt.rs`:
+
+1. `expand_views(stmt, storage, snapshot, ...)` — walks every `FromClause` in the statement.
+2. When a `FromClause::Table(tref)` resolves to a `RelationKind::View`, the stored `defining_query` SQL is re-parsed.
+3. The inner `SelectStmt` is recursively expanded (handles nested views).
+4. The `FromClause` is replaced with `FromClause::Subquery { query: inner_select, alias, lateral: false }`.
+5. Circular references are detected via an `expanding: HashSet<String>` that tracks which views are currently being expanded.
+
+This means the executor never observes view references — they are fully rewritten before execution begins.

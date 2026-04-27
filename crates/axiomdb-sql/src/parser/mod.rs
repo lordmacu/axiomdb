@@ -513,9 +513,13 @@ impl<'src> Parser<'src> {
                                     crate::ast::ShowCreateTriggerStmt { name, table },
                                 ))
                             }
+                            Token::View => {
+                                self.advance();
+                                ddl::parse_show_create_view(self)
+                            }
                             other => Err(DbError::ParseError {
                                 message: format!(
-                                    "expected TABLE or TRIGGER after SHOW CREATE, found {other:?}"
+                                    "expected TABLE, TRIGGER or VIEW after SHOW CREATE, found {other:?}"
                                 ),
                                 position: Some(self.current_pos()),
                             }),
@@ -967,6 +971,25 @@ impl<'src> Parser<'src> {
                 self.expect(&Token::View)?;
                 ddl::parse_create_materialized_view(self)
             }
+            Token::View => {
+                self.advance();
+                ddl::parse_create_view(self, false)
+            }
+            // CREATE OR REPLACE VIEW
+            Token::Or => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::Ident(kw) if kw.eq_ignore_ascii_case("replace") => {
+                        self.advance();
+                        self.expect(&Token::View)?;
+                        ddl::parse_create_view(self, true)
+                    }
+                    other => Err(DbError::ParseError {
+                        message: format!("expected REPLACE after OR in CREATE, found {other:?}"),
+                        position: Some(self.current_pos()),
+                    }),
+                }
+            }
             Token::Trigger => {
                 self.advance();
                 ddl::parse_create_trigger(self)
@@ -986,7 +1009,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1009,6 +1032,10 @@ impl<'src> Parser<'src> {
                 self.expect(&Token::View)?;
                 ddl::parse_drop_materialized_view(self)
             }
+            Token::View => {
+                self.advance();
+                ddl::parse_drop_view(self)
+            }
             Token::Index => {
                 self.advance();
                 ddl::parse_drop_index(self)
@@ -1023,7 +1050,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

@@ -9,10 +9,10 @@ use crate::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
         ConstraintTiming, CreateAggregateStmt, CreateIndexStmt, CreateMaterializedViewStmt,
         CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt,
-        DropAggregateStmt, DropIndexStmt, DropMaterializedViewStmt, DropTableStmt, DropTriggerStmt,
-        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction,
-        GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, SortOrder, Stmt,
-        TableConstraint, TriggerEvent,
+        CreateViewStmt, DropAggregateStmt, DropIndexStmt, DropMaterializedViewStmt, DropTableStmt,
+        DropTriggerStmt, DropViewStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
+        ForeignKeyAction, GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt,
+        ShowCreateViewStmt, SortOrder, Stmt, TableConstraint, TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -1440,6 +1440,45 @@ pub(crate) fn parse_drop_aggregate(p: &mut Parser) -> Result<Stmt, DbError> {
     let name = p.parse_identifier()?;
     let arg_types = parse_aggregate_signature(p)?;
     Ok(Stmt::DropAggregate(DropAggregateStmt { name, arg_types }))
+}
+
+pub(crate) fn parse_create_view(p: &mut Parser, or_replace: bool) -> Result<Stmt, DbError> {
+    let view = p.parse_table_ref()?;
+    // Optional column-name list: VIEW v (a, b, c) AS ...
+    let mut columns = Vec::new();
+    if p.eat(&Token::LParen) {
+        columns.push(p.parse_identifier()?);
+        while p.eat(&Token::Comma) {
+            columns.push(p.parse_identifier()?);
+        }
+        p.expect(&Token::RParen)?;
+    }
+    p.expect(&Token::As)?;
+    let query_start = p.current_pos();
+    p.expect(&Token::Select)?;
+    let select = super::dml::parse_select(p)?;
+    let query_sql = p.slice_sql(query_start, p.previous_end());
+    Ok(Stmt::CreateView(CreateViewStmt {
+        or_replace,
+        view,
+        columns,
+        query_sql,
+        select,
+    }))
+}
+
+pub(crate) fn parse_drop_view(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let mut views = vec![p.parse_table_ref()?];
+    while p.eat(&Token::Comma) {
+        views.push(p.parse_table_ref()?);
+    }
+    Ok(Stmt::DropView(DropViewStmt { if_exists, views }))
+}
+
+pub(crate) fn parse_show_create_view(p: &mut Parser) -> Result<Stmt, DbError> {
+    let view = p.parse_table_ref()?;
+    Ok(Stmt::ShowCreateView(ShowCreateViewStmt { view }))
 }
 
 pub(crate) fn parse_drop_materialized_view(p: &mut Parser) -> Result<Stmt, DbError> {

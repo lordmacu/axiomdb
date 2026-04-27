@@ -38,7 +38,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              13.6 (non-blocking ALTER TABLE smoke),
             13.12 (statement-level triggers smoke),
             13.13 (collation system smoke),
-            13.14 (custom aggregate functions smoke)
+            13.14 (custom aggregate functions smoke),
+            20.1 (regular views: CREATE/DROP/REPLACE VIEW, view expansion, SHOW CREATE VIEW, IS.VIEWS)
 """
 import os
 import signal
@@ -4343,6 +4344,78 @@ ok("[13.14 custom aggregate functions] median aggregate runs over the wire",
 
 cur.execute("DROP AGGREGATE median(FLOAT)")
 conn.commit()
+
+# ── Phase 20.1 — Regular views ───────────────────────────────────────────────
+
+print("\n[20.1 regular views]")
+
+cur.execute("CREATE TABLE view20_users (id INT, name TEXT)")
+cur.execute("CREATE TABLE view20_orders (id INT, user_id INT, amount INT)")
+cur.execute("INSERT INTO view20_users VALUES (1, 'Alice'), (2, 'Bob')")
+cur.execute("INSERT INTO view20_orders VALUES (10, 1, 100), (11, 1, 200), (12, 2, 50)")
+conn.commit()
+
+cur.execute("CREATE VIEW view20_alice_orders AS SELECT id, amount FROM view20_orders WHERE user_id = 1")
+conn.commit()
+
+cur.execute("SELECT id, amount FROM view20_alice_orders ORDER BY id")
+rows = cur.fetchall()
+ok("[20.1 regular views] SELECT from view returns filtered rows",
+   rows == (('10', '100'), ('11', '200')),
+   rows)
+
+cur.execute(
+    "SELECT u.name, o.amount FROM view20_alice_orders o JOIN view20_users u ON u.id = 1 ORDER BY o.amount"
+)
+rows = cur.fetchall()
+ok("[20.1 regular views] VIEW in JOIN resolves correctly",
+   len(rows) == 2 and rows[0][0] == 'Alice',
+   rows)
+
+cur.execute("CREATE VIEW view20_summary AS SELECT user_id, SUM(amount) AS total FROM view20_orders GROUP BY user_id")
+conn.commit()
+
+cur.execute("SELECT user_id, total FROM view20_summary ORDER BY user_id")
+rows = cur.fetchall()
+ok("[20.1 regular views] view with GROUP BY and aggregate",
+   rows == (('1', '300'), ('2', '50')),
+   rows)
+
+cur.execute("SHOW CREATE VIEW view20_alice_orders")
+row = cur.fetchone()
+ok("[20.1 regular views] SHOW CREATE VIEW returns DDL",
+   row is not None and "CREATE VIEW" in row[1],
+   row)
+
+cur.execute("SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.views WHERE TABLE_NAME = 'view20_alice_orders'")
+rows = cur.fetchall()
+ok("[20.1 regular views] information_schema.views contains view definition",
+   len(rows) == 1 and rows[0][0] == "view20_alice_orders",
+   rows)
+
+cur.execute("SELECT TABLE_TYPE FROM information_schema.tables WHERE TABLE_NAME = 'view20_alice_orders'")
+rows = cur.fetchall()
+ok("[20.1 regular views] information_schema.tables shows VIEW type",
+   rows == (("VIEW",),),
+   rows)
+
+cur.execute("CREATE OR REPLACE VIEW view20_alice_orders AS SELECT id, amount FROM view20_orders WHERE user_id = 1 ORDER BY amount")
+conn.commit()
+
+cur.execute("SELECT id FROM view20_alice_orders ORDER BY id")
+rows = cur.fetchall()
+ok("[20.1 regular views] CREATE OR REPLACE VIEW updates definition",
+   rows == (('10',), ('11',)),
+   rows)
+
+cur.execute("DROP VIEW view20_alice_orders, view20_summary")
+conn.commit()
+
+cur.execute("SELECT TABLE_NAME FROM information_schema.views WHERE TABLE_NAME IN ('view20_alice_orders', 'view20_summary')")
+rows = cur.fetchall()
+ok("[20.1 regular views] DROP VIEW removes entries from information_schema",
+   rows == (),
+   rows)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
