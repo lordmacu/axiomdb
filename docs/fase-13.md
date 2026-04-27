@@ -469,3 +469,81 @@ Fuera de alcance en este corte:
 - `python3 tools/wire-test.py` - paso, 448/448 assertions.
 - `cargo test --workspace` - paso.
 - `cargo clippy --workspace -- -D warnings` - paso.
+
+## 13.14 Custom aggregate functions — cerrada 2026-04-27
+
+La subfase 13.14 entrega soporte real de `CREATE AGGREGATE` / `DROP AGGREGATE`
+respaldado por catalogo, con ejecucion a traves del pipeline de agregacion
+existente, sin requerir un sistema generico de `CREATE FUNCTION` ni callbacks
+arbitrarios de usuario.
+
+### Arquitectura
+
+El sistema sigue un modelo de **registry acotado**: los nombres `SFUNC` /
+`FINALFUNC` y el identificador `STYPE` no son funciones SQL arbitrarias —
+se validan contra un registro interno de Rust en tiempo de `CREATE AGGREGATE`.
+Esto da DDL semanticamente correcto hoy, y permite ampliar el registry de forma
+controlada en fases futuras.
+
+Flujo de ejecucion:
+
+1. `CREATE AGGREGATE` valida la combinacion SFUNC/STYPE/FINALFUNC contra el
+   registry y persiste un `AggregateDef` en el catalogo.
+2. El analizador resuelve llamadas a agregados buscando primero en el catalogo,
+   luego en los built-ins.
+3. El ejecutor instancia un acumulador registrado por tipo (`AggregateHelperKind`)
+   y lo corre por el pipeline de agrupacion normal.
+4. `DROP AGGREGATE` elimina la entrada del catalogo.
+
+### Superficie SQL cerrada
+
+```sql
+CREATE AGGREGATE median(FLOAT) (
+  SFUNC = median_state,
+  STYPE = FLOAT[],
+  FINALFUNC = median_final
+);
+
+SELECT grp, median(v) FROM samples GROUP BY grp;
+
+DROP AGGREGATE median(FLOAT);
+```
+
+### Archivos nuevos
+
+- `crates/axiomdb-catalog/src/schema_aggregate.rs` — `AggregateDef` + `AggregateHelperKind` con serializacion binaria compacta
+- `crates/axiomdb-sql/src/custom_aggregate.rs` — registry de helpers (`resolve_custom_aggregate_helper`, `internal_aggregate_name`)
+- `crates/axiomdb-sql/src/executor/ddl_aggregate.rs` — `execute_create_aggregate` / `execute_drop_aggregate`
+- `crates/axiomdb-sql/tests/integration_custom_aggregates.rs` — 5 tests de integracion
+
+### Archivos modificados principales
+
+- `crates/axiomdb-catalog/src/{lib,reader,writer,schema,bootstrap}.rs` — expone `AggregateDef`, `get_aggregate`, `create_aggregate`, `delete_aggregate`
+- `crates/axiomdb-sql/src/ast.rs` — `CreateAggregateStmt`, `DropAggregateStmt`
+- `crates/axiomdb-sql/src/parser/ddl.rs` — parser para `CREATE AGGREGATE` / `DROP AGGREGATE`
+- `crates/axiomdb-sql/src/lexer.rs` — keywords `AGGREGATE`, `SFUNC`, `STYPE`, `FINALFUNC`
+- `crates/axiomdb-sql/src/analyzer_stmt.rs` — resolucion de custom aggregates por nombre + aridad
+- `crates/axiomdb-sql/src/executor/{agg_descriptor,agg_accum,agg_sorted,exec_dispatch,exec_with_ctx,mod}.rs` — acumulador custom + dispatch
+- `tools/wire-test.py` — bloque `[13.14 custom aggregate functions]`
+
+### Registry inicial
+
+| SFUNC | STYPE | FINALFUNC | Semantica |
+|---|---|---|---|
+| `median_state` | `FLOAT[]` | `median_final` | mediana exacta via sort |
+
+### Limites explicitos
+
+- Solo firmas unarias en este corte
+- `SFUNC` / `FINALFUNC` deben ser nombres del registry interno, no SQL arbitrario
+- No soporta: `INITCOND`, `COMBINEFUNC`, ventanas, ordered-set, `FILTER (WHERE ...)`
+- Ejecucion en ventanas (`OVER (...)`) devuelve `NotImplemented` claro
+
+### Validacion
+
+- `cargo nextest run -p axiomdb-sql --test integration_custom_aggregates` — 5/5 ✅
+- `cargo nextest run -p axiomdb-sql --test integration_ddl_parser -E 'test(aggregate)'` — 2/2 ✅
+- `cargo nextest run --workspace` — 3482/3482 ✅
+- `cargo clippy --workspace -- -D warnings` — limpio ✅
+- `cargo fmt --check` — limpio ✅
+- `python3 tools/wire-test.py` — 465/465 ✅

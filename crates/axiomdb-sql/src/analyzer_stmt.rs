@@ -50,7 +50,11 @@ fn analyze_stmt(
             )?;
             Ok(Stmt::CreateMaterializedView(s))
         }
-        Stmt::CreateTrigger(_) | Stmt::DropTrigger(_) | Stmt::ShowCreateTrigger(_) => Ok(stmt),
+        Stmt::CreateTrigger(_)
+        | Stmt::DropTrigger(_)
+        | Stmt::ShowCreateTrigger(_)
+        | Stmt::CreateAggregate(_)
+        | Stmt::DropAggregate(_) => Ok(stmt),
         Stmt::DropTable(s) => {
             analyze_drop_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::DropTable)
@@ -148,9 +152,11 @@ fn analyze_stmt_cached(
         | Stmt::CreateTableAsSelect(_)
         | Stmt::CreateMaterializedView(_)
         | Stmt::CreateTrigger(_)
+        | Stmt::CreateAggregate(_)
         | Stmt::DropTable(_)
         | Stmt::DropMaterializedView(_)
         | Stmt::DropTrigger(_)
+        | Stmt::DropAggregate(_)
         | Stmt::AlterTable(_) => {
             cache.invalidate();
             analyze_stmt(stmt, storage, snapshot, default_database, default_schema)
@@ -556,6 +562,8 @@ fn analyze_select_with_outer(
     }
     s.columns = resolved_cols;
 
+    rewrite_custom_aggregates_in_select(&mut s, storage, state.snapshot.clone(), default_schema)?;
+
     validate_window_usage(&s)?;
 
     // Post-pass: populate universe_indices on every GROUPING() call in HAVING,
@@ -939,6 +947,169 @@ fn on_behavior_contains_aggregate(behavior: &crate::expr::SqlJsonOnBehavior) -> 
     }
 }
 
+fn rewrite_custom_aggregates_in_select(
+    stmt: &mut SelectStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_schema: &str,
+) -> Result<(), DbError> {
+    let mut reader = CatalogReader::new(storage, snapshot)?;
+
+    if let Some(expr) = stmt.where_clause.as_mut() {
+        rewrite_custom_aggregates_in_expr(expr, &mut reader, default_schema)?;
+    }
+    if !stmt.group_by.is_empty() {
+        for expr in stmt.group_by.exprs_mut() {
+            rewrite_custom_aggregates_in_expr(expr, &mut reader, default_schema)?;
+        }
+    }
+    if let Some(expr) = stmt.having.as_mut() {
+        rewrite_custom_aggregates_in_expr(expr, &mut reader, default_schema)?;
+    }
+    for item in &mut stmt.order_by {
+        rewrite_custom_aggregates_in_expr(&mut item.expr, &mut reader, default_schema)?;
+    }
+    for item in &mut stmt.columns {
+        if let SelectItem::Expr { expr, .. } = item {
+            rewrite_custom_aggregates_in_expr(expr, &mut reader, default_schema)?;
+        }
+    }
+    for expr in &mut stmt.distinct_on {
+        rewrite_custom_aggregates_in_expr(expr, &mut reader, default_schema)?;
+    }
+    Ok(())
+}
+
+fn rewrite_custom_aggregates_in_expr(
+    expr: &mut Expr,
+    reader: &mut CatalogReader,
+    default_schema: &str,
+) -> Result<(), DbError> {
+    match expr {
+        Expr::Function { name, args } => {
+            for arg in args.iter_mut() {
+                rewrite_custom_aggregates_in_expr(arg, reader, default_schema)?;
+            }
+            if let Some(def) = reader.get_aggregate(default_schema, name, args.len())? {
+                *name = crate::custom_aggregate::internal_aggregate_name(def.helper_kind).into();
+            }
+        }
+        Expr::GroupConcat {
+            expr,
+            order_by,
+            ..
+        } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            for (item_expr, _) in order_by {
+                rewrite_custom_aggregates_in_expr(item_expr, reader, default_schema)?;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_custom_aggregates_in_expr(left, reader, default_schema)?;
+            rewrite_custom_aggregates_in_expr(right, reader, default_schema)?;
+        }
+        Expr::UnaryOp { operand, .. }
+        | Expr::Collate { expr: operand, .. }
+        | Expr::IsNull { expr: operand, .. }
+        | Expr::IsBoolean { expr: operand, .. }
+        | Expr::Cast { expr: operand, .. } => {
+            rewrite_custom_aggregates_in_expr(operand, reader, default_schema)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            rewrite_custom_aggregates_in_expr(low, reader, default_schema)?;
+            rewrite_custom_aggregates_in_expr(high, reader, default_schema)?;
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            rewrite_custom_aggregates_in_expr(pattern, reader, default_schema)?;
+            if let Some(expr) = escape {
+                rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            }
+        }
+        Expr::In { expr, list, .. } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            for item in list {
+                rewrite_custom_aggregates_in_expr(item, reader, default_schema)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            if let Some(expr) = operand {
+                rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            }
+            for (when, then) in when_thens {
+                rewrite_custom_aggregates_in_expr(when, reader, default_schema)?;
+                rewrite_custom_aggregates_in_expr(then, reader, default_schema)?;
+            }
+            if let Some(expr) = else_result {
+                rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            }
+        }
+        Expr::Window { spec, .. } => {
+            for expr in &mut spec.partition_by {
+                rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            }
+            for item in &mut spec.order_by {
+                rewrite_custom_aggregates_in_expr(&mut item.expr, reader, default_schema)?;
+            }
+        }
+        Expr::Grouping { args, .. } => {
+            for expr in args {
+                rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            }
+        }
+        Expr::SqlJsonQuery {
+            doc,
+            passing,
+            on_empty,
+            on_error,
+            ..
+        } => {
+            rewrite_custom_aggregates_in_expr(doc, reader, default_schema)?;
+            for (expr, _) in passing {
+                rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            }
+            rewrite_on_behavior_custom_aggregates(on_empty, reader, default_schema)?;
+            rewrite_on_behavior_custom_aggregates(on_error, reader, default_schema)?;
+        }
+        Expr::InSubquery { expr, .. } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+        }
+        Expr::Literal(_)
+        | Expr::Default
+        | Expr::Column { .. }
+        | Expr::OuterColumn { .. }
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
+        | Expr::Param { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists { .. } => {}
+    }
+    Ok(())
+}
+
+fn rewrite_on_behavior_custom_aggregates(
+    behavior: &mut crate::expr::SqlJsonOnBehavior,
+    reader: &mut CatalogReader,
+    default_schema: &str,
+) -> Result<(), DbError> {
+    if let crate::expr::SqlJsonOnBehavior::Default(expr) = behavior {
+        rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+    }
+    Ok(())
+}
+
 fn is_aggregate_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -956,6 +1127,7 @@ fn is_aggregate_name(name: &str) -> bool {
             | "jsonb_object_agg"
             | "json_object_agg"
             | "json_objectagg"
+            | "__axiom_internal_median"
     )
 }
 

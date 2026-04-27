@@ -73,6 +73,37 @@ fn test_show_create_trigger_parses() {
     assert!(matches!(stmt, Stmt::ShowCreateTrigger(_)));
 }
 
+#[test]
+fn test_create_aggregate_parses() {
+    let stmt = parse(
+        "CREATE AGGREGATE median(FLOAT) (SFUNC = median_state, STYPE = FLOAT[], FINALFUNC = median_final)",
+        None,
+    )
+    .unwrap();
+    match stmt {
+        Stmt::CreateAggregate(agg) => {
+            assert_eq!(agg.name, "median");
+            assert_eq!(agg.arg_types, vec![DataType::Real]);
+            assert_eq!(agg.sfunc, "median_state");
+            assert_eq!(agg.stype, "FLOAT[]");
+            assert_eq!(agg.finalfunc.as_deref(), Some("median_final"));
+        }
+        other => panic!("expected CreateAggregate, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_drop_aggregate_parses() {
+    let stmt = parse("DROP AGGREGATE median(FLOAT)", None).unwrap();
+    match stmt {
+        Stmt::DropAggregate(agg) => {
+            assert_eq!(agg.name, "median");
+            assert_eq!(agg.arg_types, vec![DataType::Real]);
+        }
+        other => panic!("expected DropAggregate, got {other:?}"),
+    }
+}
+
 // ── Basic CREATE TABLE ────────────────────────────────────────────────────────
 
 #[test]

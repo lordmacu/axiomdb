@@ -26,6 +26,7 @@ use axiomdb_core::error::DbError;
 
 include!("schema_database.rs");
 include!("schema_table.rs");
+include!("schema_aggregate.rs");
 include!("schema_index.rs");
 include!("schema_constraints.rs");
 

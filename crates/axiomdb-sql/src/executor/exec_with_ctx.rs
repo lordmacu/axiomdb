@@ -456,9 +456,11 @@ fn is_ddl(stmt: &Stmt) -> bool {
         stmt,
         Stmt::CreateTable(_)
             | Stmt::CreateMaterializedView(_)
+            | Stmt::CreateAggregate(_)
             | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
             | Stmt::DropMaterializedView(_)
+            | Stmt::DropAggregate(_)
             | Stmt::DropDatabase(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)

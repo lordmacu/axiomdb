@@ -18,10 +18,10 @@ pub use notifier::{
 pub use reader::CatalogReader;
 pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
-    ColumnDef, ColumnType, ConstraintDef, ConstraintKind, ConstraintOperator, DatabaseDef,
-    ExclusionElementDef, FkAction, FkDef, IndexColumnDef, IndexDef, RelationKind, SchemaDef,
-    SortOrder, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
-    TriggerDef, TriggerEvent, DEFAULT_DATABASE_NAME,
+    AggregateDef, AggregateHelperKind, ColumnDef, ColumnType, ConstraintDef, ConstraintKind,
+    ConstraintOperator, DatabaseDef, ExclusionElementDef, FkAction, FkDef, IndexColumnDef,
+    IndexDef, RelationKind, SchemaDef, SortOrder, StatsDef, TableDatabaseDef, TableDef, TableId,
+    TablePersistence, TableStorageLayout, TriggerDef, TriggerEvent, DEFAULT_DATABASE_NAME,
 };
 pub use writer::{
     CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_DATABASES,

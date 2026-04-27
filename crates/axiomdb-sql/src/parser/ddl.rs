@@ -7,11 +7,12 @@ use axiomdb_types::DataType;
 use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
-        ConstraintTiming, CreateIndexStmt, CreateMaterializedViewStmt, CreateTableAsSelectStmt,
-        CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt, DropIndexStmt,
-        DropMaterializedViewStmt, DropTableStmt, DropTriggerStmt, ExclusionElement,
-        ExclusionElementTarget, ExclusionOperator, ForeignKeyAction, GeneratedColumnKind,
-        IndexColumn, RefreshMaterializedViewStmt, SortOrder, Stmt, TableConstraint, TriggerEvent,
+        ConstraintTiming, CreateAggregateStmt, CreateIndexStmt, CreateMaterializedViewStmt,
+        CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt,
+        DropAggregateStmt, DropIndexStmt, DropMaterializedViewStmt, DropTableStmt, DropTriggerStmt,
+        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction,
+        GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, SortOrder, Stmt,
+        TableConstraint, TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -84,6 +85,48 @@ pub(crate) fn parse_create_trigger(p: &mut Parser) -> Result<Stmt, DbError> {
         event,
         table,
         body_sql,
+    }))
+}
+
+pub(crate) fn parse_create_aggregate(p: &mut Parser) -> Result<Stmt, DbError> {
+    let name = p.parse_identifier()?;
+    let arg_types = parse_aggregate_signature(p)?;
+    p.expect(&Token::LParen)?;
+    let mut sfunc = None;
+    let mut stype = None;
+    let mut finalfunc = None;
+    loop {
+        let option_name = p.parse_identifier()?;
+        p.expect(&Token::Eq)?;
+        if option_name.eq_ignore_ascii_case("sfunc") {
+            sfunc = Some(p.parse_identifier()?);
+        } else if option_name.eq_ignore_ascii_case("stype") {
+            stype = Some(parse_state_type_name(p)?);
+        } else if option_name.eq_ignore_ascii_case("finalfunc") {
+            finalfunc = Some(p.parse_identifier()?);
+        } else {
+            return Err(DbError::ParseError {
+                message: format!("unsupported CREATE AGGREGATE option '{option_name}'"),
+                position: Some(p.current_pos()),
+            });
+        }
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+    Ok(Stmt::CreateAggregate(CreateAggregateStmt {
+        name,
+        arg_types,
+        sfunc: sfunc.ok_or_else(|| DbError::ParseError {
+            message: "CREATE AGGREGATE requires SFUNC".into(),
+            position: Some(p.current_pos()),
+        })?,
+        stype: stype.ok_or_else(|| DbError::ParseError {
+            message: "CREATE AGGREGATE requires STYPE".into(),
+            position: Some(p.current_pos()),
+        })?,
+        finalfunc,
     }))
 }
 
@@ -970,6 +1013,118 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16, bool), D
     }
 }
 
+fn parse_aggregate_signature(p: &mut Parser) -> Result<Vec<DataType>, DbError> {
+    p.expect(&Token::LParen)?;
+    let mut arg_types = Vec::new();
+    if p.eat(&Token::RParen) {
+        return Ok(arg_types);
+    }
+    loop {
+        let (ty, _type_len, _is_char) = parse_data_type(p)?;
+        arg_types.push(ty);
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+    Ok(arg_types)
+}
+
+fn parse_state_type_name(p: &mut Parser) -> Result<String, DbError> {
+    let mut name = match p.peek().clone() {
+        Token::TyInt => {
+            p.advance();
+            "INT".to_string()
+        }
+        Token::TyInteger => {
+            p.advance();
+            "INTEGER".to_string()
+        }
+        Token::TyBigint => {
+            p.advance();
+            "BIGINT".to_string()
+        }
+        Token::TyReal => {
+            p.advance();
+            "REAL".to_string()
+        }
+        Token::TyDouble => {
+            p.advance();
+            "DOUBLE".to_string()
+        }
+        Token::TyFloat => {
+            p.advance();
+            "FLOAT".to_string()
+        }
+        Token::TyDecimal => {
+            p.advance();
+            "DECIMAL".to_string()
+        }
+        Token::TyNumeric => {
+            p.advance();
+            "NUMERIC".to_string()
+        }
+        Token::TyBool => {
+            p.advance();
+            "BOOL".to_string()
+        }
+        Token::TyBoolean => {
+            p.advance();
+            "BOOLEAN".to_string()
+        }
+        Token::TyText => {
+            p.advance();
+            "TEXT".to_string()
+        }
+        Token::TyVarchar => {
+            p.advance();
+            "VARCHAR".to_string()
+        }
+        Token::TyChar => {
+            p.advance();
+            "CHAR".to_string()
+        }
+        Token::TyBlob => {
+            p.advance();
+            "BLOB".to_string()
+        }
+        Token::TyBytea => {
+            p.advance();
+            "BYTEA".to_string()
+        }
+        Token::TyDate => {
+            p.advance();
+            "DATE".to_string()
+        }
+        Token::TyTimestamp => {
+            p.advance();
+            "TIMESTAMP".to_string()
+        }
+        Token::TyDatetime => {
+            p.advance();
+            "DATETIME".to_string()
+        }
+        Token::TyUuid => {
+            p.advance();
+            "UUID".to_string()
+        }
+        Token::TyJson => {
+            p.advance();
+            "JSON".to_string()
+        }
+        Token::TyJsonb => {
+            p.advance();
+            "JSONB".to_string()
+        }
+        _ => p.parse_identifier()?,
+    };
+    while p.eat(&Token::LBracket) {
+        p.expect(&Token::RBracket)?;
+        name.push_str("[]");
+    }
+    Ok(name)
+}
+
 fn eat_optional_precision_scale(p: &mut Parser) -> Result<(), DbError> {
     if p.eat(&Token::LParen) {
         if !matches!(p.peek(), Token::Integer(_)) {
@@ -1279,6 +1434,12 @@ pub(crate) fn parse_drop_trigger(p: &mut Parser) -> Result<Stmt, DbError> {
     p.expect(&Token::On)?;
     let table = p.parse_table_ref()?;
     Ok(Stmt::DropTrigger(DropTriggerStmt { name, table }))
+}
+
+pub(crate) fn parse_drop_aggregate(p: &mut Parser) -> Result<Stmt, DbError> {
+    let name = p.parse_identifier()?;
+    let arg_types = parse_aggregate_signature(p)?;
+    Ok(Stmt::DropAggregate(DropAggregateStmt { name, arg_types }))
 }
 
 pub(crate) fn parse_drop_materialized_view(p: &mut Parser) -> Result<Stmt, DbError> {

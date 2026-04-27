@@ -99,9 +99,11 @@ fn stmt_changes_schema(stmt: &Stmt) -> bool {
         stmt,
         Stmt::CreateTable(_)
             | Stmt::CreateMaterializedView(_)
+            | Stmt::CreateAggregate(_)
             | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
             | Stmt::DropMaterializedView(_)
+            | Stmt::DropAggregate(_)
             | Stmt::DropDatabase(_)
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)

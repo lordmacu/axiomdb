@@ -1123,3 +1123,84 @@ error or an OK packet) is required for these connectors to work without
 warnings or connection drops.
 </div>
 </div>
+
+---
+
+## CREATE AGGREGATE
+
+Define a custom aggregate function backed by a registered internal helper.
+
+```sql
+CREATE AGGREGATE name ( arg_type [, ...] ) (
+  SFUNC  = transition_function,
+  STYPE  = state_type,
+  FINALFUNC = final_function
+);
+```
+
+| Parameter | Description |
+|---|---|
+| `name` | Name of the new aggregate |
+| `arg_type` | Input column type (e.g. `FLOAT`, `INT`) |
+| `SFUNC` | Transition function called once per row |
+| `STYPE` | Internal state type |
+| `FINALFUNC` | Optional finalization function called once per group |
+
+**Example — median:**
+
+```sql
+CREATE AGGREGATE median(FLOAT) (
+  SFUNC     = median_state,
+  STYPE     = FLOAT[],
+  FINALFUNC = median_final
+);
+
+CREATE TABLE latency (service TEXT, ms FLOAT);
+INSERT INTO latency VALUES ('api', 10.0), ('api', 50.0), ('api', 30.0);
+
+SELECT service, median(ms) AS p50 FROM latency GROUP BY service;
+-- service | p50
+-- api     | 30.0
+```
+
+**Supported helpers (current registry):**
+
+| SFUNC | STYPE | FINALFUNC | Result |
+|---|---|---|---|
+| `median_state` | `FLOAT[]` | `median_final` | exact median via sort |
+
+<div class="callout callout-design">
+<span class="callout-icon">🔧</span>
+<div class="callout-body">
+<span class="callout-label">Bounded registry</span>
+<code>SFUNC</code> and <code>FINALFUNC</code> names are not arbitrary SQL functions —
+they are validated against an internal Rust registry at <code>CREATE AGGREGATE</code>
+time. This avoids the need for a generic <code>CREATE FUNCTION</code> runtime while
+still giving real catalog-backed DDL semantics. Future registry entries can be
+added without changing the DDL syntax.
+</div>
+</div>
+
+**Error cases:**
+
+| Situation | Error |
+|---|---|
+| Unknown SFUNC/FINALFUNC combination | `InvalidValue` |
+| Duplicate aggregate signature | `InvalidValue` — already exists |
+| Wrong invocation arity | signature mismatch error |
+
+---
+
+## DROP AGGREGATE
+
+Remove a custom aggregate definition.
+
+```sql
+DROP AGGREGATE name ( arg_type [, ...] );
+```
+
+Removes the aggregate from the catalog. Built-in aggregates (`SUM`, `COUNT`, etc.) cannot be dropped.
+
+```sql
+DROP AGGREGATE median(FLOAT);
+```

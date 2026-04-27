@@ -389,6 +389,19 @@ fn dispatch_ctx(
                 &db,
             )
         }
+        Stmt::CreateAggregate(s) => {
+            ctx.invalidate_all();
+            let schema = ctx.default_create_schema().to_string();
+            execute_create_aggregate(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &schema,
+            )
+        }
         Stmt::DropMaterializedView(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
@@ -419,6 +432,19 @@ fn dispatch_ctx(
                     .as_mut()
                     .expect("conn_txn must be set before dispatch_ctx"),
                 &db,
+            )
+        }
+        Stmt::DropAggregate(s) => {
+            ctx.invalidate_all();
+            let schema = ctx.default_create_schema().to_string();
+            execute_drop_aggregate(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &schema,
             )
         }
         // 5.9f: SHOW TABLE STATUS — needs database context

@@ -971,6 +971,10 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_trigger(self)
             }
+            Token::Aggregate => {
+                self.advance();
+                ddl::parse_create_aggregate(self)
+            }
             Token::Unique => {
                 self.advance();
                 self.expect(&Token::Index)?;
@@ -982,7 +986,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE, MATERIALIZED VIEW, TRIGGER or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TEMP[TORARY] TABLE, UNLOGGED TABLE, TABLE, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1013,9 +1017,13 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_trigger(self)
             }
+            Token::Aggregate => {
+                self.advance();
+                ddl::parse_drop_aggregate(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, MATERIALIZED VIEW, TRIGGER or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

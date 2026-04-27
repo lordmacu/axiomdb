@@ -1207,11 +1207,28 @@ pub struct CreateTriggerStmt {
     pub body_sql: String,
 }
 
+/// `CREATE AGGREGATE name(type[, ...]) (SFUNC=..., STYPE=..., FINALFUNC=...)`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateAggregateStmt {
+    pub name: String,
+    pub arg_types: Vec<DataType>,
+    pub sfunc: String,
+    pub stype: String,
+    pub finalfunc: Option<String>,
+}
+
 /// `DROP TRIGGER name ON table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTriggerStmt {
     pub name: String,
     pub table: TableRef,
+}
+
+/// `DROP AGGREGATE name(type[, ...])`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropAggregateStmt {
+    pub name: String,
+    pub arg_types: Vec<DataType>,
 }
 
 /// `SHOW CREATE TRIGGER name ON table`
@@ -1275,6 +1292,7 @@ pub enum Stmt {
     /// `CREATE MATERIALIZED VIEW name AS SELECT ...`.
     CreateMaterializedView(CreateMaterializedViewStmt),
     CreateTrigger(CreateTriggerStmt),
+    CreateAggregate(CreateAggregateStmt),
     CreateDatabase(CreateDatabaseStmt),
     CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
@@ -1283,6 +1301,7 @@ pub enum Stmt {
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     DropTrigger(DropTriggerStmt),
+    DropAggregate(DropAggregateStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),

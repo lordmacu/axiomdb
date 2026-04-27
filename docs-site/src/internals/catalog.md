@@ -421,3 +421,43 @@ instead of trying to patch arbitrary leaf-level damage in place. This keeps reco
 and makes the catalog root swap the only logical state transition.
 </div>
 </div>
+
+---
+
+## Custom Aggregate Catalog (Phase 13.14)
+
+Custom aggregates are first-class catalog objects stored alongside tables,
+indexes, and views.
+
+### `AggregateDef` — on-disk format
+
+```
+[schema_len: u8][schema: bytes]
+[name_len:   u8][name:   bytes]
+[arg_count:  u8][arg_types: u8 * arg_count]
+[sfunc_len:  u8][sfunc:  bytes]
+[stype_len:  u8][stype:  bytes]
+[finalfunc_len: u8][finalfunc: bytes]   -- empty string if None
+[helper_kind: u8]                        -- AggregateHelperKind tag
+```
+
+All length prefixes are single-byte so maximum field length is 255 bytes.
+`helper_kind` is a stable numeric tag (`1 = Median`) that survives
+serialization and lets the executor skip re-validating helper names at query
+time.
+
+### Catalog APIs
+
+| Function | Description |
+|---|---|
+| `CatalogWriter::create_aggregate(def)` | Persists a new `AggregateDef` |
+| `CatalogReader::get_aggregate(schema, name, arity)` | Looks up by name + arg count |
+| `CatalogWriter::delete_aggregate(schema, name, arity)` | Removes the entry |
+
+### Registry boundary
+
+`SFUNC` / `FINALFUNC` names are validated at `CREATE AGGREGATE` time against
+`custom_aggregate::resolve_custom_aggregate_helper`. Only combinations present
+in the registry are accepted. This keeps the executor simple: at runtime the
+only decision is which `AggregateHelperKind` accumulator to instantiate — no
+arbitrary function dispatch is needed.

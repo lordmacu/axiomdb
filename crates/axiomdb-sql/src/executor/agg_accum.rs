@@ -45,6 +45,9 @@ enum AggAccumulator {
         pairs: Vec<(String, serde_json::Value)>,
         returns_jsonb: bool,
     },
+    Median {
+        values: Vec<f64>,
+    },
 }
 
 impl AggAccumulator {
@@ -95,6 +98,7 @@ impl AggAccumulator {
                 pairs: Vec::new(),
                 returns_jsonb: *returns_jsonb,
             },
+            AggExpr::Median { .. } => Self::Median { values: Vec::new() },
         }
     }
 
@@ -104,6 +108,7 @@ impl AggAccumulator {
             AggExpr::Simple { arg, .. } => arg.as_ref(),
             AggExpr::GroupConcat { .. } => None,
             AggExpr::JsonbObjectAgg { .. } => None,
+            AggExpr::Median { .. } => None,
         };
 
         // Phase 9.5b: fast-path for simple column refs — avoids eval() overhead.
@@ -303,6 +308,32 @@ impl AggAccumulator {
                     pairs.push((k_str, v_sj));
                 }
             }
+            Self::Median { values } => {
+                let val_expr = match agg {
+                    AggExpr::Median { arg, .. } => arg,
+                    _ => {
+                        return Err(DbError::Internal {
+                            message: "Median accumulator paired with non-Median AggExpr".into(),
+                        });
+                    }
+                };
+                let value = eval(val_expr, row)?;
+                match value {
+                    Value::Null => {}
+                    Value::Int(n) => values.push(n as f64),
+                    Value::BigInt(n) => values.push(n as f64),
+                    Value::Real(f) => values.push(f),
+                    Value::Decimal(mantissa, scale) => {
+                        values.push((mantissa as f64) / 10f64.powi(scale as i32));
+                    }
+                    other => {
+                        return Err(DbError::TypeMismatch {
+                            expected: "numeric value for median aggregate".into(),
+                            got: other.variant_name().into(),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -425,6 +456,18 @@ impl AggAccumulator {
                     Ok(Value::Jsonb(std::sync::Arc::new(blob)))
                 } else {
                     Ok(Value::Json(val.to_string()))
+                }
+            }
+            Self::Median { mut values } => {
+                if values.is_empty() {
+                    return Ok(Value::Null);
+                }
+                values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = values.len() / 2;
+                if values.len() % 2 == 1 {
+                    Ok(Value::Real(values[mid]))
+                } else {
+                    Ok(Value::Real((values[mid - 1] + values[mid]) / 2.0))
                 }
             }
         }
