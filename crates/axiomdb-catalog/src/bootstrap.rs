@@ -16,7 +16,7 @@ use axiomdb_core::error::DbError;
 use axiomdb_storage::HeapChain;
 use axiomdb_storage::{
     read_meta_u32, read_meta_u64, write_catalog_header, write_meta_u32, write_meta_u64, Page,
-    PageType, StorageEngine, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
+    PageType, StorageEngine, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_DATABASES_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
     CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
@@ -62,6 +62,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_schemas` heap (Phase 22b.4).
     /// Zero on legacy databases; lazily initialized on first `CREATE SCHEMA`.
     pub schemas: u64,
+    /// Root page of the `axiom_aggregates` heap (Phase 13.14).
+    /// Zero on legacy databases; lazily initialized on first `CREATE AGGREGATE`.
+    pub aggregates: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -154,6 +157,16 @@ impl CatalogBootstrap {
         storage.write_page(schemas_root, &schemas_page)?;
         write_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET, schemas_root)?;
 
+        // Allocate the aggregates root (Phase 13.14).
+        let aggregates_root = storage.alloc_page(PageType::Data)?;
+        let aggregates_page = Page::new(PageType::Data, aggregates_root);
+        storage.write_page(aggregates_root, &aggregates_page)?;
+        write_meta_u64(
+            storage,
+            CATALOG_AGGREGATES_ROOT_BODY_OFFSET,
+            aggregates_root,
+        )?;
+
         // Seed the default logical database so fresh databases and upgraded
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
@@ -181,6 +194,7 @@ impl CatalogBootstrap {
             databases: databases_root,
             table_databases: table_databases_root,
             schemas: schemas_root,
+            aggregates: aggregates_root,
         })
     }
 
@@ -206,6 +220,7 @@ impl CatalogBootstrap {
         let databases = read_meta_u64(storage, CATALOG_DATABASES_ROOT_BODY_OFFSET)?;
         let table_databases = read_meta_u64(storage, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET)?;
         let schemas = read_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET)?;
+        let aggregates = read_meta_u64(storage, CATALOG_AGGREGATES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -216,6 +231,7 @@ impl CatalogBootstrap {
             databases,
             table_databases,
             schemas,
+            aggregates,
         })
     }
 
@@ -267,6 +283,14 @@ impl CatalogBootstrap {
             return Err(DbError::Internal {
                 message: "database catalog roots not initialized".into(),
             });
+        }
+
+        if ids.aggregates == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, root)?;
+            ids.aggregates = root;
         }
 
         storage.flush()?;

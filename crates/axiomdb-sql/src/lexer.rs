@@ -300,6 +300,8 @@ pub enum Token<'src> {
     Notify,
     #[token("TRIGGER", ignore(ascii_case))]
     Trigger,
+    #[token("AGGREGATE", ignore(ascii_case))]
+    Aggregate,
     #[token("AFTER", ignore(ascii_case))]
     After,
     #[token("BEFORE", ignore(ascii_case))]
@@ -619,6 +621,10 @@ pub enum Token<'src> {
     LParen,
     #[token(")")]
     RParen,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
     #[token(",")]
     Comma,
     #[token(";")]

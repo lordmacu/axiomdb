@@ -36,8 +36,9 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
              13.4 (LISTEN / NOTIFY pull-based smoke),
              13.5 (covering indexes smoke),
              13.6 (non-blocking ALTER TABLE smoke),
-             13.12 (statement-level triggers smoke),
-             13.13 (collation system smoke)
+            13.12 (statement-level triggers smoke),
+            13.13 (collation system smoke),
+            13.14 (custom aggregate functions smoke)
 """
 import os
 import signal
@@ -4320,6 +4321,28 @@ rows = cur.fetchall()
 ok("[13.13 collation system] information_schema reports effective table collation",
    rows == (("utf8mb4_general_ci",),),
    rows)
+
+# ── Phase 13.14 — Custom aggregate functions ────────────────────────────────
+
+print("\n[13.14 custom aggregate functions]")
+
+cur.execute("CREATE TABLE agg13_samples (grp INT, v FLOAT)")
+cur.execute(
+    "CREATE AGGREGATE median(FLOAT) (SFUNC = median_state, STYPE = FLOAT[], FINALFUNC = median_final)"
+)
+cur.execute(
+    "INSERT INTO agg13_samples VALUES (1, 1.0), (1, 9.0), (1, 5.0), (2, 2.0), (2, 4.0)"
+)
+conn.commit()
+
+cur.execute("SELECT grp, median(v) AS m FROM agg13_samples GROUP BY grp ORDER BY grp")
+rows = cur.fetchall()
+ok("[13.14 custom aggregate functions] median aggregate runs over the wire",
+   rows == (('1', 5.0), ('2', 3.0)),  # grp INT comes as str — pre-existing wire type issue
+   rows)
+
+cur.execute("DROP AGGREGATE median(FLOAT)")
+conn.commit()
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

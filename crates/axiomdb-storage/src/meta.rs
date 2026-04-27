@@ -15,7 +15,9 @@
 //! body[60..64] _catalog_pad: u32
 //! body[104..112] catalog_databases_root: u64 LE — axiom_databases heap root
 //! body[112..120] catalog_table_databases_root: u64 LE — axiom_table_databases heap root
-//! body[128]     clean_shutdown: u8     — 1 = cleanly closed, 0 = dirty/open
+//! body[120..128] catalog_schemas_root: u64 LE — axiom_schemas heap root
+//! body[128..136] catalog_aggregates_root: u64 LE — axiom_aggregates heap root
+//! body[136]     clean_shutdown: u8     — 1 = cleanly closed, 0 = dirty/open
 //! ```
 
 use axiomdb_core::error::DbError;
@@ -135,9 +137,14 @@ pub const CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET: usize = 112;
 /// legacy databases; lazily initialized on first `CREATE SCHEMA`.
 pub const CATALOG_SCHEMAS_ROOT_BODY_OFFSET: usize = 120;
 
+/// body offset of `catalog_aggregates_root: u64` — root heap page for
+/// `axiom_aggregates` (Phase 13.14). Value 0 = not yet allocated on
+/// legacy databases; lazily initialized on first `CREATE AGGREGATE`.
+pub const CATALOG_AGGREGATES_ROOT_BODY_OFFSET: usize = 128;
+
 /// body offset of `clean_shutdown: u8` — set to 1 on clean close and reset to
 /// 0 on open before the server starts accepting work.
-pub const CLEAN_SHUTDOWN_BODY_OFFSET: usize = 128;
+pub const CLEAN_SHUTDOWN_BODY_OFFSET: usize = 136;
 
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,

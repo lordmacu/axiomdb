@@ -13,6 +13,7 @@ pub mod ast;
 pub mod bloom;
 pub mod clustered_secondary;
 pub mod clustered_table;
+pub mod custom_aggregate;
 pub mod eval;
 pub mod exec_ctx;
 pub mod executor;
@@ -44,16 +45,17 @@ pub mod values_clause;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, CloseCursorStmt, ColumnConstraint, ColumnDef,
-    CreateDatabaseStmt, CreateIndexStmt, CreateMaterializedViewStmt, CreateSchemaStmt,
-    CreateTableStmt, CreateTriggerStmt, DeclareCursorStmt, DeleteStmt, DropDatabaseStmt,
-    DropIndexStmt, DropMaterializedViewStmt, DropTableStmt, DropTriggerStmt, ExclusionElement,
-    ExclusionElementTarget, ExclusionOperator, FetchCount, FetchCursorStmt, ForeignKeyAction,
-    FromClause, IndexColumn, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType,
-    ListenStmt, MergeAction, MergeActionCondition, MergeActionKind, MergeStmt, NotifyStmt,
-    NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, RefreshMaterializedViewStmt,
-    SelectItem, SelectStmt, SetStmt, SetValue, ShowColumnsStmt, ShowCreateTriggerStmt,
-    ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt, SortOrder, Stmt, TableConstraint, TableRef,
-    TriggerEvent, TruncateTableStmt, UnlistenStmt, UpdateStmt, UseDatabaseStmt,
+    CreateAggregateStmt, CreateDatabaseStmt, CreateIndexStmt, CreateMaterializedViewStmt,
+    CreateSchemaStmt, CreateTableStmt, CreateTriggerStmt, DeclareCursorStmt, DeleteStmt,
+    DropAggregateStmt, DropDatabaseStmt, DropIndexStmt, DropMaterializedViewStmt, DropTableStmt,
+    DropTriggerStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator, FetchCount,
+    FetchCursorStmt, ForeignKeyAction, FromClause, IndexColumn, InsertSource, InsertStmt,
+    JoinClause, JoinCondition, JoinType, ListenStmt, MergeAction, MergeActionCondition,
+    MergeActionKind, MergeStmt, NotifyStmt, NullsOrder, OnConflictAction, OnConflictClause,
+    OrderByItem, RefreshMaterializedViewStmt, SelectItem, SelectStmt, SetStmt, SetValue,
+    ShowColumnsStmt, ShowCreateTriggerStmt, ShowDatabasesStmt, ShowIndexStmt, ShowTablesStmt,
+    SortOrder, Stmt, TableConstraint, TableRef, TriggerEvent, TruncateTableStmt, UnlistenStmt,
+    UpdateStmt, UseDatabaseStmt,
 };
 pub use bloom::BloomRegistry;
 pub use eval::{

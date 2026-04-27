@@ -224,6 +224,8 @@ fn grouped_expr_name(expr: &Expr, _agg_exprs: &[AggExpr]) -> String {
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             if args.is_empty() {
                 format!("{name}(*)")
+            } else if name == crate::custom_aggregate::INTERNAL_MEDIAN_AGGREGATE_NAME {
+                "median(...)".into()
             } else {
                 format!("{name}(...)")
             }
@@ -241,6 +243,7 @@ fn grouped_expr_type(expr: &Expr, _agg_exprs: &[AggExpr]) -> (DataType, bool) {
         Expr::Function { name, .. } if is_aggregate(name.as_str()) => match name.as_str() {
             "count" => (DataType::BigInt, false),
             "avg" => (DataType::Real, true),
+            crate::custom_aggregate::INTERNAL_MEDIAN_AGGREGATE_NAME => (DataType::Real, true),
             _ => (DataType::Text, true), // SUM/MIN/MAX: type depends on column — Text fallback
         },
         Expr::Column { .. } => (DataType::Text, true), // Column refs: safe fallback

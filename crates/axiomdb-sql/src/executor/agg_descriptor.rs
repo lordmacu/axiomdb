@@ -6,6 +6,7 @@ fn is_aggregate(name: &str) -> bool {
             // Phase 11.25b — PG + MySQL JSON aggregates.
             | "jsonb_agg" | "json_agg" | "json_arrayagg"
             | "jsonb_object_agg" | "json_object_agg" | "json_objectagg"
+            | "__axiom_internal_median"
     )
 }
 
@@ -128,6 +129,11 @@ enum AggExpr {
         #[allow(dead_code)]
         agg_idx: usize,
     },
+    Median {
+        arg: Expr,
+        #[allow(dead_code)]
+        agg_idx: usize,
+    },
 }
 
 impl AggExpr {
@@ -137,7 +143,8 @@ impl AggExpr {
         match self {
             Self::Simple { agg_idx, .. }
             | Self::GroupConcat { agg_idx, .. }
-            | Self::JsonbObjectAgg { agg_idx, .. } => *agg_idx,
+            | Self::JsonbObjectAgg { agg_idx, .. }
+            | Self::Median { agg_idx, .. } => *agg_idx,
         }
     }
 
@@ -162,6 +169,11 @@ impl AggExpr {
             }
             Self::GroupConcat { .. } => false,
             Self::JsonbObjectAgg { .. } => false,
+            Self::Median { arg, .. } => {
+                name == crate::custom_aggregate::INTERNAL_MEDIAN_AGGREGATE_NAME
+                    && args.len() == 1
+                    && arg == &args[0]
+            }
         }
     }
 
@@ -212,7 +224,7 @@ impl AggExpr {
                     && ob == order_by
                     && sep.as_str() == separator
             }
-            Self::Simple { .. } | Self::JsonbObjectAgg { .. } => false,
+            Self::Simple { .. } | Self::JsonbObjectAgg { .. } | Self::Median { .. } => false,
         }
     }
 }
@@ -248,6 +260,22 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         }
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             let lower = name.to_ascii_lowercase();
+            if lower == crate::custom_aggregate::INTERNAL_MEDIAN_AGGREGATE_NAME {
+                if args.len() != 1 {
+                    return;
+                }
+                let already = result
+                    .iter()
+                    .any(|ae| ae.matches_simple(&lower, args));
+                if !already {
+                    let idx = result.len();
+                    result.push(AggExpr::Median {
+                        arg: args[0].clone(),
+                        agg_idx: idx,
+                    });
+                }
+                return;
+            }
             // Phase 11.25b — 2-arg object aggregates.
             if is_object_agg(&lower) {
                 if args.len() != 2 {
