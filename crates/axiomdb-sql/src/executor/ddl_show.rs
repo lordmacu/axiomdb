@@ -194,7 +194,9 @@ fn execute_show_tables(
 }
 
 fn show_table_type_name(table: &axiomdb_catalog::TableDef) -> &'static str {
-    if table.is_materialized_view() {
+    if table.is_view() {
+        "VIEW"
+    } else if table.is_materialized_view() {
         "MATERIALIZED VIEW"
     } else {
         "BASE TABLE"
@@ -491,6 +493,14 @@ fn execute_show_create_table(
     let database_collation = reader
         .get_database(database)?
         .and_then(|db| db.default_collation);
+    if table_def.is_view() {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "'{}' is a view — use SHOW CREATE VIEW",
+                table_def.table_name
+            ),
+        });
+    }
     if table_def.is_materialized_view() {
         let defining_query = table_def
             .defining_query

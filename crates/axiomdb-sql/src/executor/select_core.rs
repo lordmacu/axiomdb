@@ -428,9 +428,9 @@ fn execute_select_derived(
     mut stmt: SelectStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
-    _conn_txn: Option<&ConnectionTxn>,
+    conn_txn: Option<&ConnectionTxn>,
 ) -> Result<QueryResult, DbError> {
-    let (inner_query, _alias) = match stmt.from.take() {
+    let (inner_query, alias) = match stmt.from.take() {
         Some(FromClause::Subquery { query, alias, .. }) => (*query, alias),
         _ => unreachable!("execute_select_derived called with non-subquery FROM"),
     };
@@ -448,6 +448,23 @@ fn execute_select_derived(
             })
         }
     };
+
+    // Subquery FROM + JOINs: route through the shared join-loop with the
+    // materialized subquery rows as first source (mirrors JSON_TABLE join path).
+    if !stmt.joins.is_empty() {
+        let mut join_ctx = SessionContext::new();
+        let join_bloom = crate::bloom::BloomRegistry::new();
+        let join_exec_ctx = ExecutionContext::new(storage, txn, &join_bloom, None);
+        let first_source = join_source_schema_from_derived(&alias, derived_cols);
+        return execute_select_with_joins_first_materialized(
+            stmt,
+            first_source,
+            derived_rows,
+            &join_exec_ctx,
+            conn_txn,
+            &mut join_ctx,
+        );
+    }
 
     // Apply outer WHERE.
     let mut combined_rows: Vec<Row> = Vec::new();

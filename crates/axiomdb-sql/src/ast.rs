@@ -953,6 +953,31 @@ pub struct DropTableStmt {
     pub cascade: bool,
 }
 
+/// `CREATE [OR REPLACE] VIEW name [(col, ...)] AS SELECT ...`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStmt {
+    pub or_replace: bool,
+    pub view: TableRef,
+    /// Optional explicit column-name list. Empty = derive from SELECT output.
+    pub columns: Vec<String>,
+    /// Raw SQL text of the defining SELECT (stored in catalog as-is).
+    pub query_sql: String,
+    pub select: SelectStmt,
+}
+
+/// `DROP VIEW [IF EXISTS] name [, ...]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewStmt {
+    pub if_exists: bool,
+    pub views: Vec<TableRef>,
+}
+
+/// `SHOW CREATE VIEW name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowCreateViewStmt {
+    pub view: TableRef,
+}
+
 /// `DROP MATERIALIZED VIEW`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropMaterializedViewStmt {
@@ -1291,6 +1316,8 @@ pub enum Stmt {
     CreateTableAsSelect(CreateTableAsSelectStmt),
     /// `CREATE MATERIALIZED VIEW name AS SELECT ...`.
     CreateMaterializedView(CreateMaterializedViewStmt),
+    /// `CREATE [OR REPLACE] VIEW name AS SELECT ...`.
+    CreateView(CreateViewStmt),
     CreateTrigger(CreateTriggerStmt),
     CreateAggregate(CreateAggregateStmt),
     CreateDatabase(CreateDatabaseStmt),
@@ -1298,6 +1325,8 @@ pub enum Stmt {
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
     DropMaterializedView(DropMaterializedViewStmt),
+    /// `DROP VIEW [IF EXISTS] name [, ...]`.
+    DropView(DropViewStmt),
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     DropTrigger(DropTriggerStmt),
@@ -1315,6 +1344,8 @@ pub enum Stmt {
     /// `SHOW CREATE TABLE t` — reconstruct DDL (4.20b).
     ShowCreateTable(ShowCreateTableStmt),
     ShowCreateTrigger(ShowCreateTriggerStmt),
+    /// `SHOW CREATE VIEW name`.
+    ShowCreateView(ShowCreateViewStmt),
     /// `SHOW TABLE STATUS [FROM db] [LIKE pattern]` (5.9f).
     ShowTableStatus(ShowTableStatusStmt),
     /// `SHOW ENGINES` — static engine list (5.9g).

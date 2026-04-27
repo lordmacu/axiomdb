@@ -507,6 +507,94 @@ impl<'a> CatalogWriter<'a> {
         Ok(def)
     }
 
+    /// Creates a regular (non-materialized) view catalog entry.
+    ///
+    /// Unlike `create_relation_with_options`, this does **not** allocate a root
+    /// page — views have no physical storage (`root_page_id = 0`).
+    pub fn create_view(
+        &mut self,
+        schema: &str,
+        name: &str,
+        defining_query: String,
+    ) -> Result<TableDef, DbError> {
+        let table_id = alloc_table_id(self.storage)?;
+        let def = TableDef {
+            id: table_id,
+            root_page_id: 0,
+            storage_layout: TableStorageLayout::Heap,
+            schema_name: schema.to_string(),
+            table_name: name.to_string(),
+            schema_version: 1,
+            immutable: false,
+            persistence: TablePersistence::Permanent,
+            relation_kind: RelationKind::View,
+            defining_query: Some(defining_query),
+            default_collation: None,
+            triggers: vec![],
+        };
+        let data = def.to_bytes();
+        let txn_id = self.conn.txn_id;
+        let (page_id, slot_id) =
+            HeapChain::insert(self.storage, self.page_ids.tables, &data, txn_id, None)?;
+        let key = table_id.to_le_bytes();
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_TABLES,
+            &key,
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        self.fire(SchemaChangeKind::TableCreated { table_id });
+        Ok(def)
+    }
+
+    /// Replaces the defining query of an existing view (for `CREATE OR REPLACE VIEW`).
+    pub fn replace_view_query(
+        &mut self,
+        table_id: TableId,
+        new_query: String,
+    ) -> Result<(), DbError> {
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = TableDef::from_bytes(&data)?;
+            if def.id == table_id {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = table_id.to_le_bytes();
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                let new_def = TableDef {
+                    defining_query: Some(new_query),
+                    ..def
+                };
+                let new_data = new_def.to_bytes();
+                let (pg2, sl2) =
+                    HeapChain::insert(self.storage, self.page_ids.tables, &new_data, txn_id, None)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_TABLES,
+                    &key,
+                    &new_data,
+                    pg2,
+                    sl2,
+                )?;
+                return Ok(());
+            }
+        }
+        Err(DbError::Internal {
+            message: format!("replace_view_query: table_id={table_id} not found"),
+        })
+    }
+
     fn allocate_table_root(&mut self, storage_layout: TableStorageLayout) -> Result<u64, DbError> {
         let (page_type, clustered) = match storage_layout {
             TableStorageLayout::Heap => (PageType::Data, false),

@@ -194,6 +194,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::CreateAggregate(_)
             | Stmt::DropTable(_)
             | Stmt::DropMaterializedView(_)
+            | Stmt::DropView(_)
             | Stmt::DropDatabase(_)
             | Stmt::DropIndex(_)
             | Stmt::DropTrigger(_)
@@ -210,6 +211,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::ShowIndex(_)
             | Stmt::ShowCreateTable(_)
             | Stmt::ShowCreateTrigger(_)
+            | Stmt::ShowCreateView(_)
             | Stmt::ShowTableStatus(_)
             | Stmt::ShowEngines
             | Stmt::ShowCharset
@@ -252,6 +254,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::CreateTableAsSelect(s) => self.visit_select(&s.select),
             // CREATE MATERIALIZED VIEW AS SELECT — deps come from the inner SELECT.
             Stmt::CreateMaterializedView(s) => self.visit_select(&s.select),
+            // CREATE VIEW — deps come from the inner SELECT.
+            Stmt::CreateView(s) => self.visit_select(&s.select),
             // Set ops — deps come from first + every tail SELECT.
             Stmt::SetOp { first, rest } => {
                 self.visit_select(first)?;

@@ -129,6 +129,7 @@ fn generate_is_rows(
             generate_is_referential_constraints_rows(&mut reader, default_database, temp_schema)?
         }
         "statistics" => generate_is_statistics_rows(&mut reader, default_database, temp_schema)?,
+        "views" => generate_is_views_rows(&mut reader, temp_schema)?,
         _ => {
             return Err(DbError::TableNotFound {
                 name: format!("information_schema.{table_name}"),
@@ -562,6 +563,37 @@ fn column_type_to_is_data_type(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar",
     }
+}
+
+/// `information_schema.VIEWS` — one row per regular view.
+///
+/// Column order matches `IS_VIEWS_COLS` in `information_schema.rs`.
+fn generate_is_views_rows(
+    reader: &mut CatalogReader,
+    temp_schema: Option<&str>,
+) -> Result<Vec<Row>, DbError> {
+    let databases = reader.list_databases()?;
+    let mut rows = Vec::new();
+
+    for db in &databases {
+        let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
+        for t in tables {
+            if !t.is_view() {
+                continue;
+            }
+            let definition = t.defining_query.clone().unwrap_or_default();
+            rows.push(vec![
+                Value::Text("def".into()),          // TABLE_CATALOG
+                Value::Text(db.name.clone()),        // TABLE_SCHEMA
+                Value::Text(t.table_name.clone()),   // TABLE_NAME
+                Value::Text(definition),             // VIEW_DEFINITION
+                Value::Text("NONE".into()),          // CHECK_OPTION
+                Value::Text("NO".into()),            // IS_UPDATABLE
+            ]);
+        }
+    }
+
+    Ok(rows)
 }
 
 /// Maps a `ColumnType` to the MySQL `COLUMN_TYPE` string shown in IS.COLUMNS.

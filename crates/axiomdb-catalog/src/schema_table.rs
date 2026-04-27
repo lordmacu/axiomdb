@@ -56,6 +56,7 @@ pub enum RelationKind {
     #[default]
     Table,
     MaterializedView,
+    View,
 }
 
 impl From<RelationKind> for u8 {
@@ -63,6 +64,7 @@ impl From<RelationKind> for u8 {
         match value {
             RelationKind::Table => 0,
             RelationKind::MaterializedView => 1,
+            RelationKind::View => 2,
         }
     }
 }
@@ -74,6 +76,7 @@ impl TryFrom<u8> for RelationKind {
         match value {
             0 => Ok(Self::Table),
             1 => Ok(Self::MaterializedView),
+            2 => Ok(Self::View),
             other => Err(DbError::ParseError {
                 message: format!("invalid relation kind byte {other}"),
                 position: None,
@@ -246,6 +249,10 @@ impl TableDef {
 
     pub fn is_materialized_view(&self) -> bool {
         self.relation_kind == RelationKind::MaterializedView
+    }
+
+    pub fn is_view(&self) -> bool {
+        self.relation_kind == RelationKind::View
     }
 
     pub fn ensure_heap_runtime(&self, feature: &str) -> Result<(), DbError> {

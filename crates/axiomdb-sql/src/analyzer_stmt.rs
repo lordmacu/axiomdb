@@ -50,6 +50,17 @@ fn analyze_stmt(
             )?;
             Ok(Stmt::CreateMaterializedView(s))
         }
+        Stmt::CreateView(mut s) => {
+            s.select = analyze_select(
+                s.select,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            )?;
+            Ok(Stmt::CreateView(s))
+        }
+        Stmt::DropView(_) | Stmt::ShowCreateView(_) => Ok(stmt),
         Stmt::CreateTrigger(_)
         | Stmt::DropTrigger(_)
         | Stmt::ShowCreateTrigger(_)
@@ -151,10 +162,12 @@ fn analyze_stmt_cached(
         | Stmt::CreateTableLike(_)
         | Stmt::CreateTableAsSelect(_)
         | Stmt::CreateMaterializedView(_)
+        | Stmt::CreateView(_)
         | Stmt::CreateTrigger(_)
         | Stmt::CreateAggregate(_)
         | Stmt::DropTable(_)
         | Stmt::DropMaterializedView(_)
+        | Stmt::DropView(_)
         | Stmt::DropTrigger(_)
         | Stmt::DropAggregate(_)
         | Stmt::AlterTable(_) => {
@@ -257,6 +270,18 @@ fn analyze_select_with_outer(
     default_schema: &str,
     outer_scopes: &[&BindContext],
 ) -> Result<SelectStmt, DbError> {
+    // Phase 20.1 — expand regular view references before CTE expansion.
+    // CTEs shadow views of the same name (CTE wins).
+    expand_views(
+        &mut s,
+        storage,
+        snapshot.clone(),
+        default_database,
+        default_schema,
+        outer_scopes,
+        &mut std::collections::HashSet::new(),
+    )?;
+
     // Phase 21.2 — expand CTE bindings before resolving FROM.
     // Each CTE body is analyzed in order so later CTEs can reference
     // earlier ones; references in the outer query's FROM / JOINs are
@@ -1255,6 +1280,150 @@ fn resolve_on_behavior(
         *boxed.as_mut() = resolved;
     }
     Ok(())
+}
+
+/// Phase 20.1 — rewrite every `FromClause::Table` that resolves to a
+/// `RelationKind::View` into a `FromClause::Subquery` containing the
+/// parsed and analyzed view body. CTEs shadow views of the same name;
+/// call this before `expand_ctes`.
+///
+/// `expanding` tracks the set of view names currently being expanded to
+/// detect circular references.
+#[allow(clippy::too_many_arguments)]
+fn expand_views(
+    s: &mut SelectStmt,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    outer_scopes: &[&BindContext],
+    expanding: &mut std::collections::HashSet<String>,
+) -> Result<(), DbError> {
+    if let Some(from) = s.from.take() {
+        s.from = Some(substitute_view_ref(
+            from,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+            outer_scopes,
+            expanding,
+        )?);
+    }
+    for join in &mut s.joins {
+        let taken = std::mem::replace(
+            &mut join.table,
+            FromClause::Table(crate::ast::TableRef {
+                database: None,
+                schema: None,
+                name: String::new(),
+                alias: None,
+            }),
+        );
+        join.table = substitute_view_ref(
+            taken,
+            storage,
+            snapshot.clone(),
+            default_database,
+            default_schema,
+            outer_scopes,
+            expanding,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn substitute_view_ref(
+    from: FromClause,
+    storage: &dyn StorageEngine,
+    snapshot: TransactionSnapshot,
+    default_database: &str,
+    default_schema: &str,
+    outer_scopes: &[&BindContext],
+    expanding: &mut std::collections::HashSet<String>,
+) -> Result<FromClause, DbError> {
+    match from {
+        FromClause::Table(ref tref) => {
+            // Only expand unqualified or public-schema references.
+            let schema = tref
+                .schema
+                .as_deref()
+                .unwrap_or(default_schema);
+            let database = tref
+                .database
+                .as_deref()
+                .unwrap_or(default_database);
+            let mut reader = CatalogReader::new(storage, snapshot.clone())?;
+            let def = reader.get_table_in_database(database, schema, &tref.name)?;
+            match def {
+                Some(d) if d.is_view() => {
+                    let view_name = format!("{}.{}", schema, tref.name);
+                    if expanding.contains(&view_name) {
+                        return Err(DbError::InvalidValue {
+                            reason: format!("circular view reference: {}", tref.name),
+                        });
+                    }
+                    expanding.insert(view_name.clone());
+
+                    let query_sql = d.defining_query.clone().ok_or_else(|| DbError::Internal {
+                        message: format!("view '{}' has no defining query", tref.name),
+                    })?;
+                    let parsed = crate::parse(&query_sql, None)?;
+                    let view_select = match parsed {
+                        Stmt::Select(sel) => sel,
+                        other => {
+                            return Err(DbError::Internal {
+                                message: format!(
+                                    "view '{}' defining query is not a SELECT: {other:?}",
+                                    tref.name
+                                ),
+                            })
+                        }
+                    };
+                    // Recursively expand views inside this view body.
+                    let mut body = view_select;
+                    expand_views(
+                        &mut body,
+                        storage,
+                        snapshot.clone(),
+                        default_database,
+                        default_schema,
+                        outer_scopes,
+                        expanding,
+                    )?;
+                    expanding.remove(&view_name);
+
+                    let alias = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                    Ok(FromClause::Subquery {
+                        query: Box::new(body),
+                        alias,
+                        lateral: false,
+                    })
+                }
+                _ => Ok(from),
+            }
+        }
+        // Recurse into subqueries to expand views inside them.
+        FromClause::Subquery { query, alias, lateral } => {
+            let mut body = *query;
+            expand_views(
+                &mut body,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+                outer_scopes,
+                expanding,
+            )?;
+            Ok(FromClause::Subquery {
+                query: Box::new(body),
+                alias,
+                lateral,
+            })
+        }
+        other => Ok(other),
+    }
 }
 
 /// Phase 21.2 — analyze each CTE body in order, then rewrite every

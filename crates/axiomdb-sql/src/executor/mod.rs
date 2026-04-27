@@ -119,6 +119,7 @@ include!("returning.rs");
 include!("recursive_cte_exec.rs");
 include!("ddl_create_table.rs");
 include!("ddl_aggregate.rs");
+include!("ddl_view.rs");
 include!("trigger.rs");
 include!("ddl_drop_table.rs");
 include!("ddl_create_index.rs");

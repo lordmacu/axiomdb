@@ -593,6 +593,50 @@ pub fn execute_read_only_with_ctx(
             ],
             rows: vec![],
         }),
+        Stmt::ShowCreateView(s) => {
+            let db = ddl_database(&s.view.database, ctx);
+            let snap = ctx
+                .conn_txn
+                .as_ref()
+                .map(|conn| txn.active_snapshot(conn))
+                .unwrap_or_else(|| txn.snapshot());
+            let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
+            let def = if let Some(schema) = s.view.schema.as_deref() {
+                reader
+                    .get_table_in_database(&db, schema, &s.view.name)?
+                    .ok_or_else(|| DbError::TableNotFound {
+                        name: s.view.name.clone(),
+                    })?
+            } else {
+                let mut found = None;
+                for schema in &ctx.search_path {
+                    if let Some(d) = reader.get_table_in_database(&db, schema, &s.view.name)? {
+                        found = Some(d);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| DbError::TableNotFound {
+                    name: s.view.name.clone(),
+                })?
+            };
+            if !def.is_view() {
+                return Err(DbError::InvalidValue {
+                    reason: format!("'{}' is not a view", s.view.name),
+                });
+            }
+            let defining_query = def.defining_query.clone().unwrap_or_default();
+            let ddl = format!("CREATE VIEW `{}` AS {}", def.table_name, defining_query);
+            Ok(QueryResult::Rows {
+                columns: vec![
+                    ColumnMeta::computed("View", DataType::Text),
+                    ColumnMeta::computed("Create View", DataType::Text),
+                ],
+                rows: vec![vec![
+                    Value::Text(def.table_name.clone()),
+                    Value::Text(ddl),
+                ]],
+            })
+        }
         _ => Err(DbError::NotImplemented {
             feature: "read-only executor does not handle this statement type".into(),
         }),
