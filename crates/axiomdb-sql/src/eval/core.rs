@@ -621,7 +621,13 @@ pub fn eval_with<R: SubqueryRunner>(
             Ok(if *negated { apply_not(result) } else { result })
         }
 
-        Expr::Function { name, args } => eval_function(name, args, row),
+        Expr::Function { name, args } => {
+            if let Some(value) = sq.eval_function(name, args, row)? {
+                Ok(value)
+            } else {
+                eval_function(name, args, row)
+            }
+        }
 
         Expr::Cast { expr, target } => {
             let v = eval_with(expr, row, sq)?;

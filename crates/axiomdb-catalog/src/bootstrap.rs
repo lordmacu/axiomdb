@@ -20,8 +20,9 @@ use axiomdb_storage::{
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_DATABASES_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
     CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
-    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
-    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_SEQUENCES_ROOT_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
+    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
+    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
@@ -65,6 +66,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_aggregates` heap (Phase 13.14).
     /// Zero on legacy databases; lazily initialized on first `CREATE AGGREGATE`.
     pub aggregates: u64,
+    /// Root page of the `axiom_sequences` heap (Phase 20.2).
+    /// Zero on legacy databases; lazily initialized on first `CREATE SEQUENCE`.
+    pub sequences: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -167,6 +171,12 @@ impl CatalogBootstrap {
             aggregates_root,
         )?;
 
+        // Allocate the sequences root (Phase 20.2).
+        let sequences_root = storage.alloc_page(PageType::Data)?;
+        let sequences_page = Page::new(PageType::Data, sequences_root);
+        storage.write_page(sequences_root, &sequences_page)?;
+        write_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET, sequences_root)?;
+
         // Seed the default logical database so fresh databases and upgraded
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
@@ -195,6 +205,7 @@ impl CatalogBootstrap {
             table_databases: table_databases_root,
             schemas: schemas_root,
             aggregates: aggregates_root,
+            sequences: sequences_root,
         })
     }
 
@@ -221,6 +232,7 @@ impl CatalogBootstrap {
         let table_databases = read_meta_u64(storage, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET)?;
         let schemas = read_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET)?;
         let aggregates = read_meta_u64(storage, CATALOG_AGGREGATES_ROOT_BODY_OFFSET)?;
+        let sequences = read_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -232,6 +244,7 @@ impl CatalogBootstrap {
             table_databases,
             schemas,
             aggregates,
+            sequences,
         })
     }
 
@@ -291,6 +304,14 @@ impl CatalogBootstrap {
             storage.write_page(root, &page)?;
             write_meta_u64(storage, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, root)?;
             ids.aggregates = root;
+        }
+
+        if ids.sequences == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET, root)?;
+            ids.sequences = root;
         }
 
         storage.flush()?;

@@ -24,9 +24,8 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
     match lower.as_str() {
         "version" | "axiomdb_version" | "current_user" | "user" | "session_user"
         | "system_user" | "current_database" | "database" | "current_schema" | "schema"
-        | "connection_id" | "row_count" | "last_insert_id" | "lastval" | "found_rows" => {
-            system::eval(lower.as_str(), args, row)
-        }
+        | "connection_id" | "row_count" | "last_insert_id" | "lastval" | "found_rows"
+        | "nextval" | "currval" => system::eval(lower.as_str(), args, row),
 
         "coalesce" | "ifnull" | "nvl" | "nullif" | "isnull" | "if" | "iff" | "typeof"
         | "pg_typeof" | "to_char" | "str" | "tostring" => nulls::eval(lower.as_str(), args, row),

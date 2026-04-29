@@ -94,3 +94,39 @@ This means the executor never sees view references — they have been transparen
 - Column-name alias list (`CREATE VIEW v (a, b, c) AS SELECT ...`) — parser accepts it; executor stores but does not remap column names at query time.
 - Security-definer/invoker views.
 - `SHOW FULL TABLES WHERE Table_type = 'VIEW'` filtering.
+
+## 20.2 — Sequences (2026-04-29)
+
+### What was built
+
+Standalone SQL sequences: `CREATE SEQUENCE`, `DROP SEQUENCE`, `NEXTVAL(text)`,
+and `CURRVAL(text)`.
+
+### Architecture
+
+- `SequenceDef` stores schema/name plus `last_value`, `start_value`,
+  `increment`, `min_value`, `max_value`, `cycle`, `cache_size`, and `is_called`.
+- `axiom_sequences` is a new catalog heap root stored in the meta page and
+  lazily initialized for legacy databases.
+- `NEXTVAL` advances sequence state through a short internal transaction that
+  commits immediately, so user rollback does not reuse consumed values.
+- `CURRVAL` is held in `SessionContext.sequence_currvals`, keyed by lowercase
+  `schema.sequence`.
+- `SELECT` without `FROM` now uses the real session context in ctx execution so
+  session functions like `CURRVAL` see state created by previous statements.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_sequences.rs` — 12 integration tests:
+  create/drop, `IF EXISTS`, duplicate create, invalid options, `NEXTVAL`,
+  per-output-row advancement, `CURRVAL`, rollback gaps, and exhaustion.
+- `crates/axiomdb-sql/tests/integration_ddl_parser.rs` — sequence parser tests.
+- `tools/wire-test.py` — block `[20.2 sequences]` (476/476 total).
+- Closeout gates: `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`,
+  and `cargo fmt --check`.
+
+### Deferred to later phases
+
+- `ALTER SEQUENCE`, `SETVAL`, `OWNED BY`, and sequence privileges.
+- Wiring `SERIAL` / identity columns to standalone sequence objects.
+- Sequence cache preallocation beyond `CACHE 1`.

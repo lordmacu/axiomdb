@@ -4417,6 +4417,38 @@ ok("[20.1 regular views] DROP VIEW removes entries from information_schema",
    rows == (),
    rows)
 
+# ── Phase 20.2 — Sequences ──────────────────────────────────────────────────
+
+print("\n[20.2 sequences]")
+
+cur.execute("CREATE SEQUENCE seq20_order START WITH 10 INCREMENT BY 5 MAXVALUE 25")
+conn.commit()
+
+cur.execute("SELECT NEXTVAL('seq20_order')")
+row = cur.fetchone()
+ok("[20.2 sequences] NEXTVAL returns the start value",
+   row is not None and str(row[0]) == "10",
+   row)
+
+cur.execute("SELECT NEXTVAL('seq20_order'), CURRVAL('seq20_order')")
+row = cur.fetchone()
+ok("[20.2 sequences] NEXTVAL advances and CURRVAL is session-local",
+   row is not None and str(row[0]) == "15" and str(row[1]) == "15",
+   row)
+
+cur.execute("BEGIN")
+cur.execute("SELECT NEXTVAL('seq20_order')")
+row = cur.fetchone()
+cur.execute("ROLLBACK")
+cur.execute("SELECT NEXTVAL('seq20_order')")
+row_after_rollback = cur.fetchone()
+ok("[20.2 sequences] ROLLBACK does not reuse consumed sequence values",
+   row is not None and str(row[0]) == "20" and row_after_rollback is not None and str(row_after_rollback[0]) == "25",
+   (row, row_after_rollback))
+
+cur.execute("DROP SEQUENCE seq20_order")
+conn.commit()
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

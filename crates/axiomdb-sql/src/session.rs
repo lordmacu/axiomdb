@@ -787,6 +787,11 @@ pub struct SessionContext {
     /// Keyed by normalized lowercase cursor name. Cleared on transaction end
     /// and connection/session reset.
     pub cursors: HashMap<String, SessionCursor>,
+    /// Session-local `CURRVAL` state keyed by lowercase `schema.sequence`.
+    ///
+    /// PostgreSQL defines `CURRVAL` only after this session has successfully
+    /// called `NEXTVAL` for the same sequence.
+    pub sequence_currvals: HashMap<String, i64>,
 }
 
 impl Default for SessionContext {
@@ -831,6 +836,7 @@ impl SessionContext {
             deferred_fk_constraint_ids: Vec::new(),
             pending_notifications: Vec::new(),
             cursors: HashMap::new(),
+            sequence_currvals: HashMap::new(),
         }
     }
 

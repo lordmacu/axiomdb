@@ -64,6 +64,15 @@ impl Drop for CollationGuard {
 pub trait SubqueryRunner {
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError>;
 
+    fn eval_function(
+        &mut self,
+        _name: &str,
+        _args: &[crate::expr::Expr],
+        _row: &[Value],
+    ) -> Result<Option<Value>, DbError> {
+        Ok(None)
+    }
+
     /// Execute an uncorrelated `IN (SELECT …)` subquery and return whether the
     /// given `needle` is found and whether the result set contains NULLs.
     ///

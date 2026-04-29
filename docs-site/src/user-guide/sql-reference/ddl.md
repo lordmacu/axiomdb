@@ -1191,6 +1191,45 @@ added without changing the DDL syntax.
 
 ---
 
+## CREATE SEQUENCE
+
+Create a standalone BIGINT sequence object.
+
+```sql
+CREATE SEQUENCE name;
+CREATE SEQUENCE IF NOT EXISTS name;
+CREATE SEQUENCE name START WITH 10 INCREMENT BY 5 MINVALUE 1 MAXVALUE 100 NO CYCLE CACHE 1;
+DROP SEQUENCE name;
+DROP SEQUENCE IF EXISTS name;
+```
+
+`NEXTVAL('name')` returns the next value and advances the sequence. `CURRVAL('name')`
+returns the last value produced by `NEXTVAL` in the current session.
+
+Defaults:
+
+| Option | Default |
+|---|---|
+| `START WITH` | `1` |
+| `INCREMENT BY` | `1` |
+| `MINVALUE` | `1` |
+| `MAXVALUE` | `9223372036854775807` |
+| `CYCLE` | `NO CYCLE` |
+| `CACHE` | `1` |
+
+Sequence advancement is not rolled back. If a transaction calls `NEXTVAL` and
+then rolls back, that value remains consumed and the next call returns the next
+number.
+
+| Situation | Error |
+|---|---|
+| Duplicate sequence | `InvalidValue` — already exists |
+| `CURRVAL` before this session calls `NEXTVAL` | `InvalidValue` |
+| Exhausted `NO CYCLE` sequence | `InvalidValue` |
+| `INCREMENT BY 0` or invalid bounds | `InvalidValue` |
+
+---
+
 ## DROP AGGREGATE
 
 Remove a custom aggregate definition.

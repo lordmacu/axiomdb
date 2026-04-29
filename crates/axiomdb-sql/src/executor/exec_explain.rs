@@ -63,6 +63,9 @@ fn dispatch(
         Stmt::CreateAggregate(_) => Err(DbError::NotImplemented {
             feature: "CREATE AGGREGATE requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::CreateSequence(_) => Err(DbError::NotImplemented {
+            feature: "CREATE SEQUENCE requires session context — use execute_with_ctx".into(),
+        }),
         Stmt::DropTable(s) => {
             execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
@@ -83,6 +86,9 @@ fn dispatch(
         }),
         Stmt::DropAggregate(_) => Err(DbError::NotImplemented {
             feature: "DROP AGGREGATE requires session context — use execute_with_ctx".into(),
+        }),
+        Stmt::DropSequence(_) => Err(DbError::NotImplemented {
+            feature: "DROP SEQUENCE requires session context — use execute_with_ctx".into(),
         }),
         Stmt::CreateIndex(s) => {
             let noop_bloom = crate::bloom::BloomRegistry::new();

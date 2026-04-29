@@ -3,19 +3,19 @@
 ## Current (2026-04-29)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.2 — Sequences.
-Phase 20.1 Regular views is closed and committed (`4906cdd0`): `CREATE VIEW`,
-`CREATE OR REPLACE VIEW`, `DROP VIEW`, `SHOW CREATE VIEW`, transparent
-analysis-time view expansion, and `information_schema.VIEWS`.
+**Active subphase:** Phase 20.3 — ENUMs next.
+Phase 20.2 adds `CREATE SEQUENCE`, `DROP SEQUENCE`, `NEXTVAL(text)`, and
+`CURRVAL(text)` over catalog-backed `SequenceDef` rows. `NEXTVAL` advances state
+through a short internal transaction so user rollback does not reuse values;
+`CURRVAL` is tracked per session.
 
-**Last verified gates:** Phase 20.1 closeout recorded `crates/axiomdb-sql/tests/integration_views.rs`
-(16 tests), wire smoke `[20.1 regular views]` (`473/473`), workspace tests,
-clippy, and fmt.
+**Last verified gates:** Phase 20.2 closeout passed
+`crates/axiomdb-sql/tests/integration_sequences.rs` (12 tests),
+`crates/axiomdb-sql/tests/integration_ddl_parser.rs` sequence coverage,
+wire smoke `[20.2 sequences]` (`476/476`), `cargo test --workspace`,
+`cargo clippy --workspace -- -D warnings`, and `cargo fmt --check`.
 
-**Next:** Implement Phase 20.2 Sequences from
-`specs/fase-20/spec-20.2-sequences.md` and
-`specs/fase-20/plan-20.2-sequences.md`. The key semantic risk is preserving
-PostgreSQL-style non-rollback sequence gaps while keeping `CURRVAL` session-local.
+**Next:** Start Phase 20.3 ENUMs with the mandatory brainstorm/spec/plan flow.
 
 ### Phase 21 subphase status
 

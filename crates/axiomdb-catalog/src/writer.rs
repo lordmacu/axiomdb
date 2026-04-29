@@ -47,7 +47,8 @@ use crate::{
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{
         AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, RelationKind,
-        StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
+        SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence,
+        TableStorageLayout,
     },
 };
 
@@ -73,6 +74,8 @@ pub const SYSTEM_TABLE_TABLE_DATABASES: u32 = u32::MAX - 7;
 pub const SYSTEM_TABLE_SCHEMAS: u32 = u32::MAX - 8;
 /// WAL `table_id` used for inserts/deletes into `axiom_aggregates` (Phase 13.14).
 pub const SYSTEM_TABLE_AGGREGATES: u32 = u32::MAX - 9;
+/// WAL `table_id` used for inserts/deletes into `axiom_sequences` (Phase 20.2).
+pub const SYSTEM_TABLE_SEQUENCES: u32 = u32::MAX - 10;
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -162,6 +165,90 @@ impl<'a> CatalogWriter<'a> {
                 self.txn.record_delete(
                     self.conn,
                     SYSTEM_TABLE_AGGREGATES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn create_sequence(&mut self, def: SequenceDef) -> Result<(), DbError> {
+        let root = self.page_ids.sequences;
+        if root == 0 {
+            return Err(DbError::Internal {
+                message: "sequence catalog root not initialized".into(),
+            });
+        }
+        let data = def.to_bytes();
+        let txn_id = self.conn.txn_id;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        let key = format!("{}.{}", def.schema_name, def.name);
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_SEQUENCES,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_sequence_state(&mut self, def: SequenceDef) -> Result<(), DbError> {
+        let root = self.page_ids.sequences;
+        if root == 0 {
+            return Err(DbError::Internal {
+                message: "sequence catalog root not initialized".into(),
+            });
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (old, _) = SequenceDef::from_bytes(&data)?;
+            if old.schema_name == def.schema_name && old.name.eq_ignore_ascii_case(&def.name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", old.schema_name, old.name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_SEQUENCES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                self.create_sequence(def)?;
+                return Ok(());
+            }
+        }
+
+        Err(DbError::InvalidValue {
+            reason: format!("sequence '{}.{}' not found", def.schema_name, def.name),
+        })
+    }
+
+    pub fn delete_sequence(&mut self, schema: &str, name: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.sequences;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = SequenceDef::from_bytes(&data)?;
+            if def.schema_name == schema && def.name.eq_ignore_ascii_case(name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", def.schema_name, def.name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_SEQUENCES,
                     key.as_bytes(),
                     &data,
                     page_id,

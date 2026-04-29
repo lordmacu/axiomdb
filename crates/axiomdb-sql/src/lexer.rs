@@ -302,6 +302,8 @@ pub enum Token<'src> {
     Trigger,
     #[token("AGGREGATE", ignore(ascii_case))]
     Aggregate,
+    #[token("SEQUENCE", ignore(ascii_case))]
+    Sequence,
     #[token("AFTER", ignore(ascii_case))]
     After,
     #[token("BEFORE", ignore(ascii_case))]

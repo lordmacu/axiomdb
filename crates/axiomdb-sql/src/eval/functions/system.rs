@@ -40,6 +40,10 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
         // Without SQL_CALC_FOUND_ROWS, returns the same as ROW_COUNT().
         "found_rows" => Ok(Value::BigInt(crate::executor::found_rows_value() as i64)),
 
+        "nextval" | "currval" => Err(DbError::NotImplemented {
+            feature: format!("{name} requires session execution context"),
+        }),
+
         _ => unreachable!("dispatcher routed unsupported system function"),
     }
 }
