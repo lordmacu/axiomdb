@@ -464,6 +464,42 @@ arbitrary function dispatch is needed.
 
 ---
 
+## Sequences Catalog (Phase 20.2)
+
+Standalone SQL sequences are stored in `axiom_sequences`, whose root page is
+recorded in page 0 at `catalog_sequences_root`.
+
+### `SequenceDef` — on-disk format
+
+```
+[schema_len: u8][schema: bytes]
+[name_len:   u8][name:   bytes]
+[last_value:  i64]
+[start_value: i64]
+[increment:   i64]
+[min_value:   i64]
+[max_value:   i64]
+[cache_size:  u64]
+[flags:       u8]   -- bit0 = CYCLE, bit1 = is_called
+```
+
+`NEXTVAL` uses a short internal transaction that commits the updated
+`SequenceDef` immediately. That deliberately differs from ordinary DML rollback:
+once a sequence value is returned to a session, rollback does not make it
+available again. `CURRVAL` is not stored in the catalog; it is tracked per
+`SessionContext` as lowercase `schema.sequence -> i64`.
+
+### Catalog APIs
+
+| Function | Description |
+|---|---|
+| `CatalogWriter::create_sequence(def)` | Persists a new `SequenceDef` |
+| `CatalogWriter::replace_sequence_state(def)` | Replaces the visible sequence state after `NEXTVAL` |
+| `CatalogReader::get_sequence(schema, name)` | Looks up a visible sequence by schema + name |
+| `CatalogWriter::delete_sequence(schema, name)` | Removes a sequence definition |
+
+---
+
 ## Regular Views Catalog (Phase 20.1)
 
 ### `RelationKind::View`

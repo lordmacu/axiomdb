@@ -8,11 +8,12 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
         ConstraintTiming, CreateAggregateStmt, CreateIndexStmt, CreateMaterializedViewStmt,
-        CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt,
-        CreateViewStmt, DropAggregateStmt, DropIndexStmt, DropMaterializedViewStmt, DropTableStmt,
-        DropTriggerStmt, DropViewStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
-        ForeignKeyAction, GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt,
-        ShowCreateViewStmt, SortOrder, Stmt, TableConstraint, TriggerEvent,
+        CreateSequenceStmt, CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt,
+        CreateTriggerStmt, CreateViewStmt, DropAggregateStmt, DropIndexStmt,
+        DropMaterializedViewStmt, DropSequenceStmt, DropTableStmt, DropTriggerStmt, DropViewStmt,
+        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction,
+        GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, ShowCreateViewStmt,
+        SortOrder, Stmt, TableConstraint, TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -128,6 +129,101 @@ pub(crate) fn parse_create_aggregate(p: &mut Parser) -> Result<Stmt, DbError> {
         })?,
         finalfunc,
     }))
+}
+
+pub(crate) fn parse_create_sequence(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_not_exists = eat_if_not_exists(p)?;
+    let sequence = p.parse_table_ref()?;
+    let mut start_value = 1i64;
+    let mut increment = 1i64;
+    let mut min_value = 1i64;
+    let mut max_value = i64::MAX;
+    let mut cycle = false;
+    let mut cache_size = 1u64;
+
+    while !matches!(p.peek(), Token::Eof | Token::Semicolon) {
+        match p.peek().clone() {
+            Token::Start => {
+                p.advance();
+                p.eat(&Token::With);
+                start_value = parse_sequence_i64(p)?;
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("increment") => {
+                p.advance();
+                p.eat(&Token::By);
+                increment = parse_sequence_i64(p)?;
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("minvalue") => {
+                p.advance();
+                min_value = parse_sequence_i64(p)?;
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("maxvalue") => {
+                p.advance();
+                max_value = parse_sequence_i64(p)?;
+            }
+            Token::No => {
+                p.advance();
+                if p.eat_ident_ci("minvalue") {
+                    min_value = 1;
+                } else if p.eat_ident_ci("maxvalue") {
+                    max_value = i64::MAX;
+                } else if p.eat_ident_ci("cycle") {
+                    cycle = false;
+                } else {
+                    return Err(DbError::ParseError {
+                        message: "expected MINVALUE, MAXVALUE, or CYCLE after NO".into(),
+                        position: Some(p.current_pos()),
+                    });
+                }
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("cycle") => {
+                p.advance();
+                cycle = true;
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("cache") => {
+                p.advance();
+                let n = parse_sequence_i64(p)?;
+                if n < 1 {
+                    return Err(DbError::ParseError {
+                        message: "CACHE value must be at least 1".into(),
+                        position: Some(p.current_pos()),
+                    });
+                }
+                cache_size = n as u64;
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!("unsupported CREATE SEQUENCE option {other:?}"),
+                    position: Some(p.current_pos()),
+                })
+            }
+        }
+    }
+
+    Ok(Stmt::CreateSequence(CreateSequenceStmt {
+        if_not_exists,
+        sequence,
+        start_value,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+        cache_size,
+    }))
+}
+
+fn parse_sequence_i64(p: &mut Parser) -> Result<i64, DbError> {
+    let neg = p.eat(&Token::Minus);
+    match p.peek().clone() {
+        Token::Integer(n) => {
+            p.advance();
+            Ok(if neg { -n } else { n })
+        }
+        other => Err(DbError::ParseError {
+            message: format!("expected integer sequence option value, found {other:?}"),
+            position: Some(p.current_pos()),
+        }),
+    }
 }
 
 /// Consume optional CHARACTER SET / COLLATE / DEFAULT clauses after a database name.
@@ -1440,6 +1536,18 @@ pub(crate) fn parse_drop_aggregate(p: &mut Parser) -> Result<Stmt, DbError> {
     let name = p.parse_identifier()?;
     let arg_types = parse_aggregate_signature(p)?;
     Ok(Stmt::DropAggregate(DropAggregateStmt { name, arg_types }))
+}
+
+pub(crate) fn parse_drop_sequence(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let mut sequences = vec![p.parse_table_ref()?];
+    while p.eat(&Token::Comma) {
+        sequences.push(p.parse_table_ref()?);
+    }
+    Ok(Stmt::DropSequence(DropSequenceStmt {
+        if_exists,
+        sequences,
+    }))
 }
 
 pub(crate) fn parse_create_view(p: &mut Parser, or_replace: bool) -> Result<Stmt, DbError> {

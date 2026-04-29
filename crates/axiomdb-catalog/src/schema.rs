@@ -27,6 +27,7 @@ use axiomdb_core::error::DbError;
 include!("schema_database.rs");
 include!("schema_table.rs");
 include!("schema_aggregate.rs");
+include!("schema_sequence.rs");
 include!("schema_index.rs");
 include!("schema_constraints.rs");
 
@@ -90,6 +91,26 @@ mod tests {
         };
         let bytes = def.to_bytes();
         let (back, consumed) = TableDatabaseDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_sequence_def_roundtrip() {
+        let def = SequenceDef {
+            schema_name: "public".into(),
+            name: "order_seq".into(),
+            last_value: 42,
+            start_value: 10,
+            increment: 2,
+            min_value: 1,
+            max_value: 1_000,
+            cycle: true,
+            cache_size: 1,
+            is_called: true,
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = SequenceDef::from_bytes(&bytes).unwrap();
         assert_eq!(back, def);
         assert_eq!(consumed, bytes.len());
     }

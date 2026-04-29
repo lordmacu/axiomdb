@@ -18,6 +18,7 @@
 //! body[120..128] catalog_schemas_root: u64 LE — axiom_schemas heap root
 //! body[128..136] catalog_aggregates_root: u64 LE — axiom_aggregates heap root
 //! body[136]     clean_shutdown: u8     — 1 = cleanly closed, 0 = dirty/open
+//! body[144..152] catalog_sequences_root: u64 LE — axiom_sequences heap root
 //! ```
 
 use axiomdb_core::error::DbError;
@@ -146,6 +147,11 @@ pub const CATALOG_AGGREGATES_ROOT_BODY_OFFSET: usize = 128;
 /// 0 on open before the server starts accepting work.
 pub const CLEAN_SHUTDOWN_BODY_OFFSET: usize = 136;
 
+/// body offset of `catalog_sequences_root: u64` — root heap page for
+/// `axiom_sequences` (Phase 20.2). Value 0 = not yet allocated on legacy
+/// databases; lazily initialized on first `CREATE SEQUENCE`.
+pub const CATALOG_SEQUENCES_ROOT_BODY_OFFSET: usize = 144;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -169,6 +175,11 @@ const _: () = assert!(
 const _: () = assert!(
     HEADER_SIZE + CLEAN_SHUTDOWN_BODY_OFFSET < crate::page::PAGE_SIZE,
     "clean_shutdown flag must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + CATALOG_SEQUENCES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "sequence catalog root must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.

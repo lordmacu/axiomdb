@@ -1242,6 +1242,19 @@ pub struct CreateAggregateStmt {
     pub finalfunc: Option<String>,
 }
 
+/// `CREATE SEQUENCE [IF NOT EXISTS] name [options]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSequenceStmt {
+    pub if_not_exists: bool,
+    pub sequence: TableRef,
+    pub start_value: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+    pub cache_size: u64,
+}
+
 /// `DROP TRIGGER name ON table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTriggerStmt {
@@ -1254,6 +1267,13 @@ pub struct DropTriggerStmt {
 pub struct DropAggregateStmt {
     pub name: String,
     pub arg_types: Vec<DataType>,
+}
+
+/// `DROP SEQUENCE [IF EXISTS] name [, ...]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSequenceStmt {
+    pub if_exists: bool,
+    pub sequences: Vec<TableRef>,
 }
 
 /// `SHOW CREATE TRIGGER name ON table`
@@ -1320,6 +1340,7 @@ pub enum Stmt {
     CreateView(CreateViewStmt),
     CreateTrigger(CreateTriggerStmt),
     CreateAggregate(CreateAggregateStmt),
+    CreateSequence(CreateSequenceStmt),
     CreateDatabase(CreateDatabaseStmt),
     CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
@@ -1331,6 +1352,7 @@ pub enum Stmt {
     DropIndex(DropIndexStmt),
     DropTrigger(DropTriggerStmt),
     DropAggregate(DropAggregateStmt),
+    DropSequence(DropSequenceStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),

@@ -104,6 +104,62 @@ fn test_drop_aggregate_parses() {
     }
 }
 
+#[test]
+fn test_create_sequence_parses_defaults() {
+    let stmt = parse("CREATE SEQUENCE s", None).unwrap();
+    match stmt {
+        Stmt::CreateSequence(seq) => {
+            assert!(!seq.if_not_exists);
+            assert_eq!(seq.sequence.name, "s");
+            assert_eq!(seq.start_value, 1);
+            assert_eq!(seq.increment, 1);
+            assert_eq!(seq.min_value, 1);
+            assert_eq!(seq.max_value, i64::MAX);
+            assert!(!seq.cycle);
+            assert_eq!(seq.cache_size, 1);
+        }
+        other => panic!("expected CreateSequence, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_create_sequence_parses_options() {
+    let stmt = parse(
+        "CREATE SEQUENCE IF NOT EXISTS public.s START WITH 10 INCREMENT BY 5 MINVALUE 1 MAXVALUE 99 NO CYCLE CACHE 1",
+        None,
+    )
+    .unwrap();
+    match stmt {
+        Stmt::CreateSequence(seq) => {
+            assert!(seq.if_not_exists);
+            assert_eq!(seq.sequence.schema.as_deref(), Some("public"));
+            assert_eq!(seq.sequence.name, "s");
+            assert_eq!(seq.start_value, 10);
+            assert_eq!(seq.increment, 5);
+            assert_eq!(seq.min_value, 1);
+            assert_eq!(seq.max_value, 99);
+            assert!(!seq.cycle);
+            assert_eq!(seq.cache_size, 1);
+        }
+        other => panic!("expected CreateSequence, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_drop_sequence_parses() {
+    let stmt = parse("DROP SEQUENCE IF EXISTS public.s, t", None).unwrap();
+    match stmt {
+        Stmt::DropSequence(drop) => {
+            assert!(drop.if_exists);
+            assert_eq!(drop.sequences.len(), 2);
+            assert_eq!(drop.sequences[0].schema.as_deref(), Some("public"));
+            assert_eq!(drop.sequences[0].name, "s");
+            assert_eq!(drop.sequences[1].name, "t");
+        }
+        other => panic!("expected DropSequence, got {other:?}"),
+    }
+}
+
 // ── Basic CREATE TABLE ────────────────────────────────────────────────────────
 
 #[test]

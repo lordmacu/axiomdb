@@ -65,6 +65,8 @@ fn analyze_stmt(
         | Stmt::DropTrigger(_)
         | Stmt::ShowCreateTrigger(_)
         | Stmt::CreateAggregate(_)
+        | Stmt::CreateSequence(_)
+        | Stmt::DropSequence(_)
         | Stmt::DropAggregate(_) => Ok(stmt),
         Stmt::DropTable(s) => {
             analyze_drop_table(s, storage, snapshot, default_database, default_schema)
@@ -165,11 +167,13 @@ fn analyze_stmt_cached(
         | Stmt::CreateView(_)
         | Stmt::CreateTrigger(_)
         | Stmt::CreateAggregate(_)
+        | Stmt::CreateSequence(_)
         | Stmt::DropTable(_)
         | Stmt::DropMaterializedView(_)
         | Stmt::DropView(_)
         | Stmt::DropTrigger(_)
         | Stmt::DropAggregate(_)
+        | Stmt::DropSequence(_)
         | Stmt::AlterTable(_) => {
             cache.invalidate();
             analyze_stmt(stmt, storage, snapshot, default_database, default_schema)

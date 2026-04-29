@@ -20,7 +20,7 @@ fn execute_select_ctx(
 
     // SELECT without FROM: no table resolution needed.
     if stmt.from.is_none() {
-        return execute_select(stmt, storage, txn, conn_txn);
+        return execute_select_no_from_ctx(stmt, exec_ctx, ctx);
     }
 
     // Subquery in FROM: no caching path yet — delegate.
@@ -775,4 +775,70 @@ fn execute_select_ctx(
         // Multi-table JOIN path — use cache for each table.
         execute_select_with_joins_ctx(stmt, from_table_ref, exec_ctx, conn_txn, ctx)
     }
+}
+
+fn execute_select_no_from_ctx(
+    stmt: SelectStmt,
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    let mut runner = ExecSubqueryRunner {
+        storage: exec_ctx.storage(),
+        txn: exec_ctx.coord(),
+        bloom: exec_ctx.bloom(),
+        ctx,
+        outer_row: &[],
+        cache: None,
+        in_set_cache: None,
+        correlated_cache: None,
+        materialized: None,
+    };
+    let mut out_row: Row = Vec::new();
+    let mut out_cols: Vec<ColumnMeta> = Vec::new();
+    let has_windows = select_items_have_window_functions(&stmt.columns);
+    for item in &stmt.columns {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                let v = if has_windows {
+                    Value::Null
+                } else {
+                    eval_with(expr, &[], &mut runner)?
+                };
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| expr_column_name(expr, None));
+                let dt = if has_windows {
+                    infer_expr_type(expr, &[]).0
+                } else {
+                    datatype_of_value(&v)
+                };
+                out_cols.push(ColumnMeta::computed(name, dt));
+                if !has_windows {
+                    out_row.push(v);
+                }
+            }
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                return Ok(QueryResult::Rows {
+                    columns: vec![],
+                    rows: vec![],
+                });
+            }
+        }
+    }
+    let rows = if has_windows {
+        project_rows_with_window_support(&stmt.columns, &[Vec::new()], |expr, row| {
+            eval_with(expr, row, &mut runner)
+        })?
+    } else {
+        vec![out_row]
+    };
+    let rows = if stmt.distinct {
+        apply_distinct_with_session(rows)
+    } else {
+        rows
+    };
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
 }

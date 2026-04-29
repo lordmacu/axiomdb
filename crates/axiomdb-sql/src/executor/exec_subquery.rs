@@ -830,6 +830,15 @@ struct ExecSubqueryRunner<'a> {
 }
 
 impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
+    fn eval_function(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        row: &[Value],
+    ) -> Result<Option<Value>, DbError> {
+        eval_sequence_function(name, args, row, self)
+    }
+
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {
         let cache_key = std::ptr::from_ref(stmt) as usize;
         let is_uncorrelated = !stmt_has_outer_ref(stmt);

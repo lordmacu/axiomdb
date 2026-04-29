@@ -266,6 +266,7 @@ impl<'src> Parser<'src> {
             | Token::Write
             | Token::Global
             | Token::Session
+            | Token::Sequence
             | Token::Local
             | Token::Lock
             | Token::Unlock
@@ -998,6 +999,10 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_aggregate(self)
             }
+            Token::Sequence => {
+                self.advance();
+                ddl::parse_create_sequence(self)
+            }
             Token::Unique => {
                 self.advance();
                 self.expect(&Token::Index)?;
@@ -1009,7 +1014,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1048,9 +1053,13 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_aggregate(self)
             }
+            Token::Sequence => {
+                self.advance();
+                ddl::parse_drop_sequence(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1289,6 +1298,7 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         Token::Write => "write".into(),
         Token::Global => "global".into(),
         Token::Session => "session".into(),
+        Token::Sequence => "sequence".into(),
         Token::Local => "local".into(),
         Token::Lock => "lock".into(),
         Token::Unlock => "unlock".into(),

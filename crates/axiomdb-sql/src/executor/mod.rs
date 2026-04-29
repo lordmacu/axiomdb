@@ -91,6 +91,7 @@ type InlineFkSpec = (
 );
 
 include!("exec_subquery.rs");
+include!("sequence_runtime.rs");
 include!("exec_entry.rs");
 include!("exec_with_ctx.rs");
 include!("exec_dispatch.rs");
@@ -119,6 +120,7 @@ include!("returning.rs");
 include!("recursive_cte_exec.rs");
 include!("ddl_create_table.rs");
 include!("ddl_aggregate.rs");
+include!("ddl_sequence.rs");
 include!("ddl_view.rs");
 include!("trigger.rs");
 include!("ddl_drop_table.rs");
