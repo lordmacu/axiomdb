@@ -1,21 +1,21 @@
 # Project State
 
-## Current (2026-04-23)
+## Current (2026-04-29)
 
-**Active phase:** Phase 13 — Advanced PostgreSQL
-**Active subphase:** Phase 13.13 — layered collation system closed.
-AxiomDB now persists collation defaults on databases, tables, and columns;
-normalizes MySQL-facing aliases onto canonical runtime modes (`binary` / `es`);
-reconstructs that metadata through `SHOW CREATE TABLE`, `SHOW FULL COLUMNS`,
-`SHOW TABLE STATUS`, and `information_schema`; and supports query-level
-`expr COLLATE ...` overrides for the current collation-aware evaluator paths.
-The delivered cut is intentionally narrower than full ICU/UCA integration:
-runtime semantics are still the existing `binary` and `es` modes, while locale
-tailoring and larger collation registries remain deferred.
+**Active phase:** Phase 20 — Types + import/export
+**Active subphase:** Phase 20.2 — Sequences.
+Phase 20.1 Regular views is closed and committed (`4906cdd0`): `CREATE VIEW`,
+`CREATE OR REPLACE VIEW`, `DROP VIEW`, `SHOW CREATE VIEW`, transparent
+analysis-time view expansion, and `information_schema.VIEWS`.
 
-**Last verified gates:** `cargo fmt --check`; `cargo test -p axiomdb-sql --test integration_ddl_parser --test integration_mysql_compat --test integration_g9_ddl --test integration_show_full --test integration_collation_system`; `cargo test -p axiomdb-network --test integration_protocol --test integration_connection_lifecycle`; `python3 tools/wire-test.py` (`464/464`); `cargo test --workspace`; `cargo clippy --workspace -- -D warnings`.
+**Last verified gates:** Phase 20.1 closeout recorded `crates/axiomdb-sql/tests/integration_views.rs`
+(16 tests), wire smoke `[20.1 regular views]` (`473/473`), workspace tests,
+clippy, and fmt.
 
-**Next:** Phase 13.7 / 13.8 remain superseded by Phase 40 lock-manager work; the next actionable new Phase 13 subphase after 13.13 is 13.14 Custom aggregate functions.
+**Next:** Implement Phase 20.2 Sequences from
+`specs/fase-20/spec-20.2-sequences.md` and
+`specs/fase-20/plan-20.2-sequences.md`. The key semantic risk is preserving
+PostgreSQL-style non-rollback sequence gaps while keeping `CURRVAL` session-local.
 
 ### Phase 21 subphase status
 
