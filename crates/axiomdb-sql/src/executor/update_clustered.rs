@@ -241,6 +241,7 @@ fn execute_clustered_update(
 
         enforce_text_constraints(schema_cols, &mut new_values)?;
         new_values = crate::table::coerce_values(new_values, schema_cols)?;
+        validate_enum_row_values(&new_values, schema_cols, storage, txn, conn_txn)?;
 
         let pk_changed = pk_col_positions
             .iter()

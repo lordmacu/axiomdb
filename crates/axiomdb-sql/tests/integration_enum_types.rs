@@ -72,6 +72,86 @@ fn test_create_table_enum_column_requires_existing_type() {
 }
 
 #[test]
+fn test_insert_rejects_label_not_in_enum() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
+
+    common::run_ctx(
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "CREATE TABLE tasks (state mood NOT NULL)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    common::run_ctx(
+        "INSERT INTO tasks VALUES ('ok')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let err = common::run_ctx(
+        "INSERT INTO tasks VALUES ('angry')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DbError::InvalidValue { .. }));
+}
+
+#[test]
+fn test_update_rejects_label_not_in_enum() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
+
+    common::run_ctx(
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "CREATE TABLE tasks (state mood NOT NULL)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "INSERT INTO tasks VALUES ('sad')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let err = common::run_ctx(
+        "UPDATE tasks SET state = 'angry'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DbError::InvalidValue { .. }));
+}
+
+#[test]
 fn test_builtin_text_column_does_not_become_enum() {
     let ct = match axiomdb_sql::parse("CREATE TABLE tasks (state TEXT)", None).unwrap() {
         axiomdb_sql::ast::Stmt::CreateTable(ct) => ct,

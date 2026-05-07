@@ -61,7 +61,16 @@ fn execute_clustered_insert(
                             ) {
                                 Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                                 Err(e) => return Err(e),
-                                Ok(row) => prepared_rows.push(row),
+                                Ok(row) => {
+                                    validate_enum_row_values(
+                                        &row.values,
+                                        schema_cols,
+                                        storage,
+                                        txn,
+                                        conn_txn,
+                                    )?;
+                                    prepared_rows.push(row);
+                                }
                             },
                         }
                     } else {
@@ -73,7 +82,16 @@ fn execute_clustered_insert(
                         ) {
                             Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                             Err(e) => return Err(e),
-                            Ok(row) => prepared_rows.push(row),
+                            Ok(row) => {
+                                validate_enum_row_values(
+                                    &row.values,
+                                    schema_cols,
+                                    storage,
+                                    txn,
+                                    conn_txn,
+                                )?;
+                                prepared_rows.push(row);
+                            }
                         }
                     }
                 }

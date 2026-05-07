@@ -145,7 +145,9 @@ fn execute_insert(
                 }
                 materialize_generated_columns(schema_cols, &mut full_values)?;
 
-                full_batch.push(crate::table::coerce_values(full_values, schema_cols)?);
+                let full_values = crate::table::coerce_values(full_values, schema_cols)?;
+                validate_enum_row_values(&full_values, schema_cols, storage, txn, conn_txn)?;
+                full_batch.push(full_values);
             }
 
             // ── Phase 2: insert into the heap / indexes ──────────────────────
@@ -267,6 +269,7 @@ fn execute_insert(
                 }
                 materialize_generated_columns(schema_cols, &mut full_values)?;
                 let full_values = crate::table::coerce_values(full_values, schema_cols)?;
+                validate_enum_row_values(&full_values, schema_cols, storage, txn, conn_txn)?;
 
                 let rid = match TableEngine::insert_row(
                     storage,
@@ -328,6 +331,7 @@ fn execute_insert(
             }
             materialize_generated_columns(schema_cols, &mut full_values)?;
             let full_values = crate::table::coerce_values(full_values, schema_cols)?;
+            validate_enum_row_values(&full_values, schema_cols, storage, txn, conn_txn)?;
             let rid = TableEngine::insert_row(
                 storage,
                 txn,

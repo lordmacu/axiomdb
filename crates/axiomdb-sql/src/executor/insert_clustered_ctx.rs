@@ -112,7 +112,16 @@ fn execute_clustered_insert_ctx(
                         ) {
                             Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                             Err(e) => return Err(e),
-                            Ok(row) => prepared_rows.push(row),
+                            Ok(row) => {
+                                validate_enum_row_values(
+                                    &row.values,
+                                    schema_cols,
+                                    storage,
+                                    txn,
+                                    conn_txn,
+                                )?;
+                                prepared_rows.push(row);
+                            }
                         }
                     }
                 }
@@ -447,6 +456,7 @@ fn enqueue_clustered_insert_ctx(
             Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
             other => other?,
         };
+        validate_enum_row_values(&prepared.values, schema_cols, storage, txn, conn_txn)?;
 
         // Intra-batch PK duplicate check — O(1) via staged_pks HashSet.
         if ctx
