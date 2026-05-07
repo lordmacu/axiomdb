@@ -58,6 +58,7 @@ mod tests {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         }
     }
 
@@ -76,6 +77,7 @@ mod tests {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         }
     }
 
@@ -94,6 +96,7 @@ mod tests {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         }
     }
 

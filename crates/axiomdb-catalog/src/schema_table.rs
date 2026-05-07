@@ -651,6 +651,11 @@ pub struct ColumnDef {
     /// Stored in `flags bit7` as inverted virtual marker: 0 = STORED,
     /// 1 = VIRTUAL.
     pub generated_stored: bool,
+    /// Fully-qualified declared enum type name (`schema.type`) for text-backed
+    /// enum columns. `None` means the physical column type is the declared SQL
+    /// type. Stored as a trailing optional `[u16 len][utf8 bytes]` after
+    /// collation; old rows stop earlier and read as `None`.
+    pub enum_type_name: Option<String>,
 }
 
 impl ColumnDef {
@@ -665,6 +670,10 @@ impl ColumnDef {
     /// - `flags bit5` = on_update_expr extension present
     /// - `flags bit6` = generated_expr extension present
     /// - `flags bit7` = generated kind: 0 STORED, 1 VIRTUAL
+    ///
+    /// Trailing extension fields are stored after the flagged payloads:
+    /// `[collation_len:u16][collation]` when collation or enum metadata exists,
+    /// then `[enum_type_len:u16][enum_type]` when enum metadata exists.
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
@@ -677,6 +686,7 @@ impl ColumnDef {
         let generated_bytes = self.generated_expr.as_deref().map(|s| s.as_bytes());
         let has_generated = generated_bytes.is_some();
         let collation_bytes = self.collation.as_deref().map(|s| s.as_bytes());
+        let enum_type_bytes = self.enum_type_name.as_deref().map(|s| s.as_bytes());
 
         let mut flags: u8 = 0;
         if self.nullable {
@@ -707,7 +717,12 @@ impl ColumnDef {
             + default_bytes.map_or(0, |b| 2 + b.len())
             + on_update_bytes.map_or(0, |b| 2 + b.len())
             + generated_bytes.map_or(0, |b| 2 + b.len())
-            + collation_bytes.map_or(0, |b| 2 + b.len());
+            + if collation_bytes.is_some() || enum_type_bytes.is_some() {
+                2 + collation_bytes.map_or(0, |b| b.len())
+            } else {
+                0
+            }
+            + enum_type_bytes.map_or(0, |b| 2 + b.len());
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + extra);
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
@@ -730,9 +745,14 @@ impl ColumnDef {
             buf.extend_from_slice(&(gb.len() as u16).to_le_bytes());
             buf.extend_from_slice(gb);
         }
-        if let Some(cb) = collation_bytes {
+        if collation_bytes.is_some() || enum_type_bytes.is_some() {
+            let cb = collation_bytes.unwrap_or(&[]);
             buf.extend_from_slice(&(cb.len() as u16).to_le_bytes());
             buf.extend_from_slice(cb);
+        }
+        if let Some(eb) = enum_type_bytes {
+            buf.extend_from_slice(&(eb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(eb);
         }
         buf
     }
@@ -854,6 +874,7 @@ impl ColumnDef {
             None
         };
 
+        let mut enum_type_name = None;
         let collation = if bytes.len() > consumed {
             if bytes.len() < consumed + 2 {
                 return Err(err());
@@ -870,7 +891,33 @@ impl ColumnDef {
                 })?
                 .to_string();
             consumed += clen;
-            Some(s)
+            if bytes.len() > consumed {
+                if bytes.len() < consumed + 2 {
+                    return Err(err());
+                }
+                let elen =
+                    u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
+                consumed += 2;
+                if bytes.len() < consumed + elen {
+                    return Err(err());
+                }
+                enum_type_name = Some(
+                    std::str::from_utf8(&bytes[consumed..consumed + elen])
+                        .map_err(|_| DbError::ParseError {
+                            message: "invalid UTF-8 in column enum type".into(),
+                            position: None,
+                        })?
+                        .to_string(),
+                );
+                consumed += elen;
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            } else {
+                Some(s)
+            }
         } else {
             None
         };
@@ -890,6 +937,7 @@ impl ColumnDef {
                 generated_expr,
                 collation,
                 generated_stored,
+                enum_type_name,
             },
             consumed,
         ))

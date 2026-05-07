@@ -30,6 +30,7 @@ fn col(idx: u16, name: &str, col_type: ColumnType) -> ColumnDef {
         generated_expr: None,
         collation: None,
         generated_stored: false,
+        enum_type_name: None,
     }
 }
 
@@ -561,6 +562,7 @@ fn create_table_helper(
                 generated_expr: None,
                 collation: None,
                 generated_stored: false,
+                enum_type_name: None,
             })
             .unwrap();
     }

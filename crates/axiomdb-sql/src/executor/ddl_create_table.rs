@@ -362,6 +362,8 @@ fn execute_create_table(
         ensure_schema_exists_for_create(storage, txn, conn_txn, database, schema)?;
     }
 
+    let enum_type_names = resolve_create_table_enum_types(&stmt, storage, txn, conn_txn, schema)?;
+
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
         let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
@@ -457,6 +459,7 @@ fn execute_create_table(
             generated_expr,
             collation: col_def.collation.clone(),
             generated_stored,
+            enum_type_name: enum_type_names[i].clone(),
         })?;
     }
 
@@ -711,6 +714,40 @@ fn execute_create_table(
     }
 
     Ok(QueryResult::Empty)
+}
+
+fn resolve_create_table_enum_types(
+    stmt: &CreateTableStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &axiomdb_wal::ConnectionTxn,
+    default_schema: &str,
+) -> Result<Vec<Option<String>>, DbError> {
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    stmt.columns
+        .iter()
+        .map(|col| {
+            let Some(type_ref) = &col.declared_type_name else {
+                return Ok(None);
+            };
+            if type_ref.database.is_some() {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "enum type '{}' cannot be qualified with a database",
+                        type_ref.name
+                    ),
+                });
+            }
+            let type_schema = type_ref.schema.as_deref().unwrap_or(default_schema);
+            if reader.get_enum_type(type_schema, &type_ref.name)?.is_none() {
+                return Err(DbError::InvalidValue {
+                    reason: format!("enum type '{}.{}' does not exist", type_schema, type_ref.name),
+                });
+            }
+            Ok(Some(format!("{}.{}", type_schema, type_ref.name)))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1485,6 +1522,7 @@ fn execute_create_table_like(
             generated_expr: col.generated_expr.clone(),
             collation: col.collation.clone(),
             generated_stored: col.generated_stored,
+            enum_type_name: col.enum_type_name.clone(),
         })?;
     }
 
@@ -1680,6 +1718,7 @@ fn create_relation_as_select(
             generated_expr: None,
             collation: None,
             generated_stored: false,
+                enum_type_name: None,
         })?;
     }
 
@@ -1702,6 +1741,7 @@ fn create_relation_as_select(
             generated_expr: None,
             collation: None,
             generated_stored: false,
+                enum_type_name: None,
         })
         .collect();
 

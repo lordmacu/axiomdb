@@ -46,6 +46,52 @@ fn execute_create_sequence(
     Ok(QueryResult::Empty)
 }
 
+fn execute_create_enum_type(
+    stmt: crate::ast::CreateEnumTypeStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    database: &str,
+    default_schema: &str,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.enum_type.schema.as_deref().unwrap_or(default_schema);
+    let name = &stmt.enum_type.name;
+    if stmt.enum_type.database.is_some() {
+        return Err(DbError::InvalidValue {
+            reason: format!("enum type '{name}' cannot be qualified with a database"),
+        });
+    }
+
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if reader.get_enum_type(schema, name)?.is_some() {
+        return Err(DbError::InvalidValue {
+            reason: format!("enum type '{schema}.{name}' already exists"),
+        });
+    }
+    if reader
+        .get_table_in_database(database, schema, name)?
+        .is_some()
+    {
+        return Err(DbError::InvalidValue {
+            reason: format!("object '{name}' already exists as a table, view, or materialized view"),
+        });
+    }
+    if reader.get_sequence(schema, name)?.is_some() {
+        return Err(DbError::InvalidValue {
+            reason: format!("object '{name}' already exists as a sequence"),
+        });
+    }
+
+    let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+    writer.create_enum_type(axiomdb_catalog::EnumTypeDef {
+        schema_name: schema.to_string(),
+        name: name.clone(),
+        labels: stmt.labels,
+    })?;
+    Ok(QueryResult::Empty)
+}
+
 fn execute_drop_sequence(
     stmt: crate::ast::DropSequenceStmt,
     storage: &dyn StorageEngine,
@@ -101,4 +147,3 @@ fn validate_sequence_options(stmt: &crate::ast::CreateSequenceStmt) -> Result<()
     }
     Ok(())
 }
-

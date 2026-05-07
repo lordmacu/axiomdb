@@ -53,6 +53,7 @@ impl Fixture {
                     generated_expr: None,
                     collation: None,
                     generated_stored: false,
+                    enum_type_name: None,
                 })
                 .unwrap();
             }
