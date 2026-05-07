@@ -11,7 +11,7 @@
 use axiomdb_catalog::{
     bootstrap::CatalogBootstrap,
     reader::CatalogReader,
-    schema::{ColumnDef, ColumnType, IndexDef, TableStorageLayout},
+    schema::{ColumnDef, ColumnType, EnumTypeDef, IndexDef, TableStorageLayout},
     writer::CatalogWriter,
 };
 use axiomdb_core::TransactionSnapshot;
@@ -659,6 +659,74 @@ fn test_sequence_persistence_across_reopen() {
             .unwrap()
             .is_some());
     }
+}
+
+// ── Enum type catalog (MmapStorage) ──────────────────────────────────────────
+
+#[test]
+fn test_enum_type_persistence_across_reopen() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("catalog_enum.db");
+    let wal_path = db_dir.path().join("catalog_enum.wal");
+
+    {
+        let storage = MmapStorage::create(&db_path).unwrap();
+        CatalogBootstrap::init(&storage).unwrap();
+        let txn = TxnManager::create(&wal_path).unwrap();
+        let mut conn_txn = txn.begin().unwrap();
+        {
+            let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
+            w.create_enum_type(EnumTypeDef {
+                schema_name: "public".into(),
+                name: "mood".into(),
+                labels: vec!["sad".into(), "ok".into(), "very happy!".into()],
+            })
+            .unwrap();
+        }
+        txn.commit(conn_txn).unwrap();
+        storage.flush().unwrap();
+    }
+
+    {
+        let storage = MmapStorage::open(&db_path).unwrap();
+        let txn = TxnManager::open(&wal_path).unwrap();
+        let snap = txn.snapshot();
+        let mut reader = CatalogReader::new(&storage, snap).unwrap();
+        let found = reader
+            .get_enum_type("public", "mood")
+            .unwrap()
+            .expect("enum type should persist");
+        assert_eq!(
+            found.labels,
+            vec![
+                "sad".to_string(),
+                "ok".to_string(),
+                "very happy!".to_string()
+            ]
+        );
+    }
+}
+
+#[test]
+fn test_create_enum_type_rejects_duplicate_labels() {
+    let (storage, txn) = setup();
+
+    let mut conn_txn = txn.begin().unwrap();
+    let err = {
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
+        w.create_enum_type(EnumTypeDef {
+            schema_name: "public".into(),
+            name: "status".into(),
+            labels: vec!["open".into(), "open".into()],
+        })
+        .unwrap_err()
+    };
+    txn.rollback(conn_txn, &storage).unwrap();
+
+    assert!(
+        matches!(err, axiomdb_core::DbError::InvalidValue { .. }),
+        "expected InvalidValue, got {err}"
+    );
 }
 
 #[test]

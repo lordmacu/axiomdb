@@ -28,6 +28,7 @@ include!("schema_database.rs");
 include!("schema_table.rs");
 include!("schema_aggregate.rs");
 include!("schema_sequence.rs");
+include!("schema_enum.rs");
 include!("schema_index.rs");
 include!("schema_constraints.rs");
 
@@ -111,6 +112,19 @@ mod tests {
         };
         let bytes = def.to_bytes();
         let (back, consumed) = SequenceDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_enum_type_def_roundtrip() {
+        let def = EnumTypeDef {
+            schema_name: "public".into(),
+            name: "mood".into(),
+            labels: vec!["sad".into(), "ok".into(), "very happy!".into()],
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = EnumTypeDef::from_bytes(&bytes).unwrap();
         assert_eq!(back, def);
         assert_eq!(consumed, bytes.len());
     }

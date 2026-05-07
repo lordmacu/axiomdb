@@ -19,6 +19,7 @@
 //! body[128..136] catalog_aggregates_root: u64 LE — axiom_aggregates heap root
 //! body[136]     clean_shutdown: u8     — 1 = cleanly closed, 0 = dirty/open
 //! body[144..152] catalog_sequences_root: u64 LE — axiom_sequences heap root
+//! body[152..160] catalog_enum_types_root: u64 LE — axiom_enum_types heap root
 //! ```
 
 use axiomdb_core::error::DbError;
@@ -152,6 +153,11 @@ pub const CLEAN_SHUTDOWN_BODY_OFFSET: usize = 136;
 /// databases; lazily initialized on first `CREATE SEQUENCE`.
 pub const CATALOG_SEQUENCES_ROOT_BODY_OFFSET: usize = 144;
 
+/// body offset of `catalog_enum_types_root: u64` — root heap page for
+/// `axiom_enum_types` (Phase 20.3). Value 0 = not yet allocated on legacy
+/// databases; lazily initialized on first `CREATE TYPE ... AS ENUM`.
+pub const CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET: usize = 152;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -180,6 +186,11 @@ const _: () = assert!(
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SEQUENCES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
     "sequence catalog root must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "enum type catalog root must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.
