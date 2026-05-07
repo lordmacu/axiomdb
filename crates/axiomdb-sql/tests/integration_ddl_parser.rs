@@ -863,9 +863,16 @@ fn test_error_missing_paren() {
 }
 
 #[test]
-fn test_error_unknown_data_type() {
-    let e = parse_err("CREATE TABLE t (id UNKNOWNTYPE)");
-    assert!(matches!(e, DbError::ParseError { .. }));
+fn test_unknown_data_type_parses_as_user_defined_type() {
+    let ct = create_table("CREATE TABLE t (id UNKNOWNTYPE)");
+    assert_eq!(ct.columns[0].data_type, DataType::Text);
+    assert_eq!(
+        ct.columns[0]
+            .declared_type_name
+            .as_ref()
+            .map(|t| t.name.as_str()),
+        Some("UNKNOWNTYPE")
+    );
 }
 
 #[test]

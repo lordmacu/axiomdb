@@ -1,21 +1,22 @@
 # Project State
 
-## Current (2026-04-29)
+## Current (2026-05-07)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.3 — ENUMs next.
-Phase 20.2 adds `CREATE SEQUENCE`, `DROP SEQUENCE`, `NEXTVAL(text)`, and
-`CURRVAL(text)` over catalog-backed `SequenceDef` rows. `NEXTVAL` advances state
-through a short internal transaction so user rollback does not reuse values;
-`CURRVAL` is tracked per session.
+**Active subphase:** Phase 20.4 — Arrays next.
+Phase 20.3 added PostgreSQL-style enum type DDL with text-backed storage:
+`CREATE TYPE name AS ENUM (...)`, catalog-backed `EnumTypeDef`, enum column
+metadata persisted as `schema.type`, write-path label validation, and metadata
+display through `SHOW COLUMNS`, `SHOW CREATE TABLE`, and
+`information_schema.COLUMNS`.
 
-**Last verified gates:** Phase 20.2 closeout passed
-`crates/axiomdb-sql/tests/integration_sequences.rs` (12 tests),
-`crates/axiomdb-sql/tests/integration_ddl_parser.rs` sequence coverage,
-wire smoke `[20.2 sequences]` (`476/476`), `cargo test --workspace`,
-`cargo clippy --workspace -- -D warnings`, and `cargo fmt --check`.
+**Last verified gates:** Phase 20.3 closeout passed catalog enum tests,
+`crates/axiomdb-sql/tests/integration_enum_types.rs` (7 tests),
+`crates/axiomdb-sql/tests/integration_ddl_parser.rs` enum coverage, wire smoke
+(`476/476`), `cargo test --workspace --quiet`, `cargo clippy --workspace -- -D warnings`,
+and `cargo fmt --check`.
 
-**Next:** Start Phase 20.3 ENUMs with the mandatory brainstorm/spec/plan flow.
+**Next:** Start Phase 20.4 Arrays with the mandatory brainstorm/spec/plan flow.
 
 ### Phase 21 subphase status
 
