@@ -301,7 +301,7 @@ fn execute_show_columns(
     let rows: Vec<Row> = columns
         .iter()
         .map(|c| {
-            let type_str = column_type_to_sql_name(c.col_type);
+            let type_str = column_sql_type_display(c);
             let null_str = if c.nullable { "YES" } else { "NO" };
             let extra = if c.auto_increment {
                 "auto_increment"
@@ -310,7 +310,7 @@ fn execute_show_columns(
             };
             let mut row = vec![
                 Value::Text(c.name.clone()),
-                Value::Text(type_str.into()),
+                Value::Text(type_str),
                 Value::Text(null_str.into()),
                 Value::Text("".into()), // Key — deferred
                 Value::Null,            // Default — deferred
@@ -536,16 +536,20 @@ fn execute_show_create_table(
 
     // Columns
     for col in &columns {
-        let type_str = column_type_to_sql_name(col.col_type);
+        let type_str = column_sql_type_display(col);
         let null_str = if col.nullable { "" } else { " NOT NULL" };
         let extra = if col.auto_increment {
             " AUTO_INCREMENT"
         } else {
             ""
         };
-        let collate = effective_column_collation(col, &table_def, database_collation.as_deref())
-            .map(|name| format!(" COLLATE {name}"))
-            .unwrap_or_default();
+        let collate = if col.enum_type_name.is_none() {
+            effective_column_collation(col, &table_def, database_collation.as_deref())
+                .map(|name| format!(" COLLATE {name}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         ddl.push_str(&format!(
             "  `{}` {}{}{}{},\n",
             col.name, type_str, collate, null_str, extra
@@ -897,4 +901,10 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
     }
+}
+
+fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
+    col.enum_type_name
+        .clone()
+        .unwrap_or_else(|| column_type_to_sql_name(col.col_type).into())
 }
