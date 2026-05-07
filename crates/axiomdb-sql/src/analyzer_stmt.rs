@@ -66,6 +66,7 @@ fn analyze_stmt(
         | Stmt::ShowCreateTrigger(_)
         | Stmt::CreateAggregate(_)
         | Stmt::CreateSequence(_)
+        | Stmt::CreateEnumType(_)
         | Stmt::DropSequence(_)
         | Stmt::DropAggregate(_) => Ok(stmt),
         Stmt::DropTable(s) => {
@@ -168,6 +169,7 @@ fn analyze_stmt_cached(
         | Stmt::CreateTrigger(_)
         | Stmt::CreateAggregate(_)
         | Stmt::CreateSequence(_)
+        | Stmt::CreateEnumType(_)
         | Stmt::DropTable(_)
         | Stmt::DropMaterializedView(_)
         | Stmt::DropView(_)

@@ -119,6 +119,7 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
                 generated_expr: None,
                 collation: None,
                 generated_stored: false,
+                enum_type_name: None,
             })
             .unwrap();
         }
@@ -272,6 +273,7 @@ fn test_resolve_column_found() {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -288,6 +290,7 @@ fn test_resolve_column_found() {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         })
         .unwrap();
         tid
@@ -326,6 +329,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         })
         .unwrap();
         tid

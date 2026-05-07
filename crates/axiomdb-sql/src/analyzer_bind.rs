@@ -617,6 +617,7 @@ fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
                 generated_expr: None,
                 collation: None,
                 generated_stored: false,
+                enum_type_name: None,
             }
         })
         .collect()

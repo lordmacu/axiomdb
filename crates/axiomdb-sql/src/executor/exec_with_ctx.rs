@@ -458,6 +458,7 @@ fn is_ddl(stmt: &Stmt) -> bool {
             | Stmt::CreateMaterializedView(_)
             | Stmt::CreateAggregate(_)
             | Stmt::CreateSequence(_)
+            | Stmt::CreateEnumType(_)
             | Stmt::CreateDatabase(_)
             | Stmt::DropTable(_)
             | Stmt::DropMaterializedView(_)

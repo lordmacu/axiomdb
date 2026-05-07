@@ -533,6 +533,7 @@ pub fn prepare_nonblocking_heap_alter(
                 generated_expr: None,
                 collation: col_def.collation.clone(),
                 generated_stored: false,
+                enum_type_name: None,
             };
             let mut new_columns = columns.clone();
             new_columns.push(new_catalog_col);
@@ -1269,6 +1270,7 @@ fn alter_add_column(
         generated_expr: None,
         collation: col_def.collation.clone(),
         generated_stored: false,
+                enum_type_name: None,
     };
 
     // 1. Add column to catalog.
@@ -1664,6 +1666,7 @@ fn alter_modify_column(
             .clone()
             .or_else(|| old_columns[col_pos].collation.clone()),
         generated_stored: old_columns[col_pos].generated_stored,
+                enum_type_name: None,
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 

@@ -327,6 +327,7 @@ mod tests {
             generated_expr: None,
             collation: Some("es".into()),
             generated_stored: false,
+            enum_type_name: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -350,6 +351,7 @@ mod tests {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -373,6 +375,7 @@ mod tests {
             generated_expr: None,
             collation: None,
             generated_stored: false,
+            enum_type_name: None,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());
@@ -394,6 +397,31 @@ mod tests {
             generated_expr: Some("price * qty".into()),
             collation: None,
             generated_stored: true,
+            enum_type_name: None,
+        };
+        let bytes = def.to_bytes();
+        let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn test_column_def_roundtrip_enum_type_name() {
+        let def = ColumnDef {
+            table_id: 1,
+            col_idx: 1,
+            name: "mood".into(),
+            col_type: ColumnType::Text,
+            nullable: false,
+            auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
+            on_update_expr: None,
+            generated_expr: None,
+            collation: None,
+            generated_stored: false,
+            enum_type_name: Some("public.mood".into()),
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();

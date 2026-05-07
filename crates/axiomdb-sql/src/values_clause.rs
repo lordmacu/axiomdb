@@ -65,6 +65,7 @@ pub fn column_defs_for_values(vc: &ValuesClause) -> Vec<ColumnDef> {
                 generated_expr: None,
                 collation: None,
                 generated_stored: false,
+                enum_type_name: None,
             }
         })
         .collect()

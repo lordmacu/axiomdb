@@ -303,6 +303,7 @@ fn flatten_defs_recursive(
                     generated_expr: None,
                     collation: None,
                     generated_stored: false,
+                    enum_type_name: None,
                 });
             }
             JsonTableColumn::Ordinality { name } => {
@@ -322,6 +323,7 @@ fn flatten_defs_recursive(
                     generated_expr: None,
                     collation: None,
                     generated_stored: false,
+                    enum_type_name: None,
                 });
             }
             JsonTableColumn::Exists { name, ty, .. } => {
@@ -339,6 +341,7 @@ fn flatten_defs_recursive(
                     generated_expr: None,
                     collation: None,
                     generated_stored: false,
+                    enum_type_name: None,
                 });
             }
             JsonTableColumn::Nested { columns, .. } => {

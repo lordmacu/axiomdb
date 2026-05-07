@@ -192,6 +192,7 @@ pub fn make_is_catalog_columns(
                 generated_expr: None,
                 collation: None,
                 generated_stored: false,
+                enum_type_name: None,
             })
             .collect(),
     )
