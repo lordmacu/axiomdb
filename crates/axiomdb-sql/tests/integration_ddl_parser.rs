@@ -146,6 +146,41 @@ fn test_create_sequence_parses_options() {
 }
 
 #[test]
+fn test_create_type_as_enum_parses() {
+    let stmt = parse("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')", None).unwrap();
+    match stmt {
+        Stmt::CreateEnumType(enum_type) => {
+            assert_eq!(enum_type.enum_type.name, "mood");
+            assert_eq!(enum_type.labels, vec!["sad", "ok", "happy"]);
+        }
+        other => panic!("expected CreateEnumType, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_create_type_as_enum_rejects_empty_labels() {
+    assert!(matches!(
+        parse_err("CREATE TYPE mood AS ENUM ()"),
+        DbError::ParseError { .. }
+    ));
+}
+
+#[test]
+fn test_create_table_enum_column_type_parses() {
+    let ct = create_table("CREATE TABLE tasks (state mood NOT NULL)");
+    assert_eq!(ct.columns.len(), 1);
+    assert_eq!(ct.columns[0].name, "state");
+    assert_eq!(ct.columns[0].data_type, DataType::Text);
+    assert_eq!(
+        ct.columns[0]
+            .declared_type_name
+            .as_ref()
+            .map(|t| t.name.as_str()),
+        Some("mood")
+    );
+}
+
+#[test]
 fn test_drop_sequence_parses() {
     let stmt = parse("DROP SEQUENCE IF EXISTS public.s, t", None).unwrap();
     match stmt {

@@ -7,13 +7,13 @@ use axiomdb_types::DataType;
 use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
-        ConstraintTiming, CreateAggregateStmt, CreateIndexStmt, CreateMaterializedViewStmt,
-        CreateSequenceStmt, CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt,
-        CreateTriggerStmt, CreateViewStmt, DropAggregateStmt, DropIndexStmt,
-        DropMaterializedViewStmt, DropSequenceStmt, DropTableStmt, DropTriggerStmt, DropViewStmt,
-        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction,
-        GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, ShowCreateViewStmt,
-        SortOrder, Stmt, TableConstraint, TriggerEvent,
+        ConstraintTiming, CreateAggregateStmt, CreateEnumTypeStmt, CreateIndexStmt,
+        CreateMaterializedViewStmt, CreateSequenceStmt, CreateTableAsSelectStmt,
+        CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt, CreateViewStmt, DropAggregateStmt,
+        DropIndexStmt, DropMaterializedViewStmt, DropSequenceStmt, DropTableStmt, DropTriggerStmt,
+        DropViewStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
+        ForeignKeyAction, GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt,
+        ShowCreateViewStmt, SortOrder, Stmt, TableConstraint, TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -209,6 +209,31 @@ pub(crate) fn parse_create_sequence(p: &mut Parser) -> Result<Stmt, DbError> {
         max_value,
         cycle,
         cache_size,
+    }))
+}
+
+pub(crate) fn parse_create_enum_type(p: &mut Parser) -> Result<Stmt, DbError> {
+    let enum_type = p.parse_table_ref()?;
+    p.expect(&Token::As)?;
+    p.expect(&Token::Enum)?;
+    p.expect(&Token::LParen)?;
+    if p.eat(&Token::RParen) {
+        return Err(DbError::ParseError {
+            message: "CREATE TYPE AS ENUM requires at least one label".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    let mut labels = Vec::new();
+    loop {
+        labels.push(p.parse_string_literal()?);
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+    Ok(Stmt::CreateEnumType(CreateEnumTypeStmt {
+        enum_type,
+        labels,
     }))
 }
 
@@ -479,7 +504,7 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
-    let (data_type, type_len, is_char) = parse_data_type(p)?;
+    let (data_type, type_len, is_char, declared_type_name) = parse_column_data_type(p)?;
     let mut constraints = Vec::new();
     let mut collation = None;
 
@@ -589,11 +614,35 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     Ok(ColumnDef {
         name,
         data_type,
+        declared_type_name,
         constraints,
         collation,
         type_len,
         is_char,
     })
+}
+
+fn parse_column_data_type(
+    p: &mut Parser,
+) -> Result<(DataType, u16, bool, Option<crate::ast::TableRef>), DbError> {
+    match parse_data_type(p) {
+        Ok((data_type, type_len, is_char)) => Ok((data_type, type_len, is_char, None)),
+        Err(err) => {
+            if is_custom_type_start(p.peek()) {
+                let type_name = p.parse_table_ref()?;
+                Ok((DataType::Text, 0, false, Some(type_name)))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn is_custom_type_start(tok: &Token<'_>) -> bool {
+    matches!(
+        tok,
+        Token::Ident(_) | Token::QuotedIdent(_) | Token::DqIdent(_)
+    )
 }
 
 fn parse_generated_column_constraint(p: &mut Parser) -> Result<ColumnConstraint, DbError> {

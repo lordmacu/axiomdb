@@ -66,6 +66,9 @@ fn dispatch(
         Stmt::CreateSequence(_) => Err(DbError::NotImplemented {
             feature: "CREATE SEQUENCE requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::CreateEnumType(_) => Err(DbError::NotImplemented {
+            feature: "CREATE TYPE requires session context — use execute_with_ctx".into(),
+        }),
         Stmt::DropTable(s) => {
             execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }

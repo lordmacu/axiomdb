@@ -193,6 +193,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::CreateTrigger(_)
             | Stmt::CreateAggregate(_)
             | Stmt::CreateSequence(_)
+            | Stmt::CreateEnumType(_)
             | Stmt::DropTable(_)
             | Stmt::DropMaterializedView(_)
             | Stmt::DropView(_)

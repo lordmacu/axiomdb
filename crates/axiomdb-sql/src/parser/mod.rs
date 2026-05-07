@@ -267,6 +267,8 @@ impl<'src> Parser<'src> {
             | Token::Global
             | Token::Session
             | Token::Sequence
+            | Token::Type
+            | Token::Enum
             | Token::Local
             | Token::Lock
             | Token::Unlock
@@ -949,6 +951,10 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_database(self)
             }
+            Token::Type => {
+                self.advance();
+                ddl::parse_create_enum_type(self)
+            }
             Token::Schema => {
                 self.advance();
                 ddl::parse_create_schema(self)
@@ -1014,7 +1020,7 @@ impl<'src> Parser<'src> {
             }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE or INDEX after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1299,6 +1305,8 @@ fn keyword_as_identifier(tok: &Token<'_>) -> String {
         Token::Global => "global".into(),
         Token::Session => "session".into(),
         Token::Sequence => "sequence".into(),
+        Token::Type => "type".into(),
+        Token::Enum => "enum".into(),
         Token::Local => "local".into(),
         Token::Lock => "lock".into(),
         Token::Unlock => "unlock".into(),

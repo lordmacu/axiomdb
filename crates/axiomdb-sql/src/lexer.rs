@@ -100,6 +100,10 @@ pub enum Token<'src> {
     Create,
     #[token("TABLE", ignore(ascii_case))]
     Table,
+    #[token("TYPE", ignore(ascii_case))]
+    Type,
+    #[token("ENUM", ignore(ascii_case))]
+    Enum,
     #[token("MATERIALIZED", ignore(ascii_case))]
     Materialized,
     #[token("VIEW", ignore(ascii_case))]
