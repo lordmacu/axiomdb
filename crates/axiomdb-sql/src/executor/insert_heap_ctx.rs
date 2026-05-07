@@ -252,12 +252,14 @@ fn execute_insert_ctx(
                     }
                 }
 
-                full_batch.push(crate::table::coerce_values_with_ctx(
+                let full_values = crate::table::coerce_values_with_ctx(
                     full_values,
                     schema_cols,
                     ctx,
                     row_idx + 1,
-                )?);
+                )?;
+                validate_enum_row_values(&full_values, schema_cols, storage, txn, conn_txn)?;
+                full_batch.push(full_values);
             }
 
             if full_batch.len() == 1 || ignore || replace_mode || odku_mode || on_conflict_mode {
@@ -489,6 +491,7 @@ fn execute_insert_ctx(
                     ctx,
                     row_idx + 1,
                 )?;
+                validate_enum_row_values(&full_values, schema_cols, storage, txn, conn_txn)?;
                 full_batch.push(full_values);
             }
 
@@ -693,6 +696,7 @@ fn execute_insert_ctx(
             }
             let full_values =
                 crate::table::coerce_values_with_ctx(full_values, schema_cols, ctx, 1)?;
+            validate_enum_row_values(&full_values, schema_cols, storage, txn, conn_txn)?;
             if replace_mode {
                 let deleted = replace_displace_conflicts_heap(
                     storage,

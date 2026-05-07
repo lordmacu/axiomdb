@@ -137,6 +137,7 @@ fn apply_on_conflict_heap(
                 ctx,
                 1,
             )?;
+            validate_enum_row_values(&coerced_new, schema_cols, storage, txn, conn_txn)?;
             let new_rid = crate::table::TableEngine::update_row(
                 storage,
                 txn,

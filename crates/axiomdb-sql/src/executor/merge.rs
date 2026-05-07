@@ -605,6 +605,7 @@ fn apply_merge_update_heap(
     }
 
     let coerced = crate::table::coerce_values_with_ctx(new_row, &resolved.columns, ctx, 1)?;
+    validate_enum_row_values(&coerced, &resolved.columns, storage, txn, conn_txn)?;
     let new_rid = TableEngine::update_row(
         storage,
         txn,
@@ -735,6 +736,7 @@ fn apply_merge_insert_heap(
     }
 
     let full_values = crate::table::coerce_values_with_ctx(full_values, &resolved.columns, ctx, 1)?;
+    validate_enum_row_values(&full_values, &resolved.columns, storage, txn, conn_txn)?;
     let rid = TableEngine::insert_row_with_ctx(
         storage,
         txn,

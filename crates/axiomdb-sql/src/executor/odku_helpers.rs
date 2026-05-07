@@ -277,6 +277,7 @@ fn apply_odku_heap(
 
     // Perform the heap update (delete old + insert new; may change RID).
     let coerced_new = crate::table::coerce_values_with_ctx(new_row.clone(), schema_cols, ctx, 1)?;
+    validate_enum_row_values(&coerced_new, schema_cols, storage, txn, conn_txn)?;
     let new_rid = crate::table::TableEngine::update_row(
         storage,
         txn,

@@ -85,6 +85,7 @@ fn execute_update_with_candidates(
             if !changed {
                 continue;
             }
+            validate_enum_row_values(&new_values, schema_cols, storage, txn, conn_txn)?;
             to_update.push((rid, current_values, new_values));
         } else {
             // Sparse path: only evaluate and store assigned columns.
@@ -101,6 +102,7 @@ fn execute_update_with_candidates(
             if !changed {
                 continue;
             }
+            validate_enum_sparse_values(&sparse, schema_cols, storage, txn, conn_txn)?;
             to_update_sparse.push((rid, sparse));
         }
     }

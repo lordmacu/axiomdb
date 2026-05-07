@@ -1181,3 +1181,76 @@ fn rid_hi(prefix: &[u8]) -> Vec<u8> {
     }
     v
 }
+
+fn validate_enum_row_values(
+    values: &[Value],
+    columns: &[CatalogColumnDef],
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &ConnectionTxn,
+) -> Result<(), DbError> {
+    for (value, column) in values.iter().zip(columns.iter()) {
+        validate_enum_column_value(value, column, storage, txn, conn_txn)?;
+    }
+    Ok(())
+}
+
+fn validate_enum_sparse_values(
+    values: &[(usize, Value)],
+    columns: &[CatalogColumnDef],
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &ConnectionTxn,
+) -> Result<(), DbError> {
+    for (col_pos, value) in values {
+        let Some(column) = columns.get(*col_pos) else {
+            continue;
+        };
+        validate_enum_column_value(value, column, storage, txn, conn_txn)?;
+    }
+    Ok(())
+}
+
+fn validate_enum_column_value(
+    value: &Value,
+    column: &CatalogColumnDef,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &ConnectionTxn,
+) -> Result<(), DbError> {
+    let Some(type_name) = column.enum_type_name.as_deref() else {
+        return Ok(());
+    };
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    let Value::Text(label) = value else {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "invalid value for enum column '{}': expected text label",
+                column.name
+            ),
+        });
+    };
+    let (schema, name) = type_name
+        .split_once('.')
+        .ok_or_else(|| DbError::InvalidValue {
+            reason: format!("invalid enum type metadata '{type_name}'"),
+        })?;
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let enum_type = reader
+        .get_enum_type(schema, name)?
+        .ok_or_else(|| DbError::InvalidValue {
+            reason: format!("enum type '{type_name}' does not exist"),
+        })?;
+    if enum_type.labels.iter().any(|allowed| allowed == label) {
+        return Ok(());
+    }
+    Err(DbError::InvalidValue {
+        reason: format!(
+            "invalid input value '{}' for enum type '{}'",
+            label, type_name
+        ),
+    })
+}
