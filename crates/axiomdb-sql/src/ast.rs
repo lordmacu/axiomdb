@@ -238,6 +238,9 @@ pub struct ExclusionElement {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    /// Named user-defined type used for this column. Phase 20.3 uses this for
+    /// text-backed enum types while keeping `data_type = DataType::Text`.
+    pub declared_type_name: Option<TableRef>,
     pub constraints: Vec<ColumnConstraint>,
     /// Optional explicit column collation (`... COLLATE name`).
     /// `None` = inherit from table/database/session scope.
@@ -1255,6 +1258,13 @@ pub struct CreateSequenceStmt {
     pub cache_size: u64,
 }
 
+/// `CREATE TYPE name AS ENUM ('label'[, ...])`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateEnumTypeStmt {
+    pub enum_type: TableRef,
+    pub labels: Vec<String>,
+}
+
 /// `DROP TRIGGER name ON table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTriggerStmt {
@@ -1341,6 +1351,7 @@ pub enum Stmt {
     CreateTrigger(CreateTriggerStmt),
     CreateAggregate(CreateAggregateStmt),
     CreateSequence(CreateSequenceStmt),
+    CreateEnumType(CreateEnumTypeStmt),
     CreateDatabase(CreateDatabaseStmt),
     CreateSchema(CreateSchemaStmt),
     CreateIndex(CreateIndexStmt),
@@ -1514,6 +1525,7 @@ mod tests {
                 ColumnDef {
                     name: "id".into(),
                     data_type: DataType::BigInt,
+                    declared_type_name: None,
                     constraints: vec![
                         ColumnConstraint::PrimaryKey,
                         ColumnConstraint::AutoIncrement,
@@ -1525,6 +1537,7 @@ mod tests {
                 ColumnDef {
                     name: "email".into(),
                     data_type: DataType::Text,
+                    declared_type_name: None,
                     constraints: vec![ColumnConstraint::NotNull, ColumnConstraint::Unique],
                     collation: None,
                     type_len: 0,
@@ -1533,6 +1546,7 @@ mod tests {
                 ColumnDef {
                     name: "age".into(),
                     data_type: DataType::Int,
+                    declared_type_name: None,
                     constraints: vec![ColumnConstraint::Default(Expr::int(0))],
                     collation: None,
                     type_len: 0,
@@ -1556,6 +1570,7 @@ mod tests {
                 ColumnDef {
                     name: "id".into(),
                     data_type: DataType::BigInt,
+                    declared_type_name: None,
                     constraints: vec![ColumnConstraint::NotNull],
                     collation: None,
                     type_len: 0,
@@ -1564,6 +1579,7 @@ mod tests {
                 ColumnDef {
                     name: "user_id".into(),
                     data_type: DataType::BigInt,
+                    declared_type_name: None,
                     constraints: vec![ColumnConstraint::NotNull],
                     collation: None,
                     type_len: 0,
@@ -1725,6 +1741,7 @@ mod tests {
                 AlterTableOp::AddColumn(ColumnDef {
                     name: "phone".into(),
                     data_type: DataType::Text,
+                    declared_type_name: None,
                     constraints: vec![ColumnConstraint::Null],
                     collation: None,
                     type_len: 0,
@@ -1832,6 +1849,7 @@ mod tests {
         let col_def = ColumnDef {
             name: "balance".into(),
             data_type: DataType::Int,
+            declared_type_name: None,
             constraints: vec![ColumnConstraint::Default(Expr::UnaryOp {
                 op: UnaryOp::Neg,
                 operand: Box::new(Expr::int(1)),
