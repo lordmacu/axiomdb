@@ -33,6 +33,7 @@
 //! SYSTEM_TABLE_INDEXES = u32::MAX      (axiom_indexes)
 //! ```
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axiomdb_core::error::DbError;
@@ -46,8 +47,8 @@ use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{
-        AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, RelationKind,
-        SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence,
+        AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, EnumTypeDef, FkDef, IndexDef,
+        RelationKind, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence,
         TableStorageLayout,
     },
 };
@@ -76,6 +77,31 @@ pub const SYSTEM_TABLE_SCHEMAS: u32 = u32::MAX - 8;
 pub const SYSTEM_TABLE_AGGREGATES: u32 = u32::MAX - 9;
 /// WAL `table_id` used for inserts/deletes into `axiom_sequences` (Phase 20.2).
 pub const SYSTEM_TABLE_SEQUENCES: u32 = u32::MAX - 10;
+/// WAL `table_id` used for inserts/deletes into `axiom_enum_types` (Phase 20.3).
+pub const SYSTEM_TABLE_ENUM_TYPES: u32 = u32::MAX - 11;
+
+fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
+    if def.labels.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "enum type '{}.{}' must have at least one label",
+                def.schema_name, def.name
+            ),
+        });
+    }
+    let mut seen = HashSet::with_capacity(def.labels.len());
+    for label in &def.labels {
+        if !seen.insert(label) {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "duplicate enum label '{}' in type '{}.{}'",
+                    label, def.schema_name, def.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 
@@ -249,6 +275,57 @@ impl<'a> CatalogWriter<'a> {
                 self.txn.record_delete(
                     self.conn,
                     SYSTEM_TABLE_SEQUENCES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn create_enum_type(&mut self, def: EnumTypeDef) -> Result<(), DbError> {
+        let root = self.page_ids.enum_types;
+        if root == 0 {
+            return Err(DbError::Internal {
+                message: "enum type catalog root not initialized".into(),
+            });
+        }
+        validate_enum_type_def(&def)?;
+        let data = def.to_bytes();
+        let txn_id = self.conn.txn_id;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        let key = format!("{}.{}", def.schema_name, def.name);
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_ENUM_TYPES,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_enum_type(&mut self, schema: &str, name: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.enum_types;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = EnumTypeDef::from_bytes(&data)?;
+            if def.schema_name == schema && def.name.eq_ignore_ascii_case(name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", def.schema_name, def.name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_ENUM_TYPES,
                     key.as_bytes(),
                     &data,
                     page_id,

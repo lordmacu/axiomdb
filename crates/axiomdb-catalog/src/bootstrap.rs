@@ -18,11 +18,11 @@ use axiomdb_storage::{
     read_meta_u32, read_meta_u64, write_catalog_header, write_meta_u32, write_meta_u64, Page,
     PageType, StorageEngine, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_DATABASES_ROOT_BODY_OFFSET,
-    CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
-    CATALOG_SEQUENCES_ROOT_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
-    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
-    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
+    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMAS_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_SEQUENCES_ROOT_BODY_OFFSET,
+    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
+    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
@@ -69,6 +69,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_sequences` heap (Phase 20.2).
     /// Zero on legacy databases; lazily initialized on first `CREATE SEQUENCE`.
     pub sequences: u64,
+    /// Root page of the `axiom_enum_types` heap (Phase 20.3).
+    /// Zero on legacy databases; lazily initialized on first `CREATE TYPE`.
+    pub enum_types: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -177,6 +180,16 @@ impl CatalogBootstrap {
         storage.write_page(sequences_root, &sequences_page)?;
         write_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET, sequences_root)?;
 
+        // Allocate the enum types root (Phase 20.3).
+        let enum_types_root = storage.alloc_page(PageType::Data)?;
+        let enum_types_page = Page::new(PageType::Data, enum_types_root);
+        storage.write_page(enum_types_root, &enum_types_page)?;
+        write_meta_u64(
+            storage,
+            CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET,
+            enum_types_root,
+        )?;
+
         // Seed the default logical database so fresh databases and upgraded
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
@@ -206,6 +219,7 @@ impl CatalogBootstrap {
             schemas: schemas_root,
             aggregates: aggregates_root,
             sequences: sequences_root,
+            enum_types: enum_types_root,
         })
     }
 
@@ -233,6 +247,7 @@ impl CatalogBootstrap {
         let schemas = read_meta_u64(storage, CATALOG_SCHEMAS_ROOT_BODY_OFFSET)?;
         let aggregates = read_meta_u64(storage, CATALOG_AGGREGATES_ROOT_BODY_OFFSET)?;
         let sequences = read_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET)?;
+        let enum_types = read_meta_u64(storage, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -245,6 +260,7 @@ impl CatalogBootstrap {
             schemas,
             aggregates,
             sequences,
+            enum_types,
         })
     }
 
@@ -312,6 +328,14 @@ impl CatalogBootstrap {
             storage.write_page(root, &page)?;
             write_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET, root)?;
             ids.sequences = root;
+        }
+
+        if ids.enum_types == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET, root)?;
+            ids.enum_types = root;
         }
 
         storage.flush()?;

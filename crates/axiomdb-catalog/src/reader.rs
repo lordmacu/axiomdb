@@ -17,8 +17,9 @@ use axiomdb_core::RecordId;
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     schema::{
-        AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, FkDef, IndexDef, SchemaDef,
-        SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId, DEFAULT_DATABASE_NAME,
+        AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, EnumTypeDef, FkDef, IndexDef,
+        SchemaDef, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
+        DEFAULT_DATABASE_NAME,
     },
 };
 
@@ -255,6 +256,41 @@ impl<'a> CatalogReader<'a> {
         let mut result = Vec::new();
         for (_, _, data) in rows {
             let (def, _) = SequenceDef::from_bytes(&data)?;
+            if def.schema_name == schema {
+                result.push(def);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn get_enum_type(
+        &mut self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<EnumTypeDef>, DbError> {
+        let root = self.page_ids.enum_types;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = EnumTypeDef::from_bytes(&data)?;
+            if def.schema_name == schema && def.name.eq_ignore_ascii_case(name) {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn list_enum_types_in_schema(&mut self, schema: &str) -> Result<Vec<EnumTypeDef>, DbError> {
+        let root = self.page_ids.enum_types;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut result = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = EnumTypeDef::from_bytes(&data)?;
             if def.schema_name == schema {
                 result.push(def);
             }
