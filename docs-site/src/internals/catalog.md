@@ -500,6 +500,39 @@ available again. `CURRVAL` is not stored in the catalog; it is tracked per
 
 ---
 
+## Enum Type Catalog (Phase 20.3)
+
+Schema-scoped enum types are stored in `axiom_enum_types`, whose root page is
+recorded in page 0 at `catalog_enum_types_root`.
+
+### `EnumTypeDef` — on-disk format
+
+```
+[schema_len: u8][schema: bytes]
+[name_len:   u8][name:   bytes]
+[label_count: u16]
+repeated label_count times:
+  [label_len: u16][label: bytes]
+```
+
+Enum columns keep `ColumnType::Text` as the physical row type and persist the
+declared enum identity in `ColumnDef.enum_type_name` as `schema.type`. The SQL
+executor validates INSERT/UPDATE-family writes by loading the referenced
+`EnumTypeDef` and checking the incoming text label against the stored label
+list. Metadata paths use `enum_type_name` so `SHOW COLUMNS`, `SHOW CREATE
+TABLE`, and `information_schema.COLUMNS` report the declared enum type.
+
+### Catalog APIs
+
+| Function | Description |
+|---|---|
+| `CatalogWriter::create_enum_type(def)` | Persists a new `EnumTypeDef` |
+| `CatalogReader::get_enum_type(schema, name)` | Looks up a visible enum type |
+| `CatalogReader::list_enum_types_in_schema(schema)` | Lists enum types in a schema |
+| `CatalogWriter::delete_enum_type(schema, name)` | Removes an enum type definition |
+
+---
+
 ## Regular Views Catalog (Phase 20.1)
 
 ### `RelationKind::View`

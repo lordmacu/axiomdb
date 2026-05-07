@@ -628,6 +628,8 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
         | Token::Action
         | Token::Names
         | Token::Autocommit
+        | Token::Type
+        | Token::Enum
         | Token::Regexp
         | Token::Rlike
         | Token::Xor

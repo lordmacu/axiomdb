@@ -168,6 +168,34 @@ SELECT name, encode(content, 'hex') FROM attachments;
 
 ---
 
+## Enum Types
+
+`CREATE TYPE name AS ENUM (...)` creates a schema-scoped enum type. Enum
+columns are stored with the existing `TEXT` row codec but keep their declared
+type in the catalog, so writes are validated against the enum label list and
+metadata reports the enum name.
+
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+CREATE TABLE tasks (
+    id    BIGINT PRIMARY KEY AUTO_INCREMENT,
+    state mood NOT NULL
+);
+
+INSERT INTO tasks (state) VALUES ('ok');     -- accepted
+INSERT INTO tasks (state) VALUES ('angry');  -- rejected
+```
+
+`SHOW COLUMNS`, `SHOW CREATE TABLE`, and `information_schema.COLUMNS` display
+the declared enum type, for example `public.mood`, instead of the physical
+`TEXT` representation.
+
+Current limits: `ALTER TYPE ... ADD VALUE`, `DROP TYPE`, and enum-specific
+declaration-order comparison are not implemented yet.
+
+---
+
 ## Date and Time Types
 
 | SQL Type       | Storage  | Internal repr    | Notes                                     |
