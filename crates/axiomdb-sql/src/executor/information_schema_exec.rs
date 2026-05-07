@@ -255,8 +255,14 @@ fn generate_is_columns_rows(
         for t in tables {
             let columns = reader.list_columns(t.id)?;
             for col in &columns {
-                let data_type_str = column_type_to_is_data_type(col.col_type);
-                let col_type_str = column_type_to_column_type_str(col.col_type);
+                let data_type_str = col
+                    .enum_type_name
+                    .as_deref()
+                    .unwrap_or_else(|| column_type_to_is_data_type(col.col_type));
+                let col_type_str = col
+                    .enum_type_name
+                    .as_deref()
+                    .unwrap_or_else(|| column_type_to_column_type_str(col.col_type));
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
                 let extra = if col.auto_increment {
                     "auto_increment"

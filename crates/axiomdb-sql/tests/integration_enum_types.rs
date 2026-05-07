@@ -152,6 +152,53 @@ fn test_update_rejects_label_not_in_enum() {
 }
 
 #[test]
+fn test_show_metadata_uses_declared_enum_type() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
+
+    common::run_ctx(
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "CREATE TABLE tasks (state mood NOT NULL)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let show_columns = common::run_ctx(
+        "SHOW COLUMNS FROM tasks",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let rows = common::rows(show_columns);
+    assert_eq!(rows[0][1], axiomdb_types::Value::Text("public.mood".into()));
+
+    let show_create = common::run_ctx(
+        "SHOW CREATE TABLE tasks",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let rows = common::rows(show_create);
+    match &rows[0][1] {
+        axiomdb_types::Value::Text(sql) => assert!(sql.contains("`state` public.mood NOT NULL")),
+        other => panic!("expected SHOW CREATE SQL text, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_builtin_text_column_does_not_become_enum() {
     let ct = match axiomdb_sql::parse("CREATE TABLE tasks (state TEXT)", None).unwrap() {
         axiomdb_sql::ast::Stmt::CreateTable(ct) => ct,
