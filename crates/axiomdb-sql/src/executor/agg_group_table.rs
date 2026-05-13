@@ -473,6 +473,14 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
         Expr::ArrayConstructor { elements } => {
             for e in elements { collect_col_idxs_non_agg(e, out); }
         }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            collect_col_idxs_non_agg(array, out);
+            collect_col_idxs_non_agg(index, out);
+            if let Some(s) = slice {
+                collect_col_idxs_non_agg(s, out);
+            }
+        }
         Expr::Literal(_)
         | Expr::Default
         | Expr::OuterColumn { .. }
@@ -554,6 +562,14 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
         // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
         Expr::ArrayConstructor { elements } => {
             for e in elements { collect_non_agg_col_idxs_in_expr(e, inside_agg, out); }
+        }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            collect_non_agg_col_idxs_in_expr(array, inside_agg, out);
+            collect_non_agg_col_idxs_in_expr(index, inside_agg, out);
+            if let Some(s) = slice {
+                collect_non_agg_col_idxs_in_expr(s, inside_agg, out);
+            }
         }
         Expr::Column { .. }
         | Expr::Literal(_)

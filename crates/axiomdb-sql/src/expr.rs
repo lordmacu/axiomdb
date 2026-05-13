@@ -323,6 +323,21 @@ pub enum Expr {
     /// element type from all elements (all-same → that type; int+real → real).
     /// An empty `ARRAY[]` requires an explicit `::type[]` cast on the outside.
     ArrayConstructor { elements: Vec<Expr> },
+
+    // ── ARRAY subscript / slice (Phase 20.4, Step 5) ─────────────────────
+    /// `arr[index]` — 1-indexed element access, returns element value.
+    /// `arr[lo:hi]` — slice, returns sub-array as `Value::Array`.
+    ///
+    /// `Expr::Subscript { array, index: Expr::Literal(Value::Int(lo)),
+    ///                     slice: Expr::Literal(Value::Int(hi)) }` for `arr[lo:hi]`.
+    /// `Expr::Subscript { array, index, slice: None }` for `arr[index]`.
+    Subscript {
+        array: Box<Expr>,
+        /// The index expression (1-indexed). Can be any integer expression.
+        index: Box<Expr>,
+        /// If `Some(hi)`, this is a slice `arr[index:hi]`.
+        slice: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +459,10 @@ pub enum BinaryOp {
     /// `#-` — JSONB path-delete (Phase 11.18c): returns doc with the path
     /// pruned. RHS is a JSONB array of path segments.
     JsonPathDelete,
+
+    // Array operators (Phase 20.4, Step 5)
+    /// `&&` — array overlap: true if two arrays share at least one common element.
+    ArrayOverlap,
 }
 
 // ── SQL/JSON standard query functions (Phase 11.19a) ─────────────────────────

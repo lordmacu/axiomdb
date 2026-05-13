@@ -82,6 +82,8 @@ fn expr_to_sql_inner(expr: &Expr, top_level: bool) -> String {
                 BinaryOp::JsonPathExtract => "#>",
                 BinaryOp::JsonPathExtractText => "#>>",
                 BinaryOp::JsonPathDelete => "#-",
+                // Phase 20.4, Step 5 — array overlap operator.
+                BinaryOp::ArrayOverlap => "&&",
             };
             let body = format!(
                 "{} {op_str} {}",

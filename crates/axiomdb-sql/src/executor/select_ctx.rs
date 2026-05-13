@@ -248,6 +248,14 @@ fn execute_select_ctx(
                 crate::expr::Expr::ArrayConstructor { elements } => {
                     for a in elements { collect_expr_columns(a, mask); }
                 }
+                // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+                crate::expr::Expr::Subscript { array, index, slice } => {
+                    collect_expr_columns(array, mask);
+                    collect_expr_columns(index, mask);
+                    if let Some(s) = slice {
+                        collect_expr_columns(s, mask);
+                    }
+                }
                 // Subquery internals are not scanned — they run as separate queries.
                 crate::expr::Expr::Literal(_)
                 | crate::expr::Expr::Default

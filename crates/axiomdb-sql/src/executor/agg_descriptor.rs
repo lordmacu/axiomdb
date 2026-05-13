@@ -74,6 +74,12 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Grouping { .. } => false,
         // Phase 20.4 — ARRAY[expr, ...] constructor: recurse into elements.
         Expr::ArrayConstructor { elements } => elements.iter().any(contains_aggregate),
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            contains_aggregate(array)
+                || contains_aggregate(index)
+                || slice.as_ref().is_some_and(|s| contains_aggregate(s))
+        }
     }
 }
 
@@ -389,6 +395,14 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
         Expr::ArrayConstructor { elements } => {
             for e in elements { collect_agg_exprs_from(e, result); }
+        }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            collect_agg_exprs_from(array, result);
+            collect_agg_exprs_from(index, result);
+            if let Some(s) = slice {
+                collect_agg_exprs_from(s, result);
+            }
         }
     }
 }

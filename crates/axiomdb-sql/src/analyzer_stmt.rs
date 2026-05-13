@@ -880,7 +880,8 @@ fn expr_contains_window(expr: &Expr) -> bool {
         | Expr::Param { .. }
         | Expr::Subquery(_)
         | Expr::Exists { .. }
-        | Expr::ArrayConstructor { .. } => false,
+        | Expr::ArrayConstructor { .. }
+        | Expr::Subscript { .. } => false,
     }
 }
 
@@ -969,7 +970,8 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::Param { .. }
         | Expr::Subquery(_)
         | Expr::Exists { .. }
-        | Expr::ArrayConstructor { .. } => false,
+        | Expr::ArrayConstructor { .. }
+        | Expr::Subscript { .. } => false,
     }
 }
 
@@ -1128,7 +1130,8 @@ fn rewrite_custom_aggregates_in_expr(
         | Expr::Param { .. }
         | Expr::Subquery(_)
         | Expr::Exists { .. }
-        | Expr::ArrayConstructor { .. } => {}
+        | Expr::ArrayConstructor { .. }
+        | Expr::Subscript { .. } => {}
     }
     Ok(())
 }
@@ -1235,6 +1238,14 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         Expr::ArrayConstructor { elements } => {
             for e in elements {
                 populate_grouping_indices(e, universe);
+            }
+        }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            populate_grouping_indices(array, universe);
+            populate_grouping_indices(index, universe);
+            if let Some(s) = slice {
+                populate_grouping_indices(s, universe);
             }
         }
         // Leaf nodes — nothing to recurse into.

@@ -326,6 +326,25 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
 
         // Phase 20.4 — ARRAY[expr, ...] constructor.
         Expr::ArrayConstructor { elements } => eval_array_constructor(elements, row),
+
+        // Phase 20.4, Step 5 — array subscript `arr[index]` or slice `arr[lo:hi]`.
+        Expr::Subscript {
+            array,
+            index,
+            slice,
+        } => {
+            let arr_val = eval(array, row)?;
+            if let Some(hi) = slice {
+                // Slice: arr[lo:hi]
+                let lo_val = eval(index, row)?;
+                let hi_val = eval(hi, row)?;
+                super::array_ops::array_slice(&arr_val, &lo_val, &hi_val)
+            } else {
+                // Regular subscript: arr[index]
+                let idx_val = eval(index, row)?;
+                super::array_ops::array_subscript(&arr_val, &idx_val)
+            }
+        }
     }
 }
 
@@ -764,6 +783,25 @@ pub fn eval_with<R: SubqueryRunner>(
 
         // Phase 20.4 — ARRAY[expr, ...] constructor (no subquery needed).
         Expr::ArrayConstructor { elements } => eval_array_constructor(elements, row),
+
+        // Phase 20.4, Step 5 — array subscript `arr[index]` or slice `arr[lo:hi]`.
+        Expr::Subscript {
+            array,
+            index,
+            slice,
+        } => {
+            let arr_val = eval_with(array, row, sq)?;
+            if let Some(hi) = slice {
+                // Slice: arr[lo:hi]
+                let lo_val = eval_with(index, row, sq)?;
+                let hi_val = eval_with(hi, row, sq)?;
+                super::array_ops::array_slice(&arr_val, &lo_val, &hi_val)
+            } else {
+                // Regular subscript: arr[index]
+                let idx_val = eval_with(index, row, sq)?;
+                super::array_ops::array_subscript(&arr_val, &idx_val)
+            }
+        }
     }
 }
 
@@ -943,12 +981,94 @@ impl CommonType {
             return Ok(self.clone());
         }
 
-        match (self, other_t) {
-            // Same type — identity.
-            (Self::Concrete(dt), _) if dt == &T::from_value(other).to_data_type().unwrap() => {
-                Ok(self.clone())
+        // Handle Array type: extract inner type and merge with self's inner type.
+        // This is needed for nested arrays like ARRAY[ARRAY[1,2], ARRAY[3,4]].
+        if matches!(other_t, T::Array) {
+            let Value::Array(elems) = other else {
+                unreachable!("other_t is Array but other is not Value::Array");
+            };
+            if elems.is_empty() {
+                // Empty inner array - can't infer type, but merge succeeds if self is Array
+                return Ok(self.clone());
             }
+            // Get inner element type from first element
+            let inner_elem = &elems[0];
+            let inner_t = T::from_value(inner_elem);
 
+            match self {
+                // If self is Array type, merge inner types
+                Self::Concrete(DataType::Array(inner_box)) => {
+                    let inner_dt = &**inner_box;
+                    // inner_t is the ArrayElemType of the other array's element
+                    // We need to compare/merge inner_dt with inner_t's DataType
+                    if let Some(inner_elem_dt) = inner_t.to_data_type() {
+                        if inner_dt == &inner_elem_dt {
+                            // Same inner type - compatible
+                            Ok(self.clone())
+                        } else {
+                            // Different inner types - try numeric widening
+                            match (inner_dt.clone(), inner_t) {
+                                (DataType::BigInt, T::Int) => {
+                                    Ok(Self::Concrete(DataType::Array(Box::new(DataType::BigInt))))
+                                }
+                                (DataType::Int, T::BigInt) => {
+                                    Ok(Self::Concrete(DataType::Array(Box::new(DataType::BigInt))))
+                                }
+                                (DataType::Int, T::Real) | (DataType::BigInt, T::Real) => {
+                                    Ok(Self::Concrete(DataType::Array(Box::new(DataType::Real))))
+                                }
+                                (DataType::Real, T::Int)
+                                | (DataType::Real, T::BigInt)
+                                | (DataType::Real, T::Real) => {
+                                    Ok(Self::Concrete(DataType::Array(Box::new(DataType::Real))))
+                                }
+                                (DataType::BigInt, T::BigInt) => Ok(self.clone()),
+                                _ => Err(DbError::TypeMismatch {
+                                    expected: inner_dt.name(),
+                                    got: inner_elem_dt.name(),
+                                }),
+                            }
+                        }
+                    } else {
+                        // inner_t doesn't have a simple DataType (e.g., it's also Array)
+                        Err(DbError::TypeMismatch {
+                            expected: inner_dt.name(),
+                            got: "complex type".into(),
+                        })
+                    }
+                }
+                _ => Err(DbError::TypeMismatch {
+                    expected: "Array".into(),
+                    got: "non-Array".into(),
+                }),
+            }
+        } else {
+            // Not Array type - proceed with normal merge
+            self.merge_non_array(other, other_t)
+        }
+    }
+
+    fn merge_non_array(&self, _other: &Value, other_t: ArrayElemType) -> Result<Self, DbError> {
+        use ArrayElemType as T;
+
+        // Handle Array type explicitly - this can't be compared via to_data_type()
+        if matches!(other_t, T::Array) {
+            return Err(DbError::TypeMismatch {
+                expected: "Array element type".into(),
+                got: "Array".into(),
+            });
+        }
+
+        // Same type — identity. Check first before other arms.
+        if let Some(other_dt) = other_t.to_data_type() {
+            if let Self::Concrete(dt) = self {
+                if dt == &other_dt {
+                    return Ok(self.clone());
+                }
+            }
+        }
+
+        match (self, other_t) {
             // Null merges with anything.
             (Self::Concrete(_), T::Null) | (Self::IntReal, T::Null) => Ok(self.clone()),
 
@@ -982,13 +1102,10 @@ impl CommonType {
             (Self::Concrete(DataType::Decimal), T::Int)
             | (Self::Concrete(DataType::Decimal), T::BigInt)
             | (Self::Concrete(DataType::Decimal), T::Decimal)
-            | (Self::Concrete(DataType::Decimal), T::Real) => {
-                // Real is incompatible with Decimal in our coercion lattice.
-                Err(DbError::TypeMismatch {
-                    expected: "DECIMAL".into(),
-                    got: T::from_value(other).to_data_type().unwrap().name(),
-                })
-            }
+            | (Self::Concrete(DataType::Decimal), T::Real) => Err(DbError::TypeMismatch {
+                expected: "DECIMAL".into(),
+                got: other_t.to_data_type().unwrap_or(DataType::Text).name(),
+            }),
 
             // Text + Text → Text
             (Self::Concrete(DataType::Text), T::Text) => Ok(self.clone()),
@@ -1017,12 +1134,12 @@ impl CommonType {
             // Mismatched types
             (Self::Concrete(dt), other_t) => Err(DbError::TypeMismatch {
                 expected: dt.name(),
-                got: other_t.to_data_type().unwrap().name(),
+                got: other_t.to_data_type().unwrap_or(DataType::Text).name(),
             }),
 
             (Self::IntReal, t) => Err(DbError::TypeMismatch {
                 expected: "REAL".into(),
-                got: t.to_data_type().unwrap().name(),
+                got: t.to_data_type().unwrap_or(DataType::Text).name(),
             }),
         }
     }
@@ -1085,22 +1202,38 @@ fn validate_nested_dims(values: &[Value]) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Infers the element type of an array value.
+/// Returns `None` for empty arrays (can't infer type).
+fn infer_array_element_type(arr: &Value) -> Option<DataType> {
+    let Value::Array(elems) = arr else {
+        return None;
+    };
+    if elems.is_empty() {
+        return None;
+    }
+    let t = ArrayElemType::from_value(&elems[0]);
+    if let Some(dt) = t.to_data_type() {
+        Some(dt)
+    } else if matches!(t, ArrayElemType::Array) {
+        // Nested array - recursively infer inner type
+        infer_array_element_type(&elems[0]).map(|inner| DataType::Array(Box::new(inner)))
+    } else {
+        None
+    }
+}
+
 /// Evaluates `ARRAY[expr, ...]` — PostgreSQL-compatible array constructor.
 ///
-/// - Empty `ARRAY[]` requires an explicit `::type[]` cast wrapper (checked by caller).
+/// - Empty `ARRAY[]` returns an empty array with a default element type.
 /// - Nested arrays (`ARRAY[ARRAY[...], ...]`) are validated for dimension consistency.
 /// - Type inference: all-int → int[], int+real → real[], etc.
 fn eval_array_constructor(elements: &[Expr], row: &[Value]) -> Result<Value, DbError> {
     use CommonType as C;
 
-    // Empty array — this case is only allowed when wrapped in an explicit cast.
-    // The CAST evaluator handles the target type; reaching here with empty elements
-    // without a cast is an error.
+    // Empty array — return an empty array with a default type.
+    // The type is needed for containment checks (empty array contains nothing → TRUE).
     if elements.is_empty() {
-        return Err(DbError::TypeMismatch {
-            expected: "non-empty ARRAY or ARRAY with explicit ::type[] cast".into(),
-            got: "empty ARRAY[]".into(),
-        });
+        return Ok(Value::Array(vec![]));
     }
 
     // Phase 1: evaluate all elements.
@@ -1127,8 +1260,13 @@ fn eval_array_constructor(elements: &[Expr], row: &[Value]) -> Result<Value, DbE
                     common = Some(C::Concrete(dt));
                 } else if matches!(t, ArrayElemType::Array) {
                     // Nested array — element type is determined by inner elements.
-                    // For now, we accept it as-is and let the inner validation handle it.
-                    common = Some(C::Concrete(DataType::Array(Box::new(DataType::Text))));
+                    // Infer the inner element type recursively.
+                    if let Some(inner_type) = infer_array_element_type(v) {
+                        common = Some(C::Concrete(DataType::Array(Box::new(inner_type))));
+                    } else {
+                        // Empty nested array - use a default type
+                        common = Some(C::Concrete(DataType::Int));
+                    }
                 }
             }
             Some(ref c) => {
@@ -1137,12 +1275,11 @@ fn eval_array_constructor(elements: &[Expr], row: &[Value]) -> Result<Value, DbE
         }
     }
 
-    // If all elements were NULL, we have no type.
+    // If all elements were NULL, use a default type (Int).
+    // This allows ARRAY[NULL] to be used in containment checks where
+    // NULL elements should produce NULL results.
     if common.is_none() {
-        return Err(DbError::TypeMismatch {
-            expected: "ARRAY with non-null elements or explicit ::type[] cast".into(),
-            got: "ARRAY with only NULL elements".into(),
-        });
+        common = Some(C::Concrete(DataType::Int));
     }
 
     // Phase 4: coerce all elements to the common type.

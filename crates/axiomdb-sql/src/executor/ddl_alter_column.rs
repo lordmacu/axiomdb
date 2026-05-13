@@ -273,6 +273,12 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
         Expr::ArrayConstructor { elements } => {
             elements.iter().any(|e| expr_mentions_column_name(e, target_name))
         }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            expr_mentions_column_name(array, target_name)
+                || expr_mentions_column_name(index, target_name)
+                || slice.as_ref().is_some_and(|s| expr_mentions_column_name(s, target_name))
+        }
     }
 }
 

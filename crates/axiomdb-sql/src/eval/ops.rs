@@ -6,7 +6,7 @@ use crate::{
     text_semantics::compare_text,
 };
 
-use super::current_eval_collation;
+use super::{array_ops, current_eval_collation};
 
 /// Returns `true` only for `Value::Bool(true)`.
 ///
@@ -144,6 +144,92 @@ pub(super) fn eval_xor(left: &Expr, right: &Expr, row: &[Value]) -> Result<Value
     }
 }
 
+// ── Array operator dispatch (Phase 20.4, Step 5) ───────────────────────────────
+
+/// Handles binary operators when the LHS is `Value::Array`.
+///
+/// Array operators handle NULL internally following SQL 3VL semantics.
+/// This function is called BEFORE the generic NULL propagation check in `eval_binary`.
+fn eval_binary_array(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
+    // Array operators all handle NULL internally.
+    match op {
+        // Equality / inequality — element-by-element with NULL propagation
+        BinaryOp::Eq => array_ops::array_equals(&l, &r),
+        BinaryOp::NotEq => {
+            let eq = array_ops::array_equals(&l, &r)?;
+            // NULL equality → NULL; invert the bool
+            match eq {
+                Value::Bool(b) => Ok(Value::Bool(!b)),
+                Value::Null => Ok(Value::Null),
+                _ => unreachable!("array_equals returns Bool or Null"),
+            }
+        }
+
+        // Containment: @> and <@
+        BinaryOp::JsonContains => array_ops::array_contains(&l, &r),
+        BinaryOp::JsonContainedBy => array_ops::array_contained_by(&l, &r),
+
+        // Overlap: &&
+        BinaryOp::ArrayOverlap => array_ops::array_overlap(&l, &r),
+
+        // Concatenation: ||
+        BinaryOp::Concat => {
+            if matches!(&r, Value::Array(_)) {
+                array_ops::array_concat(&l, &r)
+            } else {
+                // element || array → prepend element to array
+                array_ops::array_concat_element_to_array(&r, &l)
+            }
+        }
+
+        // All other operators: type error on array
+        _ => Err(DbError::TypeMismatch {
+            expected: "array operator".into(),
+            got: format!("{} on Array", op_variant_name(&op)),
+        }),
+    }
+}
+
+fn op_variant_name(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "Add",
+        BinaryOp::Sub => "Sub",
+        BinaryOp::Mul => "Mul",
+        BinaryOp::Div => "Div",
+        BinaryOp::Mod => "Mod",
+        BinaryOp::Eq => "Eq",
+        BinaryOp::NotEq => "NotEq",
+        BinaryOp::Lt => "Lt",
+        BinaryOp::LtEq => "LtEq",
+        BinaryOp::Gt => "Gt",
+        BinaryOp::GtEq => "GtEq",
+        BinaryOp::And => "And",
+        BinaryOp::Or => "Or",
+        BinaryOp::Xor => "Xor",
+        BinaryOp::Concat => "Concat",
+        BinaryOp::NullSafe => "NullSafe",
+        BinaryOp::IntDiv => "IntDiv",
+        BinaryOp::BitAnd => "BitAnd",
+        BinaryOp::BitOr => "BitOr",
+        BinaryOp::BitXor => "BitXor",
+        BinaryOp::ShiftLeft => "ShiftLeft",
+        BinaryOp::ShiftRight => "ShiftRight",
+        BinaryOp::Regexp => "Regexp",
+        BinaryOp::JsonSub => "JsonSub",
+        BinaryOp::JsonContains => "JsonContains",
+        BinaryOp::JsonContainedBy => "JsonContainedBy",
+        BinaryOp::JsonExists => "JsonExists",
+        BinaryOp::JsonbPathExists => "JsonbPathExists",
+        BinaryOp::JsonbPathMatch => "JsonbPathMatch",
+        BinaryOp::JsonExistsAny => "JsonExistsAny",
+        BinaryOp::JsonExistsAll => "JsonExistsAll",
+        BinaryOp::JsonPathExtract => "JsonPathExtract",
+        BinaryOp::JsonPathExtractText => "JsonPathExtractText",
+        BinaryOp::JsonPathDelete => "JsonPathDelete",
+        BinaryOp::ArrayOverlap => "ArrayOverlap",
+    }
+}
+
 // ── Binary evaluation ─────────────────────────────────────────────────────────
 
 /// Evaluates a binary op on already-evaluated operands (non-AND/OR/XOR).
@@ -161,6 +247,13 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
             },
         };
         return Ok(Value::Bool(result));
+    }
+
+    // ── Array operator dispatch (Phase 20.4, Step 5) ──────────────────────────
+    // Array operators handle NULL internally and follow SQL 3VL semantics,
+    // so we intercept BEFORE the generic NULL propagation check.
+    if matches!(&l, Value::Array(_)) {
+        return eval_binary_array(op, l, r);
     }
 
     // NULL propagation for all other binary ops.
@@ -187,10 +280,14 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         | BinaryOp::GtEq => eval_comparison(op, l, r),
 
         // `||` is polymorphic (Phase 11.18a): JSONB on both sides → PG
-        // concat semantics; otherwise string concatenation (MySQL `||`
-        // default). NULL propagation already handled above.
+        // concat semantics; element || array → array with prepended element;
+        // array || element → array with appended element.
+        // NULL propagation already handled above.
         BinaryOp::Concat => match (&l, &r) {
             (Value::Jsonb(a), Value::Jsonb(b)) => eval_jsonb_concat(a, b),
+            (Value::Array(_), Value::Array(_)) => array_ops::array_concat(&l, &r),
+            (Value::Array(_), elem) => array_ops::array_concat_element_to_array(&l, elem),
+            (elem, Value::Array(_)) => array_ops::array_concat_element_to_array(&r, elem),
             _ => eval_concat(l, r),
         },
 
@@ -262,6 +359,14 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         BinaryOp::JsonPathExtract => eval_jsonb_path_extract(l, r, false),
         BinaryOp::JsonPathExtractText => eval_jsonb_path_extract(l, r, true),
         BinaryOp::JsonPathDelete => eval_jsonb_path_delete(l, r),
+
+        // Array overlap operator (Phase 20.4, Step 5)
+        // Only valid when LHS is Value::Array; otherwise type error.
+        // (If LHS were Array, eval_binary_array would have handled it already.)
+        BinaryOp::ArrayOverlap => Err(DbError::TypeMismatch {
+            expected: "Array".into(),
+            got: l.variant_name().into(),
+        }),
     }
 }
 

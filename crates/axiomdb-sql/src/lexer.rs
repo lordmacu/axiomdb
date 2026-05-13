@@ -612,6 +612,9 @@ pub enum Token<'src> {
     /// `&` — bitwise AND.
     #[token("&")]
     Amp,
+    /// `&&` — array overlap (Phase 20.4, Step 5). Must appear after `&`.
+    #[token("&&")]
+    AmpAmp,
     /// `|` — bitwise OR. Must appear after `||` so logos picks the longer match.
     #[token("|")]
     Pipe,

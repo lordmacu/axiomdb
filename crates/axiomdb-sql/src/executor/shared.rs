@@ -284,6 +284,14 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 collect_column_refs(e, mask);
             }
         }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            collect_column_refs(array, mask);
+            collect_column_refs(index, mask);
+            if let Some(s) = slice {
+                collect_column_refs(s, mask);
+            }
+        }
     }
 }
 

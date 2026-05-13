@@ -304,6 +304,12 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
             let right = parse_bitor(p)?;
             Ok(binop(BinaryOp::JsonContainedBy, left, right))
         }
+        // Phase 20.4, Step 5: `&&` array overlap — same level as `@>` / `<@`.
+        Token::AmpAmp if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::ArrayOverlap, left, right))
+        }
         // Phase 11.21b: `@?` in infix position = JSONB JSONPath exists.
         Token::JsonbPathExists if !negated => {
             p.advance();
@@ -538,7 +544,67 @@ fn parse_unary(p: &mut Parser) -> Result<Expr, DbError> {
             operand: Box::new(operand),
         });
     }
-    parse_atom(p)
+    parse_postfix(p)
+}
+
+// ── Postfix operators: subscript, field access ────────────────────────────────
+
+/// Parses postfix operators applied to an expression:
+/// - `expr[index]` — array subscript (1-indexed)
+/// - `expr[lo:hi]` — array slice
+/// - `expr[lo:hi]` with only one bound — partial slice
+///
+/// This is called after the base expression has been parsed.
+fn parse_postfix(p: &mut Parser) -> Result<Expr, DbError> {
+    let mut expr = parse_atom(p)?;
+
+    // Handle subscript: expr[ index or lo:hi ]
+    while p.eat(&Token::LBracket) {
+        // Check if this is a slice: [lo:hi] or [:hi] or [lo:]
+        if matches!(p.peek(), Token::Colon) || matches!(p.peek_at(1), Token::Colon) {
+            // Slice syntax: [lo:hi], [:hi], or [lo:]
+            // Note: when we enter here, we've already consumed the '['
+            let lo = if matches!(p.peek(), Token::Colon) {
+                // [:hi] — lo defaults to 1
+                Some(Box::new(Expr::Literal(Value::Int(1))))
+            } else {
+                // [lo:...] — parse lo
+                Some(Box::new(parse_expr(p)?))
+            };
+
+            // Expect and consume ':'
+            p.expect(&Token::Colon)?;
+
+            // Parse hi
+            let hi = if matches!(p.peek(), Token::RBracket) {
+                // [lo:] — hi defaults to array length (we'll use a large number)
+                // Since we don't know the length at parse time, we use a sentinel.
+                // The evaluator will handle clamping.
+                Some(Box::new(Expr::Literal(Value::BigInt(i64::MAX))))
+            } else {
+                Some(Box::new(parse_expr(p)?))
+            };
+
+            p.expect(&Token::RBracket)?;
+
+            expr = Expr::Subscript {
+                array: Box::new(expr),
+                index: lo.unwrap_or_else(|| Box::new(Expr::Literal(Value::Int(1)))),
+                slice: hi,
+            };
+        } else {
+            // Regular subscript: [index]
+            let index = parse_expr(p)?;
+            p.expect(&Token::RBracket)?;
+            expr = Expr::Subscript {
+                array: Box::new(expr),
+                index: Box::new(index),
+                slice: None,
+            };
+        }
+    }
+
+    Ok(expr)
 }
 
 // ── Atom ──────────────────────────────────────────────────────────────────────
