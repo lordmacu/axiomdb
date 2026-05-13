@@ -900,12 +900,45 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Date => "DATE",
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
-        ColumnType::Array => "TEXT[]", // placeholder; full display deferred to Step 3
+        ColumnType::Array => "ARRAY", // actual reconstruction done in column_sql_type_display
+    }
+}
+
+/// Returns the SQL type name string for a scalar (non-array) column type.
+fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
+    match ct {
+        ColumnType::Bool => "BOOL",
+        ColumnType::Int => "INT",
+        ColumnType::BigInt => "BIGINT",
+        ColumnType::Float => "REAL",
+        ColumnType::Decimal => "DECIMAL",
+        ColumnType::Text => "TEXT",
+        ColumnType::Json => "JSON",
+        ColumnType::Jsonb => "JSONB",
+        ColumnType::Bytes => "BYTES",
+        ColumnType::Date => "DATE",
+        ColumnType::Timestamp => "TIMESTAMP",
+        ColumnType::Uuid => "UUID",
+        ColumnType::Array => "ARRAY",
     }
 }
 
 fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
-    col.enum_type_name
-        .clone()
-        .unwrap_or_else(|| column_type_to_sql_name(col.col_type).into())
+    if let Some(ref enum_name) = col.enum_type_name {
+        return enum_name.clone();
+    }
+
+    // Handle array types: reconstruct e.g. "INT[]", "TEXT[][]", "FLOAT[3][3]"
+    if col.col_type == ColumnType::Array {
+        let element_name = col
+            .array_element_type
+            .map(scalar_type_to_sql_name)
+            .unwrap_or("TEXT");
+        let ndims = col.array_ndims.unwrap_or(1) as usize;
+        // For now, we reconstruct unbounded arrays (no size hints stored yet)
+        // Size hints would come from col.array_size_hints if we add that field
+        format!("{}{}", element_name, "[]".repeat(ndims))
+    } else {
+        column_type_to_sql_name(col.col_type).into()
+    }
 }

@@ -255,14 +255,14 @@ fn generate_is_columns_rows(
         for t in tables {
             let columns = reader.list_columns(t.id)?;
             for col in &columns {
-                let data_type_str = col
-                    .enum_type_name
-                    .as_deref()
-                    .unwrap_or_else(|| column_type_to_is_data_type(col.col_type));
-                let col_type_str = col
-                    .enum_type_name
-                    .as_deref()
-                    .unwrap_or_else(|| column_type_to_column_type_str(col.col_type));
+                let data_type_str = match col.enum_type_name.as_deref() {
+                    Some(name) => name.to_string(),
+                    None => column_type_to_is_data_type(col),
+                };
+                let col_type_str = match col.enum_type_name.as_deref() {
+                    Some(name) => name.to_string(),
+                    None => column_type_to_column_type_str(col),
+                };
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
                 let extra = if col.auto_increment {
                     "auto_increment"
@@ -287,7 +287,7 @@ fn generate_is_columns_rows(
                     Value::BigInt((col.col_idx as i64) + 1),               // ORDINAL_POSITION
                     Value::Null,                                           // COLUMN_DEFAULT
                     Value::Text(is_nullable.into()),                       // IS_NULLABLE
-                    Value::Text(data_type_str.into()),                     // DATA_TYPE
+                    Value::Text(data_type_str),                            // DATA_TYPE
                     char_max_len,                     // CHARACTER_MAXIMUM_LENGTH
                     Value::Null,                      // CHARACTER_OCTET_LENGTH
                     num_prec,                         // NUMERIC_PRECISION
@@ -299,7 +299,7 @@ fn generate_is_columns_rows(
                     is_effective_column_collation(col, &t, db.default_collation.as_deref())
                         .map(|name| Value::Text(name.into()))
                         .unwrap_or(Value::Null), // COLLATION_NAME
-                    Value::Text(col_type_str.into()), // COLUMN_TYPE
+                    Value::Text(col_type_str), // COLUMN_TYPE
                     Value::Text("".into()),           // COLUMN_KEY
                     Value::Text(extra.into()),        // EXTRA
                     Value::Text("select,insert,update,references".into()), // PRIVILEGES
@@ -553,9 +553,13 @@ fn generate_is_statistics_rows(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Maps a `ColumnType` to the MySQL `DATA_TYPE` string shown in IS.COLUMNS.
-fn column_type_to_is_data_type(ct: ColumnType) -> &'static str {
-    match ct {
+/// Maps a `ColumnDef` to the MySQL `DATA_TYPE` string shown in IS.COLUMNS.
+/// For arrays, returns "array" per PG parity.
+fn column_type_to_is_data_type(col: &axiomdb_catalog::ColumnDef) -> String {
+    if col.col_type == ColumnType::Array {
+        return "array".to_string();
+    }
+    match col.col_type {
         ColumnType::Bool => "tinyint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
@@ -568,8 +572,9 @@ fn column_type_to_is_data_type(ct: ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar",
-        ColumnType::Array => "varchar", // arrays serialized as text over wire
+        ColumnType::Array => "array",
     }
+    .to_string()
 }
 
 /// `information_schema.VIEWS` — one row per regular view.
@@ -603,8 +608,40 @@ fn generate_is_views_rows(
     Ok(rows)
 }
 
-/// Maps a `ColumnType` to the MySQL `COLUMN_TYPE` string shown in IS.COLUMNS.
-fn column_type_to_column_type_str(ct: ColumnType) -> &'static str {
+/// Maps a `ColumnDef` to the MySQL `COLUMN_TYPE` string shown in IS.COLUMNS.
+/// For arrays, reconstructs the full type e.g. "int[]", "text[][]".
+fn column_type_to_column_type_str(col: &axiomdb_catalog::ColumnDef) -> String {
+    // Handle array types: reconstruct e.g. "INT[]", "TEXT[][]"
+    if col.col_type == ColumnType::Array {
+        let element_name = col
+            .array_element_type
+            .map(scalar_type_name_for_is)
+            .unwrap_or("text");
+        let ndims = col.array_ndims.unwrap_or(1) as usize;
+        return format!("{}{}", element_name, "[]".repeat(ndims));
+    }
+    scalar_type_to_column_type_str(col.col_type).to_string()
+}
+
+fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
+    match ct {
+        ColumnType::Bool => "tinyint",
+        ColumnType::Int => "int",
+        ColumnType::BigInt => "bigint",
+        ColumnType::Float => "double",
+        ColumnType::Decimal => "decimal",
+        ColumnType::Text => "text",
+        ColumnType::Json => "json",
+        ColumnType::Jsonb => "jsonb",
+        ColumnType::Bytes => "blob",
+        ColumnType::Date => "date",
+        ColumnType::Timestamp => "datetime",
+        ColumnType::Uuid => "varchar",
+        ColumnType::Array => "array",
+    }
+}
+
+fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "tinyint(1)",
         ColumnType::Int => "int",
@@ -618,6 +655,6 @@ fn column_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar(36)",
-        ColumnType::Array => "text",
+        ColumnType::Array => "array",
     }
 }

@@ -14,6 +14,21 @@ use crate::lexer::Token;
 use crate::parser::expr::parse_expr;
 use crate::parser::Parser;
 
+/// Eat ARRAY if it appears as either the keyword token or an identifier.
+fn eat_array_tok(p: &mut Parser<'_>) -> bool {
+    match p.peek() {
+        Token::Array => {
+            p.pos += 1;
+            true
+        }
+        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("ARRAY") => {
+            p.pos += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Parses an optional `WITH [CONDITIONAL|UNCONDITIONAL] [ARRAY] WRAPPER`
 /// or `WITHOUT [ARRAY] WRAPPER` clause. Returns `None` if neither keyword
 /// is present (so the caller can keep its own default — usually `Without`
@@ -29,7 +44,7 @@ pub(crate) fn parse_optional_wrapper(
             let _ = p.eat_ident_ci("UNCONDITIONAL");
             SqlJsonWrapper::Unconditional
         };
-        let _ = p.eat_ident_ci("ARRAY");
+        let _ = eat_array_tok(p);
         if !p.eat_ident_ci("WRAPPER") {
             return Err(DbError::ParseError {
                 message: "expected WRAPPER after WITH [CONDITIONAL|UNCONDITIONAL] [ARRAY]".into(),
@@ -39,7 +54,7 @@ pub(crate) fn parse_optional_wrapper(
         return Ok(Some(kind));
     }
     if p.eat_ident_ci("WITHOUT") {
-        let _ = p.eat_ident_ci("ARRAY");
+        let _ = eat_array_tok(p);
         if !p.eat_ident_ci("WRAPPER") {
             return Err(DbError::ParseError {
                 message: "expected WRAPPER after WITHOUT [ARRAY]".into(),

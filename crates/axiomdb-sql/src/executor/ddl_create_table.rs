@@ -18,6 +18,18 @@ fn generated_column_constraint(
     Ok(generated)
 }
 
+/// Extracts the leaf scalar data type from a potentially-array DataType.
+///
+/// For `DataType::Array(Box::new(DataType::Int))`, returns `DataType::Int`.
+/// For `DataType::Array(Box::new(DataType::Array(Box::new(DataType::Text))))`, returns `DataType::Text`.
+/// For non-array types, returns the type unchanged.
+fn extract_leaf_data_type(dt: &axiomdb_types::DataType) -> axiomdb_types::DataType {
+    match dt {
+        axiomdb_types::DataType::Array(inner) => extract_leaf_data_type(inner),
+        other => other.clone(),
+    }
+}
+
 fn validate_create_table_generated_columns(stmt: &CreateTableStmt) -> Result<(), DbError> {
     let mut generated_cols = std::collections::HashSet::new();
     let mut base_cols = std::collections::HashSet::new();
@@ -397,7 +409,6 @@ fn execute_create_table(
     let mut inline_fk_specs: Vec<InlineFkSpec> = Vec::new();
 
     for (i, col_def) in stmt.columns.iter().enumerate() {
-        let col_type = datatype_to_column_type(&col_def.data_type)?;
         let type_len = col_def.type_len;
         let nullable = !col_def
             .constraints
@@ -445,6 +456,17 @@ fn execute_create_table(
             .map(|(_, kind)| matches!(kind, GeneratedColumnKind::Stored))
             .unwrap_or(false);
 
+        // Handle array columns: extract leaf element type and ndims
+        let (col_type, array_element_type, array_ndims) = if let Some(ndims) = col_def.array_ndims {
+            // This is an array column
+            let leaf_type = extract_leaf_data_type(&col_def.data_type);
+            let element_ct = datatype_to_column_type(&leaf_type)?;
+            (ColumnType::Array, Some(element_ct), Some(ndims))
+        } else {
+            let ct = datatype_to_column_type(&col_def.data_type)?;
+            (ct, None, None)
+        };
+
         writer.create_column(CatalogColumnDef {
             table_id,
             col_idx: i as u16,
@@ -460,8 +482,8 @@ fn execute_create_table(
             collation: col_def.collation.clone(),
             generated_stored,
             enum_type_name: enum_type_names[i].clone(),
-            array_element_type: None,
-            array_ndims: None,
+            array_element_type,
+            array_ndims,
         })?;
     }
 
@@ -1525,8 +1547,8 @@ fn execute_create_table_like(
             collation: col.collation.clone(),
             generated_stored: col.generated_stored,
             enum_type_name: col.enum_type_name.clone(),
-            array_element_type: None,
-            array_ndims: None,
+            array_element_type: col.array_element_type,
+            array_ndims: col.array_ndims,
         })?;
     }
 

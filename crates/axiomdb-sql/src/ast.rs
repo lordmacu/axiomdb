@@ -251,6 +251,12 @@ pub struct ColumnDef {
     /// `true` when the column was declared `CHAR(N)` (fixed-length).
     /// `false` for `VARCHAR(N)` and `TEXT`.
     pub is_char: bool,
+    /// Number of array dimensions (1-6). `None` or `0` means not an array.
+    /// Phase 20.4: populated by `parse_data_type()` when `[]` brackets or `ARRAY` keyword is present.
+    pub array_ndims: Option<u8>,
+    /// Optional size hints per dimension, e.g. `[Some(3), Some(3)]` for `FLOAT[3][3]`.
+    /// `None` means unbounded dimension. Phase 20.4: size hints are parsed but not enforced.
+    pub array_size_hints: Vec<Option<u16>>,
 }
 
 /// Inline column constraint in a column definition.
@@ -1533,6 +1539,8 @@ mod tests {
                     collation: None,
                     type_len: 0,
                     is_char: false,
+                    array_ndims: None,
+                    array_size_hints: vec![],
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -1542,6 +1550,8 @@ mod tests {
                     collation: None,
                     type_len: 0,
                     is_char: false,
+                    array_ndims: None,
+                    array_size_hints: vec![],
                 },
                 ColumnDef {
                     name: "age".into(),
@@ -1551,6 +1561,8 @@ mod tests {
                     collation: None,
                     type_len: 0,
                     is_char: false,
+                    array_ndims: None,
+                    array_size_hints: vec![],
                 },
             ],
             table_constraints: vec![],
@@ -1575,6 +1587,8 @@ mod tests {
                     collation: None,
                     type_len: 0,
                     is_char: false,
+                    array_ndims: None,
+                    array_size_hints: vec![],
                 },
                 ColumnDef {
                     name: "user_id".into(),
@@ -1584,6 +1598,8 @@ mod tests {
                     collation: None,
                     type_len: 0,
                     is_char: false,
+                    array_ndims: None,
+                    array_size_hints: vec![],
                 },
             ],
             table_constraints: vec![
@@ -1746,6 +1762,8 @@ mod tests {
                     collation: None,
                     type_len: 0,
                     is_char: false,
+                    array_ndims: None,
+                    array_size_hints: vec![],
                 }),
                 AlterTableOp::DropColumn {
                     name: "legacy_col".into(),
@@ -1857,6 +1875,8 @@ mod tests {
             collation: None,
             type_len: 0,
             is_char: false,
+            array_ndims: None,
+            array_size_hints: vec![],
         };
         assert_eq!(col_def.name, "balance");
     }
