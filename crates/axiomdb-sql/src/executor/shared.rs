@@ -311,6 +311,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Uuid => Ok(ColumnType::Uuid),
         DataType::Decimal => Ok(ColumnType::Decimal),
         DataType::Date => Ok(ColumnType::Date),
+        DataType::Array(_elem) => Ok(ColumnType::Array),
     }
 }
 
@@ -329,6 +330,11 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Uuid => DataType::Uuid,
         ColumnType::Decimal => DataType::Decimal,
         ColumnType::Date => DataType::Date,
+        ColumnType::Array => {
+            // Array element type is resolved from ColumnDef.array_element_type
+            // at a higher layer. For simple type conversion, default to Text[].
+            DataType::Array(Box::new(DataType::Text))
+        }
     }
 }
 
@@ -349,6 +355,10 @@ fn datatype_of_value(v: &Value) -> DataType {
         Value::Date(_) => DataType::Date,
         Value::Timestamp(_) => DataType::Timestamp,
         Value::Uuid(_) => DataType::Uuid,
+        Value::Array(_) => {
+            // Default to Text[] for computed expressions prior to full array support
+            DataType::Array(Box::new(DataType::Text))
+        }
     }
 }
 

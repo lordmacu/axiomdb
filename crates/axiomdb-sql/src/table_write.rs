@@ -558,7 +558,7 @@ fn toast_encode(
                 let s = if *lz4 { TOAST_SENTINEL_LZ4 } else { TOAST_SENTINEL_RAW };
                 axiomdb_types::codec::encode_toast_pointer(&mut buf, s, *page_id, *raw_len);
             }
-            ToastCol::Inline => match (col_types[i], v) {
+            ToastCol::Inline => match (col_types[i].clone(), v) {
                 (DataType::Bool, Value::Bool(b)) => buf.push(u8::from(*b)),
                 (DataType::Int, Value::Int(n)) => buf.extend_from_slice(&n.to_le_bytes()),
                 (DataType::BigInt, Value::BigInt(n)) => buf.extend_from_slice(&n.to_le_bytes()),

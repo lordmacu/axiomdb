@@ -153,7 +153,9 @@ pub(crate) fn eval_sql_json_query<R: SubqueryRunner>(
                                     _ => unreachable!(),
                                 };
                                 match returning {
-                                    Some(dt) => coerce(Value::Text(s), *dt, CoercionMode::Strict),
+                                    Some(dt) => {
+                                        coerce(Value::Text(s), dt.clone(), CoercionMode::Strict)
+                                    }
                                     None => Ok(Value::Text(s)),
                                 }
                             } else {
@@ -415,7 +417,7 @@ fn apply_on_behavior<R: SubqueryRunner>(
         SqlJsonOnBehavior::Default(expr) => {
             let v = crate::eval::eval_with(expr, row, sq)?;
             match returning {
-                Some(dt) => coerce(v, *dt, CoercionMode::Strict),
+                Some(dt) => coerce(v, dt.clone(), CoercionMode::Strict),
                 None => Ok(v),
             }
         }
@@ -469,7 +471,7 @@ fn scalar_to_value(sj: &serde_json::Value, returning: Option<&DataType>) -> Resu
         }
     };
     match returning {
-        Some(dt) => coerce(base, *dt, CoercionMode::Strict),
+        Some(dt) => coerce(base, dt.clone(), CoercionMode::Strict),
         None => match base {
             // Default: return as TEXT for JSON_VALUE.
             Value::Null => Ok(Value::Null),

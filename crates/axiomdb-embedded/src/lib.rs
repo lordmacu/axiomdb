@@ -640,6 +640,10 @@ mod ffi {
                 );
                 CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()))
             }
+            Value::Array(_elems) => {
+                // Array FFI deferred to Step 10.
+                CellValue::Text(CString::new("{}").unwrap_or_else(|_| CString::new("").unwrap()))
+            }
         }
     }
 

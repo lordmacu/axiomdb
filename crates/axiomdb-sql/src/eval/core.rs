@@ -202,7 +202,7 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         // ── CAST ──────────────────────────────────────────────────────────────
         Expr::Cast { expr, target } => {
             let v = eval(expr, row)?;
-            coerce(v, *target, CoercionMode::Strict)
+            coerce(v, target.clone(), CoercionMode::Strict)
         }
 
         // ── CASE WHEN ─────────────────────────────────────────────────────────
@@ -382,6 +382,11 @@ impl Hash for HashableValue {
             Value::Date(d) => d.hash(state),
             Value::Timestamp(t) => t.hash(state),
             Value::Uuid(u) => u.hash(state),
+            Value::Array(elems) => {
+                for elem in elems {
+                    HashableValue(elem.clone()).hash(state);
+                }
+            }
         }
     }
 }
@@ -631,7 +636,7 @@ pub fn eval_with<R: SubqueryRunner>(
 
         Expr::Cast { expr, target } => {
             let v = eval_with(expr, row, sq)?;
-            coerce(v, *target, CoercionMode::Strict)
+            coerce(v, target.clone(), CoercionMode::Strict)
         }
 
         Expr::Case {

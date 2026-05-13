@@ -270,6 +270,7 @@ pub enum ColumnType {
     Jsonb = 10,    // binary JSONB blob (Phase 11.16)
     Decimal = 11,  // i128 mantissa + u8 scale
     Date = 12,     // i32 days since 1970-01-01
+    Array = 13,    // PostgreSQL array (Phase 20.4)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -289,6 +290,7 @@ impl TryFrom<u8> for ColumnType {
             10 => Ok(Self::Jsonb),
             11 => Ok(Self::Decimal),
             12 => Ok(Self::Date),
+            13 => Ok(Self::Array),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,

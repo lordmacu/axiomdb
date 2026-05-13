@@ -66,6 +66,8 @@ pub fn column_defs_for_values(vc: &ValuesClause) -> Vec<ColumnDef> {
                 collation: None,
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             }
         })
         .collect()
@@ -79,6 +81,7 @@ fn datatype_to_column_type(dt: DataType) -> ColumnType {
         DataType::Text => ColumnType::Text,
         DataType::Json => ColumnType::Json,
         DataType::Jsonb => ColumnType::Jsonb,
+        DataType::Array(_) => ColumnType::Array,
         _ => ColumnType::Text,
     }
 }
@@ -102,6 +105,7 @@ fn value_type(v: &Value) -> DataType {
         Value::Text(_) => DataType::Text,
         Value::Json(_) => DataType::Json,
         Value::Jsonb(_) => DataType::Jsonb,
+        Value::Array(_) => DataType::Array(Box::new(DataType::Text)),
         _ => DataType::Text,
     }
 }

@@ -568,6 +568,7 @@ fn column_type_to_is_data_type(ct: ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar",
+        ColumnType::Array => "varchar", // arrays serialized as text over wire
     }
 }
 
@@ -617,5 +618,6 @@ fn column_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar(36)",
+        ColumnType::Array => "text",
     }
 }

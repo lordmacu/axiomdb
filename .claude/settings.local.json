@@ -20,7 +20,16 @@
       "Bash(cargo check:*)",
       "Bash(git stash:*)",
       "Bash(git -c user.name=lordmacu -c user.email=lordmacu@users.noreply.github.com commit -m ':*)",
-      "Bash(grep -rn \"IS DISTINCT FROM\\\\|is_distinct_from\\\\|IS_NOT_DISTINCT\" /home/familia/axiomdb/research/postgres/src/backend/parser/*.y)"
+      "Bash(grep -rn \"IS DISTINCT FROM\\\\|is_distinct_from\\\\|IS_NOT_DISTINCT\" /home/familia/axiomdb/research/postgres/src/backend/parser/*.y)",
+      "Bash(limactl shell *)",
+      "Bash(limactl start *)",
+      "Bash(limactl list *)",
+      "Bash(ssh -o StrictHostKeyChecking=no lima-axiomdb \"cd ~/nexusdb && CARGO_TARGET_DIR=/home/cristian.guest/axiomdb-target rtk cargo build -p axiomdb-sql 2>&1 | tail -20\")",
+      "Bash(ssh -o StrictHostKeyChecking=no -p 56842 cristian.guest@127.0.0.1 \"cd ~/nexusdb && CARGO_TARGET_DIR=/home/cristian.guest/axiomdb-target rtk cargo build -p axiomdb-sql 2>&1 | tail -20\")",
+      "Bash(pkill axiomdb-server *)"
+    ],
+    "additionalDirectories": [
+      "/Users/cristian/nexusdb/docs"
     ]
   }
 }

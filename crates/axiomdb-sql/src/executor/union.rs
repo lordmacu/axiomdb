@@ -213,6 +213,11 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                 key.extend_from_slice(b);
                 key.push(0);
             }
+            Value::Array(_elems) => {
+                // Array dedup key deferred to Step 5 (operators).
+                key.push(13);
+                key.push(0);
+            }
         }
     }
     key

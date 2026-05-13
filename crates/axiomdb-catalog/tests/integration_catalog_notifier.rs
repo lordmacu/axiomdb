@@ -148,6 +148,8 @@ fn test_create_column_fires_no_event() {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         })
         .unwrap();
         let count_after_column = events.lock().unwrap().len();

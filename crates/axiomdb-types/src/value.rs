@@ -56,6 +56,9 @@ pub enum Value {
     /// SQL JSONB — binary pre-parsed JSONB blob (Phase 11.16).
     /// Allows O(log k) key access without re-parsing UTF-8 text.
     Jsonb(std::sync::Arc<Vec<u8>>),
+    /// SQL array value — ordered collection of values (Phase 20.4).
+    /// All elements share the same array element type (enforced at schema level).
+    Array(Vec<Value>),
 }
 
 impl Value {
@@ -75,6 +78,7 @@ impl Value {
             Self::Uuid(_) => "Uuid",
             Self::Json(_) => "Json",
             Self::Jsonb(_) => "Jsonb",
+            Self::Array(_) => "Array",
         }
     }
 
@@ -129,6 +133,17 @@ impl fmt::Display for Value {
                     u64::from_be_bytes(buf)
                 }
             ),
+            // PG-compatible array text format: {elem1,elem2,...}
+            Self::Array(elems) => {
+                write!(f, "{{")?;
+                for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{elem}")?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -231,5 +246,59 @@ mod tests {
         assert_ne!(Value::Int(1), Value::Int(2));
         // NaN IEEE 754: NaN != NaN
         assert_ne!(Value::Real(f64::NAN), Value::Real(f64::NAN));
+    }
+
+    // ── Phase 20.4 Array tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_variant_name() {
+        let arr = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(arr.variant_name(), "Array");
+    }
+
+    #[test]
+    fn test_array_variant_basic() {
+        let arr = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        if let Value::Array(elems) = &arr {
+            assert_eq!(elems.len(), 3);
+            assert_eq!(elems[0], Value::Int(1));
+            assert_eq!(elems[1], Value::Int(2));
+            assert_eq!(elems[2], Value::Int(3));
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn test_array_display() {
+        let arr = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let s = format!("{}", arr);
+        assert_eq!(s, "{1,2,3}");
+    }
+
+    #[test]
+    fn test_array_display_empty() {
+        let arr: Value = Value::Array(vec![]);
+        assert_eq!(format!("{}", arr), "{}");
+    }
+
+    #[test]
+    fn test_array_display_mixed() {
+        let arr = Value::Array(vec![
+            Value::Text("hello".into()),
+            Value::Int(42),
+            Value::Null,
+        ]);
+        let s = format!("{}", arr);
+        assert_eq!(s, "{hello,42,NULL}");
+    }
+
+    #[test]
+    fn test_array_equality() {
+        let a = Value::Array(vec![Value::Int(1), Value::Int(2)]);
+        let b = Value::Array(vec![Value::Int(1), Value::Int(2)]);
+        let c = Value::Array(vec![Value::Int(1), Value::Int(3)]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

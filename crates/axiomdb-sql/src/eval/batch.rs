@@ -157,6 +157,7 @@ impl BatchPredicate {
                 let lit_val = f64::from_le_bytes(lit_bytes.try_into().unwrap_or_default());
                 cmp_f64(col_val, lit_val, check.op)
             }
+            DataType::Array(_) => false,
             _ => false, // unsupported type — should not happen (try_compile rejects)
         }
     }
@@ -309,11 +310,11 @@ impl BatchPredicate {
     fn locate_column_runtime(&self, row_data: &[u8], target_col: usize) -> Option<usize> {
         let mut offset = self.bitmap_len;
         let bitmap = &row_data[..self.bitmap_len];
-        for (i, &dt) in self.schema[..target_col].iter().enumerate() {
+        for (i, dt) in self.schema[..target_col].iter().enumerate() {
             if is_null_bit(bitmap, i) {
                 continue; // NULL columns occupy zero bytes
             }
-            match fixed_size(dt) {
+            match fixed_size(dt.clone()) {
                 Some(sz) => offset += sz,
                 None => {
                     // Variable-length: read u24 length prefix
@@ -385,10 +386,10 @@ fn collect_checks(expr: &Expr, schema: &[DataType], out: &mut Vec<SingleCheck>) 
             if col_idx >= schema.len() {
                 return None;
             }
-            let dt = schema[col_idx];
+            let dt = schema[col_idx].clone();
 
             // Encode literal to LE bytes.
-            let (literal_bytes, literal_len) = encode_literal(literal, dt)?;
+            let (literal_bytes, literal_len) = encode_literal(literal, dt.clone())?;
 
             out.push(SingleCheck {
                 col_idx,
@@ -462,7 +463,7 @@ fn precompute_offsets(pred: &mut BatchPredicate) {
     for check in &mut pred.checks {
         let mut offset = pred.bitmap_len;
         let mut all_fixed = true;
-        for (i, &dt) in pred.schema[..check.col_idx].iter().enumerate() {
+        for (i, dt) in pred.schema[..check.col_idx].iter().enumerate() {
             // NULL columns still occupy zero bytes — but we can't know at
             // compile time which rows have NULLs. If any preceding column is
             // nullable, we can't precompute. However, for the common case of
@@ -481,7 +482,7 @@ fn precompute_offsets(pred: &mut BatchPredicate) {
             // falls back to runtime scanning. We detect this by checking
             // the bitmap at runtime before using the precomputed offset.
             let _ = i; // suppress unused warning
-            match fixed_size(dt) {
+            match fixed_size(dt.clone()) {
                 Some(sz) => offset += sz,
                 None => {
                     all_fixed = false;
@@ -513,7 +514,8 @@ fn fixed_size(dt: DataType) -> Option<usize> {
         | DataType::Jsonb
         | DataType::Bytes
         | DataType::Decimal
-        | DataType::Uuid => None,
+        | DataType::Uuid
+        | DataType::Array(_) => None,
     }
 }
 

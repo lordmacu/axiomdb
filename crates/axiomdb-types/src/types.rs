@@ -13,7 +13,7 @@
 /// Does not carry type parameters (precision, scale, max-length) yet —
 /// those are added in Phase 4.3 when the DDL parser gains `DECIMAL(p,s)`
 /// and `VARCHAR(n)` syntax.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DataType {
     /// SQL BOOLEAN — stored as 1 byte (0x00 / 0x01).
     Bool,
@@ -42,30 +42,82 @@ pub enum DataType {
     /// SQL JSONB — stored as u24 LE length prefix + binary JSONB blob (Phase 11.16).
     /// O(log k) key access without re-parsing. Binary format: see jsonb.rs.
     Jsonb,
+    /// SQL array type — e.g. `INT[]`, `TEXT[][]` (Phase 20.4).
+    /// The inner `DataType` is the element type. Nested arrays use
+    /// `Array(Box::new(Array(Box::new(T))))`.
+    Array(Box<DataType>),
 }
 
 impl DataType {
-    /// Human-readable name used in error messages.
-    pub fn name(self) -> &'static str {
+    /// Human-readable name used in error messages and Display.
+    ///
+    /// For array types, returns `"TYPE[]"` with the inner element type name.
+    /// Nested arrays produce `"TYPE[][]"` etc.
+    pub fn name(&self) -> String {
         match self {
-            Self::Bool => "BOOL",
-            Self::Int => "INT",
-            Self::BigInt => "BIGINT",
-            Self::Real => "REAL",
-            Self::Decimal => "DECIMAL",
-            Self::Text => "TEXT",
-            Self::Bytes => "BYTES",
-            Self::Date => "DATE",
-            Self::Timestamp => "TIMESTAMP",
-            Self::Uuid => "UUID",
-            Self::Json => "JSON",
-            Self::Jsonb => "JSONB",
+            Self::Bool => "BOOL".into(),
+            Self::Int => "INT".into(),
+            Self::BigInt => "BIGINT".into(),
+            Self::Real => "REAL".into(),
+            Self::Decimal => "DECIMAL".into(),
+            Self::Text => "TEXT".into(),
+            Self::Bytes => "BYTES".into(),
+            Self::Date => "DATE".into(),
+            Self::Timestamp => "TIMESTAMP".into(),
+            Self::Uuid => "UUID".into(),
+            Self::Json => "JSON".into(),
+            Self::Jsonb => "JSONB".into(),
+            Self::Array(elem) => format!("{}[]", elem.name()),
         }
     }
 }
 
 impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
+        f.write_str(&self.name())
+    }
+}
+
+// ── Unit tests for Phase 20.4 arrays ─────────────────────────────────────────
+
+#[cfg(test)]
+mod array_type_tests {
+    use super::*;
+
+    #[test]
+    fn datatype_array_variant_display() {
+        let dt = DataType::Array(Box::new(DataType::Int));
+        assert_eq!(format!("{}", dt), "INT[]");
+        let dt2 = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Text))));
+        assert_eq!(format!("{}", dt2), "TEXT[][]");
+    }
+
+    #[test]
+    fn datatype_array_name_1d() {
+        let dt = DataType::Array(Box::new(DataType::Int));
+        assert_eq!(dt.name(), "INT[]");
+    }
+
+    #[test]
+    fn datatype_array_name_2d() {
+        let dt = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Text))));
+        assert_eq!(dt.name(), "TEXT[][]");
+    }
+
+    #[test]
+    fn datatype_array_name_3d() {
+        let dt = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Array(
+            Box::new(DataType::Bool),
+        )))));
+        assert_eq!(dt.name(), "BOOL[][][]");
+    }
+
+    #[test]
+    fn datatype_array_partial_eq() {
+        let a = DataType::Array(Box::new(DataType::Int));
+        let b = DataType::Array(Box::new(DataType::Int));
+        let c = DataType::Array(Box::new(DataType::Text));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

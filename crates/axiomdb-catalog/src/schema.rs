@@ -63,10 +63,11 @@ mod tests {
         }
     }
 
+    // Discriminants 0, 14-254, and 255 are invalid; 1-13 are valid (including Array = 13)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(13).is_err());
+        assert!(ColumnType::try_from(14).is_err());
         assert!(ColumnType::try_from(255).is_err());
     }
 
@@ -328,6 +329,8 @@ mod tests {
             collation: Some("es".into()),
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -352,6 +355,8 @@ mod tests {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -376,6 +381,8 @@ mod tests {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());
@@ -398,6 +405,8 @@ mod tests {
             collation: None,
             generated_stored: true,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -422,6 +431,8 @@ mod tests {
             collation: None,
             generated_stored: false,
             enum_type_name: Some("public.mood".into()),
+            array_element_type: None,
+            array_ndims: None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();

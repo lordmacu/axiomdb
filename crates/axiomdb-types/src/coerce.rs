@@ -66,7 +66,7 @@ mod tests {
             (Value::Uuid([0u8; 16]), DataType::Uuid),
         ];
         for (v, dt) in cases {
-            let result = coerce(v.clone(), *dt, CoercionMode::Strict).unwrap();
+            let result = coerce(v.clone(), dt.clone(), CoercionMode::Strict).unwrap();
             assert_eq!(result, *v, "identity failed for {dt:?}");
         }
     }
@@ -85,7 +85,7 @@ mod tests {
             DataType::Timestamp,
             DataType::Uuid,
         ] {
-            let result = coerce(Value::Null, target, CoercionMode::Strict).unwrap();
+            let result = coerce(Value::Null, target.clone(), CoercionMode::Strict).unwrap();
             assert_eq!(
                 result,
                 Value::Null,
