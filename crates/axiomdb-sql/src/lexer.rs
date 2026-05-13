@@ -396,6 +396,8 @@ pub enum Token<'src> {
     TyJson,
     #[token("JSONB", ignore(ascii_case))]
     TyJsonb,
+    #[token("ARRAY", ignore(ascii_case))]
+    Array,
 
     // ── Miscellaneous ─────────────────────────────────────────────────────────
     #[token("SEPARATOR", ignore(ascii_case))]

@@ -882,7 +882,8 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
                     position: Some(p.current_pos()),
                 });
             }
-            let (target, _, _) = super::ddl::parse_data_type(p)?;
+            let (target, _, _) =
+                super::ddl::parse_data_type(p).map(|p| (p.data_type, p.type_len, p.is_char))?;
             p.expect(&Token::RParen)?;
             return Ok(Expr::Cast {
                 expr: Box::new(expr),
@@ -1130,14 +1131,29 @@ fn parse_convert_type(p: &mut Parser) -> Result<DataType, DbError> {
                     p.advance();
                     Ok(DataType::Text)
                 }
-                _ => super::ddl::parse_data_type(p).map(|(dt, _, _)| dt),
+                _ => super::ddl::parse_data_type(p).map(|p| p.data_type),
             }
         }
-        _ => super::ddl::parse_data_type(p).map(|(dt, _, _)| dt),
+        _ => super::ddl::parse_data_type(p).map(|p| p.data_type),
     }
 }
 
 // ── Phase 11.19a — SQL:2016 JSON query special forms ────────────────────────-
+
+/// Eat ARRAY if it appears as either the keyword token or an identifier.
+fn eat_array_tok(p: &mut Parser<'_>) -> bool {
+    match p.peek() {
+        Token::Array => {
+            p.pos += 1;
+            true
+        }
+        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("ARRAY") => {
+            p.pos += 1;
+            true
+        }
+        _ => false,
+    }
+}
 
 /// Parses the body of `JSON_VALUE(...)`, `JSON_QUERY(...)`, or
 /// `JSON_EXISTS(...)` after the caller has consumed the function name.
@@ -1222,7 +1238,8 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
                 position: Some(p.current_pos()),
             });
         }
-        let (dt, _, _) = super::ddl::parse_data_type(p)?;
+        let (dt, _, _) =
+            super::ddl::parse_data_type(p).map(|p| (p.data_type, p.type_len, p.is_char))?;
         returning = Some(dt);
     }
 
@@ -1247,7 +1264,7 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
             let _ = p.eat_ident_ci("UNCONDITIONAL");
             SqlJsonWrapper::Unconditional
         };
-        let _ = p.eat_ident_ci("ARRAY");
+        let _ = eat_array_tok(p);
         if !p.eat_ident_ci("WRAPPER") {
             return Err(DbError::ParseError {
                 message: "expected WRAPPER after WITH [CONDITIONAL|UNCONDITIONAL] [ARRAY]".into(),
@@ -1262,7 +1279,7 @@ fn parse_sql_json_query(p: &mut Parser, kind: SqlJsonQueryKind) -> Result<Expr, 
                 position: Some(p.current_pos()),
             });
         }
-        let _ = p.eat_ident_ci("ARRAY");
+        let _ = eat_array_tok(p);
         if !p.eat_ident_ci("WRAPPER") {
             return Err(DbError::ParseError {
                 message: "expected WRAPPER after WITHOUT [ARRAY]".into(),

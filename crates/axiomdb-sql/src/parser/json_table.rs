@@ -122,7 +122,8 @@ fn parse_column_def(p: &mut Parser<'_>) -> Result<JsonTableColumn, DbError> {
     }
 
     // `name TYPE [ EXISTS ] PATH '...' [on_empty] [on_error]`.
-    let (ty, _type_len, _is_char) = parse_data_type(p)?;
+    let parsed = parse_data_type(p)?;
+    let ty = parsed.data_type;
     // `EXISTS` is a reserved token (used in `EXISTS(SELECT …)`); `PATH` is
     // not reserved — it's a plain identifier.
     let is_exists = p.eat(&Token::Exists);

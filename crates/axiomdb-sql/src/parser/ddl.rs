@@ -504,7 +504,8 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
-    let (data_type, type_len, is_char, declared_type_name) = parse_column_data_type(p)?;
+    let (data_type, type_len, is_char, declared_type_name, array_ndims, array_size_hints) =
+        parse_column_data_type(p)?;
     let mut constraints = Vec::new();
     let mut collation = None;
 
@@ -619,18 +620,42 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         collation,
         type_len,
         is_char,
+        array_ndims: if array_ndims > 0 {
+            Some(array_ndims)
+        } else {
+            None
+        },
+        array_size_hints,
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_column_data_type(
     p: &mut Parser,
-) -> Result<(DataType, u16, bool, Option<crate::ast::TableRef>), DbError> {
+) -> Result<
+    (
+        DataType,
+        u16,
+        bool,
+        Option<crate::ast::TableRef>,
+        u8,
+        Vec<Option<u16>>,
+    ),
+    DbError,
+> {
     match parse_data_type(p) {
-        Ok((data_type, type_len, is_char)) => Ok((data_type, type_len, is_char, None)),
+        Ok(parsed) => Ok((
+            parsed.data_type,
+            parsed.type_len,
+            parsed.is_char,
+            None,
+            parsed.ndims,
+            parsed.size_hints,
+        )),
         Err(err) => {
             if is_custom_type_start(p.peek()) {
                 let type_name = p.parse_table_ref()?;
-                Ok((DataType::Text, 0, false, Some(type_name)))
+                Ok((DataType::Text, 0, false, Some(type_name), 0, vec![]))
             } else {
                 Err(err)
             }
@@ -1058,104 +1083,165 @@ fn parse_check_column_constraint(p: &mut Parser) -> Result<ColumnConstraint, DbE
 
 // ── Data type ─────────────────────────────────────────────────────────────────
 
-/// Parses a SQL data type keyword, returning `(DataType, type_len, is_char)`.
+/// Result of parsing a data type, including array metadata.
+///
+/// `ndims` is 0 for non-arrays, 1-6 for arrays.
+/// `size_hints` has one entry per dimension (length = ndims), with `None` for unbounded.
+pub(crate) struct ParsedDataType {
+    pub data_type: DataType,
+    pub type_len: u16,
+    pub is_char: bool,
+    pub ndims: u8,
+    pub size_hints: Vec<Option<u16>>,
+}
+
+/// Parses a SQL data type keyword, returning `(DataType, type_len, is_char, ndims, size_hints)`.
 ///
 /// `type_len` is the `N` from `VARCHAR(N)` / `CHAR(N)`, or `0` for all other types.
 /// `is_char` is `true` only for `CHAR(N)` declarations (fixed-length).
-pub(crate) fn parse_data_type(p: &mut Parser) -> Result<(DataType, u16, bool), DbError> {
+/// `ndims` is the number of array dimensions (0 for non-arrays, 1-6 for arrays).
+/// `size_hints` has one entry per dimension with `None` for unbounded.
+pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError> {
     let pos = p.current_pos();
-    match p.peek().clone() {
+    let (data_type, type_len, is_char) = match p.peek().clone() {
         Token::TyInt | Token::TyInteger => {
             p.advance();
-            Ok((DataType::Int, 0, false))
+            (DataType::Int, 0, false)
         }
         Token::TyBigint => {
             p.advance();
-            Ok((DataType::BigInt, 0, false))
+            (DataType::BigInt, 0, false)
         }
         Token::TyReal | Token::TyDouble | Token::TyFloat => {
             p.advance();
-            Ok((DataType::Real, 0, false))
+            (DataType::Real, 0, false)
         }
         Token::TyDecimal | Token::TyNumeric => {
             p.advance();
             eat_optional_precision_scale(p)?;
-            Ok((DataType::Decimal, 0, false))
+            (DataType::Decimal, 0, false)
         }
         Token::TyBool | Token::TyBoolean => {
             p.advance();
-            Ok((DataType::Bool, 0, false))
+            (DataType::Bool, 0, false)
         }
         Token::TyText => {
             p.advance();
-            Ok((DataType::Text, 0, false))
+            (DataType::Text, 0, false)
         }
         Token::TyVarchar => {
             p.advance();
             let len = eat_optional_length(p)?;
-            Ok((DataType::Text, len, false))
+            (DataType::Text, len, false)
         }
         Token::TyChar => {
             p.advance();
             let len = eat_optional_length(p)?;
-            Ok((DataType::Text, len, true))
+            (DataType::Text, len, true)
         }
         Token::TyBlob | Token::TyBytea => {
             p.advance();
-            Ok((DataType::Bytes, 0, false))
+            (DataType::Bytes, 0, false)
         }
         Token::TyDate => {
             p.advance();
-            Ok((DataType::Date, 0, false))
+            (DataType::Date, 0, false)
         }
         Token::TyTimestamp | Token::TyDatetime => {
             p.advance();
-            Ok((DataType::Timestamp, 0, false))
+            (DataType::Timestamp, 0, false)
         }
         Token::TyUuid => {
             p.advance();
-            Ok((DataType::Uuid, 0, false))
+            (DataType::Uuid, 0, false)
         }
         Token::TyJson => {
             p.advance();
-            Ok((DataType::Json, 0, false))
+            (DataType::Json, 0, false)
         }
         Token::TyJsonb => {
             p.advance();
-            Ok((DataType::Jsonb, 0, false))
+            (DataType::Jsonb, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("TINYINT") => {
             p.advance();
             eat_optional_length(p)?; // TINYINT(N) — display width, ignored
-            Ok((DataType::Bool, 0, false))
+            (DataType::Bool, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("SMALLINT") => {
             p.advance();
             eat_optional_length(p)?;
-            Ok((DataType::Int, 0, false))
+            (DataType::Int, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("MEDIUMINT") => {
             p.advance();
             eat_optional_length(p)?;
-            Ok((DataType::Int, 0, false))
+            (DataType::Int, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("YEAR") => {
             p.advance();
             eat_optional_length(p)?; // YEAR(4)
-            Ok((DataType::Int, 0, false))
+            (DataType::Int, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("TIME") => {
             p.advance();
-            Ok((DataType::Timestamp, 0, false))
+            (DataType::Timestamp, 0, false)
         }
-        other => Err(DbError::ParseError {
-            message: format!(
-                "expected a data type (INT, TEXT, BIGINT, …) but found {:?}",
-                other,
-            ),
-            position: Some(pos),
-        }),
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "expected a data type (INT, TEXT, BIGINT, …) but found {:?}",
+                    other,
+                ),
+                position: Some(pos),
+            });
+        }
+    };
+
+    // Parse array suffixes: [] brackets and/or ARRAY keyword
+    let mut ndims = 0u8;
+    let mut size_hints: Vec<Option<u16>> = Vec::new();
+
+    loop {
+        if p.eat(&Token::LBracket) {
+            // Parse optional size in brackets, e.g. [3] in FLOAT[3][3]
+            let size_hint = if matches!(p.peek(), Token::Integer(_)) {
+                match p.peek() {
+                    Token::Integer(n) => {
+                        let size = (*n).min(u16::MAX as i64).max(1) as u16;
+                        p.advance();
+                        Some(size)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            p.expect(&Token::RBracket)?;
+            size_hints.push(size_hint);
+            ndims += 1;
+        } else if p.eat(&Token::Array) {
+            // `BOOL ARRAY` suffix — PG-compatible
+            ndims = ndims.max(1);
+        } else {
+            break;
+        }
     }
+
+    // Validate ndims (max 6 per PG spec)
+    if ndims > 6 {
+        return Err(DbError::InvalidValue {
+            reason: "number of array dimensions exceeds the maximum allowed (6)".into(),
+        });
+    }
+
+    Ok(ParsedDataType {
+        data_type,
+        type_len,
+        is_char,
+        ndims,
+        size_hints,
+    })
 }
 
 fn parse_aggregate_signature(p: &mut Parser) -> Result<Vec<DataType>, DbError> {
@@ -1165,8 +1251,8 @@ fn parse_aggregate_signature(p: &mut Parser) -> Result<Vec<DataType>, DbError> {
         return Ok(arg_types);
     }
     loop {
-        let (ty, _type_len, _is_char) = parse_data_type(p)?;
-        arg_types.push(ty);
+        let parsed = parse_data_type(p)?;
+        arg_types.push(parsed.data_type);
         if !p.eat(&Token::Comma) {
             break;
         }
