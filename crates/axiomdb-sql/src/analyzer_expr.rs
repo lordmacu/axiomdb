@@ -387,6 +387,15 @@ fn resolve_expr_full(
                 universe_indices: None,
             })
         }
+
+        // Phase 20.4 — ARRAY[expr, ...] constructor: resolve each element.
+        Expr::ArrayConstructor { elements } => {
+            let resolved_elements = elements
+                .into_iter()
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::ArrayConstructor { elements: resolved_elements })
+        }
     }
 }
 

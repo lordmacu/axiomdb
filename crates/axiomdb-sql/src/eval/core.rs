@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use axiomdb_core::error::DbError;
 use axiomdb_types::{
     coerce::{coerce, CoercionMode},
-    Value,
+    DataType, Value,
 };
 
 use crate::{
@@ -323,6 +323,9 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         Expr::Window { .. } => Err(DbError::InvalidValue {
             reason: "window function cannot be evaluated as a scalar expression".into(),
         }),
+
+        // Phase 20.4 — ARRAY[expr, ...] constructor.
+        Expr::ArrayConstructor { elements } => eval_array_constructor(elements, row),
     }
 }
 
@@ -758,6 +761,9 @@ pub fn eval_with<R: SubqueryRunner>(
         Expr::Window { .. } => Err(DbError::InvalidValue {
             reason: "window function cannot be evaluated as a scalar expression".into(),
         }),
+
+        // Phase 20.4 — ARRAY[expr, ...] constructor (no subquery needed).
+        Expr::ArrayConstructor { elements } => eval_array_constructor(elements, row),
     }
 }
 
@@ -855,4 +861,301 @@ fn eval_in_with<R: SubqueryRunner>(
     } else {
         Ok(Value::Bool(false))
     }
+}
+
+// ── Phase 20.4 — ARRAY constructor ────────────────────────────────────────────
+
+/// Type tag extracted from a Value for the purpose of array type inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayElemType {
+    Null,
+    Bool,
+    Int,
+    BigInt,
+    Real,
+    Decimal,
+    Text,
+    Json,
+    Jsonb,
+    Bytes,
+    Date,
+    Timestamp,
+    Uuid,
+    Array,
+}
+
+impl ArrayElemType {
+    fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Null => Self::Null,
+            Value::Bool(_) => Self::Bool,
+            Value::Int(_) => Self::Int,
+            Value::BigInt(_) => Self::BigInt,
+            Value::Real(_) => Self::Real,
+            Value::Decimal(..) => Self::Decimal,
+            Value::Text(_) => Self::Text,
+            Value::Json(_) => Self::Json,
+            Value::Jsonb(_) => Self::Jsonb,
+            Value::Bytes(_) => Self::Bytes,
+            Value::Date(_) => Self::Date,
+            Value::Timestamp(_) => Self::Timestamp,
+            Value::Uuid(_) => Self::Uuid,
+            Value::Array(_) => Self::Array,
+        }
+    }
+
+    fn to_data_type(self) -> Option<DataType> {
+        match self {
+            Self::Null => None,
+            Self::Bool => Some(DataType::Bool),
+            Self::Int => Some(DataType::Int),
+            Self::BigInt => Some(DataType::BigInt),
+            Self::Real => Some(DataType::Real),
+            Self::Decimal => Some(DataType::Decimal),
+            Self::Text => Some(DataType::Text),
+            Self::Json => Some(DataType::Json),
+            Self::Jsonb => Some(DataType::Jsonb),
+            Self::Bytes => Some(DataType::Bytes),
+            Self::Date => Some(DataType::Date),
+            Self::Timestamp => Some(DataType::Timestamp),
+            Self::Uuid => Some(DataType::Uuid),
+            Self::Array => None, // Nested arrays handled separately
+        }
+    }
+}
+
+/// Result of attempting to find a common type for array elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommonType {
+    /// All elements are NULL or we found a concrete type.
+    Concrete(DataType),
+    /// int + real → real widening.
+    IntReal,
+}
+
+impl CommonType {
+    fn merge(&self, other: &Value) -> Result<Self, DbError> {
+        use ArrayElemType as T;
+        let other_t = T::from_value(other);
+
+        // NULL doesn't affect type inference.
+        if matches!(other_t, T::Null) {
+            return Ok(self.clone());
+        }
+
+        match (self, other_t) {
+            // Same type — identity.
+            (Self::Concrete(dt), _) if dt == &T::from_value(other).to_data_type().unwrap() => {
+                Ok(self.clone())
+            }
+
+            // Null merges with anything.
+            (Self::Concrete(_), T::Null) | (Self::IntReal, T::Null) => Ok(self.clone()),
+
+            // Real + anything numeric → Real (already widened)
+            (Self::Concrete(DataType::Real), T::Int)
+            | (Self::Concrete(DataType::Real), T::BigInt)
+            | (Self::Concrete(DataType::Real), T::Real)
+            | (Self::IntReal, T::Real)
+            | (Self::IntReal, T::Int)
+            | (Self::IntReal, T::BigInt) => Ok(Self::IntReal),
+
+            // Int + Real → IntReal (widen to real)
+            (Self::Concrete(DataType::Int), T::Real) => Ok(Self::IntReal),
+
+            // BigInt + Real → IntReal (widen to real)
+            (Self::Concrete(DataType::BigInt), T::Real) => Ok(Self::IntReal),
+
+            // Int + Int → Int
+            (Self::Concrete(DataType::Int), T::Int) => Ok(Self::Concrete(DataType::Int)),
+
+            // Int + BigInt → BigInt (int widens to bigint for arithmetic)
+            (Self::Concrete(DataType::Int), T::BigInt) => Ok(Self::Concrete(DataType::BigInt)),
+
+            // BigInt + Int → BigInt
+            (Self::Concrete(DataType::BigInt), T::Int) => Ok(Self::Concrete(DataType::BigInt)),
+
+            // BigInt + BigInt → BigInt
+            (Self::Concrete(DataType::BigInt), T::BigInt) => Ok(Self::Concrete(DataType::BigInt)),
+
+            // Decimal + numeric → Decimal
+            (Self::Concrete(DataType::Decimal), T::Int)
+            | (Self::Concrete(DataType::Decimal), T::BigInt)
+            | (Self::Concrete(DataType::Decimal), T::Decimal)
+            | (Self::Concrete(DataType::Decimal), T::Real) => {
+                // Real is incompatible with Decimal in our coercion lattice.
+                Err(DbError::TypeMismatch {
+                    expected: "DECIMAL".into(),
+                    got: T::from_value(other).to_data_type().unwrap().name(),
+                })
+            }
+
+            // Text + Text → Text
+            (Self::Concrete(DataType::Text), T::Text) => Ok(self.clone()),
+
+            // Text + Json → Text
+            (Self::Concrete(DataType::Text), T::Json) => Ok(self.clone()),
+
+            // Json + Json → Json
+            (Self::Concrete(DataType::Json), T::Json) => Ok(self.clone()),
+
+            // Bytes + Bytes → Bytes
+            (Self::Concrete(DataType::Bytes), T::Bytes) => Ok(self.clone()),
+
+            // Date + Date → Date
+            (Self::Concrete(DataType::Date), T::Date) => Ok(self.clone()),
+
+            // Timestamp + Timestamp → Timestamp
+            (Self::Concrete(DataType::Timestamp), T::Timestamp) => Ok(self.clone()),
+
+            // Uuid + Uuid → Uuid
+            (Self::Concrete(DataType::Uuid), T::Uuid) => Ok(self.clone()),
+
+            // Bool + Bool → Bool
+            (Self::Concrete(DataType::Bool), T::Bool) => Ok(self.clone()),
+
+            // Mismatched types
+            (Self::Concrete(dt), other_t) => Err(DbError::TypeMismatch {
+                expected: dt.name(),
+                got: other_t.to_data_type().unwrap().name(),
+            }),
+
+            (Self::IntReal, t) => Err(DbError::TypeMismatch {
+                expected: "REAL".into(),
+                got: t.to_data_type().unwrap().name(),
+            }),
+        }
+    }
+}
+
+/// Extracts the inner element type from a Value::Array.
+fn get_array_ndim(value: &Value) -> Option<usize> {
+    match value {
+        Value::Array(elems) => {
+            if elems.is_empty() {
+                Some(1) // Empty array has ndim=1
+            } else if let Value::Array(_) = &elems[0] {
+                // Nested array — get inner ndim and add 1
+                get_array_ndim(&elems[0]).map(|n| n + 1)
+            } else {
+                Some(1) // Leaf level
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Validates that all nested arrays have consistent dimensions.
+fn validate_nested_dims(values: &[Value]) -> Result<(), DbError> {
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    let first_ndim = match get_array_ndim(&values[0]) {
+        Some(n) => n,
+        None => return Ok(()), // Non-array element, no nesting to validate
+    };
+
+    for (_i, v) in values.iter().enumerate().skip(1) {
+        let ndim = get_array_ndim(v);
+        match ndim {
+            None => {
+                return Err(DbError::TypeMismatch {
+                    expected: format!("array with {} dimensions", first_ndim),
+                    got: "non-array value".into(),
+                });
+            }
+            Some(n) if n != first_ndim => {
+                return Err(DbError::TypeMismatch {
+                    expected: format!("array with {} dimensions", first_ndim),
+                    got: format!("array with {} dimensions", n),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    // Validate inner arrays recursively
+    for v in values {
+        if let Value::Array(inner) = v {
+            validate_nested_dims(inner)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Evaluates `ARRAY[expr, ...]` — PostgreSQL-compatible array constructor.
+///
+/// - Empty `ARRAY[]` requires an explicit `::type[]` cast wrapper (checked by caller).
+/// - Nested arrays (`ARRAY[ARRAY[...], ...]`) are validated for dimension consistency.
+/// - Type inference: all-int → int[], int+real → real[], etc.
+fn eval_array_constructor(elements: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    use CommonType as C;
+
+    // Empty array — this case is only allowed when wrapped in an explicit cast.
+    // The CAST evaluator handles the target type; reaching here with empty elements
+    // without a cast is an error.
+    if elements.is_empty() {
+        return Err(DbError::TypeMismatch {
+            expected: "non-empty ARRAY or ARRAY with explicit ::type[] cast".into(),
+            got: "empty ARRAY[]".into(),
+        });
+    }
+
+    // Phase 1: evaluate all elements.
+    let mut values = Vec::with_capacity(elements.len());
+    for elem in elements {
+        let v = eval(elem, row)?;
+        values.push(v);
+    }
+
+    // Phase 2: validate nested array dimensions.
+    validate_nested_dims(&values)?;
+
+    // Phase 3: infer common type.
+    let mut common: Option<CommonType> = None;
+    for v in &values {
+        match common {
+            None => {
+                if matches!(ArrayElemType::from_value(v), ArrayElemType::Null) {
+                    // First non-null element determines type.
+                    continue;
+                }
+                let t = ArrayElemType::from_value(v);
+                if let Some(dt) = t.to_data_type() {
+                    common = Some(C::Concrete(dt));
+                } else if matches!(t, ArrayElemType::Array) {
+                    // Nested array — element type is determined by inner elements.
+                    // For now, we accept it as-is and let the inner validation handle it.
+                    common = Some(C::Concrete(DataType::Array(Box::new(DataType::Text))));
+                }
+            }
+            Some(ref c) => {
+                common = Some(c.merge(v)?);
+            }
+        }
+    }
+
+    // If all elements were NULL, we have no type.
+    if common.is_none() {
+        return Err(DbError::TypeMismatch {
+            expected: "ARRAY with non-null elements or explicit ::type[] cast".into(),
+            got: "ARRAY with only NULL elements".into(),
+        });
+    }
+
+    // Phase 4: coerce all elements to the common type.
+    let final_type = match common.unwrap() {
+        C::Concrete(dt) => dt,
+        C::IntReal => DataType::Real,
+    };
+
+    let mut coerced = Vec::with_capacity(values.len());
+    for v in values {
+        let coerced_v = coerce(v, final_type.clone(), CoercionMode::Strict)?;
+        coerced.push(coerced_v);
+    }
+
+    Ok(Value::Array(coerced))
 }

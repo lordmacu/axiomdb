@@ -314,3 +314,153 @@ fn parse_7d_array_rejected() {
         "7D array should be rejected (max 6 dimensions)"
     );
 }
+
+// ── ARRAY Constructor Tests (Step 4) ───────────────────────────────────────────
+
+#[test]
+fn parse_array_constructor_int() {
+    // SELECT ARRAY[1, 2, 3] → ArrayConstructor with [1, 2, 3]
+    let sql = "SELECT ARRAY[1, 2, 3]";
+    let stmt = axiomdb_sql::parse(sql, None).unwrap();
+    match stmt {
+        Stmt::Select(select) => {
+            assert_eq!(select.columns.len(), 1);
+            match &select.columns[0] {
+                axiomdb_sql::ast::SelectItem::Expr { expr, alias } => {
+                    assert!(alias.is_none());
+                    match expr {
+                        axiomdb_sql::expr::Expr::ArrayConstructor { elements } => {
+                            assert_eq!(elements.len(), 3);
+                        }
+                        other => panic!("expected ArrayConstructor, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Expr SelectItem, got {:?}", other),
+            }
+        }
+        other => panic!("expected Select, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_array_constructor_text() {
+    // SELECT ARRAY['a', 'b', 'c']
+    let sql = "SELECT ARRAY['a', 'b', 'c']";
+    let stmt = axiomdb_sql::parse(sql, None).unwrap();
+    match stmt {
+        Stmt::Select(select) => match &select.columns[0] {
+            axiomdb_sql::ast::SelectItem::Expr { expr, .. } => match expr {
+                axiomdb_sql::expr::Expr::ArrayConstructor { elements } => {
+                    assert_eq!(elements.len(), 3);
+                }
+                other => panic!("expected ArrayConstructor, got {:?}", other),
+            },
+            other => panic!("expected Expr SelectItem, got {:?}", other),
+        },
+        other => panic!("expected Select, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_array_constructor_nested() {
+    // SELECT ARRAY[ARRAY[1, 2], ARRAY[3, 4]]
+    let sql = "SELECT ARRAY[ARRAY[1, 2], ARRAY[3, 4]]";
+    let stmt = axiomdb_sql::parse(sql, None).unwrap();
+    match stmt {
+        Stmt::Select(select) => {
+            match &select.columns[0] {
+                axiomdb_sql::ast::SelectItem::Expr { expr, .. } => {
+                    match expr {
+                        axiomdb_sql::expr::Expr::ArrayConstructor { elements } => {
+                            assert_eq!(elements.len(), 2);
+                            // Both should be ArrayConstructors
+                            for elem in elements {
+                                assert!(matches!(
+                                    elem,
+                                    axiomdb_sql::expr::Expr::ArrayConstructor { .. }
+                                ));
+                            }
+                        }
+                        other => panic!("expected ArrayConstructor, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Expr SelectItem, got {:?}", other),
+            }
+        }
+        other => panic!("expected Select, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_array_constructor_empty() {
+    // SELECT ARRAY[] — empty array is valid at parse time
+    let sql = "SELECT ARRAY[]";
+    let stmt = axiomdb_sql::parse(sql, None).unwrap();
+    match stmt {
+        Stmt::Select(select) => match &select.columns[0] {
+            axiomdb_sql::ast::SelectItem::Expr { expr, .. } => match expr {
+                axiomdb_sql::expr::Expr::ArrayConstructor { elements } => {
+                    assert_eq!(elements.len(), 0);
+                }
+                other => panic!("expected ArrayConstructor, got {:?}", other),
+            },
+            other => panic!("expected Expr SelectItem, got {:?}", other),
+        },
+        other => panic!("expected Select, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_array_constructor_with_cast() {
+    // SELECT CAST(ARRAY[] AS INT[]) — empty array with explicit cast.
+    // Note: The DDL parser returns ParsedDataType with separate ndims, but
+    // the CAST parser currently only uses data_type field. So for INT[],
+    // we get DataType::Int (not DataType::Array(Int)) — this is a known
+    // gap in the DDL parser (Step 3). The important thing for Step 4 is
+    // that the ArrayConstructor is parsed correctly inside the cast.
+    let sql = "SELECT CAST(ARRAY[] AS INT[])";
+    let stmt = axiomdb_sql::parse(sql, None).unwrap();
+    match stmt {
+        Stmt::Select(select) => {
+            match &select.columns[0] {
+                axiomdb_sql::ast::SelectItem::Expr { expr, .. } => {
+                    // Should be Cast(ArrayConstructor [], ...)
+                    match expr {
+                        axiomdb_sql::expr::Expr::Cast { expr, .. } => {
+                            assert!(matches!(
+                                expr.as_ref(),
+                                axiomdb_sql::expr::Expr::ArrayConstructor { .. }
+                            ));
+                        }
+                        other => panic!("expected Cast, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Expr SelectItem, got {:?}", other),
+            }
+        }
+        other => panic!("expected Select, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_array_constructor_in_insert() {
+    // CREATE TABLE t (vals INT[]); INSERT INTO t VALUES (ARRAY[1, 2, 3]);
+    let create = axiomdb_sql::parse("CREATE TABLE t (vals INT[])", None).unwrap();
+    assert!(matches!(create, Stmt::CreateTable(_)));
+
+    let insert = axiomdb_sql::parse("INSERT INTO t VALUES (ARRAY[1, 2, 3])", None).unwrap();
+    match insert {
+        Stmt::Insert(insert_stmt) => match &insert_stmt.source {
+            axiomdb_sql::ast::InsertSource::Values(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].len(), 1);
+                assert!(matches!(
+                    &rows[0][0],
+                    axiomdb_sql::expr::Expr::ArrayConstructor { .. }
+                ));
+            }
+            other => panic!("expected Values, got {:?}", other),
+        },
+        other => panic!("expected Insert, got {:?}", other),
+    }
+}

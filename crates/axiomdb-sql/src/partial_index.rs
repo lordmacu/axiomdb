@@ -186,8 +186,10 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::Case { .. }
         | Expr::Cast { .. }
         | Expr::GroupConcat { .. }
-        | Expr::Grouping { .. } => Err(DbError::NotImplemented {
-            feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate)"
+        | Expr::Grouping { .. }
+        // Phase 20.4 — ARRAY constructor not supported in partial index predicates.
+        | Expr::ArrayConstructor { .. } => Err(DbError::NotImplemented {
+            feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate/array)"
                 .into(),
         }),
     }

@@ -244,6 +244,10 @@ fn execute_select_ctx(
                 crate::expr::Expr::Grouping { args, .. } => {
                     for a in args { collect_expr_columns(a, mask); }
                 }
+                // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+                crate::expr::Expr::ArrayConstructor { elements } => {
+                    for a in elements { collect_expr_columns(a, mask); }
+                }
                 // Subquery internals are not scanned — they run as separate queries.
                 crate::expr::Expr::Literal(_)
                 | crate::expr::Expr::Default

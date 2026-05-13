@@ -278,6 +278,12 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 collect_column_refs(a, mask);
             }
         }
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => {
+            for e in elements {
+                collect_column_refs(e, mask);
+            }
+        }
     }
 }
 
