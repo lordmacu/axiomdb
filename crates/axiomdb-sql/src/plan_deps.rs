@@ -520,6 +520,19 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+            Expr::Subscript {
+                array,
+                index,
+                slice,
+            } => {
+                self.visit_expr(array)?;
+                self.visit_expr(index)?;
+                if let Some(s) = slice {
+                    self.visit_expr(s)?;
+                }
+                Ok(())
+            }
         }
     }
 

@@ -810,6 +810,15 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
         Expr::ArrayConstructor { .. } => Err(DbError::NotImplemented {
             feature: "ARRAY constructor is not allowed in index expression".into(),
         }),
+        // Phase 20.4, Step 5 — array subscript is allowed (element access).
+        Expr::Subscript { array, index, slice } => {
+            reject_disallowed_in_index_expr(array)?;
+            reject_disallowed_in_index_expr(index)?;
+            if let Some(s) = slice {
+                reject_disallowed_in_index_expr(s)?;
+            }
+            Ok(())
+        }
         Expr::Literal(_) | Expr::Column { .. } | Expr::Default => Ok(()),
     }
 }

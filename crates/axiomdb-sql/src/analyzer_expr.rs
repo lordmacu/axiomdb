@@ -396,6 +396,21 @@ fn resolve_expr_full(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::ArrayConstructor { elements: resolved_elements })
         }
+
+        // Phase 20.4, Step 5 — array subscript/slice: resolve array and index expressions.
+        Expr::Subscript { array, index, slice } => {
+            let resolved_array = resolve_expr_full(*array, ctx, outer_scopes, state)?;
+            let resolved_index = resolve_expr_full(*index, ctx, outer_scopes, state)?;
+            let resolved_slice = slice
+                .map(|s| resolve_expr_full(*s, ctx, outer_scopes, state))
+                .map(|r| r.map(Box::new))
+                .transpose()?;
+            Ok(Expr::Subscript {
+                array: Box::new(resolved_array),
+                index: Box::new(resolved_index),
+                slice: resolved_slice,
+            })
+        }
     }
 }
 

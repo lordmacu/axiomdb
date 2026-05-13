@@ -16,6 +16,7 @@
 //!
 //! Use [`is_truthy`] to convert a result to a Rust `bool` for row filtering.
 
+pub(crate) mod array_ops;
 pub mod batch;
 mod context;
 pub(crate) mod core;

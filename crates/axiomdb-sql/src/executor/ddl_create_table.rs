@@ -333,6 +333,33 @@ fn validate_generated_expr_refs(
             }
             Ok(())
         }
+        // Phase 20.4, Step 5 — array subscript: recurse into array and index.
+        Expr::Subscript { array, index, slice } => {
+            validate_generated_expr_refs(
+                array,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            validate_generated_expr_refs(
+                index,
+                table_name,
+                generated_name,
+                base_cols,
+                generated_cols,
+            )?;
+            if let Some(s) = slice {
+                validate_generated_expr_refs(
+                    s,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
         Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. }
