@@ -806,6 +806,10 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
             }
             Ok(())
         }
+        // Phase 20.4 — ARRAY constructor not allowed in index expressions.
+        Expr::ArrayConstructor { .. } => Err(DbError::NotImplemented {
+            feature: "ARRAY constructor is not allowed in index expression".into(),
+        }),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Default => Ok(()),
     }
 }

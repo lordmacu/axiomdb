@@ -315,6 +315,14 @@ pub enum Expr {
         /// Populated by the analyzer. `None` = pre-analysis or outside Sets context.
         universe_indices: Option<Vec<usize>>,
     },
+
+    // ── ARRAY constructor (Phase 20.4) ──────────────────────────────────────
+    /// `ARRAY[expr, ...]` — PostgreSQL-compatible array constructor.
+    ///
+    /// Parsed from `ARRAY[expr, ...]` syntax. The evaluator infers the common
+    /// element type from all elements (all-same → that type; int+real → real).
+    /// An empty `ARRAY[]` requires an explicit `::type[]` cast on the outside.
+    ArrayConstructor { elements: Vec<Expr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

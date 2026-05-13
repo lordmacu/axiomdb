@@ -469,6 +469,10 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
         Expr::Grouping { args, .. } => {
             for a in args { collect_col_idxs_non_agg(a, out); }
         }
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => {
+            for e in elements { collect_col_idxs_non_agg(e, out); }
+        }
         Expr::Literal(_)
         | Expr::Default
         | Expr::OuterColumn { .. }
@@ -546,6 +550,10 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
         // GROUPING() args may reference non-aggregate columns.
         Expr::Grouping { args, .. } => {
             for a in args { collect_non_agg_col_idxs_in_expr(a, inside_agg, out); }
+        }
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => {
+            for e in elements { collect_non_agg_col_idxs_in_expr(e, inside_agg, out); }
         }
         Expr::Column { .. }
         | Expr::Literal(_)

@@ -617,6 +617,28 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
                 name: col_name,
             })
         }
+
+        // ── ARRAY[...] constructor (Phase 20.4) ───────────────────────────────
+        // Parse ARRAY[expr, ...] — PostgreSQL-compatible array constructor.
+        // This fires when we see ARRAY keyword/ident followed by '['.
+        Token::Array => {
+            p.advance();
+            parse_array_constructor(p)
+        }
+
+        // Ident "ARRAY" followed by '[' is also an array constructor.
+        // Check this BEFORE the general Token::Ident case to avoid the
+        // pattern being shadowed by Token::Ident(_).
+        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("ARRAY") => {
+            p.advance();
+            if matches!(p.peek(), Token::LBracket) {
+                parse_array_constructor(p)
+            } else {
+                // ARRAY as a bare identifier (e.g., type name) — fall through
+                Ok(Expr::Column { col_idx: 0, name: s.to_string() })
+            }
+        }
+
         // Identifiers and unreserved keywords usable as column/function names.
         Token::Ident(_)
         | Token::QuotedIdent(_)
@@ -1421,4 +1443,30 @@ fn split_sql_json_path_mode(raw: &str) -> (SqlJsonPathMode, String) {
         // SQL:2016 + PG default is strict.
         (SqlJsonPathMode::Strict, trimmed.to_string())
     }
+}
+
+// ── Phase 20.4 — ARRAY constructor ────────────────────────────────────────────
+
+/// Parses `ARRAY[expr, ...]` — PostgreSQL-compatible array constructor.
+///
+/// Expects `ARRAY` to have already been consumed. Parses the opening `[`,
+/// then comma-separated expressions until `]`.
+fn parse_array_constructor(p: &mut Parser) -> Result<Expr, DbError> {
+    p.expect(&Token::LBracket)?;
+
+    // Empty array: ARRAY[]
+    if matches!(p.peek(), Token::RBracket) {
+        p.advance();
+        return Ok(Expr::ArrayConstructor { elements: vec![] });
+    }
+
+    // Parse elements
+    let mut elements = vec![parse_expr(p)?];
+    while p.eat(&Token::Comma) {
+        elements.push(parse_expr(p)?);
+    }
+
+    p.expect(&Token::RBracket)?;
+
+    Ok(Expr::ArrayConstructor { elements })
 }

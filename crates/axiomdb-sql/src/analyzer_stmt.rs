@@ -879,7 +879,8 @@ fn expr_contains_window(expr: &Expr) -> bool {
         | Expr::Default
         | Expr::Param { .. }
         | Expr::Subquery(_)
-        | Expr::Exists { .. } => false,
+        | Expr::Exists { .. }
+        | Expr::ArrayConstructor { .. } => false,
     }
 }
 
@@ -967,7 +968,8 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::Default
         | Expr::Param { .. }
         | Expr::Subquery(_)
-        | Expr::Exists { .. } => false,
+        | Expr::Exists { .. }
+        | Expr::ArrayConstructor { .. } => false,
     }
 }
 
@@ -1125,7 +1127,8 @@ fn rewrite_custom_aggregates_in_expr(
         | Expr::ExcludedValue { .. }
         | Expr::Param { .. }
         | Expr::Subquery(_)
-        | Expr::Exists { .. } => {}
+        | Expr::Exists { .. }
+        | Expr::ArrayConstructor { .. } => {}
     }
     Ok(())
 }
@@ -1227,6 +1230,12 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         Expr::GroupConcat { expr, order_by, .. } => {
             populate_grouping_indices(expr, universe);
             for (e, _) in order_by { populate_grouping_indices(e, universe); }
+        }
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => {
+            for e in elements {
+                populate_grouping_indices(e, universe);
+            }
         }
         // Leaf nodes — nothing to recurse into.
         Expr::Literal(_)

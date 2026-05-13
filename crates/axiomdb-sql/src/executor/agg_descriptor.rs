@@ -72,6 +72,8 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::SqlJsonQuery { .. } => false,
         // GROUPING() is not an aggregate function — it reads a hidden mask column.
         Expr::Grouping { .. } => false,
+        // Phase 20.4 — ARRAY[expr, ...] constructor: recurse into elements.
+        Expr::ArrayConstructor { elements } => elements.iter().any(contains_aggregate),
     }
 }
 
@@ -383,6 +385,10 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
         // GROUPING() is not an aggregate; recurse into its args.
         Expr::Grouping { args, .. } => {
             for a in args { collect_agg_exprs_from(a, result); }
+        }
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => {
+            for e in elements { collect_agg_exprs_from(e, result); }
         }
     }
 }

@@ -513,6 +513,13 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Expr::Literal(_)
             | Expr::Default
             | Expr::Param { .. } => Ok(()),
+            // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+            Expr::ArrayConstructor { elements } => {
+                for e in elements {
+                    self.visit_expr(e)?;
+                }
+                Ok(())
+            }
         }
     }
 

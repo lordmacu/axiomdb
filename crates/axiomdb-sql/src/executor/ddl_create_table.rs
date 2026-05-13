@@ -320,6 +320,19 @@ fn validate_generated_expr_refs(
         Expr::GroupConcat { .. } | Expr::Grouping { .. } => Err(DbError::NotImplemented {
             feature: "aggregate expressions in generated columns".into(),
         }),
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => {
+            for e in elements {
+                validate_generated_expr_refs(
+                    e,
+                    table_name,
+                    generated_name,
+                    base_cols,
+                    generated_cols,
+                )?;
+            }
+            Ok(())
+        }
         Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. }

@@ -838,6 +838,8 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
                 || order_by.iter().any(|(e, _)| expr_has_outer_column_refs(e))
         }
         Expr::Grouping { args, .. } => args.iter().any(expr_has_outer_column_refs),
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => elements.iter().any(expr_has_outer_column_refs),
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
     }
 }
@@ -1042,6 +1044,8 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
             doc_has_column_refs(expr) || order_by.iter().any(|(e, _)| doc_has_column_refs(e))
         }
         Expr::Grouping { args, .. } => args.iter().any(doc_has_column_refs),
+        // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
+        Expr::ArrayConstructor { elements } => elements.iter().any(doc_has_column_refs),
         // Subqueries are not correlation we can detect at this layer — treat
         // as "yes" to force the NotImplemented branch (users can wrap the
         // doc in a CTE / derived table if they need constant materialization).
