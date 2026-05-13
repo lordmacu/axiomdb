@@ -3,6 +3,7 @@ use axiomdb_types::Value;
 
 use crate::expr::Expr;
 
+mod array;
 mod binary;
 pub(crate) mod datetime;
 mod json;
@@ -116,6 +117,12 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
 
         "gen_random_uuid" | "uuid_generate_v4" | "random_uuid" | "newid" | "uuid_generate_v7"
         | "uuid7" | "is_valid_uuid" | "is_uuid" => uuid::eval(lower.as_str(), args, row),
+
+        // Phase 20.4 Step 6: array functions
+        "array_length" | "array_lower" | "array_upper" | "array_ndims" | "array_dims"
+        | "cardinality" | "array_append" | "array_prepend" | "array_cat"
+        | "array_remove" | "array_replace" | "array_position" | "array_to_string"
+        | "string_to_array" | "unnest" => array::eval(lower.as_str(), args, row),
 
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),
