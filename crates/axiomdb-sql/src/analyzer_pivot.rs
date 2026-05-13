@@ -92,6 +92,8 @@ fn build_pivot_virtual_columns(
             collation: None,
             generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
         });
     }
 

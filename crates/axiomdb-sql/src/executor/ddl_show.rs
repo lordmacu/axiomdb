@@ -900,6 +900,7 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Date => "DATE",
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
+        ColumnType::Array => "TEXT[]", // placeholder; full display deferred to Step 3
     }
 }
 

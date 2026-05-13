@@ -203,7 +203,7 @@ fn build_binary_row_packet(
             set_binary_null_bit(&mut buf[bitmap_start..bitmap_start + bitmap_len], idx);
             continue;
         }
-        encode_binary_cell(&mut buf, col.data_type, value, results_collation)?;
+        encode_binary_cell(&mut buf, col.data_type.clone(), value, results_collation)?;
     }
 
     Ok(buf)
@@ -365,14 +365,14 @@ fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) 
     };
     buf.extend_from_slice(&charset_id.to_le_bytes());
     // column_length (display width) — use type-dependent default
-    let col_len = column_display_len(col.data_type);
+    let col_len = column_display_len(col.data_type.clone());
     buf.extend_from_slice(&col_len.to_le_bytes());
     // type byte
-    buf.push(datatype_to_mysql_type(col.data_type));
+    buf.push(datatype_to_mysql_type(col.data_type.clone()));
     // flags
-    buf.extend_from_slice(&column_flags(col.data_type).to_le_bytes());
+    buf.extend_from_slice(&column_flags(col.data_type.clone()).to_le_bytes());
     // decimals
-    buf.push(column_decimals(col.data_type));
+    buf.push(column_decimals(col.data_type.clone()));
     // filler
     buf.extend_from_slice(&0u16.to_le_bytes());
 
@@ -474,6 +474,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Date => 0x0a,                                    // DATE
         DataType::Timestamp => 0x07,                               // TIMESTAMP
         DataType::Uuid => 0xfd,                                    // VAR_STRING
+        DataType::Array(_) => 0xfd,                                // VAR_STRING (PG text format)
     }
 }
 
@@ -489,6 +490,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Date => 10,
         DataType::Timestamp => 19,
         DataType::Uuid => 36,
+        DataType::Array(_) => 16_777_215, // PG text format, variable-length
     }
 }
 
@@ -587,6 +589,11 @@ fn value_to_text(v: &Value) -> String {
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Uuid(u) => format_uuid(u),
+        Value::Array(_elems) => {
+            // Array text encoding deferred to Step 10.
+            // For now, return empty PG-compatible representation.
+            "{}".to_string()
+        }
     }
 }
 

@@ -129,6 +129,11 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) {
             buf.push(0x0A);
             buf.extend_from_slice(u);
         }
+        Value::Array(_elems) => {
+            // Array key encoding deferred to Step 5 (operators).
+            // For now, encode as empty placeholder.
+            buf.push(0x0D);
+        }
     }
 }
 

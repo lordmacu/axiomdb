@@ -17,11 +17,11 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
     }
 
     // Identity — already the correct type.
-    if value_matches_type(&value, target) {
+    if value_matches_type(&value, target.clone()) {
         return Ok(value);
     }
 
-    match (value, target) {
+    match (value, target.clone()) {
         // ── Int / BigInt → Bool (MySQL: any non-zero = true) ─────────────────
         (Value::Int(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
         (Value::BigInt(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
@@ -154,7 +154,7 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),
-            to: target.name().into(),
+            to: target.name(),
             value: value.to_string(),
             reason: "no implicit conversion exists between these types".into(),
         }),

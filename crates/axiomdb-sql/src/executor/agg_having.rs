@@ -61,6 +61,10 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
             buf.push(0x0A);
             buf.extend_from_slice(u.as_slice());
         }
+        Value::Array(_elems) => {
+            // Array key encoding deferred to Step 5 (operators).
+            buf.push(0x0D);
+        }
     }
     buf
 }
@@ -354,7 +358,7 @@ fn eval_with_aggs(
             eval(
                 &Expr::Cast {
                     expr: Box::new(Expr::Literal(v)),
-                    target: *target,
+                    target: target.clone(),
                 },
                 &[],
             )

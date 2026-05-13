@@ -46,7 +46,7 @@ fn execute_clustered_update(
     let field_patch_ok = !has_generated_columns
         && resolved.foreign_keys.is_empty()
         && assignments.iter().all(|(col_pos, _)| {
-            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos].clone()).is_some()
         });
     let pk_might_change = assignments.iter().any(|(col_pos, _)| pk_col_positions.contains(col_pos));
     let has_affected_secondary = secondary_indexes.iter().any(|idx| {
@@ -253,7 +253,7 @@ fn execute_clustered_update(
         let field_patch_ok = !has_generated_columns
             && !pk_changed
             && assignments.iter().all(|(col_pos, _)| {
-                axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+                axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos].clone()).is_some()
             });
 
         let new_row_data = if field_patch_ok {

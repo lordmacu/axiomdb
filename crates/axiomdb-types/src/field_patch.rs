@@ -30,12 +30,13 @@ pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
         | DataType::Jsonb
         | DataType::Bytes
         | DataType::Decimal
-        | DataType::Uuid => None,
+        | DataType::Uuid
+        | DataType::Array(_) => None,
     }
 }
 
 /// Pre-computed field location within an encoded row.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FieldLocation {
     /// Column index in the table schema.
     pub col_idx: usize,
@@ -77,7 +78,7 @@ pub fn compute_field_location_runtime(
     }
 
     // Target column must be fixed-size.
-    let target_size = fixed_encoded_size(schema[target_col])?;
+    let target_size = fixed_encoded_size(schema[target_col].clone())?;
 
     // If target column is NULL, can't patch.
     if is_null(null_bitmap, target_col) {
@@ -87,11 +88,11 @@ pub fn compute_field_location_runtime(
     // Calculate offset by scanning preceding columns.
     let bitmap_len = schema.len().div_ceil(8);
     let mut offset = bitmap_len;
-    for (i, &dt) in schema[..target_col].iter().enumerate() {
+    for (i, dt) in schema[..target_col].iter().enumerate() {
         if is_null(null_bitmap, i) {
             continue;
         }
-        match fixed_encoded_size(dt) {
+        match fixed_encoded_size(dt.clone()) {
             Some(sz) => offset += sz,
             None => {
                 // Variable-length column: need row data to read the u24 length.
@@ -111,7 +112,7 @@ pub fn compute_field_location_runtime(
         col_idx: target_col,
         offset,
         size: target_size,
-        data_type: schema[target_col],
+        data_type: schema[target_col].clone(),
     })
 }
 
@@ -147,7 +148,7 @@ pub fn write_field(
     let mut old_bytes = [0u8; 8];
     old_bytes[..loc.size].copy_from_slice(&row_data[loc.offset..loc.offset + loc.size]);
 
-    let new_bytes = encode_field_value(new_value, loc.data_type)?;
+    let new_bytes = encode_field_value(new_value, loc.data_type.clone())?;
     row_data[loc.offset..loc.offset + loc.size].copy_from_slice(&new_bytes[..loc.size]);
 
     Ok(old_bytes)
@@ -166,7 +167,7 @@ pub fn encode_value_fixed(value: &Value, dt: DataType) -> Result<[u8; 8], DbErro
 /// Encodes a single Value to its fixed-size byte representation.
 fn encode_field_value(value: &Value, dt: DataType) -> Result<[u8; 8], DbError> {
     let mut buf = [0u8; 8];
-    match (value, dt) {
+    match (value, dt.clone()) {
         (Value::Bool(b), DataType::Bool) => {
             buf[0] = if *b { 1 } else { 0 };
         }

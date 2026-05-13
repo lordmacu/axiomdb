@@ -205,7 +205,7 @@ fn compile_columns_recursive(
                 *next_slot += 1;
                 out.push(JsonTableColumnSpec {
                     name: name.clone(),
-                    ty: *ty,
+                    ty: ty.clone(),
                     kind: JsonTableColumnKind::Regular {
                         slot,
                         path: parse_jsonpath(path)?,
@@ -235,7 +235,7 @@ fn compile_columns_recursive(
                 *next_slot += 1;
                 out.push(JsonTableColumnSpec {
                     name: name.clone(),
-                    ty: *ty,
+                    ty: ty.clone(),
                     kind: JsonTableColumnKind::Exists {
                         slot,
                         path: parse_jsonpath(path)?,
@@ -304,6 +304,8 @@ fn flatten_defs_recursive(
                     collation: None,
                     generated_stored: false,
                     enum_type_name: None,
+                    array_element_type: None,
+                    array_ndims: None,
                 });
             }
             JsonTableColumn::Ordinality { name } => {
@@ -324,6 +326,8 @@ fn flatten_defs_recursive(
                     collation: None,
                     generated_stored: false,
                     enum_type_name: None,
+                    array_element_type: None,
+                    array_ndims: None,
                 });
             }
             JsonTableColumn::Exists { name, ty, .. } => {
@@ -342,6 +346,8 @@ fn flatten_defs_recursive(
                     collation: None,
                     generated_stored: false,
                     enum_type_name: None,
+                    array_element_type: None,
+                    array_ndims: None,
                 });
             }
             JsonTableColumn::Nested { columns, .. } => {
@@ -366,6 +372,11 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Uuid => ColumnType::Uuid,
         DataType::Decimal => ColumnType::Decimal,
         DataType::Date => ColumnType::Date,
+        DataType::Array(_) => {
+            return Err(DbError::NotImplemented {
+                feature: "JSON_TABLE with array return type".into(),
+            });
+        }
     })
 }
 
@@ -505,7 +516,16 @@ fn emit_rows_rec<R: SubqueryRunner>(
                 on_error,
             } => {
                 template[*slot] = materialize_regular(
-                    node, path, col.ty, *wrapper, *quotes, on_empty, on_error, outer_row, sq, env,
+                    node,
+                    path,
+                    col.ty.clone(),
+                    *wrapper,
+                    *quotes,
+                    on_empty,
+                    on_error,
+                    outer_row,
+                    sq,
+                    env,
                 )?;
             }
             JsonTableColumnKind::Exists {
@@ -514,7 +534,7 @@ fn emit_rows_rec<R: SubqueryRunner>(
                 on_error,
             } => {
                 template[*slot] =
-                    materialize_exists(node, path, col.ty, on_error, outer_row, sq, env)?;
+                    materialize_exists(node, path, col.ty.clone(), on_error, outer_row, sq, env)?;
             }
             JsonTableColumnKind::Nested { .. } => {
                 // Handled in pass 2.
@@ -610,7 +630,7 @@ fn materialize_regular<R: SubqueryRunner>(
             return Ok(Value::Text(s.clone()));
         }
     }
-    match serde_to_value_typed(&wrapped, ty) {
+    match serde_to_value_typed(&wrapped, ty.clone()) {
         Ok(v) => Ok(v),
         Err(_) => apply_on_behavior(on_error, ty, outer_row, sq),
     }
@@ -633,7 +653,7 @@ fn materialize_exists<R: SubqueryRunner>(
         Ok(base)
     } else {
         // EXISTS column declared as INT → coerce TRUE/FALSE to 1/0.
-        coerce(base, ty, CoercionMode::Strict)
+        coerce(base, ty.clone(), CoercionMode::Strict)
             .or_else(|_| apply_on_behavior(on_error, ty, outer_row, sq))
     }
 }
@@ -694,7 +714,7 @@ fn serde_to_value_typed(sj: &serde_json::Value, ty: DataType) -> Result<Value, D
             }
         }
     };
-    coerce(base, ty, CoercionMode::Strict)
+    coerce(base, ty.clone(), CoercionMode::Strict)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -707,7 +727,7 @@ pub fn column_metas_for_spec(spec: &JsonTableSpec) -> Vec<crate::result::ColumnM
         .iter()
         .map(|c| crate::result::ColumnMeta {
             name: c.name.clone(),
-            data_type: c.ty,
+            data_type: c.ty.clone(),
             nullable: matches!(
                 c.kind,
                 JsonTableColumnKind::Regular {

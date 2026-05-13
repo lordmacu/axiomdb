@@ -153,7 +153,7 @@ fn execute_update_ctx(
         && !schema_cols.iter().any(|c| c.generated_expr.is_some())
         && resolved.foreign_keys.is_empty()
         && assignments.iter().all(|(col_pos, _)| {
-            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos]).is_some()
+            axiomdb_types::field_patch::fixed_encoded_size(col_types[*col_pos].clone()).is_some()
         });
 
     // ── Fused index-range patch (InnoDB-inspired) ────────────────────────

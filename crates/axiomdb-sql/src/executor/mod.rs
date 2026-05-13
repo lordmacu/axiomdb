@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_column_type_to_datatype_roundtrip() {
-        for &dt in &[
+        for dt in &[
             DataType::Bool,
             DataType::Int,
             DataType::BigInt,
@@ -243,7 +243,7 @@ mod tests {
             DataType::Uuid,
         ] {
             let ct = datatype_to_column_type(&dt).unwrap();
-            assert_eq!(column_type_to_datatype(ct), dt);
+            assert_eq!(column_type_to_datatype(ct), dt.clone());
         }
     }
 

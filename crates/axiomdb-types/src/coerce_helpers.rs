@@ -15,6 +15,7 @@ fn value_matches_type(value: &Value, target: DataType) -> bool {
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
             | (Value::Uuid(_), DataType::Uuid)
+            | (Value::Array(_), DataType::Array(_))
     )
 }
 

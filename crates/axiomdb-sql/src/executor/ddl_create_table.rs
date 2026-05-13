@@ -460,6 +460,8 @@ fn execute_create_table(
             collation: col_def.collation.clone(),
             generated_stored,
             enum_type_name: enum_type_names[i].clone(),
+            array_element_type: None,
+            array_ndims: None,
         })?;
     }
 
@@ -1523,6 +1525,8 @@ fn execute_create_table_like(
             collation: col.collation.clone(),
             generated_stored: col.generated_stored,
             enum_type_name: col.enum_type_name.clone(),
+            array_element_type: None,
+            array_ndims: None,
         })?;
     }
 
@@ -1719,6 +1723,8 @@ fn create_relation_as_select(
             collation: None,
             generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
         })?;
     }
 
@@ -1742,6 +1748,8 @@ fn create_relation_as_select(
             collation: None,
             generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
         })
         .collect();
 

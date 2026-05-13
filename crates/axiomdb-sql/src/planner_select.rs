@@ -804,6 +804,11 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
         ColumnType::Date => DataType::Date,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
+        ColumnType::Array => {
+            let elem_ct = col.array_element_type.unwrap_or(ColumnType::Text);
+            let elem_dt = crate::table::column_type_to_data_type(elem_ct);
+            DataType::Array(Box::new(elem_dt))
+        }
     };
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }

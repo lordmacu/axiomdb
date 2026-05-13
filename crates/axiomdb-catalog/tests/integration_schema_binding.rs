@@ -120,6 +120,8 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
                 collation: None,
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             })
             .unwrap();
         }
@@ -274,6 +276,8 @@ fn test_resolve_column_found() {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -291,6 +295,8 @@ fn test_resolve_column_found() {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         })
         .unwrap();
         tid
@@ -330,6 +336,8 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         })
         .unwrap();
         tid

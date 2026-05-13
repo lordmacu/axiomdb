@@ -656,6 +656,14 @@ pub struct ColumnDef {
     /// type. Stored as a trailing optional `[u16 len][utf8 bytes]` after
     /// collation; old rows stop earlier and read as `None`.
     pub enum_type_name: Option<String>,
+    /// Array element column type (Phase 20.4). `Some(ct)` when `col_type` is
+    /// `ColumnType::Array`. `None` for non-array columns. Stored as trailing
+    /// bytes after `enum_type_name`.
+    pub array_element_type: Option<ColumnType>,
+    /// Number of array dimensions (1-6). `Some(ndims)` when the column is an
+    /// array type. `None` for non-array columns. Stored as trailing bytes
+    /// after `enum_type_name`.
+    pub array_ndims: Option<u8>,
 }
 
 impl ColumnDef {
@@ -674,6 +682,8 @@ impl ColumnDef {
     /// Trailing extension fields are stored after the flagged payloads:
     /// `[collation_len:u16][collation]` when collation or enum metadata exists,
     /// then `[enum_type_len:u16][enum_type]` when enum metadata exists.
+    /// Then `[array_ndims:u8]` when `array_ndims` is > 0 (Phase 20.4),
+    /// followed by `[array_element_type:u8]` when ndims > 0.
     pub fn to_bytes(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         debug_assert!(name.len() <= 255, "column name too long");
@@ -722,7 +732,12 @@ impl ColumnDef {
             } else {
                 0
             }
-            + enum_type_bytes.map_or(0, |b| 2 + b.len());
+            + enum_type_bytes.map_or(0, |b| 2 + b.len())
+            + if self.array_ndims.unwrap_or(0) > 0 {
+                2 // 1 byte ndims + 1 byte element_type
+            } else {
+                0
+            };
         let mut buf = Vec::with_capacity(4 + 2 + 1 + 1 + 1 + name.len() + extra);
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.extend_from_slice(&self.col_idx.to_le_bytes());
@@ -753,6 +768,15 @@ impl ColumnDef {
         if let Some(eb) = enum_type_bytes {
             buf.extend_from_slice(&(eb.len() as u16).to_le_bytes());
             buf.extend_from_slice(eb);
+        }
+        // Phase 20.4: array trailing fields
+        if self.array_ndims.unwrap_or(0) > 0 {
+            buf.push(self.array_ndims.unwrap_or(0));
+            buf.push(
+                self.array_element_type
+                    .map(u8::from)
+                    .unwrap_or(0),
+            );
         }
         buf
     }
@@ -922,6 +946,25 @@ impl ColumnDef {
             None
         };
 
+        // Phase 20.4: array trailing fields (backward-compatible)
+        let (array_ndims, array_element_type) = if bytes.len() > consumed + 1 {
+            let ndims = bytes[consumed];
+            if ndims > 0 {
+                if bytes.len() < consumed + 2 {
+                    return Err(err());
+                }
+                let elem = ColumnType::try_from(bytes[consumed + 1])?;
+                consumed += 2;
+                (Some(ndims), Some(elem))
+            } else {
+                consumed += 1;
+                (None, None)
+            }
+        } else {
+            // Legacy row: no array trailing fields
+            (None, None)
+        };
+
         Ok((
             Self {
                 table_id,
@@ -938,6 +981,8 @@ impl ColumnDef {
                 collation,
                 generated_stored,
                 enum_type_name,
+                array_element_type,
+                array_ndims,
             },
             consumed,
         ))

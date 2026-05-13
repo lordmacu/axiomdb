@@ -534,6 +534,8 @@ pub fn prepare_nonblocking_heap_alter(
                 collation: col_def.collation.clone(),
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             };
             let mut new_columns = columns.clone();
             new_columns.push(new_catalog_col);
@@ -852,7 +854,7 @@ pub fn prepare_nonblocking_heap_alter(
                 &new_columns,
                 &move |mut row| {
                     if let Some(val) = row.get_mut(col_pos) {
-                        *val = coerce(val.clone(), new_data_type, CoercionMode::Strict)?;
+                        *val = coerce(val.clone(), new_data_type.clone(), CoercionMode::Strict)?;
                     }
                     Ok(row)
                 },
@@ -1271,6 +1273,8 @@ fn alter_add_column(
         collation: col_def.collation.clone(),
         generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
     };
 
     // 1. Add column to catalog.
@@ -1623,7 +1627,7 @@ fn alter_modify_column(
             if let Some(val) = row.get_mut(col_pos) {
                 // Strict coercion: propagate error on conversion failure.
                 // The whole statement rolls back atomically.
-                *val = coerce(val.clone(), new_data_type, CoercionMode::Strict)?;
+                *val = coerce(val.clone(), new_data_type.clone(), CoercionMode::Strict)?;
             }
             Ok(row)
         },
@@ -1667,6 +1671,8 @@ fn alter_modify_column(
             .or_else(|| old_columns[col_pos].collation.clone()),
         generated_stored: old_columns[col_pos].generated_stored,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 

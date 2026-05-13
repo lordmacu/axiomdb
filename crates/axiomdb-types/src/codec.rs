@@ -27,7 +27,7 @@
 
 use axiomdb_core::error::DbError;
 
-use crate::{types::DataType, value::Value};
+use crate::{array_codec, types::DataType, value::Value};
 
 /// Maximum byte length of an inline Text or Bytes value.
 /// Matches the maximum representable by a u24 prefix (3 bytes LE).
@@ -115,7 +115,7 @@ fn read_u24(bytes: &[u8], pos: usize) -> Result<usize, DbError> {
 /// Checks that a non-Null `value` matches `dt`. Called by `encode_row`.
 fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
     let ok = matches!(
-        (value, dt),
+        (value, dt.clone()),
         (Value::Bool(_), DataType::Bool)
             | (Value::Int(_), DataType::Int)
             | (Value::BigInt(_), DataType::BigInt)
@@ -128,6 +128,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
             | (Value::Uuid(_), DataType::Uuid)
+            | (Value::Array(_), DataType::Array(_))
     );
     if ok {
         Ok(())
@@ -140,6 +141,32 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/// Infers the element DataType from the first non-null element of an array.
+/// Defaults to `DataType::Int` if all elements are null or array is empty.
+fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
+    for elem in elems {
+        match elem {
+            Value::Null => continue,
+            Value::Bool(_) => return crate::types::DataType::Bool,
+            Value::Int(_) => return crate::types::DataType::Int,
+            Value::BigInt(_) => return crate::types::DataType::BigInt,
+            Value::Real(_) => return crate::types::DataType::Real,
+            Value::Decimal(..) => return crate::types::DataType::Decimal,
+            Value::Text(_) => return crate::types::DataType::Text,
+            Value::Json(_) => return crate::types::DataType::Json,
+            Value::Jsonb(_) => return crate::types::DataType::Jsonb,
+            Value::Bytes(_) => return crate::types::DataType::Bytes,
+            Value::Date(_) => return crate::types::DataType::Date,
+            Value::Timestamp(_) => return crate::types::DataType::Timestamp,
+            Value::Uuid(_) => return crate::types::DataType::Uuid,
+            Value::Array(_) => {
+                return crate::types::DataType::Array(Box::new(crate::types::DataType::Int))
+            }
+        }
+    }
+    crate::types::DataType::Int // default
+}
 
 /// Returns the encoded byte length for `values` without allocating.
 ///
@@ -159,6 +186,16 @@ pub fn encoded_len(values: &[Value]) -> usize {
             Value::Text(s) | Value::Json(s) => 3 + s.len(),
             Value::Jsonb(b) => 3 + b.len(),
             Value::Bytes(b) => 3 + b.len(),
+            Value::Array(elems) => {
+                // Compute actual encoded length using encode_array.
+                // Infer element type from the first non-null element (defaulting to Int).
+                let elem_type =
+                    array_codec::data_type_to_column_type(&infer_array_elem_type(elems));
+                let array_value = Value::Array(elems.clone());
+                let blob =
+                    array_codec::encode_array(&array_value, elem_type).unwrap_or_else(|_| vec![]);
+                3 + blob.len()
+            }
         })
         .sum();
     blen + data
@@ -189,11 +226,11 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
     buf.resize(blen, 0u8);
 
     // Phase 2: set null bits + validate non-null types.
-    for (i, (v, &dt)) in values.iter().zip(schema.iter()).enumerate() {
+    for (i, (v, dt)) in values.iter().zip(schema.iter()).enumerate() {
         if v.is_null() {
             set_null_bit(&mut buf, i);
         } else {
-            validate_type(v, dt)?;
+            validate_type(v, dt.clone())?;
         }
     }
 
@@ -279,6 +316,20 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
             Value::Date(d) => buf.extend_from_slice(&d.to_le_bytes()),
             Value::Timestamp(t) => buf.extend_from_slice(&t.to_le_bytes()),
             Value::Uuid(u) => buf.extend_from_slice(u),
+            Value::Array(_elems) => {
+                // Get element type from DataType::Array in schema
+                if let DataType::Array(ref elem_dt) = schema[i] {
+                    let elem_type = array_codec::data_type_to_column_type(elem_dt);
+                    let array_blob = array_codec::encode_array(v, elem_type)?;
+                    write_u24(&mut buf, array_blob.len());
+                    buf.extend_from_slice(&array_blob);
+                } else {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Array".to_string(),
+                        got: schema[i].name(),
+                    });
+                }
+            }
             Value::Null => unreachable!("null already skipped by bitmap check"),
         }
     }
@@ -308,7 +359,7 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
     let mut pos = blen;
     let mut values = Vec::with_capacity(n);
 
-    for (i, &dt) in schema.iter().enumerate() {
+    for (i, dt) in schema.iter().enumerate() {
         if is_null_bit(bitmap, i) {
             values.push(Value::Null);
             continue;
@@ -465,6 +516,22 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += 16;
                 Value::Uuid(u)
             }
+            DataType::Array(_elem) => {
+                // Array decoding with array_codec (Step 2).
+                let len = read_u24(bytes, pos)?;
+                pos += 3;
+                if is_toast_sentinel(len) {
+                    let (_page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                    Value::Array(vec![])
+                } else {
+                    ensure_bytes(bytes, pos, len)?;
+                    let blob = &bytes[pos..pos + len];
+                    pos += len;
+                    // decode_array returns (Value::Array, elem_type, ndim)
+                    let (arr, _, _) = array_codec::decode_array(blob)?;
+                    arr
+                }
+            }
         };
         values.push(v);
     }
@@ -513,7 +580,7 @@ pub fn decode_row_masked(
     let mut pos = blen;
     let mut values = Vec::with_capacity(n);
 
-    for (i, &dt) in schema.iter().enumerate() {
+    for (i, dt) in schema.iter().enumerate() {
         // NULL columns have no wire bytes — handle before checking mask.
         if is_null_bit(bitmap, i) {
             values.push(Value::Null);
@@ -565,7 +632,7 @@ pub fn decode_row_masked(
                             len == TOAST_SENTINEL_LZ4,
                             raw_len
                         );
-                        if dt == DataType::Json {
+                        if *dt == DataType::Json {
                             Value::Json(placeholder)
                         } else {
                             Value::Text(placeholder)
@@ -579,7 +646,7 @@ pub fn decode_row_masked(
                             })?
                             .to_string();
                         pos += len;
-                        if dt == DataType::Json {
+                        if *dt == DataType::Json {
                             Value::Json(s)
                         } else {
                             Value::Text(s)
@@ -644,6 +711,20 @@ pub fn decode_row_masked(
                     pos += 16;
                     Value::Uuid(u)
                 }
+                DataType::Array(_elem) => {
+                    let len = read_u24(bytes, pos)?;
+                    pos += 3;
+                    if is_toast_sentinel(len) {
+                        let (_page_id, _raw_len) = decode_toast_pointer(bytes, &mut pos)?;
+                        Value::Array(vec![])
+                    } else {
+                        ensure_bytes(bytes, pos, len)?;
+                        let blob = &bytes[pos..pos + len];
+                        pos += len;
+                        let (arr, _, _) = array_codec::decode_array(blob)?;
+                        arr
+                    }
+                }
             };
             values.push(v);
         } else {
@@ -669,7 +750,11 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 16)?;
                     pos += 16;
                 }
-                DataType::Text | DataType::Json | DataType::Jsonb | DataType::Bytes => {
+                DataType::Text
+                | DataType::Json
+                | DataType::Jsonb
+                | DataType::Bytes
+                | DataType::Array(_) => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
                     if is_toast_sentinel(len) {

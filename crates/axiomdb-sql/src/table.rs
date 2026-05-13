@@ -198,6 +198,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Date => DataType::Date,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
+        ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
     }
 }
 
@@ -219,6 +220,12 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
             ColumnType::Jsonb => DataType::Jsonb,
+            ColumnType::Array => {
+                // Use the element type from the ColumnDef metadata
+                let elem_ct = c.array_element_type.unwrap_or(ColumnType::Text);
+                let elem_dt = column_type_to_data_type(elem_ct);
+                DataType::Array(Box::new(elem_dt))
+            }
         })
         .collect()
 }
@@ -731,6 +738,12 @@ pub(crate) fn coerce_values(
                 ColumnType::Jsonb => DataType::Jsonb,
                 ColumnType::Decimal => DataType::Decimal,
                 ColumnType::Date => DataType::Date,
+                ColumnType::Array => {
+                    // Use element type from ColumnDef metadata
+                    let elem_ct = col.array_element_type.unwrap_or(ColumnType::Text);
+                    let elem_dt = column_type_to_data_type(elem_ct);
+                    DataType::Array(Box::new(elem_dt))
+                }
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -769,6 +782,11 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::Jsonb => DataType::Jsonb,
             ColumnType::Decimal => DataType::Decimal,
             ColumnType::Date => DataType::Date,
+            ColumnType::Array => {
+                let elem_ct = col.array_element_type.unwrap_or(ColumnType::Text);
+                let elem_dt = column_type_to_data_type(elem_ct);
+                DataType::Array(Box::new(elem_dt))
+            }
         };
 
         if ctx.strict_mode {
@@ -777,7 +795,7 @@ pub(crate) fn coerce_values_with_ctx(
         }
 
         // Strict first, permissive fallback.
-        match coerce(v.clone(), target, CoercionMode::Strict) {
+        match coerce(v.clone(), target.clone(), CoercionMode::Strict) {
             Ok(strict_val) => {
                 out.push(strict_val);
             }
@@ -839,6 +857,8 @@ mod tests {
             collation: None,
             generated_stored: false,
             enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
         }
     }
 
@@ -910,6 +930,8 @@ mod tests {
                 collation: None,
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             },
             ColumnDef {
                 table_id: 1,
@@ -926,6 +948,8 @@ mod tests {
                 collation: None,
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             },
         ];
 
@@ -984,6 +1008,8 @@ mod tests {
                 collation: None,
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             },
             ColumnDef {
                 table_id: 1,
@@ -1000,6 +1026,8 @@ mod tests {
                 collation: None,
                 generated_stored: false,
                 enum_type_name: None,
+                array_element_type: None,
+                array_ndims: None,
             },
         ];
 

@@ -547,6 +547,10 @@ pub fn value_to_sql_literal(v: &Value) -> String {
                 u[8],u[9],u[10],u[11],u[12],u[13],u[14],u[15]
             )
         }
+        Value::Array(_elems) => {
+            // Array SQL literal deferred to Step 10.
+            "'{}'".to_string()
+        }
     }
 }
 

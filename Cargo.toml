@@ -72,6 +72,9 @@ hashbrown = "0.15"
 # Probabilistic data structures
 bloomfilter = "3"
 
+# Hex encoding/decoding for bytea and UUID
+hex = "0.4"
+
 # Testing / benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 

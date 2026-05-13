@@ -65,7 +65,7 @@ impl AggregateDef {
         buf.extend_from_slice(name);
         buf.push(self.arg_types.len() as u8);
         for ty in &self.arg_types {
-            buf.push(data_type_tag(*ty));
+            buf.push(data_type_tag(ty.clone()));
         }
         buf.push(sfunc.len() as u8);
         buf.extend_from_slice(sfunc);
@@ -201,6 +201,7 @@ fn data_type_tag(ty: DataType) -> u8 {
         DataType::Jsonb => 10,
         DataType::Decimal => 11,
         DataType::Date => 12,
+        DataType::Array(_) => 13,
     }
 }
 
@@ -218,6 +219,7 @@ fn data_type_from_tag(tag: u8) -> Result<DataType, DbError> {
         10 => Ok(DataType::Jsonb),
         11 => Ok(DataType::Decimal),
         12 => Ok(DataType::Date),
+        13 => Ok(DataType::Array(Box::new(DataType::Text))),
         other => Err(DbError::ParseError {
             message: format!("invalid aggregate arg type byte {other}"),
             position: None,

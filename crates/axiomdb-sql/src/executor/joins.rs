@@ -535,6 +535,11 @@ impl std::hash::Hash for HashableValue {
             Value::Date(d) => d.hash(state),
             Value::Timestamp(t) => t.hash(state),
             Value::Uuid(u) => u.hash(state),
+            Value::Array(elems) => {
+                for elem in elems {
+                    HashableValue(elem.clone()).hash(state);
+                }
+            }
         }
     }
 }
@@ -855,7 +860,7 @@ fn infer_expr_type_join(
                 let local_pos = col_idx - offset;
                 if let Some(col) = source.columns.get(local_pos) {
                     let outer_nullable = nullable_tables.get(t_idx).copied().unwrap_or(false);
-                    return (col.data_type, col.nullable || outer_nullable);
+                    return (col.data_type.clone(), col.nullable || outer_nullable);
                 }
             }
             offset = end;
