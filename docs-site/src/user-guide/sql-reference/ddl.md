@@ -78,6 +78,105 @@ next multi-database subphase.
 </div>
 </div>
 
+## CREATE SCHEMA
+
+Creates a new schema (namespace) within the current database.
+
+### Syntax
+
+```sql
+CREATE SCHEMA schema_name;
+CREATE SCHEMA IF NOT EXISTS schema_name;
+```
+
+### Behavior
+
+- Schemas organize tables, views, and sequences into named namespaces.
+- `IF NOT EXISTS` is idempotent — no error if the schema already exists.
+- The `public` schema is always implicitly available; no `CREATE SCHEMA public` is required.
+
+```sql
+CREATE SCHEMA app;
+CREATE TABLE app.users (id INT, email TEXT);
+INSERT INTO app.users VALUES (1, 'alice@example.com');
+SELECT * FROM app.users;
+```
+
+---
+
+## DROP SCHEMA
+
+Removes a schema from the current database.
+
+### Syntax
+
+```sql
+DROP SCHEMA schema_name;
+DROP SCHEMA IF EXISTS schema_name;
+DROP SCHEMA schema_name RESTRICT;    -- default: error if schema has tables
+DROP SCHEMA schema_name CASCADE;     -- drop all tables in the schema first
+```
+
+### Behavior
+
+- **RESTRICT** (default): fails with `SchemaNotEmpty` if the schema still contains tables.
+- **CASCADE**: drops all tables in the schema, then drops the schema itself.
+- `IF EXISTS` suppresses the error for a missing schema.
+- Dropping `information_schema` is always rejected.
+
+```sql
+DROP SCHEMA IF EXISTS temp_ns;
+
+DROP SCHEMA analytics CASCADE;
+
+DROP SCHEMA ns_r RESTRICT;
+-- ERROR 2BP01: can't drop schema 'ns_r'; schema is not empty
+```
+
+---
+
+## SHOW SCHEMAS
+
+Lists the schemas in the current database.
+
+### Syntax
+
+```sql
+SHOW SCHEMAS;
+SHOW SCHEMAS LIKE 'pattern%';
+```
+
+### Example
+
+```sql
+CREATE SCHEMA app_main;
+CREATE SCHEMA app_test;
+
+SHOW SCHEMAS LIKE 'app%';
+-- Schema
+-- -------
+-- app_main
+-- app_test
+```
+
+The `public` schema is always included.
+
+---
+
+## SET search_path
+
+Sets the schema search path for the current session so that unqualified table names
+resolve without an explicit `schema.table` prefix.
+
+```sql
+SET search_path = 'app';
+-- After this, `SELECT * FROM orders` is equivalent to `SELECT * FROM app.orders`
+```
+
+Only one schema at a time is supported in the current release.
+
+---
+
 ## CREATE TABLE
 
 ### Basic Syntax

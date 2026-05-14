@@ -298,3 +298,52 @@ CREATE TABLE public.users (...);
 SELECT * FROM axiom_tables;          -- works
 SELECT * FROM axiom.axiom_tables;   -- also works
 ```
+
+---
+
+## Schema Namespacing (Phase 22b.4)
+
+AxiomDB supports PostgreSQL-style multi-schema namespacing within a single database.
+
+### Creating and dropping schemas
+
+```sql
+CREATE SCHEMA app;
+CREATE SCHEMA IF NOT EXISTS app;     -- idempotent
+
+DROP SCHEMA app;                     -- fails if schema has tables (RESTRICT)
+DROP SCHEMA app CASCADE;             -- drops all tables first, then the schema
+DROP SCHEMA IF EXISTS app;           -- silent if schema does not exist
+```
+
+### Qualified table names
+
+All DDL and DML operations accept `schema.table` qualified names:
+
+```sql
+CREATE TABLE app.orders (id INT, amount DECIMAL(10,2));
+INSERT INTO app.orders VALUES (1, 99.99);
+SELECT * FROM app.orders WHERE amount > 50;
+UPDATE app.orders SET amount = 0 WHERE id = 1;
+DELETE FROM app.orders WHERE id = 1;
+```
+
+### search_path
+
+Set the session-level default schema so unqualified names resolve without a prefix:
+
+```sql
+SET search_path = 'app';
+SELECT * FROM orders;    -- resolves to app.orders
+```
+
+### Listing schemas
+
+```sql
+SHOW SCHEMAS;
+SHOW SCHEMAS LIKE 'app%';
+
+SELECT SCHEMA_NAME, CATALOG_NAME
+FROM information_schema.SCHEMATA
+WHERE SCHEMA_NAME <> 'information_schema';
+```

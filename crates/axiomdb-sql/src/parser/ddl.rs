@@ -1649,10 +1649,10 @@ fn first_column_name(expr: &Expr) -> Option<&str> {
 pub(crate) fn parse_drop_schema(p: &mut Parser) -> Result<Stmt, DbError> {
     let if_exists = eat_if_exists(p)?;
     let name = p.parse_identifier()?;
-    let cascade = if p.eat_ident_ci("CASCADE") {
+    let cascade = if p.eat(&Token::Cascade) {
         true
     } else {
-        p.eat_ident_ci("RESTRICT"); // consume optional RESTRICT; RESTRICT is the default
+        p.eat(&Token::Restrict); // consume optional RESTRICT; RESTRICT is the default
         false
     };
     Ok(Stmt::DropSchema(crate::ast::DropSchemaStmt {

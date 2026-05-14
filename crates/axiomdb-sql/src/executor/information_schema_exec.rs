@@ -130,6 +130,7 @@ fn generate_is_rows(
         }
         "statistics" => generate_is_statistics_rows(&mut reader, default_database, temp_schema)?,
         "views" => generate_is_views_rows(&mut reader, temp_schema)?,
+        "schemata" => generate_is_schemata_rows(&mut reader, default_database)?,
         _ => {
             return Err(DbError::TableNotFound {
                 name: format!("information_schema.{table_name}"),
@@ -606,6 +607,36 @@ fn generate_is_views_rows(
     }
 
     Ok(rows)
+}
+
+/// `information_schema.SCHEMATA` — one row per schema in the current database.
+///
+/// Always includes `information_schema` itself as a virtual row so that
+/// introspection queries (`SELECT schema_name FROM information_schema.schemata`)
+/// discover it. Column order matches `IS_SCHEMATA_COLS` in `information_schema.rs`.
+fn generate_is_schemata_rows(
+    reader: &mut CatalogReader,
+    database: &str,
+) -> Result<Vec<Row>, DbError> {
+    let mut schemas = reader.list_schemas(database)?;
+    // Add information_schema as a virtual row (it is not stored in axiom_schemas).
+    schemas.push(axiomdb_catalog::schema::SchemaDef {
+        database_name: database.to_string(),
+        name: "information_schema".to_string(),
+    });
+    schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(schemas
+        .into_iter()
+        .map(|s| {
+            vec![
+                Value::Text("def".into()),                       // CATALOG_NAME
+                Value::Text(s.name),                             // SCHEMA_NAME
+                Value::Text("utf8mb4".into()),                   // DEFAULT_CHARACTER_SET_NAME
+                Value::Text("utf8mb4_general_ci".into()),        // DEFAULT_COLLATION_NAME
+                Value::Null,                                     // SQL_PATH
+            ]
+        })
+        .collect())
 }
 
 /// Maps a `ColumnDef` to the MySQL `COLUMN_TYPE` string shown in IS.COLUMNS.

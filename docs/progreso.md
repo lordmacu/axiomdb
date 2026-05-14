@@ -405,7 +405,7 @@ Partitioning baseline, schemas, cross-database queries, migrations CLI, FDW, sch
 - [ ] 22b.2 ⏳ Foreign Data Wrappers — HTTP + PostgreSQL as external sources
 - [x] 22b.3a ✅ Database catalog + `CREATE/DROP DATABASE` — persisted `axiom_databases`, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, legacy tables default to `axiomdb`
 - [ ] 22b.3b ⏳ Cross-database queries — `database.schema.table`, cross-db SELECT / JOIN / DML
-- [ ] 22b.4 ⏳ Schema namespacing — `CREATE SCHEMA`, `schema.table`
+- [x] 22b.4 ✅ Schema namespacing — `CREATE SCHEMA [IF NOT EXISTS]`, `DROP SCHEMA [IF EXISTS] [CASCADE|RESTRICT]`, `schema.table` qualified names, `SET search_path`, `SHOW SCHEMAS [LIKE]`, `information_schema.schemata`
 - [ ] 22b.5 ⏳ Schema migrations CLI — `axiomdb migrate up/down/status`
 - [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
 

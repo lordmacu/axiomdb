@@ -417,6 +417,13 @@ fn execute_create_table(
 
     if stmt.persistence == axiomdb_catalog::TablePersistence::Temporary {
         ensure_schema_exists_for_create(storage, txn, conn_txn, database, schema)?;
+    } else {
+        // Permanent tables: schema must exist explicitly; reject unknown schemas.
+        let snap = txn.active_snapshot(conn_txn);
+        let mut reader = CatalogReader::new(storage, snap)?;
+        if !reader.schema_exists(database, schema)? {
+            return Err(DbError::SchemaNotFound { name: schema.to_string() });
+        }
     }
 
     let enum_type_names = resolve_create_table_enum_types(&stmt, storage, txn, conn_txn, schema)?;

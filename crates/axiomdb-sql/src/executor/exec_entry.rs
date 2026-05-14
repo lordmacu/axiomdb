@@ -637,6 +637,7 @@ pub fn execute_read_only_with_ctx(
                 ]],
             })
         }
+        Stmt::ShowSchemas(s) => execute_show_schemas(s, storage, txn, ctx),
         _ => Err(DbError::NotImplemented {
             feature: "read-only executor does not handle this statement type".into(),
         }),
