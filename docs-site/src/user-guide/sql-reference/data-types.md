@@ -191,7 +191,14 @@ INSERT INTO tasks (state) VALUES ('angry');  -- rejected
 the declared enum type, for example `public.mood`, instead of the physical
 `TEXT` representation.
 
-Current limits: `ALTER TYPE ... ADD VALUE`, `DROP TYPE`, and enum-specific
+**Dropping an enum type:**
+
+```sql
+DROP TYPE public.mood;
+DROP TYPE IF EXISTS public.mood;
+```
+
+Current limits: `ALTER TYPE ... ADD VALUE` and enum-specific
 declaration-order comparison are not implemented yet.
 
 ---

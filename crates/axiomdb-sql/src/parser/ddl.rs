@@ -212,6 +212,15 @@ pub(crate) fn parse_create_sequence(p: &mut Parser) -> Result<Stmt, DbError> {
     }))
 }
 
+pub(crate) fn parse_drop_enum_type(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let enum_type = p.parse_table_ref()?;
+    Ok(Stmt::DropEnumType(crate::ast::DropEnumTypeStmt {
+        if_exists,
+        enum_type,
+    }))
+}
+
 pub(crate) fn parse_create_enum_type(p: &mut Parser) -> Result<Stmt, DbError> {
     let enum_type = p.parse_table_ref()?;
     p.expect(&Token::As)?;

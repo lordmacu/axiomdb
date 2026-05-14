@@ -1063,9 +1063,13 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_sequence(self)
             }
+            Token::Type => {
+                self.advance();
+                ddl::parse_drop_enum_type(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

@@ -464,6 +464,7 @@ fn is_ddl(stmt: &Stmt) -> bool {
             | Stmt::DropMaterializedView(_)
             | Stmt::DropAggregate(_)
             | Stmt::DropSequence(_)
+            | Stmt::DropEnumType(_)
             | Stmt::DropDatabase(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)

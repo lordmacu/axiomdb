@@ -69,6 +69,9 @@ fn dispatch(
         Stmt::CreateEnumType(_) => Err(DbError::NotImplemented {
             feature: "CREATE TYPE requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::DropEnumType(s) => {
+            execute_drop_enum_type(s, storage, txn, conn_txn, "public")
+        }
         Stmt::DropTable(s) => {
             execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }

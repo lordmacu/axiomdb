@@ -533,6 +533,40 @@ TABLE`, and `information_schema.COLUMNS` report the declared enum type.
 
 ---
 
+## Array Column Catalog (Phase 20.4)
+
+Array columns use `ColumnType::Array` in `ColumnDef.col_type` and store the
+element type in an optional trailer appended to the `axiom_columns` row.
+
+### `ColumnDef` binary format for array columns
+
+`axiom_columns` rows use a backward-compatible trailing-field encoding:
+
+```text
+[base fields: col_idx, name, col_type, flags, ...]
+[optional collation: len:2 LE + utf8 bytes]     -- when bit3 of flags set
+[optional enum_type_name: len:2 LE + utf8]      -- when bit4 of flags set
+[optional array_element_type: 1 byte tag]        -- when bit5 of flags set
+```
+
+**Serialization invariant:** when `enum_type_name` is present but `collation`
+is absent, the encoder still emits a zero-length collation field. This ensures
+the decoder never misidentifies enum bytes as collation bytes.
+
+Element type tags mirror `ColumnType` discriminants (e.g., `1 = Int`,
+`2 = BigInt`, `8 = Text`). Array columns with element type `Text` are the
+common case (`TEXT[]`, `VARCHAR[]`); other types are explicitly tagged.
+
+### `DROP TYPE`
+
+`DROP TYPE [IF EXISTS] schema.name` removes a `EnumTypeDef` from
+`axiom_enum_types`. If the type does not exist and `IF EXISTS` is omitted, the
+executor returns `DbError::InvalidValue`. Dropping a type used by existing
+columns does not cascade — column definitions continue to reference the type
+name, but new validation against the (now-missing) type will fail.
+
+---
+
 ## Regular Views Catalog (Phase 20.1)
 
 ### `RelationKind::View`

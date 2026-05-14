@@ -464,6 +464,19 @@ fn dispatch_ctx(
                 &default_schema,
             )
         }
+        Stmt::DropEnumType(s) => {
+            ctx.invalidate_all();
+            let default_schema = ctx.default_create_schema().to_string();
+            execute_drop_enum_type(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &default_schema,
+            )
+        }
         Stmt::DropMaterializedView(s) => {
             ctx.invalidate_all();
             let db = ctx.effective_database().to_string();
