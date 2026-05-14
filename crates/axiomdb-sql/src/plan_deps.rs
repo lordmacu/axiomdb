@@ -203,6 +203,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::DropAggregate(_)
             | Stmt::DropSequence(_)
             | Stmt::DropEnumType(_)
+            | Stmt::DropSchema(_)
             | Stmt::RefreshMaterializedView(_)
             | Stmt::TruncateTable(_)
             | Stmt::AlterTable(_)
@@ -211,6 +212,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             // Introspection — catalog meta tables, no user data table deps.
             Stmt::ShowTables(_)
             | Stmt::ShowDatabases(_)
+            | Stmt::ShowSchemas(_)
             | Stmt::ShowColumns(_)
             | Stmt::ShowIndex(_)
             | Stmt::ShowCreateTable(_)

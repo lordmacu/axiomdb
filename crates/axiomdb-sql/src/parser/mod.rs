@@ -459,6 +459,15 @@ impl<'src> Parser<'src> {
                         self.advance();
                         Ok(Stmt::ShowDatabases(crate::ast::ShowDatabasesStmt))
                     }
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("SCHEMAS") => {
+                        self.advance();
+                        let like_pattern = if self.eat(&Token::Like) {
+                            Some(self.parse_string_literal()?)
+                        } else {
+                            None
+                        };
+                        Ok(Stmt::ShowSchemas(crate::ast::ShowSchemasStmt { like_pattern }))
+                    }
                     Token::Tables => {
                         self.advance();
                         let schema = if self.eat(&Token::From) || self.eat_ident_ci("IN") {
@@ -1067,9 +1076,13 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_enum_type(self)
             }
+            Token::Schema => {
+                self.advance();
+                ddl::parse_drop_schema(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA or INDEX after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

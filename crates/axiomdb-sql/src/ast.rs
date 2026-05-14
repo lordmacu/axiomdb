@@ -1203,6 +1203,21 @@ pub struct CreateSchemaStmt {
     pub if_not_exists: bool,
 }
 
+/// `DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT]` (Phase 22b.4)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSchemaStmt {
+    pub name: String,
+    pub if_exists: bool,
+    /// `true` = CASCADE (drop all tables in schema first), `false` = RESTRICT (default)
+    pub cascade: bool,
+}
+
+/// `SHOW SCHEMAS [LIKE 'pattern']` (Phase 22b.4)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowSchemasStmt {
+    pub like_pattern: Option<String>,
+}
+
 /// `DECLARE name CURSOR FOR <query>`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeclareCursorStmt {
@@ -1398,6 +1413,7 @@ pub enum Stmt {
     DropEnumType(DropEnumTypeStmt),
     DropAggregate(DropAggregateStmt),
     DropSequence(DropSequenceStmt),
+    DropSchema(DropSchemaStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
@@ -1406,6 +1422,7 @@ pub enum Stmt {
     // Introspection
     ShowTables(ShowTablesStmt),
     ShowDatabases(ShowDatabasesStmt),
+    ShowSchemas(ShowSchemasStmt),
     ShowColumns(ShowColumnsStmt),
     ShowIndex(ShowIndexStmt),
     /// `SHOW CREATE TABLE t` — reconstruct DDL (4.20b).

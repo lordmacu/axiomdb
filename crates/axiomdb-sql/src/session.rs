@@ -378,6 +378,7 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::DatabaseAlreadyExists { .. }
         | DbError::SchemaAlreadyExists { .. }
         | DbError::SchemaNotFound { .. }
+        | DbError::SchemaNotEmpty { .. }
         | DbError::IndexAlreadyExists { .. }
         | DbError::TriggerAlreadyExists { .. }
         | DbError::IndexKeyTooLong { .. }

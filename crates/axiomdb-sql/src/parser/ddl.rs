@@ -1646,6 +1646,22 @@ fn first_column_name(expr: &Expr) -> Option<&str> {
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
 
+pub(crate) fn parse_drop_schema(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let name = p.parse_identifier()?;
+    let cascade = if p.eat_ident_ci("CASCADE") {
+        true
+    } else {
+        p.eat_ident_ci("RESTRICT"); // consume optional RESTRICT; RESTRICT is the default
+        false
+    };
+    Ok(Stmt::DropSchema(crate::ast::DropSchemaStmt {
+        name,
+        if_exists,
+        cascade,
+    }))
+}
+
 pub(crate) fn parse_drop_database(p: &mut Parser) -> Result<Stmt, DbError> {
     let if_exists = eat_if_exists(p)?;
     let name = p.parse_identifier()?;

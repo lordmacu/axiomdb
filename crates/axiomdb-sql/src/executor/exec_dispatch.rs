@@ -134,6 +134,19 @@ fn dispatch_ctx(
                 &db,
             )
         }
+        Stmt::DropSchema(s) => {
+            ctx.invalidate_all();
+            let db = ctx.effective_database().to_string();
+            execute_drop_schema(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
+        }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
             let search_path = ctx.search_path.clone();
@@ -228,6 +241,7 @@ fn dispatch_ctx(
                 .as_mut()
                 .expect("conn_txn must be set before dispatch_ctx"),
         ),
+        Stmt::ShowSchemas(s) => execute_show_schemas(s, storage, txn, ctx),
         Stmt::ShowTables(s) => {
             let db = ctx.effective_database().to_string();
             let search_path = ctx.search_path.clone();
