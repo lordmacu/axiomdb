@@ -440,4 +440,74 @@ fn test_cross_db_create_table_three_part() {
     assert_eq!(rows[0][0], Value::Text("test".into()));
 }
 
+#[test]
+fn test_cross_db_join_two_databases() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    // Create table in default database (axiomdb)
+    run_ctx(
+        "CREATE TABLE orders (id INT, user_id INT, total INT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO orders VALUES (1, 10, 500), (2, 20, 300)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Create table in a second database
+    run_ctx(
+        "CREATE DATABASE crm",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("USE crm", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    run_ctx(
+        "CREATE TABLE customers (id INT, name TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "INSERT INTO customers VALUES (10, 'alice'), (20, 'bob')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Cross-db JOIN while session is on crm
+    let QueryResult::Rows { rows, .. } = run_ctx(
+        "SELECT c.name, o.total \
+         FROM customers AS c \
+         JOIN axiomdb.public.orders AS o ON o.user_id = c.id \
+         ORDER BY c.name",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap() else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Text("alice".into()));
+    assert_eq!(rows[0][1], Value::Int(500));
+    assert_eq!(rows[1][0], Value::Text("bob".into()));
+    assert_eq!(rows[1][1], Value::Int(300));
+}
+
 // ── Phase 22b.4: schema namespacing ──────────────────────────────────────────
