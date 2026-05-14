@@ -72,6 +72,11 @@ pub fn dberror_to_mysql(e: &DbError, sql: Option<&str>) -> MysqlError {
             (1007, b"42P06", format!("Schema '{name}' already exists"))
         }
         DbError::SchemaNotFound { name } => (1049, b"3F000", format!("Unknown schema '{name}'")),
+        DbError::SchemaNotEmpty { name } => (
+            1010,
+            b"HY000",
+            format!("Can't drop schema '{name}'; schema is not empty"),
+        ),
         DbError::IndexNotFound { name } => (
             1091,
             b"42000",

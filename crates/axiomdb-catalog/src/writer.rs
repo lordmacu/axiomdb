@@ -541,6 +541,40 @@ impl<'a> CatalogWriter<'a> {
         Ok(())
     }
 
+    /// Deletes the schema row from `axiom_schemas`.
+    ///
+    /// Returns `true` if a row was found and deleted, `false` if the schema row
+    /// did not exist (e.g. `public` was never explicitly created — the schema is
+    /// still considered logically present but has no catalog row).
+    /// Precondition: caller has already ensured no tables remain (RESTRICT path)
+    /// or has already dropped all contained tables (CASCADE path).
+    pub fn delete_schema(&mut self, database: &str, schema: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.schemas;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = crate::schema::SchemaDef::from_bytes(&data)?;
+            if def.database_name == database && def.name == schema {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}\0{}", database, schema);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_SCHEMAS,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Ensures the `axiom_schemas` root page exists, allocating it lazily for
     /// legacy databases created before Phase 22b.4.
     fn ensure_schemas_root(&mut self) -> Result<u64, DbError> {
