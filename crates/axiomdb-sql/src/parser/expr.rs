@@ -373,6 +373,33 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
             };
             p.advance();
             let right = parse_bitor(p)?;
+
+            // Phase 20.4, Step 7: Fix up AnyOf/AllOf placeholder with the actual LHS.
+            // When parsing `lhs = ANY(array)`, the AnyOf node was created with
+            // Literal(Null) as a placeholder. Now we have `left` available,
+            // so we substitute it in.
+            let right = match &right {
+                Expr::AnyOf { expr, .. } if matches!(**expr, Expr::Literal(Value::Null)) => {
+                    Expr::AnyOf {
+                        expr: Box::new(left.clone()),
+                        array: match right {
+                            Expr::AnyOf { array, .. } => array,
+                            _ => unreachable!(),
+                        },
+                    }
+                }
+                Expr::AllOf { expr, .. } if matches!(**expr, Expr::Literal(Value::Null)) => {
+                    Expr::AllOf {
+                        expr: Box::new(left.clone()),
+                        array: match right {
+                            Expr::AllOf { array, .. } => array,
+                            _ => unreachable!(),
+                        },
+                    }
+                }
+                _ => right,
+            };
+
             Ok(binop(op, left, right))
         }
         _ if negated => {
@@ -703,6 +730,58 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
                 // ARRAY as a bare identifier (e.g., type name) — fall through
                 Ok(Expr::Column { col_idx: 0, name: s.to_string() })
             }
+        }
+
+        // ── ANY/ALL array constructs (Phase 20.4, Step 7) ──────────────────
+        // `expr = ANY(array)` / `expr = ALL(array)`.
+        // The ANY/ALL keyword appears after the comparison operator.
+        // When we see ANY/ALL here, we parse the parenthesized content and
+        // signal to the comparison handler that it needs to build the proper
+        // AnyOf/AllOf node with the left-hand side.
+        Token::Any | Token::Some => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            // ANY(SELECT ...) → subquery
+            if matches!(p.peek(), Token::Select) {
+                let query = parse_subquery(p)?;
+                p.expect(&Token::RParen)?;
+                // Signal subquery by returning a special marker.
+                // The cmp arm detects this and converts to InSubquery with the LHS.
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(Expr::Literal(Value::Null)),
+                    query: Box::new(query),
+                    negated: false,
+                });
+            }
+            // ANY(array) — parse array expression
+            let arr_expr = parse_expr(p)?;
+            p.expect(&Token::RParen)?;
+            Ok(Expr::AnyOf {
+                expr: Box::new(Expr::Literal(Value::Null)), // placeholder; cmp handler fixes this
+                array: Box::new(arr_expr),
+            })
+        }
+
+        Token::All => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            // ALL(SELECT ...) — subquery
+            if matches!(p.peek(), Token::Select) {
+                let query = parse_subquery(p)?;
+                p.expect(&Token::RParen)?;
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(Expr::Literal(Value::Null)),
+                    query: Box::new(query),
+                    negated: true, // ALL = NOT (NOT IN)
+                });
+            }
+            // ALL(array)
+            let arr_expr = parse_expr(p)?;
+            p.expect(&Token::RParen)?;
+            Ok(Expr::AllOf {
+                expr: Box::new(Expr::Literal(Value::Null)), // placeholder; cmp handler fixes this
+                array: Box::new(arr_expr),
+            })
         }
 
         // Identifiers and unreserved keywords usable as column/function names.

@@ -470,6 +470,15 @@ fn analyze_select_with_outer(
             FromClause::Table(_) => {}
             // Phase 21.3 — recursive CTE already pre-analyzed by expand_ctes.
             FromClause::RecursiveCte(_) => {}
+            // Phase 20.4, Step 7 — UNNEST: resolve array expressions against
+            // the accumulated scope (LATERAL correlation).
+            FromClause::Unnest(mut un) => {
+                for expr in &mut un.exprs {
+                    let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                    *expr = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                }
+                join.table = FromClause::Unnest(un);
+            }
         }
         // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
         // the accumulated left-side scope and this join's right-side BoundTable,
@@ -881,7 +890,9 @@ fn expr_contains_window(expr: &Expr) -> bool {
         | Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::ArrayConstructor { .. }
-        | Expr::Subscript { .. } => false,
+        | Expr::Subscript { .. }
+        | Expr::AnyOf { .. }
+        | Expr::AllOf { .. } => false,
     }
 }
 
@@ -971,7 +982,9 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::ArrayConstructor { .. }
-        | Expr::Subscript { .. } => false,
+        | Expr::Subscript { .. }
+        | Expr::AnyOf { .. }
+        | Expr::AllOf { .. } => false,
     }
 }
 
@@ -1121,6 +1134,10 @@ fn rewrite_custom_aggregates_in_expr(
         Expr::InSubquery { expr, .. } => {
             rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
         }
+        Expr::AnyOf { expr, array } | Expr::AllOf { expr, array } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            rewrite_custom_aggregates_in_expr(array, reader, default_schema)?;
+        }
         Expr::Literal(_)
         | Expr::Default
         | Expr::Column { .. }
@@ -1260,6 +1277,11 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         | Expr::Subquery(_)
         | Expr::InSubquery { .. }
         | Expr::Exists { .. } => {}
+        // Phase 20.4, Step 7 — ANY/ALL: recurse into expr and array.
+        Expr::AnyOf { expr, array } | Expr::AllOf { expr, array } => {
+            populate_grouping_indices(expr, universe);
+            populate_grouping_indices(array, universe);
+        }
     }
 }
 

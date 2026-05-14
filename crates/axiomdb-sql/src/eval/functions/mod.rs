@@ -3,7 +3,8 @@ use axiomdb_types::Value;
 
 use crate::expr::Expr;
 
-mod array;
+pub(crate) mod any_all;
+pub(crate) mod array;
 mod binary;
 pub(crate) mod datetime;
 mod json;

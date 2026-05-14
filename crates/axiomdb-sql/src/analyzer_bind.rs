@@ -466,6 +466,20 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 20.4, Step 7 — UNNEST virtual table.
+        FromClause::Unnest(un) => {
+            let virtual_cols = crate::unnest::column_defs_for_unnest(un);
+            let n = virtual_cols.len();
+            let alias = un.alias.clone().unwrap_or_else(|| "unnest".into());
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 

@@ -93,10 +93,15 @@ fn execute_select(
         return execute_select_values_source(stmt, storage, txn, conn_txn);
     }
 
+    // Phase 20.4, Step 7 — UNNEST array expansion in FROM.
+    if matches!(stmt.from, Some(FromClause::Unnest(_))) {
+        return execute_select_unnest_source(stmt, storage, txn, conn_txn);
+    }
+
     // Extract the FROM table reference.
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values above"),
+        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values, Unnest above"),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).
@@ -418,6 +423,101 @@ fn execute_select(
         // ── Multi-table JOIN path ─────────────────────────────────────────────
         execute_select_with_joins(stmt, from_table_ref, storage, txn, conn_txn)
     }
+}
+
+/// Phase 20.4, Step 7 — SELECT whose FROM is an `UNNEST(...)` clause.
+/// Materializes the array expansion rows, then applies WHERE / GROUP BY /
+/// ORDER BY / LIMIT / joins. UNNEST is always LATERAL: when it is the first
+/// FROM source (no outer correlation) we pass an empty outer row.
+fn execute_select_unnest_source(
+    mut stmt: SelectStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    _conn_txn: Option<&ConnectionTxn>,
+) -> Result<QueryResult, DbError> {
+    let un = match stmt.from.take() {
+        Some(FromClause::Unnest(un)) => *un,
+        _ => unreachable!("execute_select_unnest_source called with non-Unnest FROM"),
+    };
+
+    let alias = un.alias.clone().unwrap_or_else(|| "unnest".to_string());
+    // UNNEST as the first FROM source has no outer correlation.
+    let derived_rows = crate::unnest::materialize_unnest(&un, None)?;
+    let derived_cols = crate::unnest::column_metas_for_unnest(&un);
+
+    if !stmt.joins.is_empty() {
+        let mut temp_ctx = SessionContext::new();
+        let temp_bloom = crate::bloom::BloomRegistry::new();
+        let temp_exec_ctx = ExecutionContext::new(storage, txn, &temp_bloom, None);
+        let first_source = join_source_schema_from_derived(&alias, derived_cols);
+        return execute_select_with_joins_first_materialized(
+            stmt,
+            first_source,
+            derived_rows,
+            &temp_exec_ctx,
+            _conn_txn,
+            &mut temp_ctx,
+        );
+    }
+
+    let mut combined_rows: Vec<Row> = Vec::new();
+    let mut sq_cache: SubqueryCache = HashMap::new();
+    let mut in_set_cache: InSetCache = HashMap::new();
+    let mut corr_cache: CorrelatedCache = HashMap::new();
+    for values in derived_rows {
+        if let Some(ref wc) = stmt.where_clause {
+            let mut temp_ctx2 = SessionContext::new();
+            let temp_bloom2 = crate::bloom::BloomRegistry::new();
+            let mut runner = ExecSubqueryRunner {
+                storage,
+                txn,
+                bloom: &temp_bloom2,
+                ctx: &mut temp_ctx2,
+                outer_row: &values,
+                cache: Some(&mut sq_cache),
+                in_set_cache: Some(&mut in_set_cache),
+                correlated_cache: Some(&mut corr_cache),
+                materialized: None,
+            };
+            if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                continue;
+            }
+        }
+        combined_rows.push(values);
+    }
+
+    if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
+        return execute_select_grouped(stmt, combined_rows, GroupByStrategy::Hash);
+    }
+
+    let resolved_ob = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+    if !stmt.distinct_on.is_empty() {
+        combined_rows = apply_distinct_on(combined_rows, &stmt.distinct_on, &resolved_ob, &stmt.columns)?;
+    } else if !resolved_ob.is_empty() && stmt.limit.is_some() && !stmt.distinct && !stmt.calc_found_rows {
+        let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+        let top_n = offset_n + limit_n.unwrap_or(usize::MAX).min(usize::MAX - offset_n);
+        combined_rows = apply_order_by_top_n(combined_rows, &resolved_ob, top_n)?;
+    } else {
+        combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
+    }
+
+    let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
+    let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
+        eval(expr, row)
+    })?;
+
+    if stmt.distinct {
+        rows = apply_distinct_with_session(rows);
+    }
+    if stmt.calc_found_rows {
+        set_found_rows(rows.len() as u64);
+    }
+    rows = apply_limit_offset(rows, &stmt.limit, &stmt.offset)?;
+
+    Ok(QueryResult::Rows {
+        columns: out_cols,
+        rows,
+    })
 }
 
 /// Executes a SELECT whose FROM clause is a derived table: `FROM (SELECT ...) AS alias`.

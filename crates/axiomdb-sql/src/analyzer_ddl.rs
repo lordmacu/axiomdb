@@ -574,6 +574,10 @@ fn analyze_merge_source(
             &[],
         ),
         other @ FromClause::Table(_) | other @ FromClause::RecursiveCte(_) => Ok(other),
+        // Phase 20.4, Step 7 — UNNEST not allowed in DDL context (no LATERAL FROM in subquery context).
+        FromClause::Unnest(_) => Err(DbError::NotImplemented {
+            feature: "UNNEST in subquery/DDL context".into(),
+        }),
     }
 }
 
@@ -818,6 +822,11 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
                 reject_disallowed_in_index_expr(s)?;
             }
             Ok(())
+        }
+        // Phase 20.4, Step 7 — ANY/ALL: recurse into expr and array.
+        Expr::AnyOf { expr, array } | Expr::AllOf { expr, array } => {
+            reject_disallowed_in_index_expr(expr)?;
+            reject_disallowed_in_index_expr(array)
         }
         Expr::Literal(_) | Expr::Column { .. } | Expr::Default => Ok(()),
     }

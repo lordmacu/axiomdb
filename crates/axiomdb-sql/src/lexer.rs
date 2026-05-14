@@ -351,6 +351,10 @@ pub enum Token<'src> {
     Except,
     #[token("ALL", ignore(ascii_case))]
     All,
+    #[token("ANY", ignore(ascii_case))]
+    Any,
+    #[token("SOME", ignore(ascii_case))]
+    Some,
 
     // ── Data type keywords (in column definitions) ────────────────────────────
     // Prefixed with `Ty` to avoid collision with literal variants Integer/Float.
@@ -398,6 +402,8 @@ pub enum Token<'src> {
     TyJsonb,
     #[token("ARRAY", ignore(ascii_case))]
     Array,
+    #[token("UNNEST", ignore(ascii_case))]
+    Unnest,
 
     // ── Miscellaneous ─────────────────────────────────────────────────────────
     #[token("SEPARATOR", ignore(ascii_case))]

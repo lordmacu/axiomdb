@@ -338,6 +338,36 @@ pub enum Expr {
         /// If `Some(hi)`, this is a slice `arr[index:hi]`.
         slice: Option<Box<Expr>>,
     },
+
+    // ── ANY/ALL array constructs (Phase 20.4, Step 7) ──────────────────
+    /// `expr = ANY(array)` — TRUE if any element comparison is TRUE.
+    ///
+    /// Returns NULL when: array is empty, OR all comparisons are NULL,
+    /// OR any comparison is NULL with no TRUE results.
+    /// The outer operator (`=`, `<>`, `<`, etc.) is implicitly applied
+    /// between `expr` and each array element.
+    ///
+    /// The `expr` field is set by the parser to the LHS of the comparison.
+    /// The evaluator applies the outer comparison operator to each element.
+    AnyOf {
+        /// The left-hand expression to compare against each array element.
+        /// Set by the parser when parsing `lhs = ANY(array)`.
+        expr: Box<Expr>,
+        /// The array expression.
+        array: Box<Expr>,
+    },
+
+    /// `expr = ALL(array)` — TRUE if all element comparisons are TRUE.
+    ///
+    /// Returns NULL when: array has at least one NULL comparison with no FALSE,
+    /// OR array is empty (no elements to compare).
+    /// Returns FALSE if any element comparison is FALSE.
+    AllOf {
+        /// The left-hand expression to compare against each array element.
+        expr: Box<Expr>,
+        /// The array expression.
+        array: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

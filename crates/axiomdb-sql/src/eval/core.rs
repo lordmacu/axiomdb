@@ -102,6 +102,30 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             right,
         } => eval_xor(left, right, row),
 
+        // Phase 20.4, Step 7: ANY/ALL as the RHS of a comparison.
+        // When the RHS is AnyOf or AllOf, we handle it specially here
+        // instead of evaluating it as a standalone expression.
+        Expr::BinaryOp { op, left, right } if matches!(right.as_ref(), Expr::AnyOf { .. }) => {
+            let (any_expr, array) = match right.as_ref() {
+                Expr::AnyOf { expr, array } => (expr, array),
+                _ => unreachable!(),
+            };
+            let _guard = explicit_collation_from_exprs(&[left, any_expr]).map(CollationGuard::new);
+            let lhs_val = eval(left, row)?;
+            let arr_val = eval(array, row)?;
+            super::functions::any_all::eval_any_of(&lhs_val, &arr_val, *op)
+        }
+        Expr::BinaryOp { op, left, right } if matches!(right.as_ref(), Expr::AllOf { .. }) => {
+            let (all_expr, array) = match right.as_ref() {
+                Expr::AllOf { expr, array } => (expr, array),
+                _ => unreachable!(),
+            };
+            let _guard = explicit_collation_from_exprs(&[left, all_expr]).map(CollationGuard::new);
+            let lhs_val = eval(left, row)?;
+            let arr_val = eval(array, row)?;
+            super::functions::any_all::eval_all_of(&lhs_val, &arr_val, *op)
+        }
+
         Expr::BinaryOp { op, left, right } => {
             let _guard = explicit_collation_from_exprs(&[left, right]).map(CollationGuard::new);
             let l = eval(left, row)?;
@@ -138,6 +162,81 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             negated,
             escape,
         } => {
+            // Phase 20.4, Step 7: Handle `expr LIKE ANY(array)` / `expr LIKE ALL(array)`.
+            // When the pattern is an AnyOf/AllOf node, we expand it element-wise.
+            // The AnyOf/AllOf was created with a NULL placeholder for the LHS expr.
+            // We substitute it with the actual LHS from this Like.
+            if let Expr::AnyOf {
+                expr: like_expr,
+                array,
+            } = pattern.as_ref()
+            {
+                // Fix up the NULL placeholder with the actual LHS
+                let resolved_like_expr = if matches!(like_expr.as_ref(), Expr::Literal(Value::Null))
+                {
+                    (*expr).clone()
+                } else {
+                    like_expr.clone()
+                };
+                let _guard = explicit_collation_from_exprs(&[expr, &resolved_like_expr])
+                    .map(CollationGuard::new);
+                let v = eval(expr, row)?;
+                let arr_val = eval(array, row)?;
+                let escape_ch = if let Some(esc_expr) = escape {
+                    match eval(esc_expr, row)? {
+                        Value::Text(esc) => esc.chars().next(),
+                        Value::Null => return Ok(Value::Null),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                // Evaluate LIKE ANY over the array
+                let result =
+                    crate::eval::functions::any_all::eval_like_any(&v, &arr_val, escape_ch)?;
+                return Ok(Value::Bool(if *negated {
+                    !is_truthy(&result)
+                } else {
+                    is_truthy(&result)
+                }));
+            }
+            if let Expr::AllOf {
+                expr: like_expr,
+                array,
+            } = pattern.as_ref()
+            {
+                // Fix up the NULL placeholder with the actual LHS
+                let resolved_like_expr = if matches!(like_expr.as_ref(), Expr::Literal(Value::Null))
+                {
+                    (*expr).clone()
+                } else {
+                    like_expr.clone()
+                };
+                let _guard = explicit_collation_from_exprs(&[expr, &resolved_like_expr])
+                    .map(CollationGuard::new);
+                let v = eval(expr, row)?;
+                let arr_val = eval(array, row)?;
+                let escape_ch = if let Some(esc_expr) = escape {
+                    match eval(esc_expr, row)? {
+                        Value::Text(esc) => esc.chars().next(),
+                        Value::Null => return Ok(Value::Null),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                // Evaluate LIKE ALL over the array
+                let result =
+                    crate::eval::functions::any_all::eval_like_all(&v, &arr_val, escape_ch)?;
+                return Ok(Value::Bool(if *negated {
+                    !is_truthy(&result)
+                } else {
+                    is_truthy(&result)
+                }));
+            }
+
             let _guard =
                 explicit_collation_from_exprs(&[expr, pattern, escape.as_deref().unwrap_or(expr)])
                     .map(CollationGuard::new);
@@ -345,6 +444,21 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 super::array_ops::array_subscript(&arr_val, &idx_val)
             }
         }
+
+        // Phase 20.4, Step 7 — ANY/ALL as standalone expressions (not in BinaryOp context).
+        // For standalone `ANY(array)` (implicit =), we use Eq semantics.
+        Expr::AnyOf { expr, array } => {
+            use super::functions::any_all::eval_any_of;
+            let elem_val = eval(expr, row)?;
+            let arr_val = eval(array, row)?;
+            eval_any_of(&elem_val, &arr_val, BinaryOp::Eq)
+        }
+        Expr::AllOf { expr, array } => {
+            use super::functions::any_all::eval_all_of;
+            let elem_val = eval(expr, row)?;
+            let arr_val = eval(array, row)?;
+            eval_all_of(&elem_val, &arr_val, BinaryOp::Eq)
+        }
     }
 }
 
@@ -497,6 +611,16 @@ pub fn eval_with<R: SubqueryRunner>(
 
         // Phase 11.19a — SQL/JSON standard query function.
         Expr::SqlJsonQuery { .. } => crate::eval::functions::eval_sql_json_query(expr, row, sq),
+
+        // Phase 20.4 — ANY/ALL array quantifiers: handled in BinaryOp.
+        Expr::AnyOf { .. } | Expr::AllOf { .. } => {
+            // AnyOf/AllOf should be handled by BinaryOp during eval_binary;
+            // if reached here directly, it's a bug.
+            Err(DbError::Internal {
+                message: "AnyOf/AllOf reached eval_with directly — should be handled in BinaryOp"
+                    .into(),
+            })
+        }
 
         Expr::InsertValue { col_idx, name } => Err(DbError::Internal {
             message: format!(

@@ -292,6 +292,11 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 collect_column_refs(s, mask);
             }
         }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            collect_column_refs(expr, mask);
+            collect_column_refs(array, mask);
+        }
     }
 }
 

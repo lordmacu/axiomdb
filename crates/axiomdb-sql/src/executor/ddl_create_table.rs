@@ -360,6 +360,11 @@ fn validate_generated_expr_refs(
             }
             Ok(())
         }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            validate_generated_expr_refs(expr, table_name, generated_name, base_cols, generated_cols)?;
+            validate_generated_expr_refs(array, table_name, generated_name, base_cols, generated_cols)
+        }
         Expr::OuterColumn { .. }
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. }

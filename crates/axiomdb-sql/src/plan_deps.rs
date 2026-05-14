@@ -378,6 +378,13 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            // Phase 20.4, Step 7 — UNNEST array expansion.
+            FromClause::Unnest(un) => {
+                for expr in &un.exprs {
+                    self.visit_expr(expr)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -532,6 +539,11 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                     self.visit_expr(s)?;
                 }
                 Ok(())
+            }
+            // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+            Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+                self.visit_expr(expr)?;
+                self.visit_expr(array)
             }
         }
     }

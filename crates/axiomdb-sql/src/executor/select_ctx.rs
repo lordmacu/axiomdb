@@ -267,6 +267,12 @@ fn execute_select_ctx(
                 | crate::expr::Expr::Subquery(_)
                 | crate::expr::Expr::InSubquery { .. }
                 | crate::expr::Expr::Exists { .. } => {}
+                // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+                crate::expr::Expr::AnyOf { expr, array, .. }
+                | crate::expr::Expr::AllOf { expr, array, .. } => {
+                    collect_expr_columns(expr, mask);
+                    collect_expr_columns(array, mask);
+                }
             }
         }
 

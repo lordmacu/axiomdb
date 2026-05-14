@@ -279,6 +279,11 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
                 || expr_mentions_column_name(index, target_name)
                 || slice.as_ref().is_some_and(|s| expr_mentions_column_name(s, target_name))
         }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            expr_mentions_column_name(expr, target_name)
+                || expr_mentions_column_name(array, target_name)
+        }
     }
 }
 

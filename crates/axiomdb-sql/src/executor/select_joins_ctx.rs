@@ -254,6 +254,12 @@ fn execute_select_with_joins_first_materialized(
                             .into(),
                     });
                 }
+                // Phase 20.4 — UNNEST on the right side of a JOIN.
+                FromClause::Unnest(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "UNNEST on the right side of a JOIN".into(),
+                    });
+                }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
                         message: "unlowered PIVOT reached join executor".into(),

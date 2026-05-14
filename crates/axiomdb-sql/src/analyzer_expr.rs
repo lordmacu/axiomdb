@@ -411,6 +411,25 @@ fn resolve_expr_full(
                 slice: resolved_slice,
             })
         }
+
+        // Phase 20.4, Step 7 — ANY/ALL: resolve both the expr and array sub-expressions.
+        Expr::AnyOf { expr, array } => {
+            let resolved_expr = resolve_expr_full(*expr, ctx, outer_scopes, state)?;
+            let resolved_array = resolve_expr_full(*array, ctx, outer_scopes, state)?;
+            Ok(Expr::AnyOf {
+                expr: Box::new(resolved_expr),
+                array: Box::new(resolved_array),
+            })
+        }
+
+        Expr::AllOf { expr, array } => {
+            let resolved_expr = resolve_expr_full(*expr, ctx, outer_scopes, state)?;
+            let resolved_array = resolve_expr_full(*array, ctx, outer_scopes, state)?;
+            Ok(Expr::AllOf {
+                expr: Box::new(resolved_expr),
+                array: Box::new(resolved_array),
+            })
+        }
     }
 }
 
