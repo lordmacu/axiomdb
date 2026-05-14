@@ -1,6 +1,6 @@
 # Phase 22b — Platform Features
 
-## Subphases completed in this session: 22b.3a
+## Subphases completed: 22b.3a, 22b.3b, 22b.4
 
 ## What was built
 
@@ -78,9 +78,40 @@ Closure gates passed:
 - `cargo fmt --check`
 - `python3 tools/wire-test.py` (`251/251` passed)
 
+### 22b.3b — Cross-database queries
+
+AxiomDB supports fully-qualified `database.schema.table` references in all DML
+and DDL statements.
+
+**Resolution model:** Each `TableRef` in a query carries an optional `database`
+field. `resolve_table_cached` reads it and delegates to a `SchemaResolver`
+scoped to the target database. The session's effective database is used as the
+fallback when the field is absent.
+
+**SQL surface:**
+
+```sql
+SELECT * FROM analytics.public.events;
+INSERT INTO axiomdb.public.log SELECT * FROM local_copy;
+UPDATE other_db.public.items SET score = 99 WHERE id = 1;
+DELETE FROM old_db.public.logs WHERE id > 100;
+CREATE TABLE analytics.public.scores (id INT, val INT);
+
+-- Cross-db JOIN (two databases in one query)
+SELECT c.name, o.total
+FROM crm.public.customers AS c
+JOIN axiomdb.public.orders AS o ON o.user_id = c.id;
+```
+
+**Error handling:** Unknown database in a 3-part name returns
+`DatabaseNotFound (ER_BAD_DB_ERROR)` immediately, before table resolution.
+
+**Tests:**
+
+- `crates/axiomdb-sql/tests/integration_namespacing_cross_db.rs` — 9 unit tests
+- `tools/wire-test.py` section `[22b.3b]` — 8 wire scenarios including cross-db JOIN
+
 ## Deferred
 
-- `22b.3b` — fully-qualified `database.schema.table`
-- `22b.3b` — cross-database SELECT / JOIN / DML
 - later schema phases — database-local schemas beyond `public`
 - later platform phases — per-database COMPAT, encryption, quotas, ownership

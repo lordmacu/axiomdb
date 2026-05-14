@@ -2319,6 +2319,29 @@ cx.execute("SELECT COUNT(*) FROM local_copy")
 ok("22b.3b unqualified still resolves to current db",
    cx.fetchone() == (1,))
 
+# 8. Cross-db JOIN: session on axiomdb, join local table with analytics table
+cx.execute("USE axiomdb")
+cx.execute("CREATE TABLE order_lines (order_id INT, item TEXT)")
+cx.execute("INSERT INTO order_lines VALUES (1, 'widget'), (2, 'gadget')")
+conn_xdb.commit()
+cx.execute("USE analytics")
+cx.execute("CREATE TABLE order_headers (id INT, amount INT)")
+cx.execute("INSERT INTO order_headers VALUES (1, 100), (2, 200)")
+conn_xdb.commit()
+cx.execute(
+    "SELECT h.amount, l.item "
+    "FROM order_headers AS h "
+    "JOIN axiomdb.public.order_lines AS l ON l.order_id = h.id "
+    "ORDER BY h.id"
+)
+join_rows = cx.fetchall()
+ok("22b.3b cross-db JOIN resolves tables from two databases",
+   join_rows == ((100, "widget"), (200, "gadget")),
+   join_rows)
+cx.execute("USE axiomdb")
+cx.execute("DROP TABLE order_lines")
+conn_xdb.commit()
+
 # Cleanup
 cx.execute("DROP DATABASE analytics")
 conn_xdb.commit()
