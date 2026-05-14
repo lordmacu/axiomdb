@@ -402,9 +402,11 @@ fn execute_create_index(
         let _ = (doc_count, total_tokens);
         // Skip regular bloom for FTS.
     } else if is_gin {
-        // ── GIN inverted index build (Phase 11.17) ────────────────────────────
-        // Extract all JSONB terms from each row and insert term postings into the
-        // B-Tree. Heap tables use RID bookmarks; clustered tables use the encoded
+        // ── GIN inverted index build (Phase 11.17 / 20.4 Step 8) ────────────
+        // Extract all JSONB or Array terms from each row and insert term postings
+        // into the B-Tree. For JSONB columns, uses jsonb::gin_extract_terms.
+        // For Array columns, uses gin_extract_array_keys (flattened leaf elements).
+        // Heap tables use RID bookmarks; clustered tables use the encoded
         // primary key as the bookmark suffix. No bloom: term keys use a specialised
         // encoding.
         let gin_col_idx = index_columns
