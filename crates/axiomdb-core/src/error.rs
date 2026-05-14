@@ -269,6 +269,9 @@ pub enum DbError {
     #[error("schema '{name}' not found")]
     SchemaNotFound { name: String },
 
+    #[error("schema '{name}' is not empty")]
+    SchemaNotEmpty { name: String },
+
     #[error("table with id {table_id} not found in catalog")]
     CatalogTableNotFound { table_id: u32 },
 
@@ -386,6 +389,7 @@ impl DbError {
             DbError::IndexAlreadyExists { .. } => "42P07",
             DbError::SchemaAlreadyExists { .. } => "42P06",
             DbError::SchemaNotFound { .. } => "3F000",
+            DbError::SchemaNotEmpty { .. } => "2BP01",
             DbError::ColumnNotFound { .. } => "42703",
             DbError::AmbiguousColumn { .. } => "42702",
             DbError::PermissionDenied { .. } => "42501",
