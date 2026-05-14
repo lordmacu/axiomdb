@@ -158,6 +158,11 @@ pub const CATALOG_SEQUENCES_ROOT_BODY_OFFSET: usize = 144;
 /// databases; lazily initialized on first `CREATE TYPE ... AS ENUM`.
 pub const CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET: usize = 152;
 
+/// body offset of `catalog_cron_jobs_root: u64` — root heap page for
+/// `axiom_cron_jobs` (Phase 22b.1). Value 0 = not yet allocated on legacy
+/// databases; lazily initialized on first `cron_schedule()` call.
+pub const CATALOG_CRON_JOBS_ROOT_BODY_OFFSET: usize = 160;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"

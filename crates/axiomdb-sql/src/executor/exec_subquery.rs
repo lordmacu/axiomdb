@@ -851,7 +851,10 @@ impl<'a> SubqueryRunner for ExecSubqueryRunner<'a> {
         args: &[Expr],
         row: &[Value],
     ) -> Result<Option<Value>, DbError> {
-        eval_sequence_function(name, args, row, self)
+        if let Some(v) = eval_sequence_function(name, args, row, self)? {
+            return Ok(Some(v));
+        }
+        eval_cron_function(name, args, row, self)
     }
 
     fn run(&mut self, stmt: &SelectStmt) -> Result<QueryResult, DbError> {

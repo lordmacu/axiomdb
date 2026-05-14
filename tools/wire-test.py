@@ -40,7 +40,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             13.13 (collation system smoke),
             13.14 (custom aggregate functions smoke),
             20.1 (regular views: CREATE/DROP/REPLACE VIEW, view expansion, SHOW CREATE VIEW, IS.VIEWS),
-            22b.4 (schema namespacing: CREATE/DROP SCHEMA, schema.table, search_path, SHOW SCHEMAS, IS.SCHEMATA)
+            22b.4 (schema namespacing: CREATE/DROP SCHEMA, schema.table, search_path, SHOW SCHEMAS, IS.SCHEMATA),
+            22b.1 (scheduled jobs: cron_schedule/unschedule/enable/disable, IS.scheduled_jobs)
 """
 import os
 import signal
@@ -4659,6 +4660,70 @@ ok("[22b.4 schema] information_schema.SCHEMATA catalog_name is def",
 cur.execute("DROP SCHEMA wire_ns CASCADE")
 conn.commit()
 ok("[22b.4 schema] DROP SCHEMA CASCADE succeeds", True, None)
+
+# ── 22b.1 Scheduled jobs ──────────────────────────────────────────────────────
+
+cur.execute("SELECT cron_schedule('wire_daily', '@daily', 'SELECT 1')")
+row = cur.fetchone()
+ok("[22b.1 cron] cron_schedule returns job name",
+   row is not None and row[0] in ('wire_daily', b'wire_daily'),
+   row)
+
+cur.execute("SELECT cron_schedule('wire_hourly', '0 * * * *', 'SELECT 2')")
+row = cur.fetchone()
+ok("[22b.1 cron] cron_schedule accepts 5-field expression",
+   row is not None and row[0] in ('wire_hourly', b'wire_hourly'),
+   row)
+
+cur.execute("SELECT JOB_NAME, SCHEDULE, ENABLED FROM information_schema.scheduled_jobs ORDER BY JOB_NAME")
+rows = cur.fetchall()
+names = [r[0] if isinstance(r[0], str) else r[0].decode() for r in rows]
+ok("[22b.1 cron] IS.scheduled_jobs lists both jobs",
+   'wire_daily' in names and 'wire_hourly' in names,
+   names)
+
+enabled_vals = [r[2] for r in rows if (r[0] if isinstance(r[0], str) else r[0].decode()) == 'wire_daily']
+ok("[22b.1 cron] newly scheduled job is enabled",
+   len(enabled_vals) == 1 and enabled_vals[0] in ('YES', b'YES', True, 1),
+   enabled_vals)
+
+cur.execute("SELECT cron_disable('wire_daily')")
+cur.fetchall()
+cur.execute("SELECT ENABLED FROM information_schema.scheduled_jobs WHERE JOB_NAME = 'wire_daily'")
+row = cur.fetchone()
+ok("[22b.1 cron] cron_disable sets ENABLED to NO",
+   row is not None and row[0] in ('NO', b'NO', False, 0),
+   row)
+
+cur.execute("SELECT cron_enable('wire_daily')")
+cur.fetchall()
+cur.execute("SELECT ENABLED FROM information_schema.scheduled_jobs WHERE JOB_NAME = 'wire_daily'")
+row = cur.fetchone()
+ok("[22b.1 cron] cron_enable restores ENABLED to YES",
+   row is not None and row[0] in ('YES', b'YES', True, 1),
+   row)
+
+cur.execute("SELECT cron_unschedule('wire_daily')")
+row = cur.fetchone()
+ok("[22b.1 cron] cron_unschedule returns 1 for existing job",
+   row is not None and row[0] in (1, b'1', '1'),
+   row)
+
+cur.execute("SELECT JOB_NAME FROM information_schema.scheduled_jobs WHERE JOB_NAME = 'wire_daily'")
+rows = cur.fetchall()
+ok("[22b.1 cron] unscheduled job no longer appears in IS",
+   len(rows) == 0,
+   rows)
+
+cur.execute("SELECT cron_unschedule('ghost_job')")
+row = cur.fetchone()
+ok("[22b.1 cron] cron_unschedule returns 0 for nonexistent job",
+   row is not None and row[0] in (0, b'0', '0'),
+   row)
+
+# cleanup
+cur.execute("SELECT cron_unschedule('wire_hourly')")
+cur.fetchall()
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

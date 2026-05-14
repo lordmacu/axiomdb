@@ -47,9 +47,9 @@ use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     schema::{
-        AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, EnumTypeDef, FkDef, IndexDef,
-        RelationKind, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence,
-        TableStorageLayout,
+        AggregateDef, ColumnDef, ConstraintDef, CronJobDef, DatabaseDef, EnumTypeDef, FkDef,
+        IndexDef, RelationKind, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
+        TablePersistence, TableStorageLayout,
     },
 };
 
@@ -79,6 +79,8 @@ pub const SYSTEM_TABLE_AGGREGATES: u32 = u32::MAX - 9;
 pub const SYSTEM_TABLE_SEQUENCES: u32 = u32::MAX - 10;
 /// WAL `table_id` used for inserts/deletes into `axiom_enum_types` (Phase 20.3).
 pub const SYSTEM_TABLE_ENUM_TYPES: u32 = u32::MAX - 11;
+/// WAL `table_id` used for inserts/deletes into `axiom_cron_jobs` (Phase 22b.1).
+pub const SYSTEM_TABLE_CRON_JOBS: u32 = u32::MAX - 12;
 
 fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
     if def.labels.is_empty() {
@@ -1742,5 +1744,127 @@ impl<'a> CatalogWriter<'a> {
             }
         }
         Ok(())
+    }
+
+    // ── Cron job operations (Phase 22b.1) ─────────────────────────────────────
+
+    /// Inserts or replaces a cron job definition in `axiom_cron_jobs`.
+    ///
+    /// If a job with the same name already exists (case-insensitive), the old
+    /// row is deleted before inserting the new one (upsert semantics).
+    pub fn upsert_cron_job(&mut self, def: CronJobDef) -> Result<(), DbError> {
+        let root = CatalogBootstrap::ensure_cron_jobs_root(self.storage)?;
+        self.page_ids.cron_jobs = root;
+
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        // Delete existing job with the same name.
+        for (page_id, slot_id, data) in rows {
+            let (existing, _) = CronJobDef::from_bytes(&data)?;
+            if existing.name.eq_ignore_ascii_case(&def.name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_CRON_JOBS,
+                    existing.name.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                break;
+            }
+        }
+
+        let data = def.to_bytes();
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_CRON_JOBS,
+            def.name.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a cron job by name. Returns `true` if found and deleted.
+    pub fn delete_cron_job(&mut self, name: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.cron_jobs;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = CronJobDef::from_bytes(&data)?;
+            if def.name.eq_ignore_ascii_case(name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_CRON_JOBS,
+                    def.name.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Updates runtime state for a cron job after execution (called by the scheduler).
+    ///
+    /// Performs an in-place delete+insert to update `next_run_ms`, `last_run_ms`,
+    /// and `last_status` without changing schedule/command/enabled.
+    pub fn update_cron_job_run(
+        &mut self,
+        name: &str,
+        last_run_ms: i64,
+        next_run_ms: i64,
+        status: &str,
+    ) -> Result<bool, DbError> {
+        let root = self.page_ids.cron_jobs;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, old_data) in rows {
+            let (mut def, _) = CronJobDef::from_bytes(&old_data)?;
+            if def.name.eq_ignore_ascii_case(name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_CRON_JOBS,
+                    def.name.as_bytes(),
+                    &old_data,
+                    page_id,
+                    slot_id,
+                )?;
+                def.last_run_ms = last_run_ms;
+                def.next_run_ms = next_run_ms;
+                def.last_status = status.chars().take(255).collect();
+                let new_data = def.to_bytes();
+                let (np, ns) = HeapChain::insert(self.storage, root, &new_data, txn_id, None)?;
+                self.txn.record_insert(
+                    self.conn,
+                    SYSTEM_TABLE_CRON_JOBS,
+                    def.name.as_bytes(),
+                    &new_data,
+                    np,
+                    ns,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }

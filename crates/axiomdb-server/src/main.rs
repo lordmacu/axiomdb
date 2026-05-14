@@ -157,6 +157,8 @@ async fn main() {
         }
     };
 
+    let _scheduler = axiomdb_network::scheduler::start(Arc::clone(&db));
+
     let addr = config.bind_addr();
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {

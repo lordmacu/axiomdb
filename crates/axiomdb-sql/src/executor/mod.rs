@@ -92,6 +92,7 @@ type InlineFkSpec = (
 
 include!("exec_subquery.rs");
 include!("sequence_runtime.rs");
+include!("cron_runtime.rs");
 include!("exec_entry.rs");
 include!("exec_with_ctx.rs");
 include!("exec_dispatch.rs");
