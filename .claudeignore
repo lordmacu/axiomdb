@@ -1,13 +1,37 @@
-# Build artifacts — never index these
+# ── Build artifacts ───────────────────────────────────────────────────────────
 target/
 **/*.profdata
 **/*.profraw
 **/*.gcda
 **/*.gcno
 
-# Large generated docs
+# ── Runtime data ──────────────────────────────────────────────────────────────
+data/
+
+# ── External source references (cloned databases, 1.9 GB) ────────────────────
+# Read manually when needed via brainstorm/spec; not useful for indexing
+research/
+
+# ── Studio frontend (Next.js app, 592 MB) ────────────────────────────────────
+studio/
+
+# ── Lockfile (60 KB, never edited manually) ──────────────────────────────────
+Cargo.lock
+
+# ── Backup files ──────────────────────────────────────────────────────────────
+**/*.bak
+**/*.orig
+
+# ── Generated docs ────────────────────────────────────────────────────────────
 docs-site/book/
 
-# Fuzz corpus (can be huge)
+# ── Fuzz corpus (can be huge) ─────────────────────────────────────────────────
 fuzz/corpus/
 fuzz/artifacts/
+
+# ── Third-party agent configs ─────────────────────────────────────────────────
+.ocx/
+.opencode/
+
+# ── Language bindings (rarely touched) ───────────────────────────────────────
+bindings/
