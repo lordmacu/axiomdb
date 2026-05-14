@@ -17,8 +17,8 @@ use axiomdb_core::RecordId;
 use crate::{
     bootstrap::{CatalogBootstrap, CatalogPageIds},
     schema::{
-        AggregateDef, ColumnDef, ConstraintDef, DatabaseDef, EnumTypeDef, FkDef, IndexDef,
-        SchemaDef, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
+        AggregateDef, ColumnDef, ConstraintDef, CronJobDef, DatabaseDef, EnumTypeDef, FkDef,
+        IndexDef, SchemaDef, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
         DEFAULT_DATABASE_NAME,
     },
 };
@@ -709,5 +709,39 @@ impl<'a> CatalogReader<'a> {
             .into_iter()
             .map(|(page_id, slot_id, data)| (RecordId { page_id, slot_id }, data))
             .collect())
+    }
+
+    // ── Cron jobs (Phase 22b.1) ───────────────────────────────────────────────
+
+    /// Returns all visible cron job definitions, sorted by name.
+    pub fn list_cron_jobs(&mut self) -> Result<Vec<CronJobDef>, DbError> {
+        let root = self.page_ids.cron_jobs;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = CronJobDef::from_bytes(&data)?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Returns a single cron job by name, or `None` if not found.
+    pub fn get_cron_job(&mut self, name: &str) -> Result<Option<CronJobDef>, DbError> {
+        let root = self.page_ids.cron_jobs;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = CronJobDef::from_bytes(&data)?;
+            if def.name.eq_ignore_ascii_case(name) {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
     }
 }

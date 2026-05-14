@@ -401,7 +401,7 @@ Partitioning baseline, schemas, cross-database queries, migrations CLI, FDW, sch
 - [ ] 14.2 ⏳ Partition pruning — query planner skips irrelevant partitions
 
 ### Phase 22b — Platform features `🔄` week 55-57
-- [ ] 22b.1 ⏳ Scheduled jobs — `cron_schedule()` with `tokio-cron-scheduler`
+- [x] 22b.1 ✅ Scheduled jobs — `cron_schedule/unschedule/enable/disable()`, persistent catalog, background tokio scheduler, `information_schema.scheduled_jobs`
 - [ ] 22b.2 ⏳ Foreign Data Wrappers — HTTP + PostgreSQL as external sources
 - [x] 22b.3a ✅ Database catalog + `CREATE/DROP DATABASE` — persisted `axiom_databases`, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, legacy tables default to `axiomdb`
 - [x] 22b.3b ✅ Cross-database queries — `database.schema.table`, cross-db SELECT / JOIN / DML; 9 integration tests + 8 wire scenarios

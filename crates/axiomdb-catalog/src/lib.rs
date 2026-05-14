@@ -19,13 +19,14 @@ pub use reader::CatalogReader;
 pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
     AggregateDef, AggregateHelperKind, ColumnDef, ColumnType, ConstraintDef, ConstraintKind,
-    ConstraintOperator, DatabaseDef, EnumTypeDef, ExclusionElementDef, FkAction, FkDef,
+    ConstraintOperator, CronJobDef, DatabaseDef, EnumTypeDef, ExclusionElementDef, FkAction, FkDef,
     IndexColumnDef, IndexDef, RelationKind, SchemaDef, SequenceDef, SortOrder, StatsDef,
     TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout, TriggerDef,
     TriggerEvent, DEFAULT_DATABASE_NAME,
 };
 pub use writer::{
-    CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_DATABASES,
-    SYSTEM_TABLE_ENUM_TYPES, SYSTEM_TABLE_FOREIGN_KEYS, SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_SCHEMAS,
-    SYSTEM_TABLE_SEQUENCES, SYSTEM_TABLE_STATS, SYSTEM_TABLE_TABLES, SYSTEM_TABLE_TABLE_DATABASES,
+    CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_CRON_JOBS,
+    SYSTEM_TABLE_DATABASES, SYSTEM_TABLE_ENUM_TYPES, SYSTEM_TABLE_FOREIGN_KEYS,
+    SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_SCHEMAS, SYSTEM_TABLE_SEQUENCES, SYSTEM_TABLE_STATS,
+    SYSTEM_TABLE_TABLES, SYSTEM_TABLE_TABLE_DATABASES,
 };

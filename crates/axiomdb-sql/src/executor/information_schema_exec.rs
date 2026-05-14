@@ -131,6 +131,7 @@ fn generate_is_rows(
         "statistics" => generate_is_statistics_rows(&mut reader, default_database, temp_schema)?,
         "views" => generate_is_views_rows(&mut reader, temp_schema)?,
         "schemata" => generate_is_schemata_rows(&mut reader, default_database)?,
+        "scheduled_jobs" => generate_is_scheduled_jobs_rows(&mut reader)?,
         _ => {
             return Err(DbError::TableNotFound {
                 name: format!("information_schema.{table_name}"),
@@ -688,4 +689,89 @@ fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::Uuid => "varchar(36)",
         ColumnType::Array => "array",
     }
+}
+
+/// `information_schema.SCHEDULED_JOBS` — one row per cron job (Phase 22b.1).
+///
+/// Column order matches `IS_SCHEDULED_JOBS_COLS` in `information_schema.rs`.
+fn generate_is_scheduled_jobs_rows(
+    reader: &mut axiomdb_catalog::CatalogReader,
+) -> Result<Vec<Row>, DbError> {
+    let jobs = reader.list_cron_jobs()?;
+    let mut rows = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let next_run = if job.next_run_ms == 0 {
+            "never".to_string()
+        } else {
+            format_ms_as_datetime(job.next_run_ms)
+        };
+        let last_run = if job.last_run_ms == 0 {
+            "never".to_string()
+        } else {
+            format_ms_as_datetime(job.last_run_ms)
+        };
+        rows.push(vec![
+            Value::Text(job.name.clone()),
+            Value::Text(job.schedule.clone()),
+            Value::Text(job.command.clone()),
+            Value::Text(job.database_name.clone()),
+            Value::Text(if job.enabled { "YES" } else { "NO" }.to_string()),
+            Value::Text(next_run),
+            Value::Text(last_run),
+            Value::Text(job.last_status.clone()),
+        ]);
+    }
+    Ok(rows)
+}
+
+fn format_ms_as_datetime(ms: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let secs = ms / 1000;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    let t = UNIX_EPOCH + Duration::new(secs as u64, nanos);
+    // Format as RFC3339-like string without extra deps.
+    let elapsed = t
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Simple manual UTC formatting (avoids chrono dep in this file).
+    let secs_in_day = elapsed % 86400;
+    let days = elapsed / 86400;
+    let h = secs_in_day / 3600;
+    let m = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+    // Days since 1970-01-01 to year/month/day.
+    let (year, month, day) = days_to_ymd(days as u32);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, h, m, s)
+}
+
+fn days_to_ymd(mut days: u32) -> (u32, u32, u32) {
+    // Gregorian proleptic calendar from Unix epoch (1970-01-01).
+    let mut year = 1970u32;
+    loop {
+        let dy = if is_leap(year) { 366 } else { 365 };
+        if days < dy {
+            break;
+        }
+        days -= dy;
+        year += 1;
+    }
+    let months = if is_leap(year) {
+        [31u32, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1u32;
+    for &dm in &months {
+        if days < dm {
+            break;
+        }
+        days -= dm;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
+fn is_leap(y: u32) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }

@@ -26,5 +26,6 @@
 //! ```
 
 pub mod mysql;
+pub mod scheduler;
 
 pub use axiomdb_storage::{DbConfig, WalDurabilityPolicy};

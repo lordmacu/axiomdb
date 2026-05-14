@@ -150,6 +150,18 @@ pub static IS_SCHEMATA_COLS: &[(&str, ColumnType)] = &[
     ("SQL_PATH", ColumnType::Text),
 ];
 
+/// Column names and types for `information_schema.SCHEDULED_JOBS` (Phase 22b.1).
+pub static IS_SCHEDULED_JOBS_COLS: &[(&str, ColumnType)] = &[
+    ("JOB_NAME", ColumnType::Text),
+    ("SCHEDULE", ColumnType::Text),
+    ("COMMAND", ColumnType::Text),
+    ("DATABASE_NAME", ColumnType::Text),
+    ("ENABLED", ColumnType::Text),
+    ("NEXT_RUN", ColumnType::Text),
+    ("LAST_RUN", ColumnType::Text),
+    ("LAST_STATUS", ColumnType::Text),
+];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Returns the column schema for the given IS virtual table name
@@ -164,6 +176,7 @@ pub fn is_table_cols(table_name: &str) -> Option<&'static [(&'static str, Column
         "statistics" => Some(IS_STATISTICS_COLS),
         "views" => Some(IS_VIEWS_COLS),
         "schemata" => Some(IS_SCHEMATA_COLS),
+        "scheduled_jobs" => Some(IS_SCHEDULED_JOBS_COLS),
         _ => None,
     }
 }

@@ -1,6 +1,6 @@
 # Phase 22b — Platform Features
 
-## Subphases completed: 22b.3a, 22b.3b, 22b.4
+## Subphases completed: 22b.1, 22b.3a, 22b.3b, 22b.4
 
 ## What was built
 
@@ -111,7 +111,57 @@ JOIN axiomdb.public.orders AS o ON o.user_id = c.id;
 - `crates/axiomdb-sql/tests/integration_namespacing_cross_db.rs` — 9 unit tests
 - `tools/wire-test.py` section `[22b.3b]` — 8 wire scenarios including cross-db JOIN
 
+### 22b.1 — Scheduled jobs (pg_cron-style)
+
+AxiomDB now supports persistent background cron jobs, compatible with the
+`pg_cron` SQL API and backed by a catalog heap.
+
+**SQL surface:**
+
+```sql
+-- Register a job (schedule, name, SQL command)
+SELECT cron_schedule('nightly_vacuum', '@daily', 'DELETE FROM logs WHERE ts < NOW() - INTERVAL 30 DAY');
+-- Returns: 'nightly_vacuum'
+
+-- Register with 5-field cron expression
+SELECT cron_schedule('top_of_hour', '0 * * * *', 'SELECT refresh_stats()');
+
+-- Pause / resume
+SELECT cron_disable('nightly_vacuum');  -- returns 1
+SELECT cron_enable('nightly_vacuum');   -- returns 1
+
+-- Remove
+SELECT cron_unschedule('nightly_vacuum');  -- returns 1 (0 if not found)
+
+-- Inspect
+SELECT JOB_NAME, SCHEDULE, COMMAND, DATABASE_NAME, ENABLED, NEXT_RUN, LAST_RUN, LAST_STATUS
+FROM information_schema.scheduled_jobs;
+```
+
+**Catalog:** `axiom_cron_jobs` heap at offset 160 in the meta page. Each row is
+a binary-encoded `CronJobDef` (name, schedule, command, database, enabled flag,
+`next_run_ms`, `last_run_ms`, `last_status`).
+
+**Scheduler:** A background tokio task (`axiomdb-network/src/scheduler.rs`)
+launched at server startup. Every minute it:
+1. Snapshots the catalog and lists enabled jobs.
+2. Fires any job whose `next_run_ms ≤ now` (or `next_run_ms == 0` = first run).
+3. Executes the job's SQL in a `SessionContext` scoped to the job's target database.
+4. Persists `last_run_ms`, `next_run_ms`, and `last_status` in a mini-transaction.
+5. Sleeps to the next minute boundary.
+
+**Cron expressions:** Custom parser (no external cron dependency in the executor).
+Supports `*`, `*/N` (step), `N-M` (range), `N,M,...` (list), and exact values
+for all 5 fields (min hour dom month dow). Aliases: `@hourly`, `@daily`,
+`@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
+
+**Tests:**
+
+- `crates/axiomdb-sql/tests/integration_scheduled_jobs.rs` — 11 unit tests
+- `tools/wire-test.py` section `[22b.1 cron]` — 9 wire scenarios
+
 ## Deferred
 
-- later schema phases — database-local schemas beyond `public`
+- 22b.2 — Foreign Data Wrappers (HTTP + PostgreSQL as external sources)
+- 22b.5 — Schema migrations CLI (`axiomdb migrate up/down/status`)
 - later platform phases — per-database COMPAT, encryption, quotas, ownership

@@ -125,6 +125,16 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "array_remove" | "array_replace" | "array_position" | "array_to_string"
         | "string_to_array" | "unnest" => array::eval(lower.as_str(), args, row),
 
+        // Cron job functions (Phase 22b.1) — handled by cron_runtime.rs in the executor;
+        // reaching here means we are in a pure-eval context without storage access.
+        "cron_schedule" | "cron_unschedule" | "cron_enable" | "cron_disable" => {
+            Err(DbError::NotImplemented {
+                feature: format!(
+                    "'{name}' requires a storage context — call from a SELECT, not a WHERE clause"
+                ),
+            })
+        }
+
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),
         }),

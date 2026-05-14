@@ -31,6 +31,7 @@ include!("schema_sequence.rs");
 include!("schema_enum.rs");
 include!("schema_index.rs");
 include!("schema_constraints.rs");
+include!("schema_cron_job.rs");
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

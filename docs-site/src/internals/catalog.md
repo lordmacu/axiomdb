@@ -37,6 +37,7 @@ introspection is documented in [Catalog & Schema](../user-guide/features/catalog
 | `axiom_stats`           | 96          | Per-column NDV and row_count for planner (Phase 6.10) |
 | `axiom_databases`       | 104         | One row per logical database                     |
 | `axiom_table_databases` | 112         | Optional table ownership binding by database     |
+| `axiom_cron_jobs`       | 160         | One row per scheduled job (`cron_schedule`)      |
 
 Each root page is stored at the corresponding u64 body offset in the meta page
 (page 0). Older database files may have `0` in the new database offsets; the

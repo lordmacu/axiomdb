@@ -17,12 +17,13 @@ use axiomdb_storage::HeapChain;
 use axiomdb_storage::{
     read_meta_u32, read_meta_u64, write_catalog_header, write_meta_u32, write_meta_u64, Page,
     PageType, StorageEngine, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
-    CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_DATABASES_ROOT_BODY_OFFSET,
-    CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
-    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMAS_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_SEQUENCES_ROOT_BODY_OFFSET,
-    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
-    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET,
+    CATALOG_DATABASES_ROOT_BODY_OFFSET, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET,
+    CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
+    CATALOG_SEQUENCES_ROOT_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
+    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
+    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
@@ -72,6 +73,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_enum_types` heap (Phase 20.3).
     /// Zero on legacy databases; lazily initialized on first `CREATE TYPE`.
     pub enum_types: u64,
+    /// Root page of the `axiom_cron_jobs` heap (Phase 22b.1).
+    /// Zero on legacy databases; lazily initialized on first `cron_schedule()`.
+    pub cron_jobs: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -190,6 +194,12 @@ impl CatalogBootstrap {
             enum_types_root,
         )?;
 
+        // Allocate the cron jobs root (Phase 22b.1).
+        let cron_jobs_root = storage.alloc_page(PageType::Data)?;
+        let cron_jobs_page = Page::new(PageType::Data, cron_jobs_root);
+        storage.write_page(cron_jobs_root, &cron_jobs_page)?;
+        write_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET, cron_jobs_root)?;
+
         // Seed the default logical database so fresh databases and upgraded
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
@@ -220,6 +230,7 @@ impl CatalogBootstrap {
             aggregates: aggregates_root,
             sequences: sequences_root,
             enum_types: enum_types_root,
+            cron_jobs: cron_jobs_root,
         })
     }
 
@@ -248,6 +259,7 @@ impl CatalogBootstrap {
         let aggregates = read_meta_u64(storage, CATALOG_AGGREGATES_ROOT_BODY_OFFSET)?;
         let sequences = read_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET)?;
         let enum_types = read_meta_u64(storage, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET)?;
+        let cron_jobs = read_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -261,6 +273,7 @@ impl CatalogBootstrap {
             aggregates,
             sequences,
             enum_types,
+            cron_jobs,
         })
     }
 
@@ -338,6 +351,14 @@ impl CatalogBootstrap {
             ids.enum_types = root;
         }
 
+        if ids.cron_jobs == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET, root)?;
+            ids.cron_jobs = root;
+        }
+
         storage.flush()?;
         Ok(ids)
     }
@@ -392,6 +413,22 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_cron_jobs` root page exists (Phase 22b.1).
+    ///
+    /// Lazily initialized on first `cron_schedule()` call.
+    pub fn ensure_cron_jobs_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }
