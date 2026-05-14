@@ -222,23 +222,59 @@ fn gin_maintenance_on_delete() {
 
 // ── GIN recheck and fallback tests ──────────────────────────────────────────
 
-/// EXPLAIN shows GIN scan with recheck for @> queries.
-#[test]
-fn gin_recheck_required() {
-    let (mut storage, mut txn) = common::setup();
-    setup_array_table(&mut storage, &mut txn);
-
-    // EXPLAIN should show 'gin' index usage
-    let result = rows("EXPLAIN SELECT id FROM tags WHERE tags @> ARRAY['bug']", &mut storage, &mut txn);
-    let explain_text = result
-        .iter()
+/// Helper: runs EXPLAIN on an array GIN query using ctx-aware session.
+fn explain_gin_with_ctx(sql: &str) -> String {
+    let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
+    // Create table with GIN index
+    common::run_ctx(
+        "CREATE TABLE tags(id INT PRIMARY KEY, tags TEXT[])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "CREATE INDEX idx_tags_gin ON tags USING GIN (tags)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "INSERT INTO tags VALUES (1, ARRAY['urgent', 'bug', 'frontend'])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "INSERT INTO tags VALUES (2, ARRAY['feature', 'backend'])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let result = common::run_ctx(sql, &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    let rows = common::rows(result);
+    rows.iter()
         .flat_map(|r| r.iter())
         .filter_map(|v| match v {
             Value::Text(s) => Some(s.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+/// EXPLAIN shows GIN scan with recheck for @> queries.
+#[test]
+fn gin_recheck_required() {
+    // EXPLAIN should show 'gin' index usage
+    let explain_text = explain_gin_with_ctx("EXPLAIN SELECT id FROM tags WHERE tags @> ARRAY['bug']");
     assert!(
         explain_text.contains("gin") || explain_text.contains("GIN"),
         "EXPLAIN should mention GIN index, got: {}",

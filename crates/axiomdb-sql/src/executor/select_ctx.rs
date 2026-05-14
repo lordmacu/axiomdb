@@ -48,6 +48,11 @@ fn execute_select_ctx(
         return execute_select_recursive_cte_ctx(stmt, exec_ctx, conn_txn, ctx);
     }
 
+    // UNNEST in FROM (Phase 20.4 Step 7): delegate to execute_select which handles it.
+    if matches!(stmt.from, Some(FromClause::Unnest(_))) {
+        return execute_select(stmt, storage, txn, conn_txn);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
         _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte above"),
