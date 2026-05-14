@@ -1,5 +1,69 @@
 // ── SHOW TABLES / SHOW COLUMNS / DESCRIBE (4.20) ─────────────────────────────
 
+fn execute_drop_schema(
+    stmt: crate::ast::DropSchemaStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    database: &str,
+) -> Result<QueryResult, DbError> {
+    if stmt.name.eq_ignore_ascii_case("information_schema") {
+        return Err(DbError::InvalidValue {
+            reason: "cannot drop schema information_schema".into(),
+        });
+    }
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if !reader.schema_exists(database, &stmt.name)? {
+        if stmt.if_exists {
+            return Ok(QueryResult::Empty);
+        }
+        return Err(DbError::SchemaNotFound { name: stmt.name });
+    }
+    let tables = reader.list_tables_in_database(database, &stmt.name)?;
+    drop(reader);
+    if stmt.cascade {
+        for table in tables {
+            drop_table_fully(storage, txn, conn_txn, table.id)?;
+        }
+    } else if !tables.is_empty() {
+        return Err(DbError::SchemaNotEmpty { name: stmt.name });
+    }
+    CatalogWriter::new(storage, txn, conn_txn)?.delete_schema(database, &stmt.name)?;
+    Ok(QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    })
+}
+
+fn execute_show_schemas(
+    stmt: crate::ast::ShowSchemasStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    ctx: &SessionContext,
+) -> Result<QueryResult, DbError> {
+    let database = ctx.effective_database();
+    let snap = ctx
+        .conn_txn
+        .as_ref()
+        .map(|c| txn.active_snapshot(c))
+        .unwrap_or_else(|| txn.snapshot());
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let schemas = reader.list_schemas(database)?;
+    let rows: Vec<Row> = schemas
+        .into_iter()
+        .filter(|s| match &stmt.like_pattern {
+            Some(pat) => crate::eval::like_match(&s.name, pat),
+            None => true,
+        })
+        .map(|s| vec![Value::Text(s.name)])
+        .collect();
+    Ok(QueryResult::Rows {
+        columns: vec![ColumnMeta::computed("Schema", DataType::Text)],
+        rows,
+    })
+}
+
 fn execute_show_databases(
     _stmt: ShowDatabasesStmt,
     storage: &dyn StorageEngine,

@@ -50,6 +50,9 @@ fn dispatch(
         Stmt::CreateSchema(s) => {
             execute_create_schema(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
+        Stmt::DropSchema(s) => {
+            execute_drop_schema(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+        }
         Stmt::CreateMaterializedView(_) => Err(DbError::NotImplemented {
             feature: "CREATE MATERIALIZED VIEW requires session context — use execute_with_ctx"
                 .into(),
@@ -143,6 +146,7 @@ fn dispatch(
             execute_alter_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
         Stmt::ShowDatabases(s) => execute_show_databases(s, storage, txn, conn_txn),
+        Stmt::ShowSchemas(_s) => Ok(QueryResult::Empty),
         Stmt::ShowTables(s) => {
             execute_show_tables(s, storage, txn, conn_txn, None, None, DEFAULT_DATABASE_NAME)
         }
