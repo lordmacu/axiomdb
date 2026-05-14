@@ -317,7 +317,7 @@ fn validate_generated_expr_refs(
                 feature: "subqueries in generated columns".into(),
             })
         }
-        Expr::GroupConcat { .. } | Expr::Grouping { .. } => Err(DbError::NotImplemented {
+        Expr::GroupConcat { .. } | Expr::Grouping { .. } | Expr::ArrayAgg { .. } => Err(DbError::NotImplemented {
             feature: "aggregate expressions in generated columns".into(),
         }),
         // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.

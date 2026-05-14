@@ -505,6 +505,13 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            Expr::ArrayAgg { expr, order_by, .. } => {
+                self.visit_expr(expr)?;
+                for (e, _) in order_by {
+                    self.visit_expr(e)?;
+                }
+                Ok(())
+            }
             Expr::Grouping { args, .. } => {
                 for a in args {
                     self.visit_expr(a)?;

@@ -385,6 +385,11 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
         }),
 
+        // ArrayAgg is only valid as an aggregate — never reached by scalar eval.
+        Expr::ArrayAgg { .. } => Err(DbError::InvalidValue {
+            reason: "array_agg can only be used as an aggregate function".into(),
+        }),
+
         // GROUPING(expr, ...) — returns a bitmask.
         // The hidden `__grouping_mask__` column is appended as the last element
         // of the row by `execute_select_grouped_sets`. Bit i of the mask is set
@@ -873,6 +878,11 @@ pub fn eval_with<R: SubqueryRunner>(
         // GroupConcat is only valid as an aggregate — never reached by scalar eval_with.
         Expr::GroupConcat { .. } => Err(DbError::InvalidValue {
             reason: "GROUP_CONCAT can only be used as an aggregate function".into(),
+        }),
+
+        // ArrayAgg is only valid as an aggregate — never reached by scalar eval_with.
+        Expr::ArrayAgg { .. } => Err(DbError::InvalidValue {
+            reason: "array_agg can only be used as an aggregate function".into(),
         }),
 
         // GROUPING — same as scalar eval path; sq is unused here.

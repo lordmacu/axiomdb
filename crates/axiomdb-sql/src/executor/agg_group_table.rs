@@ -415,7 +415,7 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
             // Do not descend into aggregate arguments — they are handled by accumulators.
             let _ = args;
         }
-        Expr::GroupConcat { .. } => {}
+        Expr::GroupConcat { .. } | Expr::ArrayAgg { .. } => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_col_idxs_non_agg(left, out);
             collect_col_idxs_non_agg(right, out);
@@ -510,7 +510,7 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
                 collect_non_agg_col_idxs_in_expr(a, true, out);
             }
         }
-        Expr::GroupConcat { .. } => {}
+        Expr::GroupConcat { .. } | Expr::ArrayAgg { .. } => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_non_agg_col_idxs_in_expr(left, inside_agg, out);
             collect_non_agg_col_idxs_in_expr(right, inside_agg, out);

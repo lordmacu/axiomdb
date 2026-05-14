@@ -295,6 +295,28 @@ pub enum Expr {
         separator: String,
     },
 
+    // ── ARRAY_AGG aggregate (Phase 20.4 Step 9) ───────────────────────────────
+    /// `array_agg(expr [ORDER BY e [ASC|DESC], ...] [DISTINCT])`
+    ///
+    /// PostgreSQL-compatible: collects values into a SQL array.
+    ///
+    /// - NULL values are included in the result array.
+    /// - Empty group (or all-NULL group) returns NULL.
+    /// - With DISTINCT, duplicate values are removed.
+    /// - With ORDER BY, elements are sorted before building the array.
+    ///
+    /// Only valid as an aggregate in a grouped or implicitly-grouped SELECT.
+    /// Reaching `eval()` with this variant (outside aggregate context) returns
+    /// `DbError::InvalidValue`.
+    ArrayAgg {
+        /// The expression to aggregate per row.
+        expr: Box<Expr>,
+        /// If true, duplicate values are removed before building the array.
+        distinct: bool,
+        /// Per-aggregate ORDER BY: list of `(sort_expr, direction)` pairs.
+        order_by: Vec<(Expr, SortOrder)>,
+    },
+
     // ── GROUPING SETS function (Phase 21.21) ──────────────────────────────────
     /// SQL standard `GROUPING(expr, ...)`.
     ///

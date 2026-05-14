@@ -988,6 +988,43 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             });
         }
 
+        // ── ARRAY_AGG (PostgreSQL-compatible) ──────────────────────────────────
+        // array_agg(expr [ORDER BY e [ASC|DESC], ...] [DISTINCT])
+        if name.eq_ignore_ascii_case("array_agg") {
+            let distinct = p.eat(&Token::Distinct);
+            let expr = parse_expr(p)?;
+
+            // Optional ORDER BY inside array_agg.
+            let mut order_by: Vec<(Expr, SortOrder)> = Vec::new();
+            if p.eat(&Token::Order) {
+                p.expect(&Token::By)?;
+                loop {
+                    let ob_expr = parse_expr(p)?;
+                    let dir = if p.eat(&Token::Asc) {
+                        SortOrder::Asc
+                    } else if p.eat(&Token::Desc) {
+                        SortOrder::Desc
+                    } else {
+                        SortOrder::Asc
+                    };
+                    order_by.push((ob_expr, dir));
+                    if !p.eat(&Token::Comma) {
+                        break;
+                    }
+                    if matches!(p.peek(), Token::RParen) {
+                        break;
+                    }
+                }
+            }
+
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::ArrayAgg {
+                expr: Box::new(expr),
+                distinct,
+                order_by,
+            });
+        }
+
         // ── STRING_AGG alias (PostgreSQL-compatible) ───────────────────────────
         // string_agg(expr, separator) — equivalent to GROUP_CONCAT(expr SEPARATOR sep)
         if name.eq_ignore_ascii_case("string_agg") {

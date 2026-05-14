@@ -115,6 +115,21 @@ fn eval_with_aggs(
             Ok(agg_values[idx].clone())
         }
 
+        // Phase 20.4 Step 9 — ARRAY_AGG: look up the pre-computed finalized value by structural match.
+        Expr::ArrayAgg {
+            expr: arr_expr,
+            distinct,
+            order_by,
+        } => {
+            let idx = agg_exprs
+                .iter()
+                .position(|ae| ae.matches_array_agg(arr_expr, *distinct, order_by))
+                .ok_or_else(|| {
+                    DbError::Other("ARRAY_AGG not pre-registered — internal error".to_string())
+                })?;
+            Ok(agg_values[idx].clone())
+        }
+
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             let lower = name.to_ascii_lowercase();
             // Phase 11.25b — 2-arg object aggregates use a different matcher.

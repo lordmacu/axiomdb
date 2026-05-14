@@ -837,6 +837,10 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
             expr_has_outer_column_refs(expr)
                 || order_by.iter().any(|(e, _)| expr_has_outer_column_refs(e))
         }
+        Expr::ArrayAgg { expr, order_by, .. } => {
+            expr_has_outer_column_refs(expr)
+                || order_by.iter().any(|(e, _)| expr_has_outer_column_refs(e))
+        }
         Expr::Grouping { args, .. } => args.iter().any(expr_has_outer_column_refs),
         // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
         Expr::ArrayConstructor { elements } => elements.iter().any(expr_has_outer_column_refs),
@@ -1057,6 +1061,9 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
                 || on_behavior_has_col_refs(on_error)
         }
         Expr::GroupConcat { expr, order_by, .. } => {
+            doc_has_column_refs(expr) || order_by.iter().any(|(e, _)| doc_has_column_refs(e))
+        }
+        Expr::ArrayAgg { expr, order_by, .. } => {
             doc_has_column_refs(expr) || order_by.iter().any(|(e, _)| doc_has_column_refs(e))
         }
         Expr::Grouping { args, .. } => args.iter().any(doc_has_column_refs),

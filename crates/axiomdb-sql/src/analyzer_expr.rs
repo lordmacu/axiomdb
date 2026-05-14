@@ -304,6 +304,24 @@ fn resolve_expr_full(
             })
         }
 
+        // Phase 20.4 Step 9 — array_agg(expr [ORDER BY ...] [DISTINCT])
+        Expr::ArrayAgg {
+            expr,
+            distinct,
+            order_by,
+        } => {
+            let expr = resolve_expr_full(*expr, ctx, outer_scopes, state)?;
+            let order_by = order_by
+                .into_iter()
+                .map(|(e, dir)| Ok((resolve_expr_full(e, ctx, outer_scopes, state)?, dir)))
+                .collect::<Result<Vec<_>, DbError>>()?;
+            Ok(Expr::ArrayAgg {
+                expr: Box::new(expr),
+                distinct,
+                order_by,
+            })
+        }
+
         // ── Subquery variants ────────────────────────────────────────────────
         //
         // The inner SELECT is analyzed with `ctx` pushed as an outer scope so

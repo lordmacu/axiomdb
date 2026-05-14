@@ -268,6 +268,12 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
                     .iter()
                     .any(|(e, _)| expr_mentions_column_name(e, target_name))
         }
+        Expr::ArrayAgg { expr, order_by, .. } => {
+            expr_mentions_column_name(expr, target_name)
+                || order_by
+                    .iter()
+                    .any(|(e, _)| expr_mentions_column_name(e, target_name))
+        }
         Expr::Grouping { args, .. } => args.iter().any(|a| expr_mentions_column_name(a, target_name)),
         // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
         Expr::ArrayConstructor { elements } => {
