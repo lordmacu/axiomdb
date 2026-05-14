@@ -406,7 +406,7 @@ Partitioning baseline, schemas, cross-database queries, migrations CLI, FDW, sch
 - [x] 22b.3a ✅ Database catalog + `CREATE/DROP DATABASE` — persisted `axiom_databases`, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, legacy tables default to `axiomdb`
 - [x] 22b.3b ✅ Cross-database queries — `database.schema.table`, cross-db SELECT / JOIN / DML; 9 integration tests + 8 wire scenarios
 - [x] 22b.4 ✅ Schema namespacing — `CREATE SCHEMA [IF NOT EXISTS]`, `DROP SCHEMA [IF EXISTS] [CASCADE|RESTRICT]`, `schema.table` qualified names, `SET search_path`, `SHOW SCHEMAS [LIKE]`, `information_schema.schemata`
-- [ ] 22b.5 ⏳ Schema migrations CLI — `axiomdb migrate up/down/status`
+- [x] 22b.5 ✅ Schema migrations CLI — `axiomdb-server migrate up/down/status/create`, `axiomdb_migrations` state table, UP+DOWN sections, 18 tests
 - [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
 
 ### Phase 23 — Backwards compatibility `⏳` week 68-71

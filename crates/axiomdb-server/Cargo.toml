@@ -29,7 +29,7 @@ path = "src/main.rs"
 default        = ["wire-protocol"]
 
 # ── Included in default ────────────────────────────────────────────────────────
-wire-protocol  = ["dep:axiomdb-network", "dep:tokio", "dep:tracing-subscriber"]
+wire-protocol  = ["dep:axiomdb-network", "dep:axiomdb-sql", "dep:axiomdb-types", "dep:tokio", "dep:tracing-subscriber"]
 
 # ── Future optional extras (uncomment when implemented) ───────────────────────
 # tls            = ["wire-protocol"]             # rustls — adds ~500 KB
@@ -43,9 +43,14 @@ axiomdb-core       = { workspace = true }
 
 # Only when wire-protocol feature is enabled
 axiomdb-network    = { path = "../axiomdb-network", optional = true }
+axiomdb-sql        = { path = "../axiomdb-sql", optional = true }
+axiomdb-types      = { path = "../axiomdb-types", optional = true }
 tokio              = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 # Always included
 thiserror = { workspace = true }
 tracing   = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
