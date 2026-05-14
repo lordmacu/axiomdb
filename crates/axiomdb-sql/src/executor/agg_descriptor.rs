@@ -15,17 +15,11 @@ fn is_object_agg(name: &str) -> bool {
     matches!(name, "jsonb_object_agg" | "json_object_agg" | "json_objectagg")
 }
 
-/// Phase 11.25b — true when the aggregate is a 1-arg array aggregate.
-#[allow(dead_code)]
-fn is_array_agg(name: &str) -> bool {
-    matches!(name, "jsonb_agg" | "json_agg" | "json_arrayagg")
-}
-
 /// Returns `true` if `expr` or any sub-expression is an aggregate call.
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        // GROUP_CONCAT is always an aggregate — detected via the dedicated AST variant.
-        Expr::GroupConcat { .. } => true,
+        // GROUP_CONCAT and ARRAY_AGG are always aggregates — detected via dedicated AST variants.
+        Expr::GroupConcat { .. } | Expr::ArrayAgg { .. } => true,
         Expr::Function { name, .. } if is_aggregate(name.as_str()) => true,
         Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::UnaryOp { operand, .. } => contains_aggregate(operand),
@@ -146,6 +140,21 @@ enum AggExpr {
         #[allow(dead_code)]
         agg_idx: usize,
     },
+    /// Phase 20.4 Step 9 — `array_agg(expr [ORDER BY ...] [DISTINCT])`.
+    ///
+    /// PostgreSQL-compatible: NULLs are included, empty group returns NULL.
+    /// Unlike `JsonArrayAgg` (which returns JSON), this produces a native SQL array.
+    ArrayAgg {
+        /// Expression to aggregate per row.
+        arg: Box<Expr>,
+        /// If true, duplicate values are removed before building the array.
+        distinct: bool,
+        /// Per-aggregate ORDER BY: (sort_expr, direction) pairs.
+        order_by: Vec<(Expr, crate::ast::SortOrder)>,
+        /// Position in `GroupState::accumulators`. Preserved for diagnostics.
+        #[allow(dead_code)]
+        agg_idx: usize,
+    },
 }
 
 impl AggExpr {
@@ -156,7 +165,8 @@ impl AggExpr {
             Self::Simple { agg_idx, .. }
             | Self::GroupConcat { agg_idx, .. }
             | Self::JsonbObjectAgg { agg_idx, .. }
-            | Self::Median { agg_idx, .. } => *agg_idx,
+            | Self::Median { agg_idx, .. }
+            | Self::ArrayAgg { agg_idx, .. } => *agg_idx,
         }
     }
 
@@ -181,6 +191,7 @@ impl AggExpr {
             }
             Self::GroupConcat { .. } => false,
             Self::JsonbObjectAgg { .. } => false,
+            Self::ArrayAgg { .. } => false,
             Self::Median { arg, .. } => {
                 name == crate::custom_aggregate::INTERNAL_MEDIAN_AGGREGATE_NAME
                     && args.len() == 1
@@ -236,7 +247,30 @@ impl AggExpr {
                     && ob == order_by
                     && sep.as_str() == separator
             }
-            Self::Simple { .. } | Self::JsonbObjectAgg { .. } | Self::Median { .. } => false,
+            Self::Simple { .. } | Self::JsonbObjectAgg { .. } | Self::Median { .. } | Self::ArrayAgg { .. } => false,
+        }
+    }
+
+    /// Returns `true` if this descriptor matches the given array_agg call.
+    fn matches_array_agg(
+        &self,
+        arg: &Expr,
+        distinct: bool,
+        order_by: &[(Expr, crate::ast::SortOrder)],
+    ) -> bool {
+        match self {
+            Self::ArrayAgg {
+                arg: a,
+                distinct: d,
+                order_by: ob,
+                ..
+            } => {
+                a.as_ref() == arg && *d == distinct && ob == order_by
+            }
+            Self::Simple { .. }
+            | Self::GroupConcat { .. }
+            | Self::JsonbObjectAgg { .. }
+            | Self::Median { .. } => false,
         }
     }
 }
@@ -263,6 +297,30 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
                     distinct: *distinct,
                     order_by: order_by.clone(),
                     separator: separator.clone(),
+                    agg_idx: idx,
+                });
+            }
+            for (e, _) in order_by {
+                collect_agg_exprs_from(e, result);
+            }
+        }
+        // Phase 20.4 Step 9 — ARRAY_AGG: register as ArrayAgg AggExpr.
+        // Do NOT recurse into `expr` itself (it IS the aggregate root).
+        // Only recurse into ORDER BY sub-exprs.
+        Expr::ArrayAgg {
+            expr: arg,
+            distinct,
+            order_by,
+        } => {
+            let already = result
+                .iter()
+                .any(|ae| ae.matches_array_agg(arg, *distinct, order_by));
+            if !already {
+                let idx = result.len();
+                result.push(AggExpr::ArrayAgg {
+                    arg: arg.clone(),
+                    distinct: *distinct,
+                    order_by: order_by.clone(),
                     agg_idx: idx,
                 });
             }

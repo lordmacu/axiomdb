@@ -703,6 +703,9 @@ fn expr_contains_grouping(expr: &Expr) -> bool {
         Expr::GroupConcat { expr, order_by, .. } => {
             expr_contains_grouping(expr) || order_by.iter().any(|(e, _)| expr_contains_grouping(e))
         }
+        Expr::ArrayAgg { expr, order_by, .. } => {
+            expr_contains_grouping(expr) || order_by.iter().any(|(e, _)| expr_contains_grouping(e))
+        }
         _ => false,
     }
 }

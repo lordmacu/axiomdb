@@ -221,6 +221,7 @@ fn grouped_expr_name(expr: &Expr, _agg_exprs: &[AggExpr]) -> String {
     match expr {
         Expr::Column { name, .. } => name.clone(),
         Expr::GroupConcat { .. } => "GROUP_CONCAT(...)".into(),
+        Expr::ArrayAgg { .. } => "ARRAY_AGG(...)".into(),
         Expr::Function { name, args } if is_aggregate(name.as_str()) => {
             if args.is_empty() {
                 format!("{name}(*)")
@@ -240,6 +241,8 @@ fn grouped_expr_type(expr: &Expr, _agg_exprs: &[AggExpr]) -> (DataType, bool) {
     match expr {
         // GROUP_CONCAT always produces TEXT; nullable (empty group → NULL).
         Expr::GroupConcat { .. } => (DataType::Text, true),
+        // ARRAY_AGG produces an array; nullable (empty group → NULL).
+        Expr::ArrayAgg { .. } => (DataType::Array(Box::new(DataType::Text)), true),
         Expr::Function { name, .. } if is_aggregate(name.as_str()) => match name.as_str() {
             "count" => (DataType::BigInt, false),
             "avg" => (DataType::Real, true),

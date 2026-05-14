@@ -272,6 +272,13 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 collect_column_refs(e, mask);
             }
         }
+        // ArrayAgg: recurse into the aggregated expr and ORDER BY exprs.
+        Expr::ArrayAgg { expr, order_by, .. } => {
+            collect_column_refs(expr, mask);
+            for (e, _) in order_by {
+                collect_column_refs(e, mask);
+            }
+        }
         // GROUPING() args may reference columns — recurse.
         Expr::Grouping { args, .. } => {
             for a in args {

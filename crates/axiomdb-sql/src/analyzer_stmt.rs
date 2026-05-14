@@ -866,6 +866,10 @@ fn expr_contains_window(expr: &Expr) -> bool {
             expr_contains_window(expr)
                 || order_by.iter().any(|(expr, _)| expr_contains_window(expr))
         }
+        Expr::ArrayAgg { expr, order_by, .. } => {
+            expr_contains_window(expr)
+                || order_by.iter().any(|(expr, _)| expr_contains_window(expr))
+        }
         Expr::Grouping { args, .. } => args.iter().any(expr_contains_window),
         Expr::SqlJsonQuery {
             doc,
@@ -905,7 +909,7 @@ fn on_behavior_contains_window(behavior: &crate::expr::SqlJsonOnBehavior) -> boo
 
 fn expr_contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::GroupConcat { .. } => true,
+        Expr::GroupConcat { .. } | Expr::ArrayAgg { .. } => true,
         Expr::Function { name, .. } if is_aggregate_name(name) => true,
         Expr::UnaryOp { operand, .. }
         | Expr::Collate { expr: operand, .. }
@@ -1043,6 +1047,16 @@ fn rewrite_custom_aggregates_in_expr(
             }
         }
         Expr::GroupConcat {
+            expr,
+            order_by,
+            ..
+        } => {
+            rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
+            for (item_expr, _) in order_by {
+                rewrite_custom_aggregates_in_expr(item_expr, reader, default_schema)?;
+            }
+        }
+        Expr::ArrayAgg {
             expr,
             order_by,
             ..
@@ -1248,6 +1262,10 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         }
         Expr::Cast { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::GroupConcat { expr, order_by, .. } => {
+            populate_grouping_indices(expr, universe);
+            for (e, _) in order_by { populate_grouping_indices(e, universe); }
+        }
+        Expr::ArrayAgg { expr, order_by, .. } => {
             populate_grouping_indices(expr, universe);
             for (e, _) in order_by { populate_grouping_indices(e, universe); }
         }

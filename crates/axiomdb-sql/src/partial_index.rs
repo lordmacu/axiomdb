@@ -186,6 +186,7 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::Case { .. }
         | Expr::Cast { .. }
         | Expr::GroupConcat { .. }
+        | Expr::ArrayAgg { .. }
         | Expr::Grouping { .. }
         // Phase 20.4 — ARRAY constructor not supported in partial index predicates.
         | Expr::ArrayConstructor { .. }

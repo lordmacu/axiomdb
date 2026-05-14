@@ -204,6 +204,13 @@ fn execute_select_ctx(
                         collect_expr_columns(ob_expr, mask);
                     }
                 }
+                // ARRAY_AGG also has expression + ORDER BY expressions inside it.
+                crate::expr::Expr::ArrayAgg { expr, order_by, .. } => {
+                    collect_expr_columns(expr, mask);
+                    for (ob_expr, _) in order_by {
+                        collect_expr_columns(ob_expr, mask);
+                    }
+                }
                 crate::expr::Expr::Cast { expr, .. } => collect_expr_columns(expr, mask),
                 crate::expr::Expr::IsNull { expr, .. } => collect_expr_columns(expr, mask),
                 crate::expr::Expr::IsBoolean { expr, .. } => collect_expr_columns(expr, mask),

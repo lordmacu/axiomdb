@@ -747,6 +747,9 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
         Expr::GroupConcat { .. } => Err(DbError::NotImplemented {
             feature: "GROUP_CONCAT is not allowed in index expression".into(),
         }),
+        Expr::ArrayAgg { .. } => Err(DbError::NotImplemented {
+            feature: "array_agg is not allowed in index expression".into(),
+        }),
         Expr::Grouping { .. } => Err(DbError::NotImplemented {
             feature: "GROUPING() is not allowed in index expression".into(),
         }),

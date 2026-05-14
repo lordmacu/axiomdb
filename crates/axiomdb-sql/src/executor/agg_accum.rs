@@ -48,6 +48,17 @@ enum AggAccumulator {
     Median {
         values: Vec<f64>,
     },
+    /// Phase 20.4 Step 9 — `array_agg(expr [ORDER BY ...] [DISTINCT])`.
+    /// Collects values into a SQL array. NULLs are included.
+    ArrayAgg {
+        /// Accumulated rows: (value, evaluated ORDER BY key values).
+        /// NULLs are included in values for PG compatibility.
+        rows: Vec<(Value, Vec<Value>)>,
+        /// Whether to deduplicate values before building the array.
+        distinct: bool,
+        /// Sort directions: `true` = ASC, `false` = DESC. One per ORDER BY key.
+        order_by_dirs: Vec<bool>,
+    },
 }
 
 impl AggAccumulator {
@@ -99,6 +110,14 @@ impl AggAccumulator {
                 returns_jsonb: *returns_jsonb,
             },
             AggExpr::Median { .. } => Self::Median { values: Vec::new() },
+            AggExpr::ArrayAgg { distinct, order_by, .. } => Self::ArrayAgg {
+                rows: Vec::new(),
+                distinct: *distinct,
+                order_by_dirs: order_by
+                    .iter()
+                    .map(|(_, dir)| matches!(dir, crate::ast::SortOrder::Asc))
+                    .collect(),
+            },
         }
     }
 
@@ -109,6 +128,7 @@ impl AggAccumulator {
             AggExpr::GroupConcat { .. } => None,
             AggExpr::JsonbObjectAgg { .. } => None,
             AggExpr::Median { .. } => None,
+            AggExpr::ArrayAgg { .. } => None,
         };
 
         // Phase 9.5b: fast-path for simple column refs — avoids eval() overhead.
@@ -334,6 +354,26 @@ impl AggAccumulator {
                     }
                 }
             }
+            Self::ArrayAgg { rows, .. } => {
+                // Extract the ARRAY_AGG expression and ORDER BY from the AggExpr descriptor.
+                let (arr_expr, arr_order_by) = match agg {
+                    AggExpr::ArrayAgg { arg, order_by, .. } => (arg.as_ref(), order_by),
+                    _ => {
+                        unreachable!("ArrayAgg accumulator paired with non-ArrayAgg AggExpr")
+                    }
+                };
+
+                // Evaluate the aggregated expression (NULLs are included for PG compatibility).
+                let val = eval(arr_expr, row)?;
+
+                // Evaluate ORDER BY key expressions for this row.
+                let keys: Vec<Value> = arr_order_by
+                    .iter()
+                    .map(|(e, _)| eval(e, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                rows.push((val, keys));
+            }
         }
         Ok(())
     }
@@ -469,6 +509,52 @@ impl AggAccumulator {
                 } else {
                     Ok(Value::Real((values[mid - 1] + values[mid]) / 2.0))
                 }
+            }
+            Self::ArrayAgg {
+                mut rows,
+                distinct,
+                order_by_dirs,
+            } => {
+                // PostgreSQL semantics: empty group returns NULL, not empty array.
+                if rows.is_empty() {
+                    return Ok(Value::Null);
+                }
+
+                // 1. Sort if ORDER BY keys are present.
+                if !order_by_dirs.is_empty() {
+                    rows.sort_by(|(_, keys_a), (_, keys_b)| {
+                        for (i, &asc) in order_by_dirs.iter().enumerate() {
+                            let a = keys_a.get(i).unwrap_or(&Value::Null);
+                            let b = keys_b.get(i).unwrap_or(&Value::Null);
+                            let cmp = compare_values_null_last_session(a, b);
+                            let cmp = if asc { cmp } else { cmp.reverse() };
+                            if cmp != std::cmp::Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+
+                // 2. Deduplicate if DISTINCT (preserves sorted order).
+                // For ArrayAgg, deduplication uses Value equality.
+                let values: Vec<Value> = if distinct {
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    rows.into_iter()
+                        .filter(|(v, _)| {
+                            let key = value_to_display_string(v.clone());
+                            seen.insert(key)
+                        })
+                        .map(|(v, _)| v)
+                        .collect()
+                } else {
+                    rows.into_iter().map(|(v, _)| v).collect()
+                };
+
+                // 3. Build and return the array value.
+                // The encoding to blob happens at storage time, not here.
+                Ok(Value::Array(values))
             }
         }
     }
