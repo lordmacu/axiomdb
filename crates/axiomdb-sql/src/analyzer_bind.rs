@@ -106,7 +106,7 @@ impl BindContext {
         let mut found = Vec::new();
         for (ti, table) in self.tables.iter().enumerate() {
             for (ci, col) in table.columns.iter().enumerate() {
-                if col.name == col_name {
+                if col.name.eq_ignore_ascii_case(col_name) {
                     found.push((ti, table.col_offset + ci, col.name.as_str()));
                 }
             }
@@ -193,7 +193,7 @@ fn find_col_in_table<'a>(
         .columns
         .iter()
         .enumerate()
-        .find(|(_, c)| c.name == col_name)
+        .find(|(_, c)| c.name.eq_ignore_ascii_case(col_name))
         .ok_or_else(|| {
             let available = table
                 .columns

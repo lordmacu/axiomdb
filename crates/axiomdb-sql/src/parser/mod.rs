@@ -459,7 +459,7 @@ impl<'src> Parser<'src> {
                         self.advance();
                         Ok(Stmt::ShowDatabases(crate::ast::ShowDatabasesStmt))
                     }
-                    Token::Ident(ref s) if s.eq_ignore_ascii_case("SCHEMAS") => {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("SCHEMAS") => {
                         self.advance();
                         let like_pattern = if self.eat(&Token::Like) {
                             Some(self.parse_string_literal()?)

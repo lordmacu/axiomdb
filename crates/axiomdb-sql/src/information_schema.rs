@@ -141,6 +141,15 @@ pub static IS_VIEWS_COLS: &[(&str, ColumnType)] = &[
     ("IS_UPDATABLE", ColumnType::Text),
 ];
 
+/// Column names and types for `information_schema.SCHEMATA`.
+pub static IS_SCHEMATA_COLS: &[(&str, ColumnType)] = &[
+    ("CATALOG_NAME", ColumnType::Text),
+    ("SCHEMA_NAME", ColumnType::Text),
+    ("DEFAULT_CHARACTER_SET_NAME", ColumnType::Text),
+    ("DEFAULT_COLLATION_NAME", ColumnType::Text),
+    ("SQL_PATH", ColumnType::Text),
+];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Returns the column schema for the given IS virtual table name
@@ -154,6 +163,7 @@ pub fn is_table_cols(table_name: &str) -> Option<&'static [(&'static str, Column
         "referential_constraints" => Some(IS_REFERENTIAL_CONSTRAINTS_COLS),
         "statistics" => Some(IS_STATISTICS_COLS),
         "views" => Some(IS_VIEWS_COLS),
+        "schemata" => Some(IS_SCHEMATA_COLS),
         _ => None,
     }
 }

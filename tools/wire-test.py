@@ -39,7 +39,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             13.12 (statement-level triggers smoke),
             13.13 (collation system smoke),
             13.14 (custom aggregate functions smoke),
-            20.1 (regular views: CREATE/DROP/REPLACE VIEW, view expansion, SHOW CREATE VIEW, IS.VIEWS)
+            20.1 (regular views: CREATE/DROP/REPLACE VIEW, view expansion, SHOW CREATE VIEW, IS.VIEWS),
+            22b.4 (schema namespacing: CREATE/DROP SCHEMA, schema.table, search_path, SHOW SCHEMAS, IS.SCHEMATA)
 """
 import os
 import signal
@@ -4576,6 +4577,65 @@ ok("[20.4 sql arrays] NULL array column IS NULL check",
 
 cur.execute("DROP TABLE arr_test")
 conn.commit()
+
+# ── 22b.4 Schema Namespacing ──────────────────────────────────────────────────
+
+cur.execute("CREATE SCHEMA IF NOT EXISTS wire_ns")
+conn.commit()
+ok("[22b.4 schema] CREATE SCHEMA IF NOT EXISTS is idempotent", True, None)
+
+cur.execute("CREATE TABLE wire_ns.things (id INT, label TEXT)")
+conn.commit()
+cur.execute("INSERT INTO wire_ns.things VALUES (1, 'hello'), (2, 'world')")
+conn.commit()
+cur.execute("SELECT id, label FROM wire_ns.things ORDER BY id")
+rows = cur.fetchall()
+ok("[22b.4 schema] schema.table INSERT + SELECT roundtrip",
+   len(rows) == 2 and rows[0][0] in (1, '1') and rows[1][1] in ('world', b'world'),
+   rows)
+
+cur.execute("UPDATE wire_ns.things SET label = 'updated' WHERE id = 1")
+conn.commit()
+cur.execute("SELECT label FROM wire_ns.things WHERE id = 1")
+row = cur.fetchone()
+ok("[22b.4 schema] schema.table UPDATE",
+   row is not None and row[0] in ('updated', b'updated'),
+   row)
+
+cur.execute("DELETE FROM wire_ns.things WHERE id = 2")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM wire_ns.things")
+row = cur.fetchone()
+ok("[22b.4 schema] schema.table DELETE",
+   row is not None and row[0] in (1, '1'),
+   row)
+
+cur.execute("SHOW SCHEMAS")
+rows = cur.fetchall()
+schema_names = [r[0] for r in rows]
+ok("[22b.4 schema] SHOW SCHEMAS lists wire_ns",
+   'wire_ns' in schema_names,
+   schema_names)
+ok("[22b.4 schema] SHOW SCHEMAS lists public",
+   'public' in schema_names,
+   schema_names)
+
+cur.execute("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'wire_ns'")
+rows = cur.fetchall()
+ok("[22b.4 schema] information_schema.SCHEMATA includes wire_ns",
+   len(rows) == 1,
+   rows)
+
+cur.execute("SELECT CATALOG_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'public'")
+rows = cur.fetchall()
+ok("[22b.4 schema] information_schema.SCHEMATA catalog_name is def",
+   len(rows) == 1 and rows[0][0] in ('def', b'def'),
+   rows)
+
+# DROP SCHEMA CASCADE cleanup
+cur.execute("DROP SCHEMA wire_ns CASCADE")
+conn.commit()
+ok("[22b.4 schema] DROP SCHEMA CASCADE succeeds", True, None)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
