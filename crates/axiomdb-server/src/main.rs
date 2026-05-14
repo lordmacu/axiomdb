@@ -17,6 +17,11 @@
 //! RUST_LOG=debug                  # log level
 //! ```
 
+// ── Migrations CLI ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "wire-protocol")]
+mod migrate;
+
 // ── Wire-protocol server ───────────────────────────────────────────────────────
 
 #[cfg(feature = "wire-protocol")]
@@ -99,6 +104,12 @@ impl ServerBootstrapConfig {
 #[cfg(feature = "wire-protocol")]
 #[tokio::main]
 async fn main() {
+    // Intercept `migrate` subcommand before the async runtime fully boots.
+    let args: Vec<String> = std::env::args().collect();
+    if migrate::run_if_migrate(&args) {
+        return;
+    }
+
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tracing::info;

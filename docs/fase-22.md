@@ -1,6 +1,6 @@
 # Phase 22b — Platform Features
 
-## Subphases completed: 22b.1, 22b.3a, 22b.3b, 22b.4
+## Subphases completed: 22b.1, 22b.3a, 22b.3b, 22b.4, 22b.5
 
 ## What was built
 
@@ -160,8 +160,62 @@ for all 5 fields (min hour dom month dow). Aliases: `@hourly`, `@daily`,
 - `crates/axiomdb-sql/tests/integration_scheduled_jobs.rs` — 11 unit tests
 - `tools/wire-test.py` section `[22b.1 cron]` — 9 wire scenarios
 
+### 22b.5 — Schema migrations CLI
+
+AxiomDB ships a built-in migrations CLI as a subcommand of `axiomdb-server`.
+
+**Commands:**
+
+```bash
+# Show migration status
+axiomdb-server migrate status --data-dir ./data --db myapp --dir ./migrations
+
+# Apply all pending migrations
+axiomdb-server migrate up --data-dir ./data --db myapp --dir ./migrations
+
+# Revert the last applied migration
+axiomdb-server migrate down --data-dir ./data --db myapp --dir ./migrations
+
+# Create a new migration file
+axiomdb-server migrate create add_users_table --dir ./migrations
+```
+
+**Migration file format** (`N_description.sql`):
+
+```sql
+-- Write your UP migration here:
+CREATE TABLE users (
+    id   INT  PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+-- +migrate Down
+DROP TABLE users;
+```
+
+Files are named `{version}_{description}.sql` (e.g., `0001_create_users.sql`).
+The `-- +migrate Down` marker separates UP from DOWN. DOWN is optional —
+if absent, `migrate down` reports an error for that migration.
+
+**State tracking:** Applied migrations are recorded in `axiomdb_migrations`
+table inside the target database. The table is created automatically on first
+use. Schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS axiomdb_migrations (
+    version    INT  NOT NULL,
+    name       TEXT NOT NULL,
+    applied_at BIGINT NOT NULL,
+    PRIMARY KEY (version)
+)
+```
+
+**Tests:** 18 unit tests in `crates/axiomdb-server/src/migrate.rs` covering
+file parsing, sorting, duplicate detection, up/down lifecycle, idempotency,
+and `create` generation.
+
 ## Deferred
 
 - 22b.2 — Foreign Data Wrappers (HTTP + PostgreSQL as external sources)
-- 22b.5 — Schema migrations CLI (`axiomdb migrate up/down/status`)
+- 22b.6 — FDW pushdown (push SQL predicates to remote origin)
 - later platform phases — per-database COMPAT, encryption, quotas, ownership
