@@ -470,12 +470,27 @@ fn analyze_select_with_outer(
             FromClause::Table(_) => {}
             // Phase 21.3 — recursive CTE already pre-analyzed by expand_ctes.
             FromClause::RecursiveCte(_) => {}
-            // Phase 20.4, Step 7 — UNNEST: resolve array expressions against
-            // the accumulated scope (LATERAL correlation).
+            // Phase GAP-20.4b — UNNEST: resolve array expressions against
+            // the accumulated scope (LATERAL correlation). For LATERAL UNNEST,
+            // use empty ctx so that column references to left-side tables
+            // (e.g., t.arr in LATERAL unnest(t.arr)) are resolved as
+            // OuterColumn nodes. For non-LATERAL, use ctx for local resolution.
             FromClause::Unnest(mut un) => {
-                for expr in &mut un.exprs {
-                    let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
-                    *expr = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                if un.lateral {
+                    // Use empty ctx so resolution falls through to outer_scopes,
+                    // creating OuterColumn references for left-side column refs.
+                    let empty_ctx = BindContext::empty();
+                    let mut scopes = outer_scopes.to_vec();
+                    scopes.push(&ctx);
+                    for expr in &mut un.exprs {
+                        let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                        *expr = resolve_expr_full(taken, &empty_ctx, &scopes, Some(&state))?;
+                    }
+                } else {
+                    for expr in &mut un.exprs {
+                        let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                        *expr = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                    }
                 }
                 join.table = FromClause::Unnest(un);
             }

@@ -195,11 +195,13 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 // Evaluate LIKE ANY over the array
                 let result =
                     crate::eval::functions::any_all::eval_like_any(&v, &arr_val, escape_ch)?;
-                return Ok(Value::Bool(if *negated {
-                    !is_truthy(&result)
-                } else {
-                    is_truthy(&result)
-                }));
+                // Preserve NULL (3VL) - only apply negation to TRUE/FALSE
+                return match result {
+                    Value::Null => Ok(Value::Null),
+                    Value::Bool(true) => Ok(Value::Bool(!*negated)),
+                    Value::Bool(false) => Ok(Value::Bool(*negated)),
+                    _ => Ok(result), // Should not happen for LIKE
+                };
             }
             if let Expr::AllOf {
                 expr: like_expr,
@@ -230,11 +232,13 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 // Evaluate LIKE ALL over the array
                 let result =
                     crate::eval::functions::any_all::eval_like_all(&v, &arr_val, escape_ch)?;
-                return Ok(Value::Bool(if *negated {
-                    !is_truthy(&result)
-                } else {
-                    is_truthy(&result)
-                }));
+                // Preserve NULL (3VL) - only apply negation to TRUE/FALSE
+                return match result {
+                    Value::Null => Ok(Value::Null),
+                    Value::Bool(true) => Ok(Value::Bool(!*negated)),
+                    Value::Bool(false) => Ok(Value::Bool(*negated)),
+                    _ => Ok(result), // Should not happen for LIKE
+                };
             }
 
             let _guard =
@@ -691,8 +695,7 @@ pub fn eval_with<R: SubqueryRunner>(
                 Expr::AnyOf { expr, array } => (expr, array),
                 _ => unreachable!(),
             };
-            let _guard =
-                explicit_collation_from_exprs(&[left, any_expr]).map(CollationGuard::new);
+            let _guard = explicit_collation_from_exprs(&[left, any_expr]).map(CollationGuard::new);
             let lhs_val = eval_with(left, row, sq)?;
             let arr_val = eval_with(array, row, sq)?;
             super::functions::any_all::eval_any_of(&lhs_val, &arr_val, *op)
@@ -702,8 +705,7 @@ pub fn eval_with<R: SubqueryRunner>(
                 Expr::AllOf { expr, array } => (expr, array),
                 _ => unreachable!(),
             };
-            let _guard =
-                explicit_collation_from_exprs(&[left, all_expr]).map(CollationGuard::new);
+            let _guard = explicit_collation_from_exprs(&[left, all_expr]).map(CollationGuard::new);
             let lhs_val = eval_with(left, row, sq)?;
             let arr_val = eval_with(array, row, sq)?;
             super::functions::any_all::eval_all_of(&lhs_val, &arr_val, *op)
@@ -744,6 +746,85 @@ pub fn eval_with<R: SubqueryRunner>(
             negated,
             escape,
         } => {
+            // Phase 20.4, Step 7: Handle `expr LIKE ANY(array)` / `expr LIKE ALL(array)`.
+            // When the pattern is an AnyOf/AllOf node, we expand it element-wise.
+            // The AnyOf/AllOf was created with a NULL placeholder for the LHS expr.
+            // We substitute it with the actual LHS from this Like.
+            if let Expr::AnyOf {
+                expr: like_expr,
+                array,
+            } = pattern.as_ref()
+            {
+                // Fix up the NULL placeholder with the actual LHS
+                let resolved_like_expr = if matches!(like_expr.as_ref(), Expr::Literal(Value::Null))
+                {
+                    (*expr).clone()
+                } else {
+                    like_expr.clone()
+                };
+                let _guard = explicit_collation_from_exprs(&[expr, &resolved_like_expr])
+                    .map(CollationGuard::new);
+                let v = eval_with(expr, row, sq)?;
+                let arr_val = eval_with(array, row, sq)?;
+                let escape_ch = if let Some(esc_expr) = escape {
+                    match eval_with(esc_expr, row, sq)? {
+                        Value::Text(esc) => esc.chars().next(),
+                        Value::Null => return Ok(Value::Null),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                // Evaluate LIKE ANY over the array
+                let result =
+                    crate::eval::functions::any_all::eval_like_any(&v, &arr_val, escape_ch)?;
+                // Preserve NULL (3VL) - only apply negation to TRUE/FALSE
+                return match result {
+                    Value::Null => Ok(Value::Null),
+                    Value::Bool(true) => Ok(Value::Bool(!*negated)),
+                    Value::Bool(false) => Ok(Value::Bool(*negated)),
+                    _ => Ok(result), // Should not happen for LIKE
+                };
+            }
+            if let Expr::AllOf {
+                expr: like_expr,
+                array,
+            } = pattern.as_ref()
+            {
+                // Fix up the NULL placeholder with the actual LHS
+                let resolved_like_expr = if matches!(like_expr.as_ref(), Expr::Literal(Value::Null))
+                {
+                    (*expr).clone()
+                } else {
+                    like_expr.clone()
+                };
+                let _guard = explicit_collation_from_exprs(&[expr, &resolved_like_expr])
+                    .map(CollationGuard::new);
+                let v = eval_with(expr, row, sq)?;
+                let arr_val = eval_with(array, row, sq)?;
+                let escape_ch = if let Some(esc_expr) = escape {
+                    match eval_with(esc_expr, row, sq)? {
+                        Value::Text(esc) => esc.chars().next(),
+                        Value::Null => return Ok(Value::Null),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                // Evaluate LIKE ALL over the array
+                let result =
+                    crate::eval::functions::any_all::eval_like_all(&v, &arr_val, escape_ch)?;
+                // Preserve NULL (3VL) - only apply negation to TRUE/FALSE
+                return match result {
+                    Value::Null => Ok(Value::Null),
+                    Value::Bool(true) => Ok(Value::Bool(!*negated)),
+                    Value::Bool(false) => Ok(Value::Bool(*negated)),
+                    _ => Ok(result), // Should not happen for LIKE
+                };
+            }
+
             let _guard =
                 explicit_collation_from_exprs(&[expr, pattern, escape.as_deref().unwrap_or(expr)])
                     .map(CollationGuard::new);

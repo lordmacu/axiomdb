@@ -58,6 +58,10 @@ fn execute_select_with_joins_first_materialized(
     // Some(subquery) → LATERAL subquery correlated to left side, must be
     // re-evaluated per outer row. None → non-LATERAL or non-correlated.
     let mut correlated_sub: Vec<Option<SelectStmt>> = vec![None];
+    // Phase GAP-20.4b: parallel tracker for correlated LATERAL UNNEST.
+    // Some(un) → LATERAL UNNEST correlated to left side, must be
+    // re-evaluated per outer row. None → non-LATERAL or non-correlated.
+    let mut correlated_unnest: Vec<Option<crate::ast::UnnestClause>> = vec![None];
     // Phase 21.9: Track accumulated columns from correlated LATERAL subqueries.
     // Even when deferred (empty columns in all_sources), subsequent LATERALs
     // need to reference these output columns for correlation detection.
@@ -95,6 +99,7 @@ fn execute_select_with_joins_first_materialized(
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                     correlated_sub.push(None);
+                    correlated_unnest.push(None);
                 }
                 FromClause::Subquery {
                     query,
@@ -176,6 +181,7 @@ fn execute_select_with_joins_first_materialized(
                     });
                     correlated_jt.push(None);
                     correlated_srf.push(None);
+                    correlated_unnest.push(None);
                 }
                 // Phase 11.20a/d3 — JSON_TABLE on the right side of a JOIN.
                 // Non-correlated doc: evaluate once with an empty row, materialize,
@@ -192,6 +198,7 @@ fn execute_select_with_joins_first_materialized(
                         correlated_jt.push(Some(spec));
                         correlated_srf.push(None);
                         correlated_sub.push(None);
+                        correlated_unnest.push(None);
                     } else {
                         let doc_val = crate::eval::eval(&jt.doc, &[])?;
                         let rows = match crate::json_table::doc_to_serde(&doc_val)? {
@@ -210,6 +217,7 @@ fn execute_select_with_joins_first_materialized(
                         correlated_jt.push(None);
                         correlated_srf.push(None);
                         correlated_sub.push(None);
+                        correlated_unnest.push(None);
                     }
                 }
                 // Phase 11.25a — JSONB SRF (jsonb_each, etc.) on the right side.
@@ -224,6 +232,7 @@ fn execute_select_with_joins_first_materialized(
                         correlated_jt.push(None);
                         correlated_srf.push(Some(srf.kind));
                         correlated_sub.push(None);
+                        correlated_unnest.push(None);
                     } else {
                         let doc_val = crate::eval::eval(&srf.doc, &[])?;
                         let rows = crate::jsonb_srf::materialize_jsonb_srf(srf.kind, &doc_val)?;
@@ -231,6 +240,7 @@ fn execute_select_with_joins_first_materialized(
                         correlated_jt.push(None);
                         correlated_srf.push(None);
                         correlated_sub.push(None);
+                        correlated_unnest.push(None);
                     }
                 }
                 // Phase 21.22 — inline VALUES on the right side.
@@ -244,6 +254,7 @@ fn execute_select_with_joins_first_materialized(
                     correlated_jt.push(None);
                     correlated_srf.push(None);
                     correlated_sub.push(None);
+                    correlated_unnest.push(None);
                 }
                 // Phase 21.3 — recursive CTE as join right side is deferred;
                 // MVP only supports recursive CTE as first-FROM source.
@@ -254,11 +265,40 @@ fn execute_select_with_joins_first_materialized(
                             .into(),
                     });
                 }
-                // Phase 20.4 — UNNEST on the right side of a JOIN.
-                FromClause::Unnest(_) => {
-                    return Err(DbError::NotImplemented {
-                        feature: "UNNEST on the right side of a JOIN".into(),
-                    });
+                // Phase GAP-20.4b — UNNEST on the right side of a JOIN.
+                // UNNEST can be LATERAL-correlated: array expressions reference
+                // columns from earlier tables in the FROM clause.
+                FromClause::Unnest(un) => {
+                    let base_left_cols =
+                        all_sources.iter().map(|s| s.columns.len()).sum::<usize>();
+                    let effective_left_cols = base_left_cols + lateral_accum_cols;
+                    let is_correlated =
+                        un.lateral && crate::unnest::unnest_is_correlated(un, effective_left_cols);
+                    let column_metas = crate::unnest::column_metas_for_unnest(un);
+                    let alias = un.alias.clone().unwrap_or_else(|| "unnest".into());
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&alias, column_metas.clone()));
+                    if is_correlated {
+                        // Deferred: store the UNNEST clause for the combine loop.
+                        // LATERAL UNNEST's output columns become available to
+                        // subsequent LATERAL items (update lateral_accum_cols).
+                        lateral_accum_cols += un.exprs.len();
+                        scanned.push(Vec::new());
+                        correlated_unnest.push(Some((**un).clone()));
+                        correlated_jt.push(None);
+                        correlated_srf.push(None);
+                        correlated_sub.push(None);
+                    } else {
+                        // Non-correlated: materialize once with an empty outer row
+                        // (no left-side columns visible when lateral=false).
+                        let rows = crate::unnest::materialize_unnest(un, None)?;
+                        scanned.push(rows);
+                        correlated_unnest.push(None);
+                        correlated_jt.push(None);
+                        correlated_srf.push(None);
+                        correlated_sub.push(None);
+                    }
                 }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
@@ -333,6 +373,18 @@ fn execute_select_with_joins_first_materialized(
                 exec_ctx,
                 conn_txn,
                 ctx,
+            )?
+        } else if let Some(un) = correlated_unnest[right_idx].as_ref() {
+            // Phase GAP-20.4b — correlated LATERAL UNNEST right side.
+            apply_correlated_unnest_join(
+                combined_rows,
+                un,
+                &all_sources[right_idx].columns,
+                right_col_count,
+                join.join_type,
+                &join.condition,
+                &left_schema,
+                right_col_offset,
             )?
         } else {
             apply_join(

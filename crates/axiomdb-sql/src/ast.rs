@@ -401,6 +401,7 @@ pub enum FromClause {
 }
 
 /// Phase 20.4, Step 7 — `UNNEST(expr1[, expr2, ...]) [AS alias(col1, col2, ...)]`.
+/// Phase GAP-20.4b: `lateral: bool` for `LATERAL UNNEST(...)` (21.9 parity).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnnestClause {
     /// One or more array expressions to expand.
@@ -409,6 +410,10 @@ pub struct UnnestClause {
     pub alias: Option<String>,
     /// Optional explicit column names per array: `AS u(a, b)`.
     pub column_names: Vec<String>,
+    /// Phase GAP-20.4b: `true` for `LATERAL UNNEST(...)`.
+    /// When `true`, the UNNEST expressions can reference columns from
+    /// earlier tables in the FROM clause (outer correlation).
+    pub lateral: bool,
 }
 
 /// Phase 21.25 — bounded `FROM source PIVOT (...) [AS alias]`.

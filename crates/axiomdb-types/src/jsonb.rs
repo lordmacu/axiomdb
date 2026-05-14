@@ -988,6 +988,11 @@ pub fn gin_extract_terms(data: &[u8]) -> Result<Vec<Vec<u8>>, DbError> {
     let root = JsonbDecoder::decode(data)?;
     let mut terms: Vec<Vec<u8>> = Vec::new();
     gin_collect(&root, &mut terms);
+    // Deduplicate: the same key can appear in multiple sub-objects (e.g., "sku"
+    // in two array items). Without dedup, inserting per-row GIN entries would
+    // produce [term][0x00][pk_key] twice in the B-Tree → DuplicateKey.
+    terms.sort_unstable();
+    terms.dedup();
     Ok(terms)
 }
 
@@ -1014,6 +1019,8 @@ pub fn gin_extract_terms_from_str(s: &str) -> Result<Vec<Vec<u8>>, DbError> {
     })?;
     let mut terms: Vec<Vec<u8>> = Vec::new();
     gin_collect(&root, &mut terms);
+    terms.sort_unstable();
+    terms.dedup();
     Ok(terms)
 }
 

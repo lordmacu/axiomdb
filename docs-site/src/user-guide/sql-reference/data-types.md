@@ -452,6 +452,91 @@ INSERT INTO room_reservations VALUES (1, '[2026-03-21 10:00, 2026-03-21 12:00)')
 
 ---
 
+## Array Types
+
+Any scalar type can be declared as a 1-D or multi-dimensional array by appending
+`[]` (or `ARRAY`) to the type name.
+
+| Syntax          | Meaning                            |
+|-----------------|------------------------------------|
+| `INT[]`         | 1-D integer array                  |
+| `TEXT[][]`      | 2-D text array                     |
+| `BOOL[3]`       | 1-D boolean array (size hint only) |
+| `ARRAY[INT]`    | keyword form for 1-D `INT[]`       |
+
+```sql
+CREATE TABLE tags_example (
+    id   INT    PRIMARY KEY,
+    tags TEXT[],
+    nums INT[]
+);
+
+-- Array literals use ARRAY[e1, e2, ...]
+INSERT INTO tags_example VALUES (1, ARRAY['alpha','beta'], ARRAY[10, 20, 30]);
+
+-- 1-based subscript (PostgreSQL-compatible)
+SELECT tags[1] FROM tags_example WHERE id = 1;   -- 'alpha'
+
+-- Slice
+SELECT nums[1:2] FROM tags_example WHERE id = 1; -- {10,20}
+
+-- Containment: does array contain all elements of the right side?
+SELECT nums @> ARRAY[20] FROM tags_example;       -- TRUE
+
+-- Concatenation
+SELECT ARRAY[1,2] || ARRAY[3,4];                  -- {1,2,3,4}
+```
+
+### Array Functions
+
+| Function | Description |
+|----------|-------------|
+| `array_length(arr, dim)` | Length of dimension `dim` (1-based) |
+| `cardinality(arr)` | Total number of elements across all dimensions |
+| `array_ndims(arr)` | Number of dimensions |
+| `array_append(arr, elem)` | Add element at end |
+| `array_prepend(elem, arr)` | Add element at front |
+| `array_cat(a, b)` | Concatenate two arrays (same as `\|\|`) |
+| `array_remove(arr, val)` | Remove all occurrences of `val` |
+| `array_replace(arr, old, new)` | Replace all occurrences of `old` with `new` |
+| `array_upper(arr, dim)` / `array_lower(arr, dim)` | Upper/lower bound of dimension |
+| `array_fill(val, dims)` | Create array filled with `val` |
+| `array_to_string(arr, delim)` | Join elements with delimiter |
+| `string_to_array(str, delim)` | Split string into array |
+| `array_position(arr, elem)` | 1-based position of first occurrence (NULL if not found) |
+| `array_positions(arr, elem)` | All positions of `elem` |
+| `unnest(arr)` | Expand array into a set of rows |
+| `array_agg(expr ORDER BY ...)` | Aggregate values into an array |
+
+### ANY / ALL Operators
+
+```sql
+-- True if any element equals the left operand
+SELECT 20 = ANY(ARRAY[10, 20, 30]);   -- TRUE
+
+-- True if all elements satisfy the comparison
+SELECT 5 < ALL(ARRAY[10, 20, 30]);    -- TRUE
+```
+
+### Array Operators
+
+| Operator | Meaning |
+|----------|---------|
+| `@>` | Contains (left contains all elements of right) |
+| `<@` | Contained by |
+| `&&` | Overlaps (have any element in common) |
+| `\|\|` | Concatenation |
+| `=`, `<>` | Element-wise equality / inequality |
+
+GIN indexes can be created on array columns to accelerate `@>` and `&&` queries:
+
+```sql
+CREATE INDEX ON tags_example USING GIN (tags);
+-- Now "WHERE tags @> ARRAY['alpha']" uses the GIN index.
+```
+
+---
+
 ## NULL in Every Type
 
 Every column of every type can hold NULL unless declared `NOT NULL`. The row codec

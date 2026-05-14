@@ -102,6 +102,8 @@ pub(crate) fn eval_all_of(
 }
 
 /// Evaluate `expr LIKE ANY(array)` where array contains patterns.
+/// Implements 3VL: TRUE if any comparison is TRUE, NULL if any comparison is NULL
+/// (with no TRUE), FALSE if all comparisons are FALSE (no NULLs).
 pub(crate) fn eval_like_any(
     text: &Value,
     arr_val: &Value,
@@ -122,8 +124,15 @@ pub(crate) fn eval_like_any(
     };
 
     let mut saw_true = false;
+    let mut saw_null = false;
 
     for pat_val in patterns {
+        // NULL pattern → NULL result per 3VL (unknown)
+        if matches!(pat_val, Value::Null) {
+            saw_null = true;
+            continue;
+        }
+
         let Value::Text(pattern) = pat_val else {
             continue; // Skip non-text patterns
         };
@@ -146,12 +155,16 @@ pub(crate) fn eval_like_any(
 
     if saw_true {
         Ok(Value::Bool(true))
+    } else if saw_null {
+        Ok(Value::Null) // NULL if any NULLs were encountered with no TRUE
     } else {
-        Ok(Value::Bool(false))
+        Ok(Value::Bool(false)) // All FALSE, no NULLs
     }
 }
 
 /// Evaluate `expr LIKE ALL(array)` where array contains patterns.
+/// Implements 3VL: FALSE if any comparison is FALSE, NULL if any comparison is NULL
+/// (with no FALSE), TRUE if all comparisons are TRUE (no NULLs), NULL if array is empty.
 pub(crate) fn eval_like_all(
     text: &Value,
     arr_val: &Value,
@@ -177,8 +190,15 @@ pub(crate) fn eval_like_all(
     };
 
     let mut saw_false = false;
+    let mut saw_null = false;
 
     for pat_val in patterns {
+        // NULL pattern → NULL result per 3VL (unknown)
+        if matches!(pat_val, Value::Null) {
+            saw_null = true;
+            continue;
+        }
+
         let Value::Text(pattern) = pat_val else {
             continue; // Skip non-text patterns
         };
@@ -200,8 +220,10 @@ pub(crate) fn eval_like_all(
     }
 
     if saw_false {
-        Ok(Value::Bool(false))
+        Ok(Value::Bool(false)) // FALSE short-circuits ALL
+    } else if saw_null {
+        Ok(Value::Null) // NULL if any NULLs were encountered with no FALSE
     } else {
-        Ok(Value::Bool(true))
+        Ok(Value::Bool(true)) // All TRUE, no NULLs
     }
 }

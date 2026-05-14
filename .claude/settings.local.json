@@ -26,7 +26,8 @@
       "Bash(limactl list *)",
       "Bash(ssh -o StrictHostKeyChecking=no lima-axiomdb \"cd ~/nexusdb && CARGO_TARGET_DIR=/home/cristian.guest/axiomdb-target rtk cargo build -p axiomdb-sql 2>&1 | tail -20\")",
       "Bash(ssh -o StrictHostKeyChecking=no -p 56842 cristian.guest@127.0.0.1 \"cd ~/nexusdb && CARGO_TARGET_DIR=/home/cristian.guest/axiomdb-target rtk cargo build -p axiomdb-sql 2>&1 | tail -20\")",
-      "Bash(pkill axiomdb-server *)"
+      "Bash(pkill axiomdb-server *)",
+      "Bash(pkill -f axiomdb-server)"
     ],
     "additionalDirectories": [
       "/Users/cristian/nexusdb/docs"

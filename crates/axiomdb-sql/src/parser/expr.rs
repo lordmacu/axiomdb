@@ -631,6 +631,27 @@ fn parse_postfix(p: &mut Parser) -> Result<Expr, DbError> {
         }
     }
 
+    // Handle PostgreSQL-style type cast: `expr::type[]`
+    // This must appear AFTER subscript handling (which consumes LBracket/RBracket).
+    // We check for :: specifically to avoid interfering with slice [lo:hi] syntax.
+    if matches!(p.peek(), Token::Colon) && matches!(p.peek_at(1), Token::Colon) {
+        p.advance(); // consume first ':'
+        p.advance(); // consume second ':'
+        let parsed = super::ddl::parse_data_type(p)?;
+        // Construct the proper DataType with array dimensions.
+        // For `int[]`, ndims=1 and data_type=Int → DataType::Array(Int)
+        // For `int[][]`, ndims=2 → DataType::Array(Array(Int))
+        use axiomdb_types::DataType;
+        let mut target = parsed.data_type;
+        for _ in 0..parsed.ndims {
+            target = DataType::Array(Box::new(target));
+        }
+        expr = Expr::Cast {
+            expr: Box::new(expr),
+            target,
+        };
+    }
+
     Ok(expr)
 }
 

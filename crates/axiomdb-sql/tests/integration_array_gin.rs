@@ -36,11 +36,27 @@ fn setup_array_table(
         txn,
     );
     // Insert test data
-    common::run("INSERT INTO tags VALUES (1, ARRAY['urgent', 'bug', 'frontend'])", storage, txn);
-    common::run("INSERT INTO tags VALUES (2, ARRAY['feature', 'backend'])", storage, txn);
-    common::run("INSERT INTO tags VALUES (3, ARRAY['urgent', 'backend'])", storage, txn);
+    common::run(
+        "INSERT INTO tags VALUES (1, ARRAY['urgent', 'bug', 'frontend'])",
+        storage,
+        txn,
+    );
+    common::run(
+        "INSERT INTO tags VALUES (2, ARRAY['feature', 'backend'])",
+        storage,
+        txn,
+    );
+    common::run(
+        "INSERT INTO tags VALUES (3, ARRAY['urgent', 'backend'])",
+        storage,
+        txn,
+    );
     common::run("INSERT INTO tags VALUES (4, ARRAY['bug'])", storage, txn);
-    common::run("INSERT INTO tags VALUES (5, ARRAY['frontend', 'backend'])", storage, txn);
+    common::run(
+        "INSERT INTO tags VALUES (5, ARRAY['frontend', 'backend'])",
+        storage,
+        txn,
+    );
     common::run(
         "INSERT INTO tags VALUES (6, ARRAY['urgent', 'bug', 'backend', 'feature'])",
         storage,
@@ -65,7 +81,11 @@ fn gin_probe_contains() {
     setup_array_table(&mut storage, &mut txn);
 
     // Find all rows containing both 'urgent' AND 'bug'
-    let result = rows("SELECT id FROM tags WHERE tags @> ARRAY['urgent', 'bug']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags @> ARRAY['urgent', 'bug']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     // Rows 1 (urgent, bug, frontend) and 6 (urgent, bug, backend, feature) match
     assert_eq!(ids, vec![1, 6]);
@@ -78,7 +98,11 @@ fn gin_probe_overlap() {
     setup_array_table(&mut storage, &mut txn);
 
     // Find all rows with any overlap with ARRAY['urgent', 'backend']
-    let result = rows("SELECT id FROM tags WHERE tags && ARRAY['urgent', 'backend']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags && ARRAY['urgent', 'backend']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     // Row 1: urgent, bug, frontend (matches urgent)
     // Row 2: feature, backend (matches backend)
@@ -118,12 +142,20 @@ fn gin_probe_equality() {
     setup_array_table(&mut storage, &mut txn);
 
     // Find exact match
-    let result = rows("SELECT id FROM tags WHERE tags = ARRAY['urgent', 'bug', 'frontend']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags = ARRAY['urgent', 'bug', 'frontend']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert_eq!(ids, vec![1]);
 
     // Non-matching case
-    let result = rows("SELECT id FROM tags WHERE tags = ARRAY['urgent', 'bug']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags = ARRAY['urgent', 'bug']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert!(ids.is_empty());
 }
@@ -157,7 +189,11 @@ fn gin_null_elements_not_indexed() {
     );
 
     // Query should still find row 1 via 'a'
-    let result = rows("SELECT id FROM t_nulls WHERE arr @> ARRAY['a']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM t_nulls WHERE arr @> ARRAY['a']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert_eq!(ids, vec![1, 2]);
 }
@@ -176,7 +212,11 @@ fn gin_maintenance_on_insert() {
     );
 
     // Query should find the new row
-    let result = rows("SELECT id FROM tags WHERE tags @> ARRAY['bug']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags @> ARRAY['bug']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert!(ids.contains(&4)); // original row with 'bug'
     assert!(ids.contains(&7)); // newly inserted row with 'bug'
@@ -196,7 +236,11 @@ fn gin_maintenance_on_update() {
     );
 
     // Row 4 should now appear in queries for 'urgent'
-    let result = rows("SELECT id FROM tags WHERE tags @> ARRAY['urgent']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags @> ARRAY['urgent']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert!(ids.contains(&4), "updated row 4 should now match 'urgent'");
     // Original rows 1, 3, 6 should still match
@@ -213,7 +257,11 @@ fn gin_maintenance_on_delete() {
     common::run("DELETE FROM tags WHERE id = 1", &mut storage, &mut txn);
 
     // Query for 'urgent' should not include row 1 anymore
-    let result = rows("SELECT id FROM tags WHERE tags @> ARRAY['urgent']", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM tags WHERE tags @> ARRAY['urgent']",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert!(!ids.contains(&1), "deleted row 1 should not appear");
     // Should still find rows 3 and 6
@@ -274,7 +322,8 @@ fn explain_gin_with_ctx(sql: &str) -> String {
 #[test]
 fn gin_recheck_required() {
     // EXPLAIN should show 'gin' index usage
-    let explain_text = explain_gin_with_ctx("EXPLAIN SELECT id FROM tags WHERE tags @> ARRAY['bug']");
+    let explain_text =
+        explain_gin_with_ctx("EXPLAIN SELECT id FROM tags WHERE tags @> ARRAY['bug']");
     assert!(
         explain_text.contains("gin") || explain_text.contains("GIN"),
         "EXPLAIN should mention GIN index, got: {}",
@@ -329,18 +378,38 @@ fn gin_integer_array() {
         &mut storage,
         &mut txn,
     );
-    common::run("INSERT INTO numbers VALUES (1, ARRAY[1, 2, 3])", &mut storage, &mut txn);
-    common::run("INSERT INTO numbers VALUES (2, ARRAY[4, 5, 6])", &mut storage, &mut txn);
-    common::run("INSERT INTO numbers VALUES (3, ARRAY[2, 4, 6])", &mut storage, &mut txn);
+    common::run(
+        "INSERT INTO numbers VALUES (1, ARRAY[1, 2, 3])",
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        "INSERT INTO numbers VALUES (2, ARRAY[4, 5, 6])",
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        "INSERT INTO numbers VALUES (3, ARRAY[2, 4, 6])",
+        &mut storage,
+        &mut txn,
+    );
 
     // @> containment
-    let result = rows("SELECT id FROM numbers WHERE nums @> ARRAY[2]", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM numbers WHERE nums @> ARRAY[2]",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     // Rows 1 (contains 2) and 3 (contains 2) match
     assert_eq!(ids, vec![1, 3]);
 
     // && overlap
-    let result = rows("SELECT id FROM numbers WHERE nums && ARRAY[1, 4]", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM numbers WHERE nums && ARRAY[1, 4]",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     // Rows 1 (has 1), 2 (has 4), 3 (has 4) match
     assert_eq!(ids, vec![1, 2, 3]);
@@ -376,7 +445,11 @@ fn gin_multidimensional_array() {
     );
 
     // Should find row with element 3
-    let result = rows("SELECT id FROM multi WHERE arr @> ARRAY[3]", &mut storage, &mut txn);
+    let result = rows(
+        "SELECT id FROM multi WHERE arr @> ARRAY[3]",
+        &mut storage,
+        &mut txn,
+    );
     let ids = int_ids(result);
     assert_eq!(ids, vec![1]);
 }

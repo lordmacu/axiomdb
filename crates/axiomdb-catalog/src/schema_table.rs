@@ -695,7 +695,16 @@ impl ColumnDef {
         let has_on_update = on_update_bytes.is_some();
         let generated_bytes = self.generated_expr.as_deref().map(|s| s.as_bytes());
         let has_generated = generated_bytes.is_some();
-        let collation_bytes = self.collation.as_deref().map(|s| s.as_bytes());
+        // When enum_type_name is present we must always emit a collation section (even
+        // an empty one) so the decoder can unambiguously find the enum field. Without
+        // this invariant a `collation=None, enum_type_name=Some(...)` row would write
+        // the enum length bytes at the position the decoder expects collation, causing
+        // silent data corruption (the enum string is misread as the collation value).
+        let collation_bytes: Option<&[u8]> = if self.enum_type_name.is_some() {
+            Some(self.collation.as_deref().unwrap_or("").as_bytes())
+        } else {
+            self.collation.as_deref().map(|s| s.as_bytes())
+        };
         let enum_type_bytes = self.enum_type_name.as_deref().map(|s| s.as_bytes());
 
         let mut flags: u8 = 0;

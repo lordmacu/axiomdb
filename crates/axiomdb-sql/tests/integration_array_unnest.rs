@@ -71,8 +71,9 @@ fn unnest_multiple_arrays() {
 #[test]
 fn unnest_three_arrays() {
     // SELECT * FROM unnest(ARRAY[1,2], ARRAY['a','b'], ARRAY[true,false]) AS u(n, l, b)
-    let result =
-        sql_with_ctx("SELECT * FROM unnest(ARRAY[1,2], ARRAY['a','b'], ARRAY[true,false]) AS u(n, l, b)");
+    let result = sql_with_ctx(
+        "SELECT * FROM unnest(ARRAY[1,2], ARRAY['a','b'], ARRAY[true,false]) AS u(n, l, b)",
+    );
     assert_eq!(result.len(), 2);
     assert_eq!(result[0][0], Value::Int(1));
     assert_eq!(result[0][1], Value::Text("a".to_string()));
@@ -106,10 +107,92 @@ fn unnest_null_elements() {
 }
 
 // ── LATERAL correlation ────────────────────────────────────────────────────────
-// NOTE: LATERAL correlation with UNNEST (e.g., FROM t, LATERAL unnest(t.arr)) is
-// not yet implemented. These tests document expected behavior:
-// - SELECT t.id, u.val FROM t, LATERAL unnest(t.arr) AS u(val) should work
-// - UNNEST as first FROM source works correctly (tested in unnest_single_array)
+
+#[test]
+fn unnest_lateral_correlation() {
+    // CREATE TABLE t (id INT, arr INT[]); INSERT INTO t VALUES (1, ARRAY[10,20]);
+    // SELECT t.id, u.val FROM t, LATERAL unnest(t.arr) AS u(val) → (1,10), (1,20)
+    let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
+    common::run_ctx(
+        "CREATE TABLE t(id INT, arr INT[])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, ARRAY[30])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let result = rows(
+        common::run_ctx(
+            "SELECT t.id, u.val FROM t, LATERAL unnest(t.arr) AS u(val) ORDER BY t.id, u.val",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    // Row 1: id=1, val=10
+    assert_eq!(result[0][0], Value::Int(1));
+    assert_eq!(result[0][1], Value::Int(10));
+    // Row 2: id=1, val=20
+    assert_eq!(result[1][0], Value::Int(1));
+    assert_eq!(result[1][1], Value::Int(20));
+    // Row 3: id=2, val=30
+    assert_eq!(result[2][0], Value::Int(2));
+    assert_eq!(result[2][1], Value::Int(30));
+    assert_eq!(result.len(), 3);
+}
+
+#[test]
+fn unnest_lateral_empty_array() {
+    // LATERAL UNNEST with an empty array should produce 0 rows for that entry,
+    // but still emit rows for non-empty arrays.
+    let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
+    common::run_ctx(
+        "CREATE TABLE t(id INT, arr INT[])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    common::run_ctx(
+        "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, ARRAY[]), (3, ARRAY[30])",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let result = rows(
+        common::run_ctx(
+            "SELECT t.id, u.val FROM t, LATERAL unnest(t.arr) AS u(val) ORDER BY t.id, u.val",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
+    // id=1: two rows (10, 20)
+    assert_eq!(result[0][0], Value::Int(1));
+    assert_eq!(result[0][1], Value::Int(10));
+    assert_eq!(result[1][0], Value::Int(1));
+    assert_eq!(result[1][1], Value::Int(20));
+    // id=2: no rows (empty array)
+    // id=3: one row (30)
+    assert_eq!(result[2][0], Value::Int(3));
+    assert_eq!(result[2][1], Value::Int(30));
+    assert_eq!(result.len(), 3);
+}
 
 // ── Without alias (first FROM source) ─────────────────────────────────────────
 

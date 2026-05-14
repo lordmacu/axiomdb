@@ -106,11 +106,7 @@ fn flatten_array_elements(arr: &[Value], out: &mut Vec<Vec<u8>>) {
                 // NULL elements are not indexed (skip)
             }
             Value::Bool(b) => {
-                // ColumnType::Bool = 1, followed by 1 byte (0 or 1)
-                let mut t = Vec::with_capacity(2);
-                t.push(1u8); // ColumnType::Bool
-                t.push(*b as u8);
-                out.push(t);
+                out.push(vec![1u8, *b as u8]);
             }
             Value::Int(n) => {
                 // ColumnType::Int = 2, followed by 4-byte big-endian

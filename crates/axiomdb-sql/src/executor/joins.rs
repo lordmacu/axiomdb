@@ -1142,6 +1142,53 @@ fn apply_correlated_srf_join(
     Ok(out)
 }
 
+/// Phase GAP-20.4b — JOIN where the right side is a correlated LATERAL UNNEST.
+/// The UNNEST expressions reference outer columns from the left side, so it must be
+/// re-evaluated per outer row. Semantics mirror `apply_correlated_srf_join`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_correlated_unnest_join(
+    left_rows: Vec<Row>,
+    un: &crate::ast::UnnestClause,
+    right_columns: &[ColumnMeta],
+    right_col_count: usize,
+    join_type: JoinType,
+    condition: &crate::ast::JoinCondition,
+    left_schema: &[(String, usize)],
+    right_col_offset: usize,
+) -> Result<Vec<Row>, DbError> {
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        return Err(DbError::NotImplemented {
+            feature: "RIGHT/FULL JOIN on LATERAL-correlated UNNEST — \
+                      PG-compatible rejection"
+                .into(),
+        });
+    }
+    let null_right: Row = vec![axiomdb_types::Value::Null; right_col_count];
+    let mut out: Vec<Row> = Vec::with_capacity(left_rows.len());
+    for outer in &left_rows {
+        // Materialize UNNEST using the outer row as correlation scope.
+        let rows = crate::unnest::materialize_unnest(un, Some(outer))?;
+        let mut matched = false;
+        for right in &rows {
+            let combined = concat_rows(outer, right);
+            if eval_join_cond(
+                condition,
+                &combined,
+                left_schema,
+                right_col_offset,
+                right_columns,
+            )? {
+                out.push(combined);
+                matched = true;
+            }
+        }
+        if !matched && matches!(join_type, JoinType::Left) {
+            out.push(concat_rows(outer, &null_right));
+        }
+    }
+    Ok(out)
+}
+
 /// Phase 21.9 — JOIN where the right side is a correlated LATERAL subquery.
 /// The subquery references outer columns from the left side, so it must be
 /// re-evaluated per outer row. Semantics mirror `apply_correlated_jt_join`.

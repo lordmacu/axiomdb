@@ -28,6 +28,7 @@ use axiomdb_types::{DataType, Value};
 
 use crate::ast::UnnestClause;
 use crate::eval;
+use crate::expr::Expr;
 use crate::result::ColumnMeta;
 
 /// Default column name for position `i` when no explicit column list is given.
@@ -90,6 +91,157 @@ pub fn column_defs_for_unnest(un: &UnnestClause) -> Vec<ColumnDef> {
         .collect()
 }
 
+/// Phase GAP-20.4b — Returns `true` if the UNNEST clause is correlated to
+/// outer columns from the left side of the join (i.e., any array expression
+/// references an `OuterColumn` with `col_idx < left_col_count`).
+///
+/// This mirrors `json_table::subquery_is_correlated` but for UNNEST expressions.
+pub fn unnest_is_correlated(un: &UnnestClause, left_col_count: usize) -> bool {
+    for expr in &un.exprs {
+        if crate::json_table::expr_has_outer_column_refs(expr) {
+            if let Some(idx) = crate::json_table::outer_column_idx(expr) {
+                if idx < left_col_count {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Substitute OuterColumn references in an expression with values from the outer row.
+/// This is used during LATERAL UNNEST execution to replace correlated column
+/// references with the actual values from the outer query's row.
+fn substitute_outer_columns(expr: &Expr, outer_row: &[Value]) -> Expr {
+    match expr {
+        Expr::OuterColumn {
+            col_idx,
+            name: _,
+            depth: 0,
+        } => {
+            // depth 0 means immediate outer scope - substitute with the value
+            Expr::Literal(outer_row.get(*col_idx).cloned().unwrap_or(Value::Null))
+        }
+        Expr::OuterColumn { .. } => {
+            // depth > 0 would be for nested outer scopes - not supported in UNNEST
+            expr.clone()
+        }
+        // Variants that don't contain nested expressions - clone as-is
+        Expr::Literal(_)
+        | Expr::Default
+        | Expr::Column { .. }
+        | Expr::Param { .. }
+        | Expr::InsertValue { .. }
+        | Expr::ExcludedValue { .. }
+        | Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. } => expr.clone(),
+        // Variants with boxed expressions that need recursive substitution
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op: *op,
+            operand: Box::new(substitute_outer_columns(operand, outer_row)),
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op: *op,
+            left: Box::new(substitute_outer_columns(left, outer_row)),
+            right: Box::new(substitute_outer_columns(right, outer_row)),
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            collation: collation.clone(),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            negated: *negated,
+        },
+        Expr::IsBoolean {
+            expr,
+            value,
+            negated,
+        } => Expr::IsBoolean {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            value: *value,
+            negated: *negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            low: Box::new(substitute_outer_columns(low, outer_row)),
+            high: Box::new(substitute_outer_columns(high, outer_row)),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            escape,
+        } => Expr::Like {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            pattern: Box::new(substitute_outer_columns(pattern, outer_row)),
+            negated: *negated,
+            escape: escape
+                .as_ref()
+                .map(|e| Box::new(substitute_outer_columns(e, outer_row))),
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            list: list
+                .iter()
+                .map(|e| substitute_outer_columns(e, outer_row))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|e| substitute_outer_columns(e, outer_row))
+                .collect(),
+        },
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(substitute_outer_columns(e, outer_row))),
+            when_thens: when_thens
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        substitute_outer_columns(w, outer_row),
+                        substitute_outer_columns(t, outer_row),
+                    )
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(substitute_outer_columns(e, outer_row))),
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(substitute_outer_columns(expr, outer_row)),
+            target: target.clone(),
+        },
+        Expr::ArrayConstructor { elements } => Expr::ArrayConstructor {
+            elements: elements
+                .iter()
+                .map(|e| substitute_outer_columns(e, outer_row))
+                .collect(),
+        },
+        // Window, SqlJsonQuery, GroupConcat, ArrayAgg, Grouping, etc. - clone as-is
+        other => other.clone(),
+    }
+}
+
 /// Materialize UNNEST into `Vec<Vec<Value>>` (one Vec per output row).
 ///
 /// # Arguments
@@ -110,7 +262,13 @@ pub fn materialize_unnest(
     // Store owned Vec<Value> for each array to avoid borrow checker issues.
     let mut arrays: Vec<Vec<Value>> = Vec::with_capacity(un.exprs.len());
     for expr in &un.exprs {
-        let val = eval(expr, outer_row.unwrap_or(&[]))?;
+        // Substitute OuterColumn references with values from the outer row.
+        let expr_to_eval = if let Some(row) = outer_row {
+            substitute_outer_columns(expr, row)
+        } else {
+            expr.clone()
+        };
+        let val = eval(&expr_to_eval, outer_row.unwrap_or(&[]))?;
         match val {
             Value::Array(elems) => arrays.push(elems),
             Value::Null => {
@@ -180,6 +338,7 @@ mod tests {
             exprs: vec![expr("ARRAY[1,2,3]")],
             alias: Some("u".to_string()),
             column_names: vec!["x".to_string()],
+            lateral: false,
         };
         let rows = materialize_unnest(&un, None).unwrap();
         assert_eq!(rows.len(), 3);
@@ -194,6 +353,7 @@ mod tests {
             exprs: vec![expr("NULL::int[]")],
             alias: Some("u".to_string()),
             column_names: vec![],
+            lateral: false,
         };
         let rows = materialize_unnest(&un, None).unwrap();
         assert!(rows.is_empty());
@@ -205,6 +365,7 @@ mod tests {
             exprs: vec![expr("ARRAY[]::int[]")],
             alias: Some("u".to_string()),
             column_names: vec![],
+            lateral: false,
         };
         let rows = materialize_unnest(&un, None).unwrap();
         assert!(rows.is_empty());
@@ -216,6 +377,7 @@ mod tests {
             exprs: vec![expr("ARRAY[1,2]"), expr("ARRAY['a','b']")],
             alias: Some("u".to_string()),
             column_names: vec!["n".to_string(), "l".to_string()],
+            lateral: false,
         };
         let rows = materialize_unnest(&un, None).unwrap();
         assert_eq!(rows.len(), 2);
@@ -229,6 +391,7 @@ mod tests {
             exprs: vec![expr("ARRAY[1,2,3]"), expr("ARRAY['a','b']")],
             alias: Some("u".to_string()),
             column_names: vec![],
+            lateral: false,
         };
         let err = materialize_unnest(&un, None).unwrap_err();
         assert!(err.to_string().contains("UNNEST: array 2 has 2 elements"));
@@ -242,6 +405,7 @@ mod tests {
             exprs: vec![expr("ARRAY[42]")], // simplified: just use literal
             alias: Some("u".to_string()),
             column_names: vec!["val".to_string()],
+            lateral: true,
         };
         let outer_row = vec![Value::Int(10)];
         let rows = materialize_unnest(&un, Some(&outer_row)).unwrap();
