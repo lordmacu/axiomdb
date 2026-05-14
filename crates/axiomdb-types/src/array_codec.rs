@@ -308,6 +308,12 @@ fn decode_element(
     pos: &mut usize,
     elem_type: ColumnType,
 ) -> Result<(Value, usize), DbError> {
+    // Infallible slice-to-array conversion: all callers check blob bounds before calling
+    // this helper, so the slice is always exactly the expected length.
+    let slice_err = || DbError::ParseError {
+        message: "internal: fixed-size slice conversion (bounds checked above)".into(),
+        position: None,
+    };
     match elem_type {
         ColumnType::Bool => {
             if *pos + 1 > blob.len() {
@@ -327,7 +333,7 @@ fn decode_element(
                     position: None,
                 });
             }
-            let n = i32::from_le_bytes(blob[*pos..*pos + 4].try_into().unwrap());
+            let n = i32::from_le_bytes(blob[*pos..*pos + 4].try_into().map_err(|_| slice_err())?);
             *pos += 4;
             let value = match elem_type {
                 ColumnType::Date => Value::Date(n),
@@ -346,15 +352,21 @@ fn decode_element(
             *pos += 8;
             match elem_type {
                 ColumnType::Float => {
-                    let f = f64::from_le_bytes(blob[*pos - 8..*pos].try_into().unwrap());
+                    let f = f64::from_le_bytes(
+                        blob[*pos - 8..*pos].try_into().map_err(|_| slice_err())?,
+                    );
                     Ok((Value::Real(f), 8))
                 }
                 ColumnType::Timestamp => {
-                    let v = i64::from_le_bytes(blob[*pos - 8..*pos].try_into().unwrap());
+                    let v = i64::from_le_bytes(
+                        blob[*pos - 8..*pos].try_into().map_err(|_| slice_err())?,
+                    );
                     Ok((Value::Timestamp(v), 8))
                 }
                 _ => {
-                    let v = i64::from_le_bytes(blob[*pos - 8..*pos].try_into().unwrap());
+                    let v = i64::from_le_bytes(
+                        blob[*pos - 8..*pos].try_into().map_err(|_| slice_err())?,
+                    );
                     Ok((Value::BigInt(v), 8))
                 }
             }
@@ -366,7 +378,7 @@ fn decode_element(
                     position: None,
                 });
             }
-            let m = i128::from_le_bytes(blob[*pos..*pos + 16].try_into().unwrap());
+            let m = i128::from_le_bytes(blob[*pos..*pos + 16].try_into().map_err(|_| slice_err())?);
             let s = blob[*pos + 16];
             *pos += 17;
             Ok((Value::Decimal(m, s), 17))
@@ -378,7 +390,7 @@ fn decode_element(
                     position: None,
                 });
             }
-            let u: [u8; 16] = blob[*pos..*pos + 16].try_into().unwrap();
+            let u: [u8; 16] = blob[*pos..*pos + 16].try_into().map_err(|_| slice_err())?;
             *pos += 16;
             Ok((Value::Uuid(u), 16))
         }
@@ -693,8 +705,12 @@ pub fn decode_array(blob: &[u8]) -> Result<(Value, ColumnType, i32), DbError> {
             position: None,
         });
     }
+    let slice_err = || DbError::ParseError {
+        message: "internal: fixed-size slice conversion (bounds checked above)".into(),
+        position: None,
+    };
 
-    let total_len = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+    let total_len = u32::from_le_bytes(blob[0..4].try_into().map_err(|_| slice_err())?) as usize;
     if blob.len() < total_len {
         return Err(DbError::ParseError {
             message: format!(
@@ -706,8 +722,8 @@ pub fn decode_array(blob: &[u8]) -> Result<(Value, ColumnType, i32), DbError> {
         });
     }
 
-    let ndim = i32::from_le_bytes(blob[4..8].try_into().unwrap());
-    let dataoffset = i32::from_le_bytes(blob[8..12].try_into().unwrap());
+    let ndim = i32::from_le_bytes(blob[4..8].try_into().map_err(|_| slice_err())?);
+    let dataoffset = i32::from_le_bytes(blob[8..12].try_into().map_err(|_| slice_err())?);
     let elem_type_val = blob[12];
     let elem_type = ColumnType::try_from(elem_type_val).map_err(|_| DbError::ParseError {
         message: format!(
@@ -748,7 +764,11 @@ pub fn decode_array(blob: &[u8]) -> Result<(Value, ColumnType, i32), DbError> {
     // Read dims
     let mut dims = Vec::with_capacity(ndim_usize);
     for i in 0..ndim_usize {
-        let d = i32::from_le_bytes(blob[13 + i * 4..13 + (i + 1) * 4].try_into().unwrap());
+        let d = i32::from_le_bytes(
+            blob[13 + i * 4..13 + (i + 1) * 4]
+                .try_into()
+                .map_err(|_| slice_err())?,
+        );
         dims.push(d);
     }
 

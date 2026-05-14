@@ -130,3 +130,113 @@ and `CURRVAL(text)`.
 - `ALTER SEQUENCE`, `SETVAL`, `OWNED BY`, and sequence privileges.
 - Wiring `SERIAL` / identity columns to standalone sequence objects.
 - Sequence cache preallocation beyond `CACHE 1`.
+
+## 20.3 — ENUM types (2026-05-12)
+
+### What was built
+
+User-defined ENUM types: `CREATE TYPE name AS ENUM (...)`, `DROP TYPE`, ENUM
+column DDL, validated INSERT, SELECT, and WHERE filtering.
+
+### Architecture
+
+#### Type system (`axiomdb-types`)
+
+- `DataType::UserDefinedEnum(type_name: String)` — carries the qualified type name.
+- `Value::Text` is reused at runtime; ENUM values are stored as plain strings.
+
+#### Catalog layer (`axiomdb-catalog`)
+
+- `EnumTypeDef { id, schema, name, variants }` — on-disk entry in the `axiom_enum_types` catalog heap.
+- `CatalogWriter::create_enum_type` / `delete_enum_type`.
+- `CatalogReader::list_enum_types`, `get_enum_type_by_name`.
+- `ColumnDef.enum_type_name: Option<String>` — stores the qualified enum type reference.
+- **Binary format fix (Phase 20.4 audit)**: when `collation=None` and `enum_type_name=Some(...)`,
+  the encoder now always writes an empty collation section so the decoder can unambiguously find
+  the enum field (prevents silent data corruption).
+
+#### Parser / Executor
+
+- `CREATE TYPE … AS ENUM` and `DROP TYPE` AST nodes.
+- Column definitions accept `col_name type_name` where `type_name` resolves to an ENUM.
+- `INSERT` validates each ENUM value against the stored variant list.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_enums.rs` — integration tests covering
+  DDL, persistence, validation, and SELECT/WHERE.
+- Wire smoke block `[20.3 enum types]` in `tools/wire-test.py`.
+
+### Deferred to later phases
+
+- `ALTER TYPE … ADD VALUE`, `RENAME VALUE`.
+- `ORDER BY` on ENUM columns using variant-list order rather than lexicographic.
+- ENUM in information_schema.COLUMNS reporting.
+
+## 20.4 — SQL Arrays (2026-05-13)
+
+### What was built
+
+Full PostgreSQL-compatible SQL arrays: column DDL (`INT[]`, `TEXT[][]`, …),
+array literals (`ARRAY[…]`), subscript (`a[1]`), slice (`a[1:3]`), operators
+(`@>`, `<@`, `&&`, `||`, `=`, `<>`), functions (`array_length`, `array_ndims`,
+`cardinality`, `array_append`, `array_prepend`, `array_cat`, `array_remove`,
+`array_replace`, `array_upper`, `array_lower`, `array_fill`, `array_to_string`,
+`string_to_array`, `array_position`, `array_positions`), `unnest()` set-returning
+function, `array_agg()` aggregate, and GIN index support.
+
+### Architecture
+
+#### Type system (`axiomdb-types`)
+
+- `Value::Array(ArrayValue)` — recursive typed array: carries element type, dimensions,
+  and a flat `Vec<Value>` payload.
+- `ArrayValue` serializes to/from bytes via `array_codec.rs` using a PostgreSQL-compatible
+  binary format: header (element type, ndims, flags) + dimension descriptors (len, lower bound)
+  + flat element payload.
+- TOAST threshold: individual arrays larger than 8 KB are stored via the TOAST mechanism
+  when they exceed the row-level threshold; the array codec itself handles up to 16 MB.
+
+#### Catalog layer (`axiomdb-catalog`)
+
+- `ColumnDef.array_ndims: Option<u8>` — stored as trailing byte after collation/enum fields.
+- `ColumnDef.array_element_type: Option<ColumnType>` — element type stored as trailing byte.
+- `ColumnType::Array` tag registered.
+
+#### Parser / AST (`axiomdb-sql`)
+
+- `Expr::ArrayLiteral(Vec<Expr>)` — `ARRAY[e1, e2, …]`.
+- `Expr::ArraySubscript { expr, index }` — `a[i]`.
+- `Expr::ArraySlice { expr, lo, hi }` — `a[lo:hi]`.
+- `Expr::ArrayOp { left, op: ArrayOp, right }` — `@>`, `<@`, `&&`, `||`, `=`, `<>`.
+- `ANY(array)` / `ALL(array)` — parsed and evaluated.
+
+#### Executor
+
+- `array_io.rs` — evaluates all array expressions and functions.
+- `array_agg` aggregate — collects values across groups.
+- `unnest()` handled as a set-returning function in the FROM clause.
+- GIN index integration: array `@>` and `&&` operators can use a GIN index when
+  one exists on the array column (reusing Phase 11.17 GIN infrastructure).
+
+#### Binary serialization invariant
+
+Trailing fields in `ColumnDef` binary format are written in a fixed order with
+an explicit collation section always present when `enum_type_name` is set. This
+ensures the decoder always finds enum bytes at the correct offset without ambiguity.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_array_operators.rs` — subscript, slice, operators.
+- `crates/axiomdb-sql/tests/integration_array_functions.rs` — all built-in array functions.
+- `crates/axiomdb-sql/tests/integration_array_unnest.rs` — `unnest()` set-returning function.
+- `crates/axiomdb-sql/tests/integration_array_any_all.rs` — `ANY`/`ALL` operator semantics.
+- `crates/axiomdb-catalog/tests/…` — `ColumnDef` round-trip for array columns.
+- Wire smoke block `[20.4 sql arrays]` in `tools/wire-test.py`.
+
+### Deferred to later phases
+
+- Multi-dimensional `unnest()` with multiple array arguments (zip semantics).
+- `array_dims()` returning text format like `[1:3][1:2]`.
+- `ARRAY(SELECT …)` subquery-to-array constructor.
+- Updatable array subscript assignment (`UPDATE t SET a[1] = 42`).

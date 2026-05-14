@@ -29,7 +29,13 @@ fn sql_with_ctx(sql: &str) -> Vec<Vec<Value>> {
 /// Run SQL that returns a single boolean/text value.
 fn scalar(sql: &str) -> Value {
     let result = sql_with_ctx(sql);
-    result.into_iter().next().unwrap().into_iter().next().unwrap()
+    result
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
 }
 
 // ── ANY/ALL = ─────────────────────────────────────────────────────────────────
@@ -126,11 +132,55 @@ fn all_with_null_unknown() {
 }
 
 // ── LIKE with ANY ─────────────────────────────────────────────────────────────
-// NOTE: LIKE/ILIKE with ANY/ALL requires special handling in the evaluator
-// because Expr::Like doesn't handle AnyOf patterns. This is deferred.
-// The tests below document the expected PostgreSQL semantics:
-// SELECT 'hello' LIKE ANY(ARRAY['%ello','world']) → TRUE
-// SELECT 'hello' LIKE ANY(ARRAY['%world','foo']) → FALSE
+
+#[test]
+fn any_like_true() {
+    // SELECT 'hello' LIKE ANY(ARRAY['%ello', '%world']) → TRUE
+    let val = scalar("SELECT 'hello' LIKE ANY(ARRAY['%ello', '%world'])");
+    assert_eq!(val, Value::Bool(true));
+}
+
+#[test]
+fn any_like_false() {
+    // SELECT 'hello' LIKE ANY(ARRAY['%world', '%foo']) → FALSE
+    let val = scalar("SELECT 'hello' LIKE ANY(ARRAY['%world', '%foo'])");
+    assert_eq!(val, Value::Bool(false));
+}
+
+#[test]
+fn any_like_null() {
+    // SELECT 'hello' LIKE ANY(ARRAY[NULL]) → NULL (no TRUE found, saw NULL)
+    let val = scalar("SELECT 'hello' LIKE ANY(ARRAY[NULL])");
+    assert_eq!(val, Value::Null);
+}
+
+#[test]
+fn all_like_true() {
+    // SELECT 'hello' LIKE ALL(ARRAY['%ello', '%llo']) → TRUE
+    let val = scalar("SELECT 'hello' LIKE ALL(ARRAY['%ello', '%llo'])");
+    assert_eq!(val, Value::Bool(true));
+}
+
+#[test]
+fn all_like_false() {
+    // SELECT 'hello' LIKE ALL(ARRAY['%ello', '%world']) → FALSE
+    let val = scalar("SELECT 'hello' LIKE ALL(ARRAY['%ello', '%world'])");
+    assert_eq!(val, Value::Bool(false));
+}
+
+#[test]
+fn all_like_null() {
+    // SELECT 'hello' LIKE ALL(ARRAY['%ello', NULL]) → NULL (saw NULL with no FALSE)
+    let val = scalar("SELECT 'hello' LIKE ALL(ARRAY['%ello', NULL])");
+    assert_eq!(val, Value::Null);
+}
+
+#[test]
+fn any_not_like() {
+    // SELECT 'hello' NOT LIKE ANY(ARRAY['%world', '%foo']) → TRUE
+    let val = scalar("SELECT 'hello' NOT LIKE ANY(ARRAY['%world', '%foo'])");
+    assert_eq!(val, Value::Bool(true));
+}
 
 // ── ANY/ALL with text arrays ───────────────────────────────────────────────────
 
@@ -210,8 +260,16 @@ fn any_equals_with_table_column() {
         &mut ctx,
     )
     .unwrap();
-    let result =
-        rows(common::run_ctx("SELECT x FROM t WHERE x = ANY(arr)", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap());
+    let result = rows(
+        common::run_ctx(
+            "SELECT x FROM t WHERE x = ANY(arr)",
+            &mut storage,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        )
+        .unwrap(),
+    );
     let ids: Vec<i32> = result
         .into_iter()
         .map(|row| match row.into_iter().next().unwrap() {

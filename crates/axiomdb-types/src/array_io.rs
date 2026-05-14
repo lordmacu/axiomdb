@@ -67,7 +67,10 @@ fn read_dims_from_blob(blob: &[u8]) -> Result<Vec<i32>, DbError> {
             position: None,
         });
     }
-    let ndim = i32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize;
+    let ndim = i32::from_le_bytes(blob[4..8].try_into().map_err(|_| DbError::ParseError {
+        message: "internal: fixed-size slice conversion".into(),
+        position: None,
+    })?) as usize;
     if ndim == 0 {
         return Ok(vec![]);
     }
@@ -80,7 +83,13 @@ fn read_dims_from_blob(blob: &[u8]) -> Result<Vec<i32>, DbError> {
     }
     let mut dims = Vec::with_capacity(ndim);
     for i in 0..ndim {
-        let d = i32::from_le_bytes(blob[13 + i * 4..13 + (i + 1) * 4].try_into().unwrap());
+        let d =
+            i32::from_le_bytes(blob[13 + i * 4..13 + (i + 1) * 4].try_into().map_err(|_| {
+                DbError::ParseError {
+                    message: "internal: fixed-size slice conversion reading dim".into(),
+                    position: None,
+                }
+            })?);
         dims.push(d);
     }
     Ok(dims)
@@ -572,7 +581,10 @@ fn parse_elements(s: &str, initial_depth: i32) -> Result<Vec<&str>, DbError> {
     let mut entered_nested = initial_depth > 0;
 
     while i < s.len() {
-        let c = s[i..].chars().next().unwrap();
+        let c = s[i..].chars().next().ok_or_else(|| DbError::ParseError {
+            message: "unexpected end of array literal string".into(),
+            position: None,
+        })?;
         match c {
             '"' if !in_quote => {
                 // Opening quote: enter quoted element (increase depth)

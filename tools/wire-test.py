@@ -4449,6 +4449,134 @@ ok("[20.2 sequences] ROLLBACK does not reuse consumed sequence values",
 cur.execute("DROP SEQUENCE seq20_order")
 conn.commit()
 
+# ── Phase 20.3 — ENUM types ──────────────────────────────────────────────────
+
+print("\n[20.3 enum types]")
+
+cur.execute("CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')")
+conn.commit()
+
+cur.execute("CREATE TABLE moods (id INT PRIMARY KEY, feeling mood)")
+conn.commit()
+
+cur.execute("INSERT INTO moods VALUES (1, 'happy'), (2, 'sad'), (3, 'neutral')")
+conn.commit()
+
+cur.execute("SELECT id, feeling FROM moods ORDER BY id")
+rows = cur.fetchall()
+ok("[20.3 enum types] INSERT and SELECT enum column",
+   len(rows) == 3 and rows[0][1] == 'happy' and rows[1][1] == 'sad' and rows[2][1] == 'neutral',
+   rows)
+
+cur.execute("SELECT id, feeling FROM moods WHERE feeling = 'sad'")
+rows = cur.fetchall()
+ok("[20.3 enum types] WHERE filter on enum column",
+   len(rows) == 1 and rows[0][1] == 'sad',
+   rows)
+
+cur.execute("SHOW CREATE TABLE moods")
+row = cur.fetchone()
+ok("[20.3 enum types] SHOW CREATE TABLE shows enum type in column definition",
+   row is not None and 'mood' in str(row).lower(),
+   row)
+
+cur.execute("DROP TABLE moods")
+cur.execute("DROP TYPE mood")
+conn.commit()
+
+# ── Phase 20.4 — SQL Arrays ───────────────────────────────────────────────────
+
+print("\n[20.4 sql arrays]")
+
+cur.execute("CREATE TABLE arr_test (id INT PRIMARY KEY, tags TEXT[], scores INT[])")
+conn.commit()
+
+cur.execute("INSERT INTO arr_test VALUES (1, ARRAY['alpha','beta','gamma'], ARRAY[10,20,30])")
+cur.execute("INSERT INTO arr_test VALUES (2, ARRAY['delta'], ARRAY[99])")
+cur.execute("INSERT INTO arr_test VALUES (3, NULL, ARRAY[1,2])")
+conn.commit()
+
+cur.execute("SELECT id, tags, scores FROM arr_test WHERE id = 1")
+row = cur.fetchone()
+ok("[20.4 sql arrays] INSERT and SELECT array columns",
+   row is not None and row[0] in (1, '1'),
+   row)
+
+cur.execute("SELECT tags[1] FROM arr_test WHERE id = 1")
+row = cur.fetchone()
+ok("[20.4 sql arrays] 1-based array subscript returns first element",
+   row is not None and row[0] == 'alpha',
+   row)
+
+cur.execute("SELECT array_length(scores, 1) FROM arr_test WHERE id = 1")
+row = cur.fetchone()
+ok("[20.4 sql arrays] array_length() returns correct element count",
+   row is not None and str(row[0]) == '3',
+   row)
+
+cur.execute("SELECT cardinality(scores) FROM arr_test WHERE id = 1")
+row = cur.fetchone()
+ok("[20.4 sql arrays] cardinality() returns total element count",
+   row is not None and str(row[0]) == '3',
+   row)
+
+cur.execute("SELECT array_append(tags, 'new') FROM arr_test WHERE id = 2")
+row = cur.fetchone()
+ok("[20.4 sql arrays] array_append() adds element",
+   row is not None and 'delta' in str(row[0]) and 'new' in str(row[0]),
+   row)
+
+cur.execute("SELECT scores @> ARRAY[20] FROM arr_test WHERE id = 1")
+row = cur.fetchone()
+ok("[20.4 sql arrays] @> contains operator returns true when element present",
+   row is not None and row[0] in (True, 1, '1', 'true', 'True'),
+   row)
+
+cur.execute("SELECT ARRAY[1,2,3] <@ ARRAY[1,2,3,4,5]")
+row = cur.fetchone()
+ok("[20.4 sql arrays] <@ is-contained-by operator",
+   row is not None and row[0] in (True, 1, '1', 'true', 'True'),
+   row)
+
+cur.execute("SELECT ARRAY[1,2] || ARRAY[3,4]")
+row = cur.fetchone()
+ok("[20.4 sql arrays] || concatenation operator",
+   row is not None and ('1' in str(row[0]) or 1 in (row[0] if isinstance(row[0], (list,)) else [])),
+   row)
+
+cur.execute("SELECT id FROM arr_test WHERE 99 = ANY(scores)")
+rows = cur.fetchall()
+ok("[20.4 sql arrays] ANY(array) subquery returns matching rows",
+   len(rows) == 1 and rows[0][0] in (2, '2'),
+   rows)
+
+cur.execute("SELECT id FROM arr_test WHERE 1 = ALL(ARRAY[1,1,1])")
+rows = cur.fetchall()
+ok("[20.4 sql arrays] ALL(array) is true when all elements match",
+   len(rows) == 3,
+   rows)
+
+cur.execute("SELECT id, unnest(scores) FROM arr_test WHERE id = 1 ORDER BY 2")
+rows = cur.fetchall()
+ok("[20.4 sql arrays] unnest() expands array to rows",
+   len(rows) == 3 and str(rows[0][1]) == '10' and str(rows[1][1]) == '20' and str(rows[2][1]) == '30',
+   rows)
+
+cur.execute("SELECT array_agg(id ORDER BY id) FROM arr_test WHERE id <= 2")
+row = cur.fetchone()
+ok("[20.4 sql arrays] array_agg() aggregates values into array",
+   row is not None and row[0] is not None,
+   row)
+
+cur.execute("SELECT id FROM arr_test WHERE tags IS NULL")
+rows = cur.fetchall()
+ok("[20.4 sql arrays] NULL array column IS NULL check",
+   len(rows) == 1 and rows[0][0] in (3, '3'),
+   rows)
+
+cur.execute("DROP TABLE arr_test")
+conn.commit()
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

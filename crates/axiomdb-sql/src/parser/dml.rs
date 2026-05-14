@@ -722,6 +722,7 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
                 exprs,
                 alias,
                 column_names: column_names.unwrap_or_default(),
+                lateral: lateral_consumed,
             })),
         );
     }
