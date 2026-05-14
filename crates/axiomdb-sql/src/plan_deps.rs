@@ -202,6 +202,7 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::DropTrigger(_)
             | Stmt::DropAggregate(_)
             | Stmt::DropSequence(_)
+            | Stmt::DropEnumType(_)
             | Stmt::RefreshMaterializedView(_)
             | Stmt::TruncateTable(_)
             | Stmt::AlterTable(_)

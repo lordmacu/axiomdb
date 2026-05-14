@@ -92,6 +92,25 @@ fn execute_create_enum_type(
     Ok(QueryResult::Empty)
 }
 
+pub(crate) fn execute_drop_enum_type(
+    stmt: crate::ast::DropEnumTypeStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    default_schema: &str,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.enum_type.schema.as_deref().unwrap_or(default_schema);
+    let name = &stmt.enum_type.name;
+    let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+    let found = writer.delete_enum_type(schema, name)?;
+    if !found && !stmt.if_exists {
+        return Err(DbError::InvalidValue {
+            reason: format!("enum type '{schema}.{name}' does not exist"),
+        });
+    }
+    Ok(QueryResult::Empty)
+}
+
 fn execute_drop_sequence(
     stmt: crate::ast::DropSequenceStmt,
     storage: &dyn StorageEngine,

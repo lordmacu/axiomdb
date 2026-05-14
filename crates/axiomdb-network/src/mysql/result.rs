@@ -11,7 +11,7 @@
 
 use axiomdb_core::error::DbError;
 use axiomdb_sql::result::{ColumnMeta, QueryResult, Row};
-use axiomdb_types::array_codec::data_type_to_column_type;
+use axiomdb_types::array_codec::{data_type_to_column_type, ColumnType};
 use axiomdb_types::{array_to_text, encode_array, DataType, Value};
 
 use super::charset::{self, CollationDef, BINARY_COLLATION_DEF};
@@ -449,14 +449,19 @@ fn build_row_into(
             Value::Timestamp(t) => {
                 write_timestamp_to_buf(buf, *t);
             }
-            Value::Array(_) => {
+            Value::Array(elems) => {
+                // Infer element ColumnType from column metadata when the type is
+                // concrete (non-Text inner type means schema-declared), otherwise
+                // infer from the actual element values. This covers computed
+                // expressions (array_agg, ||, etc.) where metadata falls back to
+                // DataType::Array(Text) as a placeholder.
                 let elem_ct = match &col.data_type {
-                    DataType::Array(inner) => data_type_to_column_type(inner),
-                    _ => {
-                        return Err(DbError::InvalidValue {
-                            reason: "Array value but non-Array column type".to_string(),
-                        });
+                    DataType::Array(inner)
+                        if data_type_to_column_type(inner) != ColumnType::Text =>
+                    {
+                        data_type_to_column_type(inner)
                     }
+                    _ => axiomdb_types::codec::infer_elem_ct_for_wire(elems),
                 };
                 let blob = encode_array(value, elem_ct)?;
                 let text = array_to_text(&blob)?;

@@ -168,6 +168,16 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
     crate::types::DataType::Int // default
 }
 
+/// Infers the `ColumnType` for wire-protocol array encoding from element values.
+///
+/// Used when column metadata does not carry array element type information
+/// (e.g., computed expressions whose type was not resolved at analysis time).
+pub fn infer_elem_ct_for_wire(elems: &[crate::value::Value]) -> crate::array_codec::ColumnType {
+    use crate::array_codec::data_type_to_column_type;
+    let dt = infer_array_elem_type(elems);
+    data_type_to_column_type(&dt)
+}
+
 /// Returns the encoded byte length for `values` without allocating.
 ///
 /// Infallible and schema-free: each `Value` variant determines its own size.

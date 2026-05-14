@@ -788,6 +788,7 @@ fn execute_select_ctx(
             };
             eval_with(expr, v, &mut runner)
         })?;
+        rows = expand_unnest_rows(&stmt.columns, rows);
 
         if stmt.distinct {
             rows = apply_distinct_with_session(rows);
@@ -862,6 +863,7 @@ fn execute_select_no_from_ctx(
     } else {
         vec![out_row]
     };
+    let rows = expand_unnest_rows(&stmt.columns, rows);
     let rows = if stmt.distinct {
         apply_distinct_with_session(rows)
     } else {

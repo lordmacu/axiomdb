@@ -356,11 +356,16 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Uuid => DataType::Uuid,
         ColumnType::Decimal => DataType::Decimal,
         ColumnType::Date => DataType::Date,
-        ColumnType::Array => {
-            // Array element type is resolved from ColumnDef.array_element_type
-            // at a higher layer. For simple type conversion, default to Text[].
-            DataType::Array(Box::new(DataType::Text))
-        }
+        ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
+    }
+}
+
+fn catalog_col_to_datatype(col: &CatalogColumnDef) -> DataType {
+    if col.col_type == ColumnType::Array {
+        let elem_ct = col.array_element_type.unwrap_or(ColumnType::Text);
+        DataType::Array(Box::new(column_type_to_datatype(elem_ct)))
+    } else {
+        column_type_to_datatype(col.col_type)
     }
 }
 
@@ -381,9 +386,10 @@ fn datatype_of_value(v: &Value) -> DataType {
         Value::Date(_) => DataType::Date,
         Value::Timestamp(_) => DataType::Timestamp,
         Value::Uuid(_) => DataType::Uuid,
-        Value::Array(_) => {
-            // Default to Text[] for computed expressions prior to full array support
-            DataType::Array(Box::new(DataType::Text))
+        Value::Array(elems) => {
+            // Infer element type from the first non-null element.
+            let elem_dt = elems.iter().find(|e| !matches!(e, Value::Null)).map(datatype_of_value).unwrap_or(DataType::Int);
+            DataType::Array(Box::new(elem_dt))
         }
     }
 }
@@ -396,7 +402,7 @@ fn infer_expr_type(expr: &Expr, columns: &[CatalogColumnDef]) -> (DataType, bool
     match expr {
         Expr::Column { col_idx, .. } => {
             if let Some(col) = columns.get(*col_idx) {
-                (column_type_to_datatype(col.col_type), col.nullable)
+                (catalog_col_to_datatype(col), col.nullable)
             } else {
                 (DataType::Text, true)
             }
@@ -420,6 +426,59 @@ fn expr_column_name(expr: &Expr, alias: Option<&str>) -> String {
         },
         _ => "?column?".to_string(),
     }
+}
+
+/// Expands rows that contain `unnest(array_expr)` SELECT items.
+///
+/// For each source row, if any SELECT item is an `unnest()` call whose
+/// projected value is `Value::Array(elems)`, the row is replaced by
+/// `elems.len()` rows — one per element. Multiple unnest columns zip by
+/// position (PostgreSQL semantics). `unnest(NULL)` produces zero rows.
+pub(super) fn expand_unnest_rows(items: &[SelectItem], rows: Vec<Row>) -> Vec<Row> {
+    let unnest_idxs: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            SelectItem::Expr {
+                expr: Expr::Function { name, .. },
+                ..
+            } if name.eq_ignore_ascii_case("unnest") => Some(i),
+            _ => None,
+        })
+        .collect();
+
+    if unnest_idxs.is_empty() {
+        return rows;
+    }
+
+    let mut result = Vec::new();
+    for row in rows {
+        let col_idx = unnest_idxs[0];
+        if col_idx >= row.len() {
+            result.push(row);
+            continue;
+        }
+        match &row[col_idx] {
+            Value::Array(elems) => {
+                for ei in 0..elems.len() {
+                    let mut new_row = row.clone();
+                    for &uidx in &unnest_idxs {
+                        if uidx >= new_row.len() {
+                            break;
+                        }
+                        new_row[uidx] = match &row[uidx] {
+                            Value::Array(a) => a.get(ei).cloned().unwrap_or(Value::Null),
+                            other => other.clone(),
+                        };
+                    }
+                    result.push(new_row);
+                }
+            }
+            Value::Null => {} // unnest(NULL) → no rows
+            _ => result.push(row),
+        }
+    }
+    result
 }
 
 fn select_items_have_window_functions(items: &[SelectItem]) -> bool {
@@ -606,7 +665,7 @@ fn build_select_column_meta(
                 for col in columns {
                     out.push(ColumnMeta {
                         name: col.name.clone(),
-                        data_type: column_type_to_datatype(col.col_type),
+                        data_type: catalog_col_to_datatype(col),
                         nullable: col.nullable,
                         table_name: Some(table_def.table_name.clone()),
                     });

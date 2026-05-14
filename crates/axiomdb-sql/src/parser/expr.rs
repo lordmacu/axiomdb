@@ -805,6 +805,19 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             })
         }
 
+        // unnest(array_expr) — set-returning function; parsed as a regular Function
+        // call so the SRF expansion in the executor can detect it by name.
+        Token::Unnest => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            let arg = parse_expr(p)?;
+            p.expect(&Token::RParen)?;
+            Ok(Expr::Function {
+                name: "unnest".to_string(),
+                args: vec![arg],
+            })
+        }
+
         // Identifiers and unreserved keywords usable as column/function names.
         Token::Ident(_)
         | Token::QuotedIdent(_)

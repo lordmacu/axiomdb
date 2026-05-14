@@ -1291,6 +1291,13 @@ pub struct CreateEnumTypeStmt {
     pub labels: Vec<String>,
 }
 
+/// `DROP TYPE [IF EXISTS] name`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropEnumTypeStmt {
+    pub if_exists: bool,
+    pub enum_type: TableRef,
+}
+
 /// `DROP TRIGGER name ON table`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTriggerStmt {
@@ -1388,6 +1395,7 @@ pub enum Stmt {
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     DropTrigger(DropTriggerStmt),
+    DropEnumType(DropEnumTypeStmt),
     DropAggregate(DropAggregateStmt),
     DropSequence(DropSequenceStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
