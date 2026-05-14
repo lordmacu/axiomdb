@@ -727,11 +727,9 @@ impl ColumnDef {
             + default_bytes.map_or(0, |b| 2 + b.len())
             + on_update_bytes.map_or(0, |b| 2 + b.len())
             + generated_bytes.map_or(0, |b| 2 + b.len())
-            + if collation_bytes.is_some() || enum_type_bytes.is_some() {
-                2 + collation_bytes.map_or(0, |b| b.len())
-            } else {
-                0
-            }
+            // Collation: 2-byte length prefix + data (only when present)
+            + collation_bytes.map_or(0, |b| 2 + b.len())
+            // Enum_type_name: 2-byte length prefix + data (only when present)
             + enum_type_bytes.map_or(0, |b| 2 + b.len())
             + if self.array_ndims.unwrap_or(0) > 0 {
                 2 // 1 byte ndims + 1 byte element_type
@@ -760,11 +758,12 @@ impl ColumnDef {
             buf.extend_from_slice(&(gb.len() as u16).to_le_bytes());
             buf.extend_from_slice(gb);
         }
-        if collation_bytes.is_some() || enum_type_bytes.is_some() {
-            let cb = collation_bytes.unwrap_or(&[]);
+        // Write collation only when present (original behavior)
+        if let Some(cb) = collation_bytes {
             buf.extend_from_slice(&(cb.len() as u16).to_le_bytes());
             buf.extend_from_slice(cb);
         }
+        // Write enum_type_name only when present
         if let Some(eb) = enum_type_bytes {
             buf.extend_from_slice(&(eb.len() as u16).to_le_bytes());
             buf.extend_from_slice(eb);
@@ -899,7 +898,11 @@ impl ColumnDef {
         };
 
         let mut enum_type_name = None;
-        let collation = if bytes.len() > consumed {
+        // Collation section: written only when collation_bytes.is_some() in to_bytes.
+        // We only enter this block if there are at least 4 bytes: 2 for the length prefix
+        // plus 2 minimum for the data itself. This prevents misinterpreting array metadata
+        // (ndims + elem_type = 2 bytes) as a collation section.
+        let collation = if bytes.len() >= consumed + 4 {
             if bytes.len() < consumed + 2 {
                 return Err(err());
             }
@@ -915,10 +918,11 @@ impl ColumnDef {
                 })?
                 .to_string();
             consumed += clen;
-            if bytes.len() > consumed {
-                if bytes.len() < consumed + 2 {
-                    return Err(err());
-                }
+            // Enum_type_name section: written only when enum_type_bytes.is_some() in to_bytes.
+            // Distinguishing "no enum" from "enum empty": if exactly 4 bytes remain after
+            // collation, it's [collation_len=0][ndims][elem_type] (no enum). If >= 5 bytes
+            // remain, the first 2 bytes are the enum length prefix.
+            if bytes.len() >= consumed + 5 {
                 let elen =
                     u16::from_le_bytes([bytes[consumed], bytes[consumed + 1]]) as usize;
                 consumed += 2;
@@ -939,6 +943,8 @@ impl ColumnDef {
                 } else {
                     Some(s)
                 }
+            } else if s.is_empty() {
+                None
             } else {
                 Some(s)
             }

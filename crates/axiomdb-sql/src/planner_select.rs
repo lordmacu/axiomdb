@@ -191,10 +191,14 @@ pub fn plan_select(
 
 // ── Rule G helper: GIN scan planner ──────────────────────────────────────────
 
-/// Detects JSONB predicates that a `jsonb_ops` GIN index can accelerate:
+/// Detects JSONB and Array predicates that a `jsonb_ops` GIN index can accelerate:
 ///
-/// - `col @>  <jsonb_literal>` (Phase 11.17 — containment)
-/// - `col ?   <text_literal>`  (Phase 11.18a — key/array-string exists)
+/// - `col @>  <jsonb_literal>` (Phase 11.17 — JSONB containment)
+/// - `col @>  <array_literal>`  (Phase 20.4 Step 8 — array @> array)
+/// - `col &&  <array_literal>`  (Phase 20.4 Step 8 — array overlap)
+/// - `col <@  <array_literal>`  (Phase 20.4 Step 8 — array contained by)
+/// - `col =   <array_literal>`  (Phase 20.4 Step 8 — array equality)
+/// - `col ?   <text_literal>`   (Phase 11.18a — key/array-string exists)
 ///
 /// Returns `AccessMethod::GinScan` with the probe terms when a GIN index
 /// whose first column matches `col` exists. The executor always runs the
@@ -204,20 +208,97 @@ pub fn plan_select(
 fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Option<AccessMethod> {
     enum GinProbe {
         Contains,
+        ArrayContains,
+        ArrayOverlap,
+        ArrayContainedBy,
+        ArrayEquals,
         Exists,
         JsonPathExists,
         JsonPathMatch,
     }
 
+    /// Extracts the column name from a column expression, if it references an array column.
+    fn get_array_column_info<'a>(
+        left: &'a Expr,
+        right: &'a Expr,
+        columns: &[ColumnDef],
+    ) -> Option<(&'a str, &'a Value)> {
+        let (col_expr, val_expr) = match (left, right) {
+            (Expr::Column { name, .. }, v) => (name.as_str(), v),
+            _ => return None,
+        };
+        // Check if column is an array type
+        let col_idx = columns.iter().find(|c| c.name == col_expr)?.col_idx as usize;
+        let col_def = columns.get(col_idx)?;
+        if col_def.col_type != axiomdb_catalog::schema::ColumnType::Array {
+            return None;
+        }
+        // Get the array literal value
+        let arr_val = match val_expr {
+            Expr::Literal(v) => v,
+            _ => return None,
+        };
+        if !matches!(arr_val, Value::Array(_)) {
+            return None;
+        }
+        Some((col_expr, arr_val))
+    }
+
     let (probe, col_name, literal) = match expr {
+        // Array: col @> ARRAY[...] — containment
         Expr::BinaryOp {
             op: BinaryOp::JsonContains,
             left,
             right,
-        } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column { name, .. }, Expr::Literal(v)) => (GinProbe::Contains, name.as_str(), v),
-            _ => return None,
-        },
+        } => {
+            if let Some((name, val)) = get_array_column_info(left, right, columns) {
+                (GinProbe::ArrayContains, name, val)
+            } else {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column { name, .. }, Expr::Literal(v)) => {
+                        (GinProbe::Contains, name.as_str(), v)
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        // Array: col && ARRAY[...] — overlap
+        Expr::BinaryOp {
+            op: BinaryOp::ArrayOverlap,
+            left,
+            right,
+        } => {
+            if let Some((name, val)) = get_array_column_info(left, right, columns) {
+                (GinProbe::ArrayOverlap, name, val)
+            } else {
+                return None;
+            }
+        }
+        // Array: col <@ ARRAY[...] — contained by
+        Expr::BinaryOp {
+            op: BinaryOp::JsonContainedBy,
+            left,
+            right,
+        } => {
+            if let Some((name, val)) = get_array_column_info(left, right, columns) {
+                (GinProbe::ArrayContainedBy, name, val)
+            } else {
+                return None;
+            }
+        }
+        // Array: col = ARRAY[...] — equality
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            if let Some((name, val)) = get_array_column_info(left, right, columns) {
+                (GinProbe::ArrayEquals, name, val)
+            } else {
+                return None;
+            }
+        }
+        // JSONB: col ? <text_literal>
         Expr::BinaryOp {
             op: BinaryOp::JsonExists,
             left,
@@ -226,6 +307,7 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
             (Expr::Column { name, .. }, Expr::Literal(v)) => (GinProbe::Exists, name.as_str(), v),
             _ => return None,
         },
+        // JSONB: col @? <jsonpath>
         Expr::BinaryOp {
             op: BinaryOp::JsonbPathExists,
             left,
@@ -236,6 +318,7 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
             }
             _ => return None,
         },
+        // JSONB: col @@ <jsonpath>
         Expr::BinaryOp {
             op: BinaryOp::JsonbPathMatch,
             left,
@@ -259,6 +342,39 @@ fn plan_gin_scan(expr: &Expr, indexes: &[IndexDef], columns: &[ColumnDef]) -> Op
 
     // Extract query terms from the literal value at plan time.
     let query_terms = match probe {
+        // Array @> containment: all query elements must be in the indexed column
+        GinProbe::ArrayContains => {
+            if let Value::Array(arr) = literal {
+                crate::index_maintenance::gin_extract_array_keys(arr)
+            } else {
+                return None;
+            }
+        }
+        // Array && overlap: at least one query element must be in the indexed column
+        GinProbe::ArrayOverlap => {
+            if let Value::Array(arr) = literal {
+                crate::index_maintenance::gin_extract_array_keys(arr)
+            } else {
+                return None;
+            }
+        }
+        // Array <@ contained-by: all indexed elements must be in the query array
+        // This is the reverse check - the indexed column must be a subset of query
+        GinProbe::ArrayContainedBy => {
+            if let Value::Array(arr) = literal {
+                crate::index_maintenance::gin_extract_array_keys(arr)
+            } else {
+                return None;
+            }
+        }
+        // Array = equality: all elements must match (same as @> for identical arrays)
+        GinProbe::ArrayEquals => {
+            if let Value::Array(arr) = literal {
+                crate::index_maintenance::gin_extract_array_keys(arr)
+            } else {
+                return None;
+            }
+        }
         GinProbe::Contains => match literal {
             // SQL text literals ('{"a":1}') are treated as JSON; Jsonb is
             // pre-encoded binary.

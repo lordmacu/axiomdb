@@ -81,6 +81,129 @@ fn dedup_gin_terms(mut terms: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     terms
 }
 
+/// Extracts all leaf elements from a `Value::Array` and encodes each as a GIN key.
+///
+/// Format per element: `[ColumnType tag:u8][encoded element bytes]`.
+///
+/// - NULL elements are skipped (not indexed).
+/// - Nested arrays are flattened recursively.
+/// - Results are deduplicated and sorted.
+///
+/// This mirrors the PostgreSQL `gin_extract_array` function for `text[]` ops.
+/// The encoding uses ColumnType tags (1-13) to identify element types,
+/// which aligns with how JSONB GIN extraction uses type-specific flags.
+pub(crate) fn gin_extract_array_keys(arr: &[Value]) -> Vec<Vec<u8>> {
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    flatten_array_elements(arr, &mut terms);
+    dedup_gin_terms(terms)
+}
+
+/// Recursively flattens array elements into GIN key bytes.
+fn flatten_array_elements(arr: &[Value], out: &mut Vec<Vec<u8>>) {
+    for elem in arr {
+        match elem {
+            Value::Null => {
+                // NULL elements are not indexed (skip)
+            }
+            Value::Bool(b) => {
+                // ColumnType::Bool = 1, followed by 1 byte (0 or 1)
+                let mut t = Vec::with_capacity(2);
+                t.push(1u8); // ColumnType::Bool
+                t.push(*b as u8);
+                out.push(t);
+            }
+            Value::Int(n) => {
+                // ColumnType::Int = 2, followed by 4-byte big-endian
+                let mut t = Vec::with_capacity(5);
+                t.push(2u8); // ColumnType::Int
+                t.extend_from_slice(&n.to_be_bytes());
+                out.push(t);
+            }
+            Value::BigInt(n) => {
+                // ColumnType::BigInt = 3, followed by 8-byte big-endian
+                let mut t = Vec::with_capacity(9);
+                t.push(3u8); // ColumnType::BigInt
+                t.extend_from_slice(&n.to_be_bytes());
+                out.push(t);
+            }
+            Value::Real(f) => {
+                // ColumnType::Float = 4, followed by 8-byte IEEE 754 big-endian
+                let mut t = Vec::with_capacity(9);
+                t.push(4u8); // ColumnType::Float
+                t.extend_from_slice(&f.to_be_bytes());
+                out.push(t);
+            }
+            Value::Text(s) => {
+                // ColumnType::Text = 5, followed by length-prefixed UTF-8 bytes
+                let mut t = Vec::with_capacity(1 + 4 + s.len());
+                t.push(5u8); // ColumnType::Text
+                t.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                t.extend_from_slice(s.as_bytes());
+                out.push(t);
+            }
+            Value::Json(s) => {
+                // JSON strings encoded same as Text (ColumnType::Json = 9)
+                let mut t = Vec::with_capacity(1 + 4 + s.len());
+                t.push(9u8); // ColumnType::Json
+                t.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                t.extend_from_slice(s.as_bytes());
+                out.push(t);
+            }
+            Value::Uuid(u) => {
+                // ColumnType::Uuid = 8, followed by 16 raw bytes
+                let mut t = Vec::with_capacity(17);
+                t.push(8u8); // ColumnType::Uuid
+                t.extend_from_slice(u);
+                out.push(t);
+            }
+            Value::Date(days) => {
+                // ColumnType::Date = 12, followed by 4-byte big-endian i32
+                let mut t = Vec::with_capacity(5);
+                t.push(12u8); // ColumnType::Date
+                t.extend_from_slice(&days.to_be_bytes());
+                out.push(t);
+            }
+            Value::Timestamp(micros) => {
+                // ColumnType::Timestamp = 7, followed by 8-byte big-endian i64
+                let mut t = Vec::with_capacity(9);
+                t.push(7u8); // ColumnType::Timestamp
+                t.extend_from_slice(&micros.to_be_bytes());
+                out.push(t);
+            }
+            Value::Bytes(b) => {
+                // ColumnType::Bytes = 6, followed by length-prefixed bytes
+                let mut t = Vec::with_capacity(1 + 4 + b.len());
+                t.push(6u8); // ColumnType::Bytes
+                t.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                t.extend_from_slice(b);
+                out.push(t);
+            }
+            Value::Decimal(mantissa, scale) => {
+                // ColumnType::Decimal = 11
+                // 16-byte i128 mantissa (big-endian) + 1-byte scale
+                let mut t = Vec::with_capacity(18);
+                t.push(11u8); // ColumnType::Decimal
+                t.extend_from_slice(&mantissa.to_be_bytes());
+                t.push(*scale);
+                out.push(t);
+            }
+            Value::Jsonb(_) => {
+                // JSONB elements not typically in SQL arrays, but handle via JSON text
+                // This shouldn't happen in practice since JSONB is stored separately
+            }
+            Value::Array(nested) => {
+                // Flatten nested arrays recursively
+                flatten_array_elements(nested, out);
+            }
+        }
+    }
+}
+
+/// Returns GIN key terms for a row value, handling JSONB, JSON text, and Arrays.
+///
+/// - JSONB: uses `axiomdb_types::jsonb::gin_extract_terms`
+/// - JSON/Text: uses `axiomdb_types::jsonb::gin_extract_terms_from_str`
+/// - Array: uses `gin_extract_array_keys` (flattens all leaf elements)
 pub(crate) fn gin_terms_for_row_value(
     value: Option<&Value>,
 ) -> Result<Option<Vec<Vec<u8>>>, DbError> {
@@ -89,9 +212,10 @@ pub(crate) fn gin_terms_for_row_value(
         Some(Value::Json(s)) | Some(Value::Text(s)) => {
             axiomdb_types::jsonb::gin_extract_terms_from_str(s)?
         }
+        Some(Value::Array(arr)) => gin_extract_array_keys(arr),
         _ => return Ok(None),
     };
-    Ok(Some(dedup_gin_terms(terms)))
+    Ok(Some(terms))
 }
 
 pub(crate) fn gin_terms_if_indexed(
