@@ -11,7 +11,8 @@
 
 use axiomdb_core::error::DbError;
 use axiomdb_sql::result::{ColumnMeta, QueryResult, Row};
-use axiomdb_types::{DataType, Value};
+use axiomdb_types::array_codec::data_type_to_column_type;
+use axiomdb_types::{array_to_text, encode_array, DataType, Value};
 
 use super::charset::{self, CollationDef, BINARY_COLLATION_DEF};
 use super::packets::{
@@ -247,6 +248,14 @@ fn encode_binary_cell(
             let encoded = charset::encode_text(results_collation.charset, &s_text)?;
             write_lenenc_str(buf, &encoded);
         }
+        (DataType::Array(ref inner), Value::Array(_)) => {
+            // Array in binary protocol: encode to blob, convert to PG text, send as length-prefixed string
+            let elem_ct = data_type_to_column_type(inner);
+            let blob = encode_array(value, elem_ct)?;
+            let text = array_to_text(&blob)?;
+            let encoded = charset::encode_text(results_collation.charset, &text)?;
+            write_lenenc_str(buf, &encoded);
+        }
         // Any mismatch is a QueryResult invariant violation — not a user-visible error.
         (_, other) => unreachable!("binary cell type/value mismatch: {other:?}"),
     }
@@ -327,7 +336,7 @@ fn serialize_rows(
     let mut row_buf = Vec::with_capacity(cols.len() * 32);
     for row in rows {
         row_buf.clear(); // Reset length to 0, retain heap capacity.
-        build_row_into(&mut row_buf, row, results_collation)?;
+        build_row_into(&mut row_buf, cols, row, results_collation)?;
         // Clone the buffer content into the packet. The original retains capacity
         // for the next row — no new allocation if next row fits.
         packets.push((seq, row_buf.clone()));
@@ -383,11 +392,12 @@ fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) 
 /// Avoids per-row Vec allocation — inspired by MySQL's persistent net->buff.
 fn build_row_into(
     buf: &mut Vec<u8>,
+    cols: &[ColumnMeta],
     row: &[Value],
     results_collation: &'static CollationDef,
 ) -> Result<(), DbError> {
     let mut num_buf = [0u8; 32];
-    for value in row {
+    for (col, value) in cols.iter().zip(row.iter()) {
         match value {
             Value::Null => buf.push(0xfb),
             Value::Bytes(b) => write_lenenc_str(buf, b),
@@ -439,6 +449,20 @@ fn build_row_into(
             Value::Timestamp(t) => {
                 write_timestamp_to_buf(buf, *t);
             }
+            Value::Array(_) => {
+                let elem_ct = match &col.data_type {
+                    DataType::Array(inner) => data_type_to_column_type(inner),
+                    _ => {
+                        return Err(DbError::InvalidValue {
+                            reason: "Array value but non-Array column type".to_string(),
+                        });
+                    }
+                };
+                let blob = encode_array(value, elem_ct)?;
+                let text = array_to_text(&blob)?;
+                let encoded = charset::encode_text(results_collation.charset, &text)?;
+                write_lenenc_str(buf, &encoded);
+            }
             v => {
                 let s = value_to_text(v);
                 let encoded = charset::encode_text(results_collation.charset, &s)?;
@@ -452,11 +476,12 @@ fn build_row_into(
 /// Legacy wrapper — allocates a new Vec per row. Used by binary protocol path.
 #[allow(dead_code)]
 fn build_row_packet(
+    cols: &[ColumnMeta],
     row: &[Value],
     results_collation: &'static CollationDef,
 ) -> Result<Vec<u8>, DbError> {
     let mut buf = Vec::with_capacity(row.len() * 32);
-    build_row_into(&mut buf, row, results_collation)?;
+    build_row_into(&mut buf, cols, row, results_collation)?;
     Ok(buf)
 }
 
@@ -954,8 +979,9 @@ mod tests {
     #[test]
     fn test_text_row_latin1_encodes_cafe() {
         use super::super::charset::LATIN1_SWEDISH_CI;
+        let cols = vec![ColumnMeta::computed("s".to_string(), DataType::Text)];
         let row = vec![Value::Text("café".into())];
-        let pkt = build_row_packet(&row, &LATIN1_SWEDISH_CI).unwrap();
+        let pkt = build_row_packet(&cols, &row, &LATIN1_SWEDISH_CI).unwrap();
         // lenenc(4) + 0x63 0x61 0x66 0xE9 = 5 bytes
         assert_eq!(pkt.len(), 5);
         assert_eq!(pkt[0], 4); // lenenc: 4 bytes
@@ -965,8 +991,9 @@ mod tests {
     #[test]
     fn test_text_row_latin1_emoji_errors() {
         use super::super::charset::LATIN1_SWEDISH_CI;
+        let cols = vec![ColumnMeta::computed("s".to_string(), DataType::Text)];
         let row = vec![Value::Text("hello 🎉".into())];
-        let err = build_row_packet(&row, &LATIN1_SWEDISH_CI).unwrap_err();
+        let err = build_row_packet(&cols, &row, &LATIN1_SWEDISH_CI).unwrap_err();
         assert!(
             err.to_string().contains("cannot be encoded"),
             "error: {err}"
