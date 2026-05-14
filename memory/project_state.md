@@ -1,22 +1,20 @@
 # Project State
 
-## Current (2026-05-07)
+## Current (2026-05-14)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.4 — Arrays next.
-Phase 20.3 added PostgreSQL-style enum type DDL with text-backed storage:
-`CREATE TYPE name AS ENUM (...)`, catalog-backed `EnumTypeDef`, enum column
-metadata persisted as `schema.type`, write-path label validation, and metadata
-display through `SHOW COLUMNS`, `SHOW CREATE TABLE`, and
-`information_schema.COLUMNS`.
+**Active subphase:** Phase 20.4 — Arrays COMPLETE.
+Phase 20.4 added PostgreSQL-compatible SQL arrays with DDL (`INT[]`, `TEXT[]`, etc.),
+ARRAY constructor (`ARRAY[1,2,3]`), subscript access (`arr[1]`), `@>` containment,
+`&&` overlap, `||` concatenation, `=`/`<>` equality, GIN indexes, 17 array functions,
+ANY/ALL quantifiers, and FROM UNNEST() set-returning function.
 
-**Last verified gates:** Phase 20.3 closeout passed catalog enum tests,
-`crates/axiomdb-sql/tests/integration_enum_types.rs` (7 tests),
-`crates/axiomdb-sql/tests/integration_ddl_parser.rs` enum coverage, wire smoke
-(`476/476`), `cargo test --workspace --quiet`, `cargo clippy --workspace -- -D warnings`,
-and `cargo fmt --check`.
+**Last verified gates:** Phase 20.4 closeout passed 7 integration test files
+(139 tests: arrays, array_operators, array_functions, array_gin, array_agg,
+array_any_all, array_unnest), wire smoke, `cargo test --workspace`,
+`cargo clippy --workspace -- -D warnings`, and `cargo fmt --check`.
 
-**Next:** Start Phase 20.4 Arrays with the mandatory brainstorm/spec/plan flow.
+**Next:** Start Phase 20.5 COPY FROM/TO or Phase 21 Advanced SQL (CTE, MERGE, etc.)
 
 ### Phase 21 subphase status
 
@@ -74,6 +72,17 @@ and `cargo fmt --check`.
 - **11.20d2** — JSON_TABLE as first FROM + JOINs; CROSS/OUTER APPLY parser sugar. ✅ closed.
 - **11.20d3** — LATERAL-correlated `doc` / PASSING referencing outer columns + `LATERAL` keyword. ✅ closed.
 - **11.20d4** — JSON_TABLE as UPDATE/DELETE source (MERGE deferred until MERGE lands).
+
+### Phase 20 subphase status
+
+| Subphase | Status |
+|---|---|
+| 20.1 Regular views | ✅ closed |
+| 20.2 Sequences | ✅ closed |
+| 20.3 ENUMs | ✅ closed |
+| **20.4 Arrays** | ✅ closed |
+| 20.5 COPY FROM/TO | ⏳ pending |
+| 20.14 UNNEST | ⏳ pending |
 
 ### Completed phases
 

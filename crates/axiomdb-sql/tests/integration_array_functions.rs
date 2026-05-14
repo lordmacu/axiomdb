@@ -479,19 +479,5 @@ fn string_to_array_null_str() {
     assert_eq!(elems[2], Value::Text("c".to_string()));
 }
 
-// ── unnest (smoke test) ───────────────────────────────────────────────────────
-
-#[test]
-fn unnest_smoke() {
-    let (mut s, mut t, mut b, mut c) = setup();
-    // unnest returns the array as a value (SRF expansion handled in Step 7)
-    let v = scalar(
-        "SELECT unnest(ARRAY[1,2,3])",
-        &mut s,
-        &mut t,
-        &mut b,
-        &mut c,
-    );
-    let elems = expect_array(&v);
-    assert_eq!(elems.len(), 3);
-}
+// NOTE: unnest() is a FROM-clause SRF only — not a scalar function.
+// Proper UNNEST tests live in `integration_array_unnest.rs`.

@@ -683,6 +683,32 @@ pub fn eval_with<R: SubqueryRunner>(
             right,
         } => eval_xor_with(left, right, row, sq),
 
+        // Phase 20.4, Step 7: ANY/ALL as the RHS of a comparison.
+        // When the RHS is AnyOf or AllOf, we handle it specially here
+        // instead of evaluating it as a standalone expression.
+        Expr::BinaryOp { op, left, right } if matches!(right.as_ref(), Expr::AnyOf { .. }) => {
+            let (any_expr, array) = match right.as_ref() {
+                Expr::AnyOf { expr, array } => (expr, array),
+                _ => unreachable!(),
+            };
+            let _guard =
+                explicit_collation_from_exprs(&[left, any_expr]).map(CollationGuard::new);
+            let lhs_val = eval_with(left, row, sq)?;
+            let arr_val = eval_with(array, row, sq)?;
+            super::functions::any_all::eval_any_of(&lhs_val, &arr_val, *op)
+        }
+        Expr::BinaryOp { op, left, right } if matches!(right.as_ref(), Expr::AllOf { .. }) => {
+            let (all_expr, array) = match right.as_ref() {
+                Expr::AllOf { expr, array } => (expr, array),
+                _ => unreachable!(),
+            };
+            let _guard =
+                explicit_collation_from_exprs(&[left, all_expr]).map(CollationGuard::new);
+            let lhs_val = eval_with(left, row, sq)?;
+            let arr_val = eval_with(array, row, sq)?;
+            super::functions::any_all::eval_all_of(&lhs_val, &arr_val, *op)
+        }
+
         Expr::BinaryOp { op, left, right } => {
             let _guard = explicit_collation_from_exprs(&[left, right]).map(CollationGuard::new);
             let l = eval_with(left, row, sq)?;

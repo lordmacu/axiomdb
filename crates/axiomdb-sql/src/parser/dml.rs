@@ -663,61 +663,67 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
     }
 
     // Phase 20.4, Step 7 — `FROM UNNEST(expr [, expr2, ...]) [AS alias(col1, col2, ...)]]`.
-    if let Token::Ident(s) = p.peek() {
-        if s.eq_ignore_ascii_case("UNNEST") && matches!(p.peek_at(1), Token::LParen) {
-            p.advance(); // consume the UNNEST identifier
-            p.expect(&Token::LParen)?;
-            // Parse comma-separated array expressions.
-            let mut exprs = vec![crate::parser::expr::parse_expr(p)?];
+    // UNNEST is tokenized as Token::Unnest (not Token::Ident), so we check both.
+    let peek_token = p.peek();
+    let is_unnest = matches!(peek_token, Token::Unnest);
+    let is_unnest_as_ident = if let Token::Ident(s) = peek_token {
+        s.eq_ignore_ascii_case("UNNEST")
+    } else {
+        false
+    };
+    if (is_unnest || is_unnest_as_ident) && matches!(p.peek_at(1), Token::LParen) {
+        p.advance(); // consume the UNNEST token/identifier
+        p.expect(&Token::LParen)?;
+        // Parse comma-separated array expressions.
+        let mut exprs = vec![crate::parser::expr::parse_expr(p)?];
+        while p.eat(&Token::Comma) {
+            exprs.push(crate::parser::expr::parse_expr(p)?);
+        }
+        p.expect(&Token::RParen)?;
+
+        // Optional alias: `AS name` or implicit `name` followed by optional `(col1, col2, ...)`.
+        let alias = if p.eat(&Token::As)
+            || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p))
+        {
+            Some(p.parse_identifier()?)
+        } else {
+            None
+        };
+
+        // Optional explicit column names: `AS u(a, b)`.
+        let column_names = if p.eat(&Token::LParen) {
+            let mut cols = vec![p.parse_identifier()?];
             while p.eat(&Token::Comma) {
-                exprs.push(crate::parser::expr::parse_expr(p)?);
+                cols.push(p.parse_identifier()?);
             }
             p.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
 
-            // Optional alias: `AS name` or implicit `name` followed by optional `(col1, col2, ...)`.
-            let alias = if p.eat(&Token::As)
-                || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p))
-            {
-                Some(p.parse_identifier()?)
-            } else {
-                None
-            };
-
-            // Optional explicit column names: `AS u(a, b)`.
-            let column_names = if p.eat(&Token::LParen) {
-                let mut cols = vec![p.parse_identifier()?];
-                while p.eat(&Token::Comma) {
-                    cols.push(p.parse_identifier()?);
-                }
-                p.expect(&Token::RParen)?;
-                Some(cols)
-            } else {
-                None
-            };
-
-            // Validate that column_names width matches exprs width if both are present.
-            if let (Some(ref cols), n) = (&column_names, exprs.len()) {
-                if cols.len() != n {
-                    return Err(DbError::ParseError {
-                        message: format!(
-                            "UNNEST: {} column names given but {} array expressions present",
-                            cols.len(),
-                            n
-                        ),
-                        position: Some(p.current_pos()),
-                    });
-                }
+        // Validate that column_names width matches exprs width if both are present.
+        if let (Some(ref cols), n) = (&column_names, exprs.len()) {
+            if cols.len() != n {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "UNNEST: {} column names given but {} array expressions present",
+                        cols.len(),
+                        n
+                    ),
+                    position: Some(p.current_pos()),
+                });
             }
-
-            return parse_optional_pivot_clause(
-                p,
-                FromClause::Unnest(Box::new(crate::ast::UnnestClause {
-                    exprs,
-                    alias,
-                    column_names: column_names.unwrap_or_default(),
-                })),
-            );
         }
+
+        return parse_optional_pivot_clause(
+            p,
+            FromClause::Unnest(Box::new(crate::ast::UnnestClause {
+                exprs,
+                alias,
+                column_names: column_names.unwrap_or_default(),
+            })),
+        );
     }
 
     // Phase 11.25a — PostgreSQL JSONB set-returning functions in FROM.
