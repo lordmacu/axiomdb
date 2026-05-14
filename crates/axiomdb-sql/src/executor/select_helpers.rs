@@ -94,6 +94,12 @@ fn execute_select_with_joins(
                         feature: "recursive CTE JOIN via the non-ctx executor path".into(),
                     });
                 }
+                // Phase 20.4 — UNNEST via the non-ctx executor path.
+                FromClause::Unnest(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "UNNEST JOIN via the non-ctx executor path".into(),
+                    });
+                }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
                         message: "unlowered PIVOT reached non-ctx join executor".into(),

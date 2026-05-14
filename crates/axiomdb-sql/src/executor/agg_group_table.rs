@@ -491,6 +491,11 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
         | Expr::Subquery(_)
         | Expr::InSubquery { .. }
         | Expr::Exists { .. } => {}
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            collect_col_idxs_non_agg(expr, out);
+            collect_col_idxs_non_agg(array, out);
+        }
     }
 }
 
@@ -582,5 +587,10 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
         | Expr::Subquery(_)
         | Expr::InSubquery { .. }
         | Expr::Exists { .. } => {}
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            collect_non_agg_col_idxs_in_expr(expr, inside_agg, out);
+            collect_non_agg_col_idxs_in_expr(array, inside_agg, out);
+        }
     }
 }

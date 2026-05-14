@@ -30,6 +30,7 @@ fn pivot_result_alias(pivot: &crate::ast::PivotClause) -> String {
         FromClause::Values(vc) => vc.alias.clone(),
         FromClause::RecursiveCte(rc) => rc.alias.clone(),
         FromClause::Pivot(_) => "__pivot".into(),
+        FromClause::Unnest(un) => un.alias.clone().unwrap_or_else(|| "unnest".into()),
     }
 }
 

@@ -497,6 +497,12 @@ fn collect_dml_join_candidates_ctx(
                     feature: "recursive CTE as UPDATE/DELETE JOIN source deferred".into(),
                 });
             }
+            // Phase 20.4 — UNNEST as DML JOIN right-side source.
+            FromClause::Unnest(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "UNNEST on the right side of a DML JOIN".into(),
+                });
+            }
             FromClause::Pivot(_) => {
                 return Err(DbError::Internal {
                     message: "unlowered PIVOT reached DML join executor".into(),

@@ -394,6 +394,21 @@ pub enum FromClause {
     /// the analyzer when a `FromClause::Table` matches a recursive CTE
     /// name; carries base+step SELECTs plus iteration semantics.
     RecursiveCte(Box<RecursiveCteClause>),
+    /// Phase 20.4, Step 7 — `FROM UNNEST(array) AS u(elem)`.
+    /// Set-returning function that expands one or more arrays into rows.
+    /// Multiple arrays are zipped together (same-length required per PG).
+    Unnest(Box<UnnestClause>),
+}
+
+/// Phase 20.4, Step 7 — `UNNEST(expr1[, expr2, ...]) [AS alias(col1, col2, ...)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnnestClause {
+    /// One or more array expressions to expand.
+    pub exprs: Vec<Expr>,
+    /// Optional table alias: `FROM UNNEST(...) AS u(...)`.
+    pub alias: Option<String>,
+    /// Optional explicit column names per array: `AS u(a, b)`.
+    pub column_names: Vec<String>,
 }
 
 /// Phase 21.25 — bounded `FROM source PIVOT (...) [AS alias]`.

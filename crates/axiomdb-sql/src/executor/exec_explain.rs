@@ -321,6 +321,12 @@ fn explain_select(
                 "EXPLAIN for VALUES FROM not yet supported".into(),
             ))
         }
+        // Phase 20.4 — UNNEST as FROM source.
+        crate::ast::FromClause::Unnest(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for UNNEST FROM not yet supported".into(),
+            ))
+        }
         crate::ast::FromClause::RecursiveCte(_) => {
             return Err(DbError::Other(
                 "EXPLAIN for recursive CTE FROM not yet supported".into(),

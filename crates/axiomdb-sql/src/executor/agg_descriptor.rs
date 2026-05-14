@@ -80,6 +80,10 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 || contains_aggregate(index)
                 || slice.as_ref().is_some_and(|s| contains_aggregate(s))
         }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            contains_aggregate(expr) || contains_aggregate(array)
+        }
     }
 }
 
@@ -403,6 +407,11 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             if let Some(s) = slice {
                 collect_agg_exprs_from(s, result);
             }
+        }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            collect_agg_exprs_from(expr, result);
+            collect_agg_exprs_from(array, result);
         }
     }
 }

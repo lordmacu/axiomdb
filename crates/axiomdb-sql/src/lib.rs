@@ -40,6 +40,7 @@ pub mod table;
 pub mod text_semantics;
 pub mod tokenizer;
 pub mod trigram;
+pub mod unnest;
 pub mod vacuum;
 pub mod values_clause;
 

@@ -852,6 +852,10 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
                     .as_ref()
                     .is_some_and(|s| expr_has_outer_column_refs(s))
         }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            expr_has_outer_column_refs(expr) || expr_has_outer_column_refs(array)
+        }
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
     }
 }
@@ -1067,6 +1071,10 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
             doc_has_column_refs(array)
                 || doc_has_column_refs(index)
                 || slice.as_ref().is_some_and(|s| doc_has_column_refs(s))
+        }
+        // Phase 20.4 — ANY/ALL: recurse into expr (comparison target) and array.
+        Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
+            doc_has_column_refs(expr) || doc_has_column_refs(array)
         }
         // Subqueries are not correlation we can detect at this layer — treat
         // as "yes" to force the NotImplemented branch (users can wrap the
