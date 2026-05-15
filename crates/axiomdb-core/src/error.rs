@@ -27,6 +27,9 @@ pub enum DbError {
     #[error("disk full during '{operation}': no space left on device")]
     DiskFull { operation: &'static str },
 
+    #[error("backup error: {message}")]
+    BackupError { message: String },
+
     // ── I/O ──────────────────────────────────────────────────────
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
