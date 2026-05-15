@@ -37,6 +37,7 @@ pub mod recursive_cte;
 pub mod result;
 pub mod schema_cache;
 pub mod session;
+pub mod srf_normalize;
 pub mod table;
 pub mod text_semantics;
 pub mod tokenizer;
