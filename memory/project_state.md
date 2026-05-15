@@ -14,6 +14,12 @@ ANY/ALL quantifiers, and FROM UNNEST() set-returning function.
 array_any_all, array_unnest), wire smoke, `cargo test --workspace`,
 `cargo clippy --workspace -- -D warnings`, and `cargo fmt --check`.
 
+**Recently completed:** 22b.6 — FDW predicate pushdown (2026-05-14).
+`extract_fdw_pushable` extracts `col = literal` predicates from WHERE, `render_fdw_url`
+substitutes `{col}` path placeholders and appends `pushdown_cols` as `?k=v` plus
+`limit_param`. Full WHERE always applied locally for correctness. 3837/3837 tests pass.
+Phase 22b fully closed.
+
 **Next:** Start Phase 20.5 COPY FROM/TO or Phase 21 Advanced SQL (CTE, MERGE, etc.)
 
 ### Phase 21 subphase status
