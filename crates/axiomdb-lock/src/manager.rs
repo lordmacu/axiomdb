@@ -542,6 +542,18 @@ impl LockManager {
             // Shard mutex dropped here.
         };
 
+        // NOWAIT: remove ourselves from the queue and fail immediately.
+        if flags.contains(LockFlags::NOWAIT) {
+            let mut shard = self.record_shards[shard_idx].lock().unwrap();
+            if let Some(queue) = shard.get_mut(&page_id) {
+                queue.remove_waiter_by_txn(txn_id);
+                if queue.is_empty() {
+                    shard.remove(&page_id);
+                }
+            }
+            return Err(DbError::LockTimeout);
+        }
+
         // ── Deadlock detection ───────────────────────────────────────────
         let lock_ref = LockRef::Record { page_id, slot_id };
         {
@@ -1242,5 +1254,34 @@ mod tests {
             assert!(async_result == LockResult::WaitGranted || async_result == LockResult::Granted);
             assert!(sync_result == LockResult::WaitGranted || sync_result == LockResult::Granted);
         });
+    }
+
+    #[test]
+    fn sync_nowait_returns_lock_timeout_immediately() {
+        let lm = std::sync::Arc::new(LockManager::new());
+
+        // Txn 1 holds Exclusive on slot 5.
+        lm.acquire_record_lock_sync(1, 100, 5, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+
+        // Txn 2 requests Exclusive + NOWAIT → must fail instantly without sleeping.
+        let flags = LockFlags::REC_NOT_GAP.union(LockFlags::NOWAIT);
+        let start = std::time::Instant::now();
+        let result = lm.acquire_record_lock_sync(2, 100, 5, LockMode::Exclusive, flags);
+        assert!(result.is_err(), "expected LockTimeout");
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "NOWAIT must not block; elapsed={:?}",
+            start.elapsed()
+        );
+        match result.unwrap_err() {
+            DbError::LockTimeout => {}
+            other => panic!("expected LockTimeout, got {:?}", other),
+        }
+
+        // Queue must be clean after NOWAIT failure.
+        let shard = lm.record_shards[100 % RECORD_SHARDS].lock().unwrap();
+        let queue = shard.get(&100).unwrap();
+        assert!(queue.waiting.is_empty(), "waiter must be removed on NOWAIT");
     }
 }
