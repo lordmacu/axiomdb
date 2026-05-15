@@ -2,7 +2,7 @@
 
 Phase: 20 — Types + import/export
 Task: UNNEST as set-returning function in the SELECT projection list
-Status: approved
+Status: implemented
 
 ## Context
 

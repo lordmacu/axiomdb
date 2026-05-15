@@ -3,7 +3,7 @@
 Phase: 20 — Types + import/export
 Task: UNNEST as set-returning function in SELECT projection list
 Spec: specs/fase-20/spec-20.14-unnest-select.md
-Status: in-progress
+Status: done
 
 ## Summary
 
