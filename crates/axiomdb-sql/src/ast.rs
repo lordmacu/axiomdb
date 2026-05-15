@@ -729,8 +729,8 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
-    /// Row-level lock mode: `FOR UPDATE` or `LOCK IN SHARE MODE` (ignored until Phase 13.7).
-    pub lock_mode: Option<LockMode>,
+    /// Phase 13.7 — locking clause (`FOR UPDATE / FOR SHARE [NOWAIT]`); `None` when absent.
+    pub lock_clause: Option<SelectLockClause>,
     /// Phase 21.9b — UNION/INTERSECT/EXCEPT tails when this SelectStmt is the
     /// first branch of a set operation embedded inside a subquery or FROM clause.
     /// Empty for plain SELECT statements (the common case).
@@ -876,13 +876,35 @@ pub struct MergeStmt {
     pub actions: Vec<MergeAction>,
 }
 
-/// Row-level lock mode for `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE`.
+/// Locking strength for `SELECT … FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE`.
+///
+/// Phase 13.7 — replaces the old `LockMode` stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockMode {
-    /// `FOR UPDATE` — exclusive write lock (ignored until Phase 13.7).
+pub enum LockStrength {
+    /// Weakest shared lock; keys only (compat alias for `FOR SHARE`).
+    ForKeyShare,
+    /// Shared lock; `LOCK IN SHARE MODE` maps here.
+    ForShare,
+    /// Exclusive lock, non-key columns only.
+    ForNoKeyUpdate,
+    /// Strongest exclusive lock (`FOR UPDATE`).
     ForUpdate,
-    /// `LOCK IN SHARE MODE` — shared read lock (ignored until Phase 13.7).
-    ShareMode,
+}
+
+/// Wait policy for a locking clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWaitPolicy {
+    /// Default: wait up to `lock_timeout_secs`.
+    Block,
+    /// `NOWAIT`: fail immediately on conflict.
+    NoWait,
+}
+
+/// Combined locking clause (`FOR UPDATE [NOWAIT]`, etc.) on a `SELECT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectLockClause {
+    pub strength: LockStrength,
+    pub wait_policy: LockWaitPolicy,
 }
 
 /// `CREATE TABLE new_table LIKE source_table` — copy schema without data.
@@ -1573,7 +1595,7 @@ mod tests {
             }],
             limit: Some(Expr::int(10)),
             offset: Some(Expr::int(0)),
-            lock_mode: None,
+            lock_clause: None,
             set_op_rest: vec![],
         });
         assert!(matches!(stmt, Stmt::Select(_)));
@@ -1600,7 +1622,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            lock_mode: None,
+            lock_clause: None,
             set_op_rest: vec![],
         });
         if let Stmt::Select(s) = stmt {
@@ -1824,7 +1846,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            lock_mode: None,
+            lock_clause: None,
             set_op_rest: vec![],
         };
         let from = FromClause::Subquery {

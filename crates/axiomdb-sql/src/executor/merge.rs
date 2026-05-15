@@ -362,7 +362,7 @@ fn materialize_merge_source(
         order_by: vec![],
         limit: None,
         offset: None,
-        lock_mode: None::<LockMode>,
+        lock_clause: None,
         set_op_rest: vec![],
     };
     match execute_select_ctx(select, exec_ctx, Some(conn_txn), ctx)? {

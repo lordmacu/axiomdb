@@ -60,7 +60,7 @@ use crate::{
         CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt,
         DropAggregateStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, DropTriggerStmt,
         FromClause, GeneratedColumnKind, GroupByClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, LockMode, MergeActionCondition, MergeActionKind, MergeStmt,
+        JoinCondition, JoinType, MergeActionCondition, MergeActionKind, MergeStmt,
         NullsOrder, OnConflictAction, OrderByItem, SelectItem, SelectStmt, SetOpKind, SetOpTail,
         SetStmt, SetValue, ShowCreateTriggerStmt, ShowDatabasesStmt, SortOrder, Stmt, TableRef,
         TriggerEvent, UpdateStmt, UseDatabaseStmt,
