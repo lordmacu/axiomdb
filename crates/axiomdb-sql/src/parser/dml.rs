@@ -284,7 +284,10 @@ fn parse_lock_clause(p: &mut Parser) -> Result<Option<SelectLockClause>, DbError
         LockWaitPolicy::Block
     };
 
-    Ok(Some(SelectLockClause { strength, wait_policy }))
+    Ok(Some(SelectLockClause {
+        strength,
+        wait_policy,
+    }))
 }
 
 fn parse_optimizer_hints(p: &mut Parser) -> Result<Vec<SelectHint>, DbError> {
