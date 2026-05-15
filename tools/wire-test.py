@@ -5321,6 +5321,29 @@ _null_tilde = cur.fetchone()[0]
 ok("[20.15g null_tilde_propagates] NULL ~ 'x' → NULL", _null_tilde is None, _null_tilde)
 
 
+# ── 20.11 — TABLESAMPLE ───────────────────────────────────────────────────────
+
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_tablesample (v INT)")
+cur.execute("DELETE FROM _wire_tablesample")
+for _i in range(20):
+    cur.execute(f"INSERT INTO _wire_tablesample VALUES ({_i})")
+conn.commit()
+
+cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE SYSTEM(100)")
+ok("[20.11a tablesample_system_100] TABLESAMPLE SYSTEM(100) returns all rows",
+   cur.fetchone()[0] == 20)
+
+cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE SYSTEM(0)")
+ok("[20.11b tablesample_system_0] TABLESAMPLE SYSTEM(0) returns no rows",
+   cur.fetchone()[0] == 0)
+
+cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE BERNOULLI(100)")
+ok("[20.11c tablesample_bernoulli_100] TABLESAMPLE BERNOULLI(100) returns all rows",
+   cur.fetchone()[0] == 20)
+
+conn.commit()
+
+
 # ── 20.12 — ORDER BY RANDOM() ─────────────────────────────────────────────────
 
 cur.execute("CREATE TABLE IF NOT EXISTS _wire_random (v INT)")
