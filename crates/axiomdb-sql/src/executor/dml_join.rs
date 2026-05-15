@@ -503,6 +503,12 @@ fn collect_dml_join_candidates_ctx(
                     feature: "UNNEST on the right side of a DML JOIN".into(),
                 });
             }
+            // Phase 20.10 — GENERATE_SERIES as DML JOIN right-side source.
+            FromClause::GenerateSeries(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "GENERATE_SERIES on the right side of a DML JOIN".into(),
+                });
+            }
             FromClause::Pivot(_) => {
                 return Err(DbError::Internal {
                     message: "unlowered PIVOT reached DML join executor".into(),

@@ -782,6 +782,50 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         );
     }
 
+    // Phase 20.10 — `FROM GENERATE_SERIES(start, stop [, step]) [AS alias(col)]`.
+    if let Token::Ident(s) = p.peek() {
+        if s.eq_ignore_ascii_case("GENERATE_SERIES") && matches!(p.peek_at(1), Token::LParen) {
+            p.advance(); // consume identifier
+            p.expect(&Token::LParen)?;
+            let start = crate::parser::expr::parse_expr(p)?;
+            p.expect(&Token::Comma)?;
+            let stop = crate::parser::expr::parse_expr(p)?;
+            let step = if p.eat(&Token::Comma) {
+                Some(crate::parser::expr::parse_expr(p)?)
+            } else {
+                None
+            };
+            p.expect(&Token::RParen)?;
+
+            let alias = if p.eat(&Token::As)
+                || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p))
+            {
+                Some(p.parse_identifier()?)
+            } else {
+                None
+            };
+
+            let column_name = if p.eat(&Token::LParen) {
+                let col = p.parse_identifier()?;
+                p.expect(&Token::RParen)?;
+                Some(col)
+            } else {
+                None
+            };
+
+            return parse_optional_pivot_clause(
+                p,
+                FromClause::GenerateSeries(Box::new(crate::ast::GenerateSeriesClause {
+                    start,
+                    stop,
+                    step,
+                    alias,
+                    column_name,
+                })),
+            );
+        }
+    }
+
     // Phase 11.25a — PostgreSQL JSONB set-returning functions in FROM.
     if let Token::Ident(s) = p.peek() {
         if let Some(kind) = crate::ast::JsonbSrfKind::from_fn_name(s) {
@@ -1783,7 +1827,8 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         | FromClause::Values(_)
         | FromClause::RecursiveCte(_)
         | FromClause::Pivot(_)
-        | FromClause::Unnest(_) => {
+        | FromClause::Unnest(_)
+        | FromClause::GenerateSeries(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -1999,7 +2044,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::Values(_)
             | FromClause::RecursiveCte(_)
             | FromClause::Pivot(_)
-            | FromClause::Unnest(_) => {
+            | FromClause::Unnest(_)
+            | FromClause::GenerateSeries(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -2019,7 +2065,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::Values(_)
             | FromClause::RecursiveCte(_)
             | FromClause::Pivot(_)
-            | FromClause::Unnest(_) => {
+            | FromClause::Unnest(_)
+            | FromClause::GenerateSeries(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

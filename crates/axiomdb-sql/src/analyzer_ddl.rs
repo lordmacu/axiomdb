@@ -578,6 +578,10 @@ fn analyze_merge_source(
         FromClause::Unnest(_) => Err(DbError::NotImplemented {
             feature: "UNNEST in subquery/DDL context".into(),
         }),
+        // Phase 20.10 — GENERATE_SERIES not allowed in DDL context.
+        FromClause::GenerateSeries(_) => Err(DbError::NotImplemented {
+            feature: "GENERATE_SERIES in subquery/DDL context".into(),
+        }),
     }
 }
 

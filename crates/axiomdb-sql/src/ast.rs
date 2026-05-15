@@ -398,6 +398,9 @@ pub enum FromClause {
     /// Set-returning function that expands one or more arrays into rows.
     /// Multiple arrays are zipped together (same-length required per PG).
     Unnest(Box<UnnestClause>),
+    /// Phase 20.10 — `FROM GENERATE_SERIES(start, stop [, step]) [AS alias(col)]`.
+    /// Produces a sequence of integer or date values.
+    GenerateSeries(Box<GenerateSeriesClause>),
 }
 
 /// Phase 20.4, Step 7 — `UNNEST(expr1[, expr2, ...]) [AS alias(col1, col2, ...)]`.
@@ -414,6 +417,19 @@ pub struct UnnestClause {
     /// When `true`, the UNNEST expressions can reference columns from
     /// earlier tables in the FROM clause (outer correlation).
     pub lateral: bool,
+}
+
+/// Phase 20.10 — `FROM GENERATE_SERIES(start, stop [, step]) [AS alias(col)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerateSeriesClause {
+    pub start: Expr,
+    pub stop: Expr,
+    /// `None` → step defaults to 1 (integer) or 1 day (date) at execution time.
+    pub step: Option<Expr>,
+    /// Optional table alias: `AS g`.
+    pub alias: Option<String>,
+    /// Optional explicit column name from `AS g(n)`.
+    pub column_name: Option<String>,
 }
 
 /// Phase 21.25 — bounded `FROM source PIVOT (...) [AS alias]`.

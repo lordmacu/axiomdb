@@ -480,6 +480,10 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 20.10 — GENERATE_SERIES virtual table (full impl in Step 2).
+        FromClause::GenerateSeries(_) => Err(DbError::NotImplemented {
+            feature: "GENERATE_SERIES".into(),
+        }),
     }
 }
 

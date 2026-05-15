@@ -494,6 +494,18 @@ fn analyze_select_with_outer(
                 }
                 join.table = FromClause::Unnest(un);
             }
+            // Phase 20.10 — GENERATE_SERIES: resolve start/stop/step expressions.
+            FromClause::GenerateSeries(mut gs) => {
+                let taken = std::mem::replace(&mut gs.start, Expr::Literal(axiomdb_types::Value::Null));
+                gs.start = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                let taken = std::mem::replace(&mut gs.stop, Expr::Literal(axiomdb_types::Value::Null));
+                gs.stop = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                if let Some(step) = gs.step.take() {
+                    let resolved = resolve_expr_full(step, &ctx, outer_scopes, Some(&state))?;
+                    gs.step = Some(resolved);
+                }
+                join.table = FromClause::GenerateSeries(gs);
+            }
         }
         // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
         // the accumulated left-side scope and this join's right-side BoundTable,

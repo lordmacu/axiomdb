@@ -98,10 +98,19 @@ fn execute_select(
         return execute_select_unnest_source(stmt, storage, txn, conn_txn);
     }
 
+    // Phase 20.10 — GENERATE_SERIES TVF in FROM (full impl in generate_series.rs Step 2).
+    if matches!(stmt.from, Some(FromClause::GenerateSeries(_))) {
+        return Err(DbError::NotImplemented {
+            feature: "GENERATE_SERIES".into(),
+        });
+    }
+
     // Extract the FROM table reference.
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values, Unnest above"),
+        _ => unreachable!(
+            "already handled None, Subquery, JsonTable, JsonbSrf, Values, Unnest, GenerateSeries above"
+        ),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).

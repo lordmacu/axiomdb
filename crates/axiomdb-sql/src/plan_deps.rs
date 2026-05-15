@@ -395,6 +395,15 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            // Phase 20.10 — GENERATE_SERIES TVF.
+            FromClause::GenerateSeries(gs) => {
+                self.visit_expr(&gs.start)?;
+                self.visit_expr(&gs.stop)?;
+                if let Some(step) = &gs.step {
+                    self.visit_expr(step)?;
+                }
+                Ok(())
+            }
         }
     }
 

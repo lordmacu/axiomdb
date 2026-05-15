@@ -307,6 +307,12 @@ fn execute_select_with_joins_first_materialized(
                         correlated_sub.push(None);
                     }
                 }
+                // Phase 20.10 — GENERATE_SERIES JOIN right-side.
+                FromClause::GenerateSeries(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "GENERATE_SERIES JOIN via the ctx executor path".into(),
+                    });
+                }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
                         message: "unlowered PIVOT reached join executor".into(),

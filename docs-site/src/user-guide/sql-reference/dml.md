@@ -2306,3 +2306,85 @@ COPY products TO '/tmp/products.json' WITH (FORMAT JSON);
 same executor as INSERT, so FK constraints, triggers, generated columns,
 and auto-increment all apply without a separate load-then-validate step.
 </div>
+
+---
+
+## GENERATE_SERIES
+
+`GENERATE_SERIES` is a **table-valued function** (TVF) that produces a
+sequence of integer or date values without needing a real table.
+It follows PostgreSQL semantics.
+
+### Syntax
+
+```sql
+FROM GENERATE_SERIES(start, stop [, step]) [AS alias [(col_name)]]
+```
+
+| Argument | Description |
+|---|---|
+| `start` | First value in the series |
+| `stop` | Last value in the series (inclusive) |
+| `step` | Increment per row. Optional for integers (default `1`). Required for dates. |
+
+### Integer series
+
+```sql
+-- 1 to 10 with default step 1
+SELECT * FROM GENERATE_SERIES(1, 10) AS g(n);
+
+-- Odd numbers 1–9
+SELECT * FROM GENERATE_SERIES(1, 9, 2) AS g(n);
+
+-- Countdown 10 to 1
+SELECT * FROM GENERATE_SERIES(10, 1, -1) AS g(n);
+```
+
+**Rules:**
+
+- `step` defaults to `1` when omitted.
+- `step = 0` → error.
+- Ascending (`step > 0`): yields values while `value <= stop`.
+- Descending (`step < 0`): yields values while `value >= stop`.
+- Empty result (no error) when direction and range are inconsistent
+  (e.g., `GENERATE_SERIES(5, 1)` with default step `1`).
+- Maximum 10,000,000 rows per call.
+
+### Date series
+
+```sql
+-- Monthly dates in 2024
+SELECT * FROM GENERATE_SERIES(
+    '2024-01-01'::date, '2024-12-31'::date, '1 month'
+) AS g(d);
+
+-- Weekly dates
+SELECT * FROM GENERATE_SERIES(
+    '2024-01-01'::date, '2024-06-30'::date, '1 week'
+) AS g(d);
+```
+
+The `step` for date series is a string interval literal:
+`'N unit'` where unit is `day`, `days`, `week`, `weeks`,
+`month`, `months`, `year`, or `years`.
+
+### Column naming
+
+| Syntax | Column name |
+|---|---|
+| `AS g(n)` | `n` |
+| `AS g` | `generate_series` |
+| *(no alias)* | `generate_series` |
+
+### In JOIN and CTE
+
+```sql
+-- JOIN with a table
+SELECT t.id, g.n
+FROM t
+JOIN GENERATE_SERIES(1, 5) AS g(n) ON t.id = g.n;
+
+-- In a CTE
+WITH nums AS (SELECT * FROM GENERATE_SERIES(1, 100) AS g(n))
+SELECT SUM(n) FROM nums;
+```

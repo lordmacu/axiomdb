@@ -53,9 +53,16 @@ fn execute_select_ctx(
         return execute_select(stmt, storage, txn, conn_txn);
     }
 
+    // GENERATE_SERIES in FROM (Phase 20.10): delegate to execute_select which handles it.
+    if matches!(stmt.from, Some(FromClause::GenerateSeries(_))) {
+        return execute_select(stmt, storage, txn, conn_txn);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
-        _ => unreachable!("already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte above"),
+        _ => unreachable!(
+            "already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte, GenerateSeries above"
+        ),
     };
 
     // INFORMATION_SCHEMA virtual tables (4.20c).

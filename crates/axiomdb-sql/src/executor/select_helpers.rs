@@ -100,6 +100,12 @@ fn execute_select_with_joins(
                         feature: "UNNEST JOIN via the non-ctx executor path".into(),
                     });
                 }
+                // Phase 20.10 — GENERATE_SERIES via the non-ctx executor path.
+                FromClause::GenerateSeries(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "GENERATE_SERIES JOIN via the non-ctx executor path".into(),
+                    });
+                }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
                         message: "unlowered PIVOT reached non-ctx join executor".into(),

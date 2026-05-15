@@ -345,6 +345,12 @@ fn explain_select(
                 "EXPLAIN for UNNEST FROM not yet supported".into(),
             ))
         }
+        // Phase 20.10 — GENERATE_SERIES as FROM source.
+        crate::ast::FromClause::GenerateSeries(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for GENERATE_SERIES FROM not yet supported".into(),
+            ))
+        }
         crate::ast::FromClause::RecursiveCte(_) => {
             return Err(DbError::Other(
                 "EXPLAIN for recursive CTE FROM not yet supported".into(),
