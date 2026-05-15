@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 155/442 subphases (35.1%) — Phase 11, 13 complete; Phase 20 in progress; Phase 22b complete**
+> **MySQL+PG parity path: 156/442 subphases (35.3%) — Phase 11, 13 complete; Phase 20 in progress; Phase 22b complete**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
@@ -217,7 +217,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [ ] 20.7 ⏳ Incremental backup — diff from last backup + full restore
 - [ ] 20.8 ⏳ COPY streaming — import CSV/JSON line-by-line without loading into memory; support files >RAM
 - [ ] 20.9 ⏳ Parquet write — export query result to Parquet with Snappy/Zstd compression; useful for data pipelines
-- [ ] 20.10 ⏳ GENERATE_SERIES — `SELECT * FROM GENERATE_SERIES(1, 100)` and `GENERATE_SERIES('2024-01-01'::date, '2024-12-31', '1 month')`; fill calendar gaps, generate synthetic data, pivot by time period; used in reporting, IoT dashboards, financial calendars; no app-side loop needed
+- [x] 20.10 ✅ GENERATE_SERIES — closed 2026-05-15: `FROM GENERATE_SERIES(start, stop [, step])` table-valued function following PostgreSQL semantics; integer series (Int/BigInt, default step 1, ascending/descending, empty-range safe, 10M-row limit); date series with string step `'N unit'` (day/week/month/year) using chrono calendar arithmetic; column naming: explicit `AS g(n)`, alias-only `AS g`, or default `generate_series`; wired through all 14 match sites (analyzer, executor, planner, DDL); CTE and JOIN support; srf_wildcard_columns expansion fixes `SELECT *` column naming in CTEs for GENERATE_SERIES and UNNEST. Coverage: 8 parser tests, 15 executor integration tests, 12 unit tests, wire smoke 4 assertions (542/542), 3927/3927 workspace tests. Deferred: timestamp/interval step, negative date step, GENERATE_SUBSCRIPTS.
 - [ ] 20.11 ⏳ TABLESAMPLE — `SELECT * FROM users TABLESAMPLE SYSTEM(1)` returns ~1% of rows with minimal I/O (page-level sampling); `TABLESAMPLE BERNOULLI(0.1)` for row-level random sampling; A/B testing, statistical analysis, ML train/test splits, approximate analytics on large tables without full scan
 - [ ] 20.12 ⏳ ORDER BY RANDOM() — `SELECT * FROM items WHERE rarity='epic' ORDER BY RANDOM() LIMIT 5`; random ordering using Fisher-Yates shuffle on result set; gaming loot drops, quiz randomization, A/B test group assignment, recommendation diversity; simple but missing from current plan
 - [ ] 20.13 ⏳ Range types — `int4range`, `int8range`, `numrange`, `daterange`, `tsrange`; operators: `@>` (contains), `&&` (overlaps), `+` (union), `*` (intersection), `-` (difference); hotel booking systems (no overlapping reservations), salary bands, price ranges, event scheduling; stored compactly as two values + bounds

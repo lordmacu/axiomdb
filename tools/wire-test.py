@@ -5050,6 +5050,39 @@ for p in (csv_path, out_path, jsonl_path):
     except: pass
 
 
+# ── Phase 20.10: GENERATE_SERIES ─────────────────────────────────────────────
+
+# Integer series: basic 1..5 → 5 rows, values 1 to 5
+cur.execute("SELECT * FROM GENERATE_SERIES(1, 5) AS g(n)")
+gs_rows = cur.fetchall()
+ok("[20.10 gs_int_basic] GENERATE_SERIES(1,5) produces 5 rows",
+   len(gs_rows) == 5 and int(gs_rows[0][0]) == 1 and int(gs_rows[4][0]) == 5,
+   gs_rows)
+
+# Integer series with step 2: odd numbers 1,3,5,7,9
+cur.execute("SELECT * FROM GENERATE_SERIES(1, 9, 2) AS g(n)")
+gs_odd = cur.fetchall()
+ok("[20.10 gs_int_step2] GENERATE_SERIES(1,9,2) produces odd numbers 1..9",
+   len(gs_odd) == 5 and int(gs_odd[2][0]) == 5,
+   gs_odd)
+
+# Descending series: 5 down to 1
+cur.execute("SELECT * FROM GENERATE_SERIES(5, 1, -1) AS g(n)")
+gs_desc = cur.fetchall()
+ok("[20.10 gs_int_desc] GENERATE_SERIES(5,1,-1) produces 5,4,3,2,1",
+   len(gs_desc) == 5 and int(gs_desc[0][0]) == 5 and int(gs_desc[4][0]) == 1,
+   gs_desc)
+
+# Date series: monthly 2024-01-01 to 2024-03-01 → 3 rows
+cur.execute("SELECT COUNT(*) FROM GENERATE_SERIES(CAST('2024-01-01' AS DATE), CAST('2024-03-01' AS DATE), '1 month') AS g(d)")
+gs_date_cnt = cur.fetchone()[0]
+ok("[20.10 gs_date_monthly] GENERATE_SERIES date monthly produces 3 rows",
+   int(gs_date_cnt) == 3,
+   gs_date_cnt)
+
+conn.commit()
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
