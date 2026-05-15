@@ -275,16 +275,16 @@ fn parse_into_outfile(p: &mut Parser) -> Result<Option<IntoOutfile>, DbError> {
         if p.eat_ident_ci("FIELDS") || p.eat_ident_ci("COLUMNS") {
             // TERMINATED BY
             if p.eat_ident_ci("TERMINATED") {
-                expect_ident_ci(p, "BY")?;
+                p.expect(&Token::By)?;
                 field_sep = parse_single_char_lit(p, "FIELDS TERMINATED BY")?;
             }
             // OPTIONALLY ENCLOSED BY or ENCLOSED BY
             if p.eat_ident_ci("OPTIONALLY") {
                 p.eat_ident_ci("ENCLOSED");
-                expect_ident_ci(p, "BY")?;
+                p.expect(&Token::By)?;
                 enclosure = Some(parse_single_char_lit(p, "ENCLOSED BY")?);
             } else if p.eat_ident_ci("ENCLOSED") {
-                expect_ident_ci(p, "BY")?;
+                p.expect(&Token::By)?;
                 enclosure = Some(parse_single_char_lit(p, "ENCLOSED BY")?);
             }
             // ESCAPED BY — consume and ignore (not implemented)
@@ -303,7 +303,7 @@ fn parse_into_outfile(p: &mut Parser) -> Result<Option<IntoOutfile>, DbError> {
                 }
             }
             if p.eat_ident_ci("TERMINATED") {
-                expect_ident_ci(p, "BY")?;
+                p.expect(&Token::By)?;
                 line_term = match p.peek().clone() {
                     Token::StringLit(s) => {
                         p.advance();
