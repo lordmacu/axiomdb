@@ -99,15 +99,24 @@ fn try_eq_push(
     }
 }
 
-/// Entry point called from `select_joins_ctx.rs` when `table_id >= FOREIGN_TABLE_ID_BASE`.
+/// Entry point called from `select_ctx.rs` / `select_joins_ctx.rs` when
+/// `table_id >= FOREIGN_TABLE_ID_BASE`.
 ///
-/// Looks up the ForeignTableDef and ForeignServerDef from the catalog, then
-/// issues an HTTP GET and maps the JSON-array response to rows.
+/// Looks up the ForeignTableDef and ForeignServerDef from the catalog, applies
+/// predicate and LIMIT pushdown via `render_fdw_url`, issues an HTTP GET, and
+/// maps the JSON-array response to rows.
+///
+/// `pushed_predicates` — equality predicates already extracted from the WHERE
+///   clause by `extract_fdw_pushable`; forwarded to the remote via URL.
+/// `limit` — the LIMIT value if it was a plain integer literal; forwarded via
+///   `limit_param` option if configured.
 fn fdw_scan_table(
     storage: &dyn StorageEngine,
     snap: axiomdb_core::TransactionSnapshot,
     table_id: u32,
     columns: &[CatalogColumnDef],
+    pushed_predicates: &HashMap<String, Value>,
+    limit: Option<u64>,
 ) -> Result<Vec<(RecordId, crate::result::Row)>, DbError> {
     let mut reader = CatalogReader::new(storage, snap)?;
 
@@ -142,7 +151,24 @@ fn fdw_scan_table(
         .unwrap_or(10_000);
 
     let endpoint = table_opts.get("endpoint").map(|s| s.as_str()).unwrap_or("/");
-    let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
+
+    // Phase 22b.6: parse pushdown options.
+    let pushdown_raw = table_opts.get("pushdown_cols").cloned().unwrap_or_default();
+    let pushdown_cols: Vec<&str> = if pushdown_raw.is_empty() {
+        vec![]
+    } else {
+        pushdown_raw.split(',').map(str::trim).collect()
+    };
+    let limit_param = table_opts.get("limit_param").map(|s| s.as_str());
+
+    let url = render_fdw_url(
+        &base_url,
+        endpoint,
+        pushed_predicates,
+        &pushdown_cols,
+        limit_param,
+        limit,
+    );
 
     let body = http_get(&url, timeout_ms)?;
     json_to_rows(&body, columns)

@@ -102,7 +102,7 @@ fn execute_select_ctx(
         // plan (WHERE, ORDER BY, LIMIT, etc.) is applied after materialisation by
         // the joins executor which handles already-materialised first sources.
         if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
-            let fdw_rows = fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns)?;
+            let fdw_rows = fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns, &HashMap::new(), None)?;
             let first_source = join_source_schema_from_resolved(&from_table_ref, &resolved);
             let first_rows: Vec<Row> = fdw_rows.into_iter().map(|(_, r)| r).collect();
             return execute_select_with_joins_first_materialized(
