@@ -131,6 +131,8 @@ include!("ddl_drop_index.rs");
 include!("ddl_analyze.rs");
 include!("ddl_fdw.rs");
 include!("fdw_http.rs");
+include!("copy_from.rs");
+include!("copy_to.rs");
 include!("ddl_show.rs");
 include!("ddl_alter_column.rs");
 include!("ddl_alter_constraint.rs");

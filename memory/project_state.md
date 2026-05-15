@@ -1,26 +1,21 @@
 # Project State
 
-## Current (2026-05-14)
+## Current (2026-05-15)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.4 — Arrays COMPLETE.
-Phase 20.4 added PostgreSQL-compatible SQL arrays with DDL (`INT[]`, `TEXT[]`, etc.),
-ARRAY constructor (`ARRAY[1,2,3]`), subscript access (`arr[1]`), `@>` containment,
-`&&` overlap, `||` concatenation, `=`/`<>` equality, GIN indexes, 17 array functions,
-ANY/ALL quantifiers, and FROM UNNEST() set-returning function.
+**Active subphase:** Phase 20.5 — COPY FROM/TO COMPLETE.
+Phase 20.5 added `COPY table FROM 'path' [WITH (FORMAT CSV|JSON|JSONL, HEADER, DELIMITER, NULL)]`
+and `COPY table TO 'path' [WITH (...)]`. Server-side bulk import/export using the `csv` crate
+(CSV), `serde_json` (JSON array + JSONL). COPY FROM routes through `execute_insert_ctx` for
+full INSERT semantics (FK, triggers, coercion). 10 parser tests, 14 executor tests, 4 wire
+assertions (538/538).
 
-**Last verified gates:** Phase 20.4 closeout passed 7 integration test files
-(139 tests: arrays, array_operators, array_functions, array_gin, array_agg,
-array_any_all, array_unnest), wire smoke, `cargo test --workspace`,
-`cargo clippy --workspace -- -D warnings`, and `cargo fmt --check`.
+**Last verified gates:** Phase 20.5 closeout passed 3892/3892 tests, clippy clean,
+fmt clean, wire test 538/538.
 
-**Recently completed:** 22b.6 — FDW predicate pushdown (2026-05-14).
-`extract_fdw_pushable` extracts `col = literal` predicates from WHERE, `render_fdw_url`
-substitutes `{col}` path placeholders and appends `pushdown_cols` as `?k=v` plus
-`limit_param`. Full WHERE always applied locally for correctness. 3837/3837 tests pass.
-Phase 22b fully closed.
+**Recently completed:** 20.4 — Arrays (2026-05-14). 20.5 — COPY FROM/TO (2026-05-15).
 
-**Next:** Start Phase 20.5 COPY FROM/TO or Phase 21 Advanced SQL (CTE, MERGE, etc.)
+**Next:** Phase 20.5b (SELECT … INTO OUTFILE) or Phase 20.6 (Parquet) or Phase 21 Advanced SQL.
 
 ### Phase 21 subphase status
 
@@ -55,7 +50,7 @@ Phase 22b fully closed.
 | 11.9 + 11.10 Prefetch + Write Combining | ✅ closed |
 | 11.16 Binary JSONB + JSONPath | ✅ closed |
 | 11.17 GIN index for JSONB | ✅ closed |
-| 11.18a / 11.18b / 11.18c JSONB operators | ✅ closed — path/delete parity uses documented JSONB-array RHS divergence |
+| 11.18a / 11.18b / 11.18c JSONB operators | ✅ closed |
 | 11.19a / 11.19b / 11.19c SQL/JSON query functions | ✅ closed |
 | 11.20a `JSON_TABLE` flat | ✅ closed |
 | 11.20b `JSON_TABLE` single-level NESTED | ✅ closed |
@@ -64,20 +59,11 @@ Phase 22b fully closed.
 | 11.20d2 `JSON_TABLE` first FROM + CROSS/OUTER APPLY | ✅ closed |
 | 11.20d3 `JSON_TABLE` LATERAL-correlated doc + PASSING | ✅ closed |
 | **11.20d4** `JSON_TABLE` as UPDATE/DELETE source | ✅ closed — **Phase 11.20 COMPLETE** |
-| 11.21a–h JSONPath parity + planner pushdown | ✅ closed — simple `@?` / `@@` key probes now use GIN with executor recheck |
+| 11.21a–h JSONPath parity + planner pushdown | ✅ closed |
 | 11.22a / 11.22b JSONB mutations | ✅ closed |
-| 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed — 11.23c moved to `features-roadmap.md` (Oracle-only DDL) |
-| 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed — 11.24c moved to `features-roadmap.md` (Oracle-only dot notation) |
-| **11.25** JSON SRF + aggregates + construction helpers (PG streaming parity) | ✅ complete — 11.25a ✅ 11.25b ✅ 11.25c ✅ 11.25d ✅ |
-
-### 11.20 follow-ups
-
-- **11.20b** — Single-level `NESTED PATH` with LEFT-OUTER NULL padding + per-level ordinality.
-- **11.20c** — Multi-sibling (`UNION` semantics) and multi-level NESTED PATH.
-- **11.20d1** — WRAPPER/QUOTES, `PASSING` on the row path. ✅ closed.
-- **11.20d2** — JSON_TABLE as first FROM + JOINs; CROSS/OUTER APPLY parser sugar. ✅ closed.
-- **11.20d3** — LATERAL-correlated `doc` / PASSING referencing outer columns + `LATERAL` keyword. ✅ closed.
-- **11.20d4** — JSON_TABLE as UPDATE/DELETE source (MERGE deferred until MERGE lands).
+| 11.23a / 11.23b / 11.23d / 11.23e / 11.23f JSON Schema | ✅ closed |
+| 11.24a / 11.24b / 11.24d (partial) Oracle JSON | ✅ closed |
+| **11.25** JSON SRF + aggregates + construction helpers | ✅ complete |
 
 ### Phase 20 subphase status
 
@@ -86,8 +72,9 @@ Phase 22b fully closed.
 | 20.1 Regular views | ✅ closed |
 | 20.2 Sequences | ✅ closed |
 | 20.3 ENUMs | ✅ closed |
-| **20.4 Arrays** | ✅ closed |
-| 20.5 COPY FROM/TO | ⏳ pending |
+| 20.4 Arrays | ✅ closed |
+| **20.5 COPY FROM/TO** | ✅ closed |
+| 20.5b SELECT INTO OUTFILE | ⏳ pending |
 | 20.14 UNNEST | ⏳ pending |
 
 ### Completed phases

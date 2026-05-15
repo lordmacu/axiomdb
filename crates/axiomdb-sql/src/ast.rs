@@ -739,6 +739,45 @@ pub struct SelectStmt {
     pub set_op_rest: Vec<SetOpTail>,
 }
 
+// ── COPY statements ───────────────────────────────────────────────────────────
+
+/// File format for `COPY FROM` / `COPY TO`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyFormat {
+    Csv,
+    Json,
+    Jsonl,
+}
+
+/// Options for `COPY FROM` / `COPY TO`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CopyOptions {
+    /// `FORMAT CSV|JSON|JSONL`. `None` = auto-detect from file extension.
+    pub format: Option<CopyFormat>,
+    /// `HEADER TRUE|FALSE`. `None` = default (true for CSV, ignored for JSON/JSONL).
+    pub header: Option<bool>,
+    /// `DELIMITER 'c'`. `None` = `,` (CSV only).
+    pub delimiter: Option<char>,
+    /// `NULL 'str'`. `None` = `\N` (CSV only).
+    pub null_str: Option<String>,
+}
+
+/// `COPY table FROM 'path' [WITH (...)]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyFromStmt {
+    pub table: String,
+    pub path: String,
+    pub options: CopyOptions,
+}
+
+/// `COPY table TO 'path' [WITH (...)]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyToStmt {
+    pub table: String,
+    pub path: String,
+    pub options: CopyOptions,
+}
+
 // ── DML statements ────────────────────────────────────────────────────────────
 
 /// Source of rows for an `INSERT` statement.
@@ -1447,6 +1486,10 @@ pub enum Stmt {
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Merge(MergeStmt),
+    /// `COPY table FROM 'path' [WITH (...)]` — bulk import (Phase 20.5).
+    CopyFrom(CopyFromStmt),
+    /// `COPY table TO 'path' [WITH (...)]` — bulk export (Phase 20.5).
+    CopyTo(CopyToStmt),
     /// `CALL proc(args)` — MySQL stored procedure call; executes as Noop (Phase 17+).
     Call {
         name: String,

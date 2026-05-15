@@ -4998,6 +4998,58 @@ cur.execute("DROP TABLE wire_skip")
 conn.commit()
 
 
+# ── Phase 20.5: COPY FROM / COPY TO ──────────────────────────────────────────
+
+import tempfile, os
+
+cur.execute("CREATE TABLE wire_copy (id INT, label TEXT)")
+conn.commit()
+
+# COPY FROM CSV with header
+csv_path = tempfile.mktemp(suffix=".csv")
+with open(csv_path, "w") as fh:
+    fh.write("id,label\n1,alpha\n2,beta\n3,gamma\n")
+
+cur.execute(f"COPY wire_copy FROM '{csv_path}' WITH (FORMAT CSV, HEADER TRUE)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM wire_copy")
+cnt = cur.fetchone()[0]
+ok("[20.5 copy_from_csv] COPY FROM CSV loads correct row count", int(cnt) == 3, cnt)
+
+# COPY TO CSV with header
+out_path = tempfile.mktemp(suffix=".csv")
+cur.execute(f"COPY wire_copy TO '{out_path}' WITH (FORMAT CSV, HEADER TRUE)")
+conn.commit()
+with open(out_path) as fh:
+    lines = [l.strip() for l in fh if l.strip()]
+ok("[20.5 copy_to_csv] COPY TO CSV produces header + 3 data rows",
+   len(lines) == 4 and lines[0] == "id,label", lines)
+
+# COPY TO JSONL
+jsonl_path = tempfile.mktemp(suffix=".jsonl")
+cur.execute(f"COPY wire_copy TO '{jsonl_path}' WITH (FORMAT JSONL)")
+conn.commit()
+import json
+with open(jsonl_path) as fh:
+    objs = [json.loads(l) for l in fh if l.strip()]
+ok("[20.5 copy_to_jsonl] COPY TO JSONL produces one object per row", len(objs) == 3, objs)
+
+# Round-trip: COPY TO then COPY FROM into a new table
+cur.execute("CREATE TABLE wire_copy2 (id INT, label TEXT)")
+cur.execute(f"COPY wire_copy2 FROM '{out_path}' WITH (FORMAT CSV, HEADER TRUE)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM wire_copy2")
+cnt2 = cur.fetchone()[0]
+ok("[20.5 roundtrip] CSV round-trip produces identical row count", int(cnt2) == 3, cnt2)
+
+cur.execute("DROP TABLE wire_copy")
+cur.execute("DROP TABLE wire_copy2")
+conn.commit()
+for p in (csv_path, out_path, jsonl_path):
+    try: os.unlink(p)
+    except: pass
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

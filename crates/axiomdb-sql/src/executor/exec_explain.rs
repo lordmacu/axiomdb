@@ -200,6 +200,10 @@ fn dispatch(
         Stmt::Noop => Ok(QueryResult::Empty),
         // G5.1: CALL / DO — execute as Noop (no session context needed)
         Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
+        // Phase 20.5: COPY FROM/TO requires session context
+        Stmt::CopyFrom(_) | Stmt::CopyTo(_) => Err(DbError::NotImplemented {
+            feature: "COPY requires session context — use execute_with_ctx".into(),
+        }),
         // G5.5: CREATE TABLE LIKE
         Stmt::CreateTableLike(s) => {
             execute_create_table_like(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)

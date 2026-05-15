@@ -2208,3 +2208,101 @@ Remaining pieces of 11.20d:
   reference outer columns (env rebuilt per outer row).
 - `11.20d4` — JSON_TABLE as source for UPDATE / DELETE (`MERGE`
   deferred until `MERGE` itself lands).
+
+---
+
+## COPY FROM / COPY TO
+
+Bulk import and export between a table and a server-side file.
+
+### COPY FROM
+
+```sql
+COPY table_name FROM 'path' [WITH ( option [, ...] )]
+```
+
+Reads the file at `path`, parses it, and inserts all rows into
+`table_name` using the same code path as INSERT (auto-increment,
+FK enforcement, triggers all apply).
+
+#### Options
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `FORMAT` | `CSV` \| `JSON` \| `JSONL` | auto-detected from extension |
+| `HEADER` | `TRUE` \| `FALSE` | `TRUE` for CSV, `FALSE` otherwise |
+| `DELIMITER` | single-character string | `','` |
+| `NULL` | string | `'\N'` |
+
+**Format auto-detection**: `.csv` → CSV; `.json` → JSON (array of
+objects); `.jsonl` or `.ndjson` → JSONL (one JSON object per line).
+Unknown extensions default to CSV.
+
+#### Examples
+
+```sql
+-- Import a CSV file with a header row
+COPY orders FROM '/tmp/orders.csv' WITH (FORMAT CSV, HEADER TRUE);
+
+-- Import without header — columns mapped positionally to the table schema
+COPY orders FROM '/tmp/raw.csv' WITH (FORMAT CSV, HEADER FALSE);
+
+-- Pipe-delimited file
+COPY logs FROM '/data/logs.csv' WITH (FORMAT CSV, DELIMITER '|');
+
+-- JSON array of objects
+COPY products FROM '/tmp/products.json' WITH (FORMAT JSON);
+
+-- JSONL (one object per line) — auto-detected from extension
+COPY products FROM '/tmp/products.jsonl';
+
+-- Treat empty string as NULL
+COPY t FROM '/data/t.csv' WITH (FORMAT CSV, NULL '');
+```
+
+#### Return value
+
+`Affected { count }` — number of rows inserted.
+
+### COPY TO
+
+```sql
+COPY table_name TO 'path' [WITH ( option [, ...] )]
+```
+
+Scans all rows from `table_name` and writes them to `path`. The file
+is created (or overwritten). The same options as COPY FROM apply.
+
+#### Examples
+
+```sql
+-- Export to CSV with header
+COPY orders TO '/tmp/orders_backup.csv' WITH (FORMAT CSV, HEADER TRUE);
+
+-- Export to JSONL
+COPY products TO '/tmp/products.jsonl' WITH (FORMAT JSONL);
+
+-- Export to a JSON array
+COPY products TO '/tmp/products.json' WITH (FORMAT JSON);
+```
+
+#### Return value
+
+`Affected { count }` — number of rows exported.
+
+### Notes
+
+- Paths are **server-side**: the path is on the filesystem of the
+  AxiomDB server process, not the client.
+- JSON format writes a pretty-printed array of objects. JSONL writes
+  one compact JSON object per line (newline-delimited JSON).
+- CSV NULL values are written as `\N` (PostgreSQL convention) and read
+  back as SQL NULL.
+- Type coercion follows the same rules as INSERT: `"42"` in a CSV file
+  targeting an INT column is coerced to `42`.
+
+<div class="callout-advantage">
+<strong>No staging table required.</strong> COPY FROM routes through the
+same executor as INSERT, so FK constraints, triggers, generated columns,
+and auto-increment all apply without a separate load-then-validate step.
+</div>

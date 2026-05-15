@@ -275,6 +275,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::DropServer(_)
             | Stmt::CreateForeignTable(_)
             | Stmt::DropForeignTable(_) => Ok(()),
+            // Phase 20.5: COPY — deps are the target table (no inline queries).
+            Stmt::CopyFrom(_) | Stmt::CopyTo(_) => Ok(()),
         }
     }
 

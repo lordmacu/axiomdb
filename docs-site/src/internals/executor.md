@@ -2098,3 +2098,50 @@ This means values that coerce cleanly in strict mode (e.g. <code>'42'</code> →
 behavior where warning 1265 is reserved for actual data loss, not clean widening.
 </div>
 </div>
+
+---
+
+## COPY FROM / COPY TO
+
+`execute_copy_from` and `execute_copy_to` are implemented in
+`executor/copy_from.rs` and `executor/copy_to.rs` (both `include!`d into
+`executor/mod.rs`).
+
+### COPY FROM
+
+1. The file is opened with `std::fs::File::open`.
+2. Format is resolved: explicit `WITH (FORMAT ...)` wins; otherwise inferred
+   from the file extension.
+3. Parsing dispatches to one of three parsers:
+   - **CSV** (`csv` crate) — respects `DELIMITER`, `HEADER`, and `NULL`.
+     With `HEADER TRUE` the first row becomes column names; with `HEADER FALSE`
+     column names are omitted and INSERT uses positional (schema-order) mapping.
+   - **JSON** (`serde_json`) — the file must be a JSON array of objects.
+     Column names are collected from all objects (first-appearance order).
+   - **JSONL** (`serde_json`) — one JSON object per line; blank lines are
+     skipped. Column names accumulated incrementally.
+4. The parsed `Vec<Vec<Value>>` is converted to `Vec<Vec<Expr::Literal>>` and
+   wrapped in an `InsertStmt` with `InsertSource::Values`.
+5. `execute_insert_ctx` is called — this reuses the full INSERT path including
+   auto-increment, FK enforcement, coercion, and triggers.
+
+### COPY TO
+
+1. `resolve_table_cached` looks up the table definition and column list.
+2. `TableEngine::scan_table` performs a full heap scan within the caller's
+   transaction snapshot.
+3. The result rows are written using the appropriate serializer:
+   - **CSV** — `csv::WriterBuilder` with optional header row.
+   - **JSON** — `serde_json::to_string_pretty` over a `Vec<Object>`.
+   - **JSONL** — one `serde_json::to_string` object per line.
+4. Returns `QueryResult::Affected { count }` with the number of rows written.
+
+### Value serialization
+
+`value_to_csv_field` converts all `Value` variants to strings (NULL → `\N`,
+Decimal → decimal string, Timestamp → `{secs}.{microsecs}`, Date → YYYY-MM-DD,
+UUID → hex with dashes, Bytes → hex, Array → JSON array string).
+
+`value_to_json_val` converts `Value` variants to `serde_json::Value` (Decimal
+rendered as JSON string to preserve precision; JSON/JSONB are parsed back to
+their native `serde_json::Value`).

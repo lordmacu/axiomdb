@@ -86,6 +86,19 @@ fn dispatch_ctx(
                 ctx,
             )
         }
+        // Phase 20.5: COPY FROM / TO
+        Stmt::CopyFrom(s) => {
+            let mut conn = ctx.conn_txn.take().expect("conn_txn set");
+            let r = execute_copy_from(s, exec_ctx, &mut conn, ctx);
+            ctx.conn_txn = Some(conn);
+            r
+        }
+        Stmt::CopyTo(s) => {
+            let conn_opt = ctx.conn_txn.take();
+            let r = execute_copy_to(s, exec_ctx, conn_opt.as_ref(), ctx);
+            ctx.conn_txn = conn_opt;
+            r
+        }
         Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();
             if s.persistence == axiomdb_catalog::TablePersistence::Temporary {

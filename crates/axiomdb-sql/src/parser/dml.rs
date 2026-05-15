@@ -6,11 +6,11 @@ use axiomdb_types::Value;
 
 use crate::{
     ast::{
-        Assignment, DeleteStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition,
-        MergeActionKind, MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem,
-        SelectHint, SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder,
-        Stmt, UpdateStmt,
+        Assignment, CopyFormat, CopyFromStmt, CopyOptions, CopyToStmt, DeleteStmt, FromClause,
+        GroupByClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, LockStrength,
+        LockWaitPolicy, MergeAction, MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder,
+        OnConflictAction, OnConflictClause, OrderByItem, SelectHint, SelectItem, SelectLockClause,
+        SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -2058,4 +2058,189 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
         limit,
         returning,
     }))
+}
+
+// ── COPY FROM / TO ────────────────────────────────────────────────────────────
+
+/// Parse `COPY table FROM|TO 'path' [WITH ( options )]`.
+///
+/// Called after `COPY` has been consumed by the top-level dispatcher.
+pub(crate) fn parse_copy(p: &mut Parser) -> Result<Stmt, DbError> {
+    let table = p.parse_identifier()?;
+
+    let is_from = if p.eat(&Token::From) {
+        true
+    } else if p.eat(&Token::To) {
+        false
+    } else {
+        return Err(DbError::ParseError {
+            message: format!("expected FROM or TO after COPY table, found {:?}", p.peek()),
+            position: Some(p.current_pos()),
+        });
+    };
+
+    // path — single-quoted string literal
+    let path = match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "expected file path string after COPY … FROM/TO, found {:?}",
+                    other
+                ),
+                position: Some(p.current_pos()),
+            });
+        }
+    };
+
+    // Optional WITH ( options )
+    let options = if p.eat(&Token::With) {
+        p.expect(&Token::LParen)?;
+        let opts = parse_copy_options(p)?;
+        p.expect(&Token::RParen)?;
+        opts
+    } else {
+        CopyOptions::default()
+    };
+
+    if is_from {
+        Ok(Stmt::CopyFrom(CopyFromStmt {
+            table,
+            path,
+            options,
+        }))
+    } else {
+        Ok(Stmt::CopyTo(CopyToStmt {
+            table,
+            path,
+            options,
+        }))
+    }
+}
+
+fn parse_copy_options(p: &mut Parser) -> Result<CopyOptions, DbError> {
+    let mut opts = CopyOptions::default();
+    loop {
+        if p.peek() == &Token::RParen {
+            break;
+        }
+        // Consume option key — handle both identifier tokens and reserved keywords
+        // that happen to be valid COPY option names (e.g. Token::Null).
+        let key = match p.peek().clone() {
+            Token::Null => {
+                p.advance();
+                "NULL".to_string()
+            }
+            _ => p.parse_identifier()?,
+        };
+        match key.to_ascii_uppercase().as_str() {
+            "FORMAT" => {
+                // FORMAT value: JSON lexes as Token::TyJson, not Token::Ident.
+                let fmt_str = match p.peek().clone() {
+                    Token::TyJson => {
+                        p.advance();
+                        "JSON".to_string()
+                    }
+                    _ => p.parse_identifier()?,
+                };
+                opts.format = Some(match fmt_str.to_ascii_uppercase().as_str() {
+                    "CSV" => CopyFormat::Csv,
+                    "JSON" => CopyFormat::Json,
+                    "JSONL" | "NDJSON" => CopyFormat::Jsonl,
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "unknown COPY FORMAT '{}'; expected CSV, JSON, or JSONL",
+                                other
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                });
+            }
+            "HEADER" => {
+                opts.header = Some(match p.peek().clone() {
+                    Token::True => {
+                        p.advance();
+                        true
+                    }
+                    Token::False => {
+                        p.advance();
+                        false
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("true") => {
+                        p.advance();
+                        true
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("false") => {
+                        p.advance();
+                        false
+                    }
+                    // bare HEADER without value = TRUE (PostgreSQL compat)
+                    _ => true,
+                });
+            }
+            "DELIMITER" => {
+                let delim_str = match p.peek().clone() {
+                    Token::StringLit(s) => {
+                        p.advance();
+                        s
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "COPY DELIMITER must be a single-character string, found {:?}",
+                                other
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                };
+                let mut chars = delim_str.chars();
+                let ch = chars.next().ok_or_else(|| DbError::ParseError {
+                    message: "COPY DELIMITER must be a single character".into(),
+                    position: Some(p.current_pos()),
+                })?;
+                if chars.next().is_some() {
+                    return Err(DbError::ParseError {
+                        message: "COPY DELIMITER must be a single character".into(),
+                        position: Some(p.current_pos()),
+                    });
+                }
+                opts.delimiter = Some(ch);
+            }
+            "NULL" => {
+                opts.null_str = Some(match p.peek().clone() {
+                    Token::StringLit(s) => {
+                        p.advance();
+                        s
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "COPY NULL must be a string literal, found {:?}",
+                                other
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                });
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "unknown COPY option '{}'; expected FORMAT, HEADER, DELIMITER, or NULL",
+                        other
+                    ),
+                    position: Some(p.current_pos()),
+                });
+            }
+        }
+        // Optional comma between options
+        p.eat(&Token::Comma);
+    }
+    Ok(opts)
 }

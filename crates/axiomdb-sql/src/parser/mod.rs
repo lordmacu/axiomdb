@@ -372,6 +372,10 @@ impl<'src> Parser<'src> {
                 self.advance();
                 dml::parse_replace(self)
             }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("copy") => {
+                self.advance();
+                dml::parse_copy(self)
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("declare") => {
                 self.advance();
                 self.parse_declare_cursor()
