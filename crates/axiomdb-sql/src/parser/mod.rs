@@ -428,6 +428,14 @@ impl<'src> Parser<'src> {
                 self.advance();
                 Ok(Stmt::Checkpoint)
             }
+            Token::Backup => {
+                self.advance();
+                dml::parse_backup(self)
+            }
+            Token::Restore => {
+                self.advance();
+                dml::parse_restore(self)
+            }
             Token::Refresh => {
                 self.advance();
                 ddl::parse_refresh_materialized_view(self)

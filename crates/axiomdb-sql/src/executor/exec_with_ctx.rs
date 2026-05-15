@@ -18,6 +18,14 @@ pub fn execute_with_ctx_locked(
     lock_mgr: Option<&axiomdb_lock::LockManager>,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
+    // BACKUP/RESTORE run their own checkpoint — bypass all transaction wrappers.
+    if matches!(&stmt, Stmt::Backup(_) | Stmt::Restore(_)) {
+        return match stmt {
+            Stmt::Backup(b) => execute_backup(b, storage, txn),
+            Stmt::Restore(r) => execute_restore(r),
+            _ => unreachable!(),
+        };
+    }
     let exec_ctx = ExecutionContext::new(storage, txn, bloom, lock_mgr);
     if ctx.conn_txn.is_some() {
         match &stmt {

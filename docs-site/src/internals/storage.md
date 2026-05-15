@@ -1603,3 +1603,62 @@ update_row_header_in_place(&mut page, idx, &new_header)?;
 Rust's ownership model requires releasing the immutable borrow before taking a mutable one. The split-phase pattern avoids <code>row_data.to_vec()</code> (heap allocation) by keeping field locations in a stack-allocated <code>Vec&lt;(usize, usize, [u8;8], [u8;8])&gt;</code> computed during the immutable phase and consumed during the mutable phase. This is the same invariant InnoDB enforces manually with pointer arithmetic.
 </div>
 </div>
+
+---
+
+## Backup and restore (Phase 20.7)
+
+### `read_page_raw` — checksum-bypass reads
+
+```rust
+fn read_page_raw(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError>;
+```
+
+Added to the `StorageEngine` trait for backup and export paths. Unlike `read_page`, this method does **not** validate the page checksum before returning the raw bytes. This is semantically correct for backup: the goal is to capture every page as-is, including pages whose in-memory state may temporarily differ from their on-disk checksum during a write epoch.
+
+`MmapStorage` delegates to `copy_raw_page_from_mmap`; `MemoryStorage` copies directly from the flat page array.
+
+### `.axbk` binary format
+
+```
+Offset  Size  Field
+0       8     magic 0x4158494F4D424B01 ("AXIOMBK\x01")
+8       1     kind  0 = Full | 1 = Incremental
+9       7     _pad
+16      8     backup_lsn   (checkpoint LSN at backup time)
+24      8     page_count   (total pages in storage at backup time)
+32      4     page_size    (always 16384)
+36      4     _pad2
+40      8     base_lsn     (Full → 0; Incremental → base file's backup_lsn)
+48      8     delta_count  (Full → page_count; Incremental → changed pages)
+56      72    base_path    (NUL-terminated UTF-8; 71 chars max + NUL)
+128+    ...   page entries: { page_id: u64le, page_bytes: [u8; 16384] }
+```
+
+### Full backup
+
+1. `txn.checkpoint(storage)` — flushes WAL + storage to durable state, returns the checkpoint LSN.
+2. Writes header with `kind = 0`, `base_lsn = 0`, `delta_count = page_count`.
+3. Streams all pages via `read_page_raw` with 64-page prefetch hints.
+
+### Incremental backup
+
+1. Opens and validates the base `.axbk` (must be Full kind).
+2. Builds a `HashMap<page_id → CRC32c>` by scanning all page entries in the base file (checksum at byte offset 12 within each page).
+3. Checkpoints the current DB.
+4. For each current page, reads raw bytes and compares the stored CRC32c against the base map. Changed pages (or pages not present in the base) are written to the output.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">⚡</span>
+<div class="callout-body">
+<span class="callout-label">Advantage — O(changed pages) incremental</span>
+The page-checksum diff strategy keeps the incremental backup proportional to the number of <em>actually modified</em> pages, not the total database size. A 10 GB database with 1 MB of changes since last backup produces a ~1 MB incremental file.
+</div>
+</div>
+
+### Restore
+
+`RESTORE DATABASE FROM 'src' TO 'dest'` auto-detects the backup kind:
+
+- **Full**: streams all page entries from the source file directly to the destination using `pwrite64` (`write_at`), then calls `sync_all`.
+- **Incremental**: restores the base full backup first (via `base_path` embedded in the header), then applies the incremental delta on top, overwriting only the changed pages. The result is a complete, consistent database file.

@@ -639,3 +639,12 @@
 
 - `axiomdb-network/src/mysql/lifecycle.rs`: explicit `CONNECTED → AUTH → IDLE → EXECUTING → CLOSING`
 - `ConnectionLifecycle` (timeout policy) separate from `ConnectionState` (SQL session state)
+
+## 2026-05-15 — Backup/restore (20.7)
+
+- `StorageEngine` trait gains `read_page_raw(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError>` — reads without checksum validation for backup/export paths.
+- `executor/backup.rs` (included into `executor/mod.rs`) implements `execute_backup` / `execute_restore`.
+- `.axbk` binary format: 128-byte header + `{page_id: u64, bytes: [u8; 16384]}` entries.
+- BACKUP/RESTORE are intercepted at the top of `execute_with_ctx_locked` before any transaction wrapping, same pattern as CHECKPOINT.
+- Incremental diff: CRC32c at byte offset 12 of each page header; `HashMap<page_id, u32>` built from base file.
+- Restore uses `pwrite64` (`write_at`) for sparse writes; applies incremental pages on top of restored full backup.

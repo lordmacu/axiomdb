@@ -688,6 +688,11 @@ pub fn execute(
             txn.checkpoint(storage)?;
             Ok(QueryResult::Empty)
         }
+        // Phase 20.7: BACKUP/RESTORE — handled outside the autocommit wrapper
+        // like CHECKPOINT (they run their own checkpoint internally).
+        // Wired in step 7; stub returns NotImplemented until then.
+        Stmt::Backup(b) => execute_backup(b, storage, txn),
+        Stmt::Restore(r) => execute_restore(r),
         Stmt::Commit => Err(DbError::NoActiveTransaction),
         Stmt::Rollback => Err(DbError::NoActiveTransaction),
         other => {

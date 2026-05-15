@@ -46,6 +46,10 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "nvl2" | "insert" | "ord" | "soundex" | "format" | "bin" | "oct" | "hex" | "unhex"
         | "quote" | "field" | "elt" => string::eval(lower.as_str(), args, row),
 
+        // Phase 20.15 — PostgreSQL regex scalar functions
+        "regexp_like" => string::eval_regexp_like(args, row),
+        "regexp_replace" => string::eval_regexp_replace(args, row),
+
         "now" | "current_timestamp" | "getdate" | "sysdate" | "current_date" | "curdate"
         | "today" | "unix_timestamp" | "year" | "month" | "day" | "hour" | "minute" | "second"
         | "datediff" | "date_format" | "str_to_date" | "find_in_set"

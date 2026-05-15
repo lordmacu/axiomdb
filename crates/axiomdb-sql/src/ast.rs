@@ -838,6 +838,24 @@ pub struct CopyToStmt {
     pub options: CopyOptions,
 }
 
+/// `BACKUP DATABASE TO 'path' [INCREMENTAL FROM 'base_path']` — Phase 20.7.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackupStmt {
+    /// Destination `.axbk` file path.
+    pub dest: String,
+    /// If `Some`, produce an incremental backup diffed against this full backup.
+    pub incremental_from: Option<String>,
+}
+
+/// `RESTORE DATABASE FROM 'source' TO 'dest_path'` — Phase 20.7.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreStmt {
+    /// Source `.axbk` file (full or incremental).
+    pub source: String,
+    /// New `.db` file path to create (must not exist).
+    pub dest_path: String,
+}
+
 // ── DML statements ────────────────────────────────────────────────────────────
 
 /// Source of rows for an `INSERT` statement.
@@ -1550,6 +1568,10 @@ pub enum Stmt {
     CopyFrom(CopyFromStmt),
     /// `COPY table TO 'path' [WITH (...)]` — bulk export (Phase 20.5).
     CopyTo(CopyToStmt),
+    /// `BACKUP DATABASE TO 'path' [INCREMENTAL FROM 'base']` — Phase 20.7.
+    Backup(BackupStmt),
+    /// `RESTORE DATABASE FROM 'source' TO 'dest_path'` — Phase 20.7.
+    Restore(RestoreStmt),
     /// `CALL proc(args)` — MySQL stored procedure call; executes as Noop (Phase 17+).
     Call {
         name: String,

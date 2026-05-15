@@ -559,6 +559,182 @@ fn roundtrip_jsonl() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ── 20.8 streaming tests ──────────────────────────────────────────────────────
+
+fn make_csv(rows: usize, suffix: &str) -> std::path::PathBuf {
+    let path = tmpfile(suffix);
+    let mut s = String::from("id,val\n");
+    for i in 0..rows {
+        s.push_str(&format!("{i},{i}\n"));
+    }
+    std::fs::write(&path, &s).unwrap();
+    path
+}
+
+#[test]
+fn copy_from_csv_exact_batch_size() {
+    let path = make_csv(1024, "batch1024.csv");
+    let path_str = path.to_str().unwrap();
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE b1 (id INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = run_ctx(
+        &format!("COPY b1 FROM '{path_str}' WITH (FORMAT CSV, HEADER TRUE)"),
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(r), 1024);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn copy_from_csv_batch_plus_one() {
+    let path = make_csv(1025, "batch1025.csv");
+    let path_str = path.to_str().unwrap();
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE b2 (id INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = run_ctx(
+        &format!("COPY b2 FROM '{path_str}' WITH (FORMAT CSV, HEADER TRUE)"),
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(r), 1025);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn copy_from_jsonl_unknown_key_ignored() {
+    let path = tmpfile("jsonl_unk.jsonl");
+    std::fs::write(&path, "{\"id\":1,\"val\":\"hi\",\"extra\":\"ignored\"}\n").unwrap();
+    let path_str = path.to_str().unwrap();
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE jlu (id INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = run_ctx(
+        &format!("COPY jlu FROM '{path_str}' WITH (FORMAT JSONL)"),
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(r), 1);
+    let result = run_ctx(
+        "SELECT id, val FROM jlu",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let got = rows(result);
+    assert_eq!(got[0], vec![Value::Int(1), Value::Text("hi".into())]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn copy_from_jsonl_missing_key_is_null() {
+    let path = tmpfile("jsonl_miss.jsonl");
+    // "val" is missing — should be NULL
+    std::fs::write(&path, "{\"id\":42}\n").unwrap();
+    let path_str = path.to_str().unwrap();
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE jlm (id INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = run_ctx(
+        &format!("COPY jlm FROM '{path_str}' WITH (FORMAT JSONL)"),
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(affected_count(r), 1);
+    let result = run_ctx(
+        "SELECT val FROM jlm",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let got = rows(result);
+    assert_eq!(got[0][0], Value::Null);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn copy_from_jsonl_error_mid_stream_rolls_back() {
+    let path = tmpfile("jsonl_err.jsonl");
+    // line 3 is invalid JSON — previous rows must NOT be committed
+    std::fs::write(
+        &path,
+        "{\"id\":1,\"val\":\"a\"}\n{\"id\":2,\"val\":\"b\"}\nnot_json\n",
+    )
+    .unwrap();
+    let path_str = path.to_str().unwrap();
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE jle (id INT, val TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let result = run_ctx(
+        &format!("COPY jle FROM '{path_str}' WITH (FORMAT JSONL)"),
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    assert!(result.is_err(), "COPY with bad line must return error");
+    // table must be empty — partial rows rolled back
+    let count_r = run_ctx(
+        "SELECT COUNT(*) FROM jle",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let count = rows(count_r);
+    assert_eq!(count[0][0], Value::BigInt(0));
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn copy_from_missing_file_returns_error() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();

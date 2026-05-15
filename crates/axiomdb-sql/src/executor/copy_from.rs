@@ -4,9 +4,16 @@
 // into the target table by routing through execute_insert_ctx.
 // Included directly into executor/mod.rs — all names from that module's scope
 // are available here.
+//
+// Phase 20.8: CSV and JSONL are streamed in batches of COPY_BATCH_SIZE rows so
+// that files larger than available RAM can be imported without OOM.
+// JSON array format still loads the full file (JSON arrays are not streamable
+// without a full parse tree — use JSONL for files that exceed RAM).
 
 use std::io::BufRead;
 use std::path::Path;
+
+const COPY_BATCH_SIZE: usize = 1024;
 
 fn execute_copy_from(
     stmt: crate::ast::CopyFromStmt,
@@ -14,7 +21,7 @@ fn execute_copy_from(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    use crate::ast::{CopyFormat, InsertSource, InsertStmt, TableRef};
+    use crate::ast::CopyFormat;
 
     let format = resolve_copy_format(&stmt.options, &stmt.path);
     let use_header = stmt.options.header.unwrap_or(format == CopyFormat::Csv);
@@ -29,10 +36,22 @@ fn execute_copy_from(
     let file = std::fs::File::open(&stmt.path)
         .map_err(|e| DbError::Io(std::io::Error::new(e.kind(), format!("COPY FROM: cannot open '{}': {e}", stmt.path))))?;
 
-    let (columns, value_rows) = match format {
-        CopyFormat::Csv => parse_csv_file(file, use_header, delimiter, &null_str, &stmt.path)?,
-        CopyFormat::Json => parse_json_file(file, &stmt.path)?,
-        CopyFormat::Jsonl => parse_jsonl_file(file, &stmt.path)?,
+    let total = match format {
+        CopyFormat::Csv => stream_copy_csv(
+            file, use_header, delimiter, &null_str, &stmt.path, &stmt.table,
+            exec_ctx, conn_txn, ctx,
+        )?,
+        CopyFormat::Jsonl => stream_copy_jsonl(
+            file, &stmt.path, &stmt.table,
+            exec_ctx, conn_txn, ctx,
+        )?,
+        CopyFormat::Json => {
+            let (columns, value_rows) = parse_json_file(file, &stmt.path)?;
+            if value_rows.is_empty() {
+                return Ok(QueryResult::Affected { count: 0, last_insert_id: None });
+            }
+            flush_batch_owned(value_rows, columns, &stmt.table, exec_ctx, conn_txn, ctx)?
+        }
         CopyFormat::Parquet => {
             return Err(DbError::NotImplemented {
                 feature: "COPY FROM FORMAT PARQUET (use READ_PARQUET() TVF to read Parquet files)"
@@ -41,125 +60,88 @@ fn execute_copy_from(
         }
     };
 
-    if value_rows.is_empty() {
-        return Ok(QueryResult::Affected {
-            count: 0,
-            last_insert_id: None,
-        });
-    }
-
-    // Convert Vec<Vec<Value>> → Vec<Vec<Expr::Literal>> → InsertStmt.
-    // execute_insert_ctx handles auto-increment, FK enforcement, and triggers.
-    let expr_rows: Vec<Vec<Expr>> = value_rows
-        .into_iter()
-        .map(|row| row.into_iter().map(Expr::Literal).collect())
-        .collect();
-
-    let cols = if columns.is_empty() {
-        None // HEADER FALSE — positional, let executor use schema order
-    } else {
-        Some(columns)
-    };
-
-    let insert = InsertStmt {
-        table: TableRef::simple(stmt.table.clone()),
-        columns: cols,
-        source: InsertSource::Values(expr_rows),
-        ignore: false,
-        replace: false,
-        returning: vec![],
-        on_duplicate_update: None,
-        on_conflict: None,
-    };
-
-    execute_insert_ctx(insert, exec_ctx, conn_txn, ctx)
+    Ok(QueryResult::Affected { count: total, last_insert_id: None })
 }
 
-// ── CSV ───────────────────────────────────────────────────────────────────────
+// ── CSV streaming ─────────────────────────────────────────────────────────────
 
-fn parse_csv_file(
+#[allow(clippy::too_many_arguments)]
+fn stream_copy_csv(
     file: std::fs::File,
     use_header: bool,
     delimiter: char,
     null_str: &str,
     path: &str,
-) -> Result<(Vec<String>, Vec<Vec<axiomdb_types::Value>>), DbError> {
+    table: &str,
+    exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
+    ctx: &mut SessionContext,
+) -> Result<u64, DbError> {
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delimiter as u8)
         .has_headers(use_header)
         .flexible(false)
         .from_reader(file);
 
-    if !use_header {
-        return parse_csv_no_header(rdr, null_str, path);
-    }
+    let columns: Option<Vec<String>> = if use_header {
+        Some(
+            rdr.headers()
+                .map_err(|e| DbError::InvalidValue {
+                    reason: format!("COPY FROM: {path}: CSV header error: {e}"),
+                })?
+                .iter()
+                .map(|s| s.trim().to_string())
+                .collect(),
+        )
+    } else {
+        None
+    };
 
-    let columns: Vec<String> = rdr
-        .headers()
-        .map_err(|e| DbError::InvalidValue {
-            reason: format!("COPY FROM: {path}: CSV header error: {e}"),
-        })?
-        .iter()
-        .map(|s| s.trim().to_string())
-        .collect();
-
-    let mut rows: Vec<Vec<axiomdb_types::Value>> = Vec::new();
-    for (row_idx, result) in rdr.records().enumerate() {
-        let record = result.map_err(|e| DbError::InvalidValue {
-            reason: format!(
-                "COPY FROM: {path}: line {}: CSV parse error: {e}",
-                row_idx + 2
-            ),
-        })?;
-        let row: Vec<axiomdb_types::Value> = record
-            .iter()
-            .map(|field| copy_csv_field_to_value(field, null_str))
-            .collect();
-        rows.push(row);
-    }
-
-    Ok((columns, rows))
-}
-
-fn parse_csv_no_header(
-    mut rdr: csv::Reader<std::fs::File>,
-    null_str: &str,
-    path: &str,
-) -> Result<(Vec<String>, Vec<Vec<axiomdb_types::Value>>), DbError> {
-    let mut rows: Vec<Vec<axiomdb_types::Value>> = Vec::new();
+    let mut batch: Vec<Vec<axiomdb_types::Value>> = Vec::with_capacity(COPY_BATCH_SIZE);
+    let mut total: u64 = 0;
     let mut col_count: Option<usize> = None;
+    let base_line = if use_header { 2usize } else { 1usize };
 
     for (row_idx, result) in rdr.records().enumerate() {
         let record = result.map_err(|e| DbError::InvalidValue {
             reason: format!(
                 "COPY FROM: {path}: line {}: CSV parse error: {e}",
-                row_idx + 1
+                base_line + row_idx
             ),
         })?;
 
         let n = record.len();
-        match col_count {
-            None => col_count = Some(n),
-            Some(expected) if n != expected => {
-                return Err(DbError::InvalidValue {
-                    reason: format!(
-                        "COPY FROM: {path}: line {}: expected {expected} columns, got {n}",
-                        row_idx + 1
-                    ),
-                });
+        if use_header {
+            // flexible=false already enforces column count for header mode
+        } else {
+            match col_count {
+                None => col_count = Some(n),
+                Some(expected) if n != expected => {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "COPY FROM: {path}: line {}: expected {expected} columns, got {n}",
+                            base_line + row_idx
+                        ),
+                    });
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         let row: Vec<axiomdb_types::Value> = record
             .iter()
             .map(|field| copy_csv_field_to_value(field, null_str))
             .collect();
-        rows.push(row);
-    }
+        batch.push(row);
 
-    // Empty columns list signals schema-order (columns=None in InsertStmt).
-    Ok((vec![], rows))
+        if batch.len() == COPY_BATCH_SIZE {
+            total += flush_batch(&mut batch, columns.clone(), table, exec_ctx, conn_txn, ctx)?;
+        }
+    }
+    if !batch.is_empty() {
+        total += flush_batch(&mut batch, columns, table, exec_ctx, conn_txn, ctx)?;
+    }
+    Ok(total)
 }
 
 fn copy_csv_field_to_value(field: &str, null_str: &str) -> axiomdb_types::Value {
@@ -170,7 +152,81 @@ fn copy_csv_field_to_value(field: &str, null_str: &str) -> axiomdb_types::Value 
     }
 }
 
-// ── JSON (array of objects) ───────────────────────────────────────────────────
+// ── JSONL streaming (schema-first) ────────────────────────────────────────────
+
+fn stream_copy_jsonl(
+    file: std::fs::File,
+    path: &str,
+    table: &str,
+    exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
+    ctx: &mut SessionContext,
+) -> Result<u64, DbError> {
+    use crate::ast::TableRef;
+
+    // Resolve table schema once — col_index maps lowercase column name → position.
+    let resolved = resolve_table_cached(
+        exec_ctx.storage(),
+        exec_ctx.coord(),
+        ctx,
+        Some(conn_txn),
+        &TableRef::simple(table.to_string()),
+    )?;
+    let col_count = resolved.columns.len();
+    let column_names: Vec<String> = resolved.columns.iter().map(|c| c.name.clone()).collect();
+    let col_index: hashbrown::HashMap<String, usize> = column_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+
+    let reader = std::io::BufReader::new(file);
+    let mut batch: Vec<Vec<axiomdb_types::Value>> = Vec::with_capacity(COPY_BATCH_SIZE);
+    let mut total: u64 = 0;
+
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(DbError::Io)?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line).map_err(|e| DbError::InvalidValue {
+                reason: format!(
+                    "COPY FROM: {path}: line {}: JSON parse error: {e}",
+                    line_idx + 1
+                ),
+            })?;
+
+        let mut row = vec![axiomdb_types::Value::Null; col_count];
+        for (key, val) in &obj {
+            let lc = key.to_ascii_lowercase();
+            if let Some(&idx) = col_index.get(&lc) {
+                row[idx] = copy_json_to_value(val);
+            }
+            // unknown keys silently ignored
+        }
+        batch.push(row);
+
+        if batch.len() == COPY_BATCH_SIZE {
+            total += flush_batch(
+                &mut batch,
+                Some(column_names.clone()),
+                table,
+                exec_ctx,
+                conn_txn,
+                ctx,
+            )?;
+        }
+    }
+    if !batch.is_empty() {
+        total += flush_batch(&mut batch, Some(column_names), table, exec_ctx, conn_txn, ctx)?;
+    }
+    Ok(total)
+}
+
+// ── JSON (array of objects) — full load ───────────────────────────────────────
 
 fn parse_json_file(
     file: std::fs::File,
@@ -222,60 +278,53 @@ fn parse_json_file(
     Ok((columns, rows))
 }
 
-// ── JSONL (one JSON object per line) ─────────────────────────────────────────
+// ── Batch insert helpers ──────────────────────────────────────────────────────
 
-fn parse_jsonl_file(
-    file: std::fs::File,
-    path: &str,
-) -> Result<(Vec<String>, Vec<Vec<axiomdb_types::Value>>), DbError> {
-    let reader = std::io::BufReader::new(file);
+/// Drains `batch` into an `execute_insert_ctx` call; returns the affected count.
+/// `batch` is cleared after a successful flush.
+fn flush_batch(
+    batch: &mut Vec<Vec<axiomdb_types::Value>>,
+    columns: Option<Vec<String>>,
+    table: &str,
+    exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
+    ctx: &mut SessionContext,
+) -> Result<u64, DbError> {
+    let rows = std::mem::take(batch);
+    flush_batch_owned(rows, columns.unwrap_or_default(), table, exec_ctx, conn_txn, ctx)
+}
 
-    let mut columns: Vec<String> = Vec::new();
-    let mut col_index: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
-    let mut raw_rows: Vec<Vec<(String, serde_json::Value)>> = Vec::new();
-
-    for (line_idx, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(DbError::Io)?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue; // skip blank lines
-        }
-        let obj: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(line).map_err(|e| DbError::InvalidValue {
-                reason: format!(
-                    "COPY FROM: {path}: line {}: JSON parse error: {e}",
-                    line_idx + 1
-                ),
-            })?;
-
-        let mut row_pairs: Vec<(String, serde_json::Value)> = Vec::new();
-        for (key, val) in obj {
-            let lc = key.to_ascii_lowercase();
-            if !col_index.contains_key(&lc) {
-                col_index.insert(lc.clone(), columns.len());
-                columns.push(lc.clone());
-            }
-            row_pairs.push((lc, val));
-        }
-        raw_rows.push(row_pairs);
+fn flush_batch_owned(
+    rows: Vec<Vec<axiomdb_types::Value>>,
+    columns: Vec<String>,
+    table: &str,
+    exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
+    ctx: &mut SessionContext,
+) -> Result<u64, DbError> {
+    use crate::ast::{InsertSource, InsertStmt, TableRef};
+    if rows.is_empty() {
+        return Ok(0);
     }
-
-    if raw_rows.is_empty() {
-        return Ok((vec![], vec![]));
+    let expr_rows: Vec<Vec<Expr>> = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(Expr::Literal).collect())
+        .collect();
+    let cols = if columns.is_empty() { None } else { Some(columns) };
+    let insert = InsertStmt {
+        table: TableRef::simple(table.to_string()),
+        columns: cols,
+        source: InsertSource::Values(expr_rows),
+        ignore: false,
+        replace: false,
+        returning: vec![],
+        on_duplicate_update: None,
+        on_conflict: None,
+    };
+    match execute_insert_ctx(insert, exec_ctx, conn_txn, ctx)? {
+        QueryResult::Affected { count, .. } => Ok(count),
+        _ => Ok(0),
     }
-
-    let mut rows: Vec<Vec<axiomdb_types::Value>> = Vec::with_capacity(raw_rows.len());
-    for pairs in raw_rows {
-        let mut row = vec![axiomdb_types::Value::Null; columns.len()];
-        for (key, val) in pairs {
-            if let Some(&idx) = col_index.get(&key) {
-                row[idx] = copy_json_to_value(&val);
-            }
-        }
-        rows.push(row);
-    }
-
-    Ok((columns, rows))
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────

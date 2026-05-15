@@ -45,7 +45,9 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table),
             13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking),
             13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns),
-            20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip)
+            20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip),
+            20.7 (BACKUP DATABASE TO / RESTORE DATABASE FROM: full + incremental + restore),
+            20.8 (COPY FROM streaming: CSV batch loop + JSONL schema-first, O(batch_size) memory)
 """
 import os
 import signal
@@ -5172,6 +5174,151 @@ count_pq = cur.fetchone()[0]
 ok("[20.6 read_parquet_count_star] COUNT(*) on READ_PARQUET returns 2",
    count_pq == 2,
    count_pq)
+
+
+# ── 20.7 — BACKUP / RESTORE ───────────────────────────────────────────────────
+
+import tempfile as _tempfile, os as _os
+
+_bk_full = _os.path.join(_tempfile.gettempdir(), "axm_wire_full.axbk")
+_bk_inc  = _os.path.join(_tempfile.gettempdir(), "axm_wire_inc.axbk")
+_bk_rest = _os.path.join(_tempfile.gettempdir(), "axm_wire_rest.db")
+for _p in [_bk_full, _bk_inc, _bk_rest]:
+    if _os.path.exists(_p):
+        _os.remove(_p)
+
+# 20.7a: full backup returns a status row
+cur.execute(f"BACKUP DATABASE TO '{_bk_full}'")
+_bk_row = cur.fetchone()
+ok("[20.7a full_backup_status] BACKUP DATABASE returns status row",
+   _bk_row is not None and "Full backup" in str(_bk_row[0]),
+   _bk_row)
+
+# 20.7b: .axbk file created on disk
+ok("[20.7b full_backup_file_exists] Full .axbk file created on disk",
+   _os.path.isfile(_bk_full),
+   _bk_full)
+
+# 20.7c: duplicate destination rejected
+try:
+    cur.execute(f"BACKUP DATABASE TO '{_bk_full}'")
+    cur.fetchall()
+    ok("[20.7c full_backup_dup_rejected] Duplicate destination must error", False, "no error raised")
+except Exception as _e:
+    ok("[20.7c full_backup_dup_rejected] Duplicate destination rejected with error",
+       True, str(_e))
+
+# 20.7d: incremental backup
+cur.execute(f"BACKUP DATABASE TO '{_bk_inc}' INCREMENTAL FROM '{_bk_full}'")
+_inc_row = cur.fetchone()
+ok("[20.7d inc_backup_status] INCREMENTAL BACKUP returns status row",
+   _inc_row is not None and "Incremental backup" in str(_inc_row[0]),
+   _inc_row)
+
+# 20.7e: incremental .axbk file created
+ok("[20.7e inc_backup_file_exists] Incremental .axbk file created on disk",
+   _os.path.isfile(_bk_inc),
+   _bk_inc)
+
+# 20.7f: restore full backup
+cur.execute(f"RESTORE DATABASE FROM '{_bk_full}' TO '{_bk_rest}'")
+_rest_row = cur.fetchone()
+ok("[20.7f restore_status] RESTORE DATABASE returns status row",
+   _rest_row is not None and "Restored" in str(_rest_row[0]),
+   _rest_row)
+
+# 20.7g: restored file created on disk
+ok("[20.7g restore_file_exists] Restored file created on disk",
+   _os.path.isfile(_bk_rest),
+   _bk_rest)
+
+# 20.7h: restore to existing path rejected
+try:
+    cur.execute(f"RESTORE DATABASE FROM '{_bk_full}' TO '{_bk_rest}'")
+    cur.fetchall()
+    ok("[20.7h restore_dup_rejected] Restore to existing path must error", False, "no error raised")
+except Exception as _e:
+    ok("[20.7h restore_dup_rejected] Restore to existing path rejected with error",
+       True, str(_e))
+
+# cleanup
+for _p in [_bk_full, _bk_inc, _bk_rest]:
+    if _os.path.exists(_p):
+        _os.remove(_p)
+
+
+# ── 20.8 — COPY FROM streaming ───────────────────────────────────────────────
+
+import csv as _csv, io as _io
+
+# 20.8a: COPY FROM CSV with 2000 rows (>1 batch)
+_csv_path = _os.path.join(_tempfile.gettempdir(), "axm_wire_stream.csv")
+with open(_csv_path, "w", newline="") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["id", "val"])
+    for _i in range(2000):
+        _w.writerow([_i, f"v{_i}"])
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_copy_stream (id INT, val TEXT)")
+cur.execute("DELETE FROM _wire_copy_stream")
+cur.execute(f"COPY _wire_copy_stream FROM '{_csv_path}' WITH (FORMAT CSV, HEADER TRUE)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM _wire_copy_stream")
+_stream_cnt = cur.fetchone()[0]
+ok("[20.8a csv_streaming_count] COPY FROM 2000-row CSV inserts all rows across batches",
+   int(_stream_cnt) == 2000,
+   _stream_cnt)
+_os.remove(_csv_path)
+
+# 20.8b: COPY FROM JSONL with unknown/missing keys
+_jsonl_path = _os.path.join(_tempfile.gettempdir(), "axm_wire_stream.jsonl")
+with open(_jsonl_path, "w") as _f:
+    _f.write('{"id":1,"val":"hi","extra":"ignored"}\n')   # unknown key
+    _f.write('{"id":2}\n')                                 # missing val → NULL
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_copy_jsonl (id INT, val TEXT)")
+cur.execute("DELETE FROM _wire_copy_jsonl")
+cur.execute(f"COPY _wire_copy_jsonl FROM '{_jsonl_path}' WITH (FORMAT JSONL)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM _wire_copy_jsonl")
+_jsonl_cnt = cur.fetchone()[0]
+ok("[20.8b jsonl_streaming_schema_first] COPY FROM JSONL unknown/missing keys → 2 rows inserted",
+   int(_jsonl_cnt) == 2,
+   _jsonl_cnt)
+_os.remove(_jsonl_path)
+
+
+# ── 20.15 — PostgreSQL regex operators + REGEXP_LIKE + REGEXP_REPLACE ────────
+
+# 20.15a: ~ case-sensitive match
+cur.execute("SELECT 'hello' ~ 'h.*'")
+ok("[20.15a ~_match] 'hello' ~ 'h.*' → true", cur.fetchone()[0] == 1)
+
+# 20.15b: ~* case-insensitive match
+cur.execute("SELECT 'Hello' ~* 'hello'")
+ok("[20.15b ~*_ci] 'Hello' ~* 'hello' → true", cur.fetchone()[0] == 1)
+
+# 20.15c: !~ negation
+cur.execute("SELECT 'hello' !~ 'world'")
+ok("[20.15c !~_neg] 'hello' !~ 'world' → true", cur.fetchone()[0] == 1)
+
+# 20.15d: !~* case-insensitive negation (matches, so negation → false)
+cur.execute("SELECT 'Hello' !~* 'HELLO'")
+ok("[20.15d !~*_ci_neg] 'Hello' !~* 'HELLO' → false", cur.fetchone()[0] == 0)
+
+# 20.15e: REGEXP_LIKE with 'i' flag
+cur.execute("SELECT REGEXP_LIKE('Hello World', 'hello', 'i')")
+ok("[20.15e regexp_like_ci] REGEXP_LIKE('Hello World','hello','i') → true",
+   cur.fetchone()[0] == 1)
+
+# 20.15f: REGEXP_REPLACE with backreference (using [0-9] to avoid SQL string escape issues)
+cur.execute("SELECT REGEXP_REPLACE('2024-01-15', '([0-9]{4})-([0-9]{2})-([0-9]{2})', '$3/$2/$1')")
+_repl_result = cur.fetchone()[0]
+ok("[20.15f regexp_replace_backref] REGEXP_REPLACE date reformat → '15/01/2024'",
+   _repl_result == "15/01/2024", _repl_result)
+
+# 20.15g: NULL propagation — NULL ~ pattern → NULL
+cur.execute("SELECT NULL ~ 'x'")
+_null_tilde = cur.fetchone()[0]
+ok("[20.15g null_tilde_propagates] NULL ~ 'x' → NULL", _null_tilde is None, _null_tilde)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────

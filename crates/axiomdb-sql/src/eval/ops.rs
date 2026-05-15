@@ -215,6 +215,10 @@ fn op_variant_name(op: &BinaryOp) -> &'static str {
         BinaryOp::ShiftLeft => "ShiftLeft",
         BinaryOp::ShiftRight => "ShiftRight",
         BinaryOp::Regexp => "Regexp",
+        BinaryOp::RegexpTilde => "RegexpTilde",
+        BinaryOp::RegexpITilde => "RegexpITilde",
+        BinaryOp::RegexpNotTilde => "RegexpNotTilde",
+        BinaryOp::RegexpNotITilde => "RegexpNotITilde",
         BinaryOp::JsonSub => "JsonSub",
         BinaryOp::JsonContains => "JsonContains",
         BinaryOp::JsonContainedBy => "JsonContainedBy",
@@ -314,6 +318,10 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         }
 
         BinaryOp::Regexp => eval_regexp(l, r),
+        BinaryOp::RegexpTilde => eval_regexp_tilde(l, r, false, false),
+        BinaryOp::RegexpITilde => eval_regexp_tilde(l, r, true, false),
+        BinaryOp::RegexpNotTilde => eval_regexp_tilde(l, r, false, true),
+        BinaryOp::RegexpNotITilde => eval_regexp_tilde(l, r, true, true),
 
         BinaryOp::Xor => match (&l, &r) {
             (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a ^ b)),
@@ -1149,6 +1157,43 @@ fn eval_regexp(l: Value, r: Value) -> Result<Value, DbError> {
         reason: format!("invalid REGEXP pattern: {e}"),
     })?;
     Ok(Value::Bool(re.is_match(&text)))
+}
+
+// ── PostgreSQL tilde regex operators (Phase 20.15) ────────────────────────────
+
+/// `~`, `~*`, `!~`, `!~*` — POSIX regex operators.
+/// NULL propagation is handled by `eval_binary` before this call.
+fn eval_regexp_tilde(
+    l: Value,
+    r: Value,
+    case_insensitive: bool,
+    negate: bool,
+) -> Result<Value, DbError> {
+    let text = match l {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let pattern = match r {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let re = regex::RegexBuilder::new(&pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| DbError::InvalidValue {
+            reason: format!("invalid regex pattern: {e}"),
+        })?;
+    Ok(Value::Bool(re.is_match(&text) ^ negate))
 }
 
 // ── JSONB containment: @> (Phase 11.17) ──────────────────────────────────────

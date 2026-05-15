@@ -107,6 +107,17 @@ impl StorageEngine for MemoryStorage {
         Ok(crate::page_ref::PageRef::from_bytes(bytes))
     }
 
+    fn read_page_raw(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let idx = page_id as usize;
+        if idx >= inner.pages.len() || !inner.allocated[idx] {
+            return Err(DbError::PageNotFound { page_id });
+        }
+        let mut bytes = [0u8; PAGE_SIZE];
+        bytes.copy_from_slice(inner.pages[idx].as_bytes());
+        Ok(bytes)
+    }
+
     fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
         let _page_guard = self.page_locks.write(page_id);
         self.write_page_inner(page_id, page)

@@ -348,6 +348,72 @@ SELECT * FROM products WHERE sku RLIKE '^[0-9]';
 SELECT * FROM products WHERE name NOT REGEXP '[0-9]';
 ```
 
+### PostgreSQL Regex Operators — ~, ~*, !~, !~*
+
+Four PostgreSQL-compatible POSIX regex operators are supported:
+
+| Operator | Meaning | Case |
+|----------|---------|------|
+| `~`      | text matches regex | sensitive |
+| `~*`     | text matches regex | insensitive |
+| `!~`     | text does NOT match regex | sensitive |
+| `!~*`    | text does NOT match regex | insensitive |
+
+Both operands must be `TEXT`. Returns `BOOL` or `NULL` if either operand is `NULL`.
+
+```sql
+-- Case-sensitive match
+SELECT * FROM logs WHERE message ~ '^ERROR';
+
+-- Case-insensitive match
+SELECT * FROM users WHERE email ~* '@gmail\.com$';
+
+-- Negation: rows NOT matching
+SELECT * FROM items WHERE code !~ '^[0-9]';
+
+-- Case-insensitive negation
+SELECT * FROM items WHERE name !~* 'test';
+```
+
+### REGEXP_LIKE
+
+```sql
+REGEXP_LIKE(text, pattern)
+REGEXP_LIKE(text, pattern, flags)
+```
+
+Returns `BOOL`. Supported flags:
+- `'i'` — case-insensitive match
+
+Returns `NULL` if `text` or `pattern` is `NULL`. `NULL` flags are treated as no flags.
+
+```sql
+SELECT REGEXP_LIKE('Hello World', 'hello', 'i');  -- TRUE
+SELECT REGEXP_LIKE('foo123', '^[a-z]+$');          -- FALSE
+```
+
+### REGEXP_REPLACE
+
+```sql
+REGEXP_REPLACE(text, pattern, replacement)
+REGEXP_REPLACE(text, pattern, replacement, flags)
+```
+
+Returns `TEXT`. Replaces occurrences of `pattern` with `replacement`. Supports backreferences `$1`…`$9`.
+
+Supported flags:
+- `'g'` — replace all occurrences (default: first only)
+- `'i'` — case-insensitive match
+
+Returns `NULL` if `text`, `pattern`, or `replacement` is `NULL`. `NULL` flags are treated as no flags.
+
+```sql
+SELECT REGEXP_REPLACE('foo bar', 'o+', 'X');          -- 'fX bar'
+SELECT REGEXP_REPLACE('aaa', 'a', 'b', 'g');          -- 'bbb'
+SELECT REGEXP_REPLACE('2024-01-15',
+  '([0-9]{4})-([0-9]{2})-([0-9]{2})', '$3/$2/$1');   -- '15/01/2024'
+```
+
 ### XOR — Exclusive OR
 
 ```sql

@@ -56,14 +56,15 @@ use axiomdb_wal::{ConnectionTxn, IndexUndoRecord, Savepoint, TxnManager};
 use crate::exec_ctx::ExecutionContext;
 use crate::{
     ast::{
-        AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, CreateAggregateStmt,
-        CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt,
-        DropAggregateStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, DropTriggerStmt,
-        FromClause, GeneratedColumnKind, GroupByClause, InsertSource, InsertStmt, IntoOutfile,
-        JoinClause, JoinCondition, JoinType, LockStrength, LockWaitPolicy, MergeActionCondition,
-        MergeActionKind, MergeStmt, NullsOrder, OnConflictAction, OrderByItem, SelectItem,
-        SelectStmt, SetOpKind, SetOpTail, SetStmt, SetValue, ShowCreateTriggerStmt,
-        ShowDatabasesStmt, SortOrder, Stmt, TableRef, TriggerEvent, UpdateStmt, UseDatabaseStmt,
+        AlterTableOp, AlterTableStmt, Assignment, BackupStmt, ColumnConstraint,
+        CreateAggregateStmt, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
+        CreateTriggerStmt, DeleteStmt, DropAggregateStmt, DropDatabaseStmt, DropIndexStmt,
+        DropTableStmt, DropTriggerStmt, FromClause, GeneratedColumnKind, GroupByClause,
+        InsertSource, InsertStmt, IntoOutfile, JoinClause, JoinCondition, JoinType, LockStrength,
+        LockWaitPolicy, MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder,
+        OnConflictAction, OrderByItem, RestoreStmt, SelectItem, SelectStmt, SetOpKind, SetOpTail,
+        SetStmt, SetValue, ShowCreateTriggerStmt, ShowDatabasesStmt, SortOrder, Stmt, TableRef,
+        TriggerEvent, UpdateStmt, UseDatabaseStmt,
     },
     eval::{eval, eval_with, is_truthy, CollationGuard, InSubquerySet, SubqueryRunner},
     expr::{BinaryOp, Expr},
@@ -94,6 +95,7 @@ type InlineFkSpec = (
 include!("exec_subquery.rs");
 include!("sequence_runtime.rs");
 include!("cron_runtime.rs");
+include!("backup.rs");
 include!("exec_entry.rs");
 include!("exec_with_ctx.rs");
 include!("exec_dispatch.rs");

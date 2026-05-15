@@ -150,6 +150,10 @@ pub enum Token<'src> {
     Vacuum,
     #[token("CHECKPOINT", ignore(ascii_case))]
     Checkpoint,
+    #[token("BACKUP", ignore(ascii_case))]
+    Backup,
+    #[token("RESTORE", ignore(ascii_case))]
+    Restore,
     #[token("SAVEPOINT", ignore(ascii_case))]
     SavepointKw,
     #[token("RELEASE", ignore(ascii_case))]
@@ -627,7 +631,16 @@ pub enum Token<'src> {
     /// `^` — bitwise XOR.
     #[token("^")]
     Caret,
-    /// `~` — bitwise NOT (unary).
+    /// `!~*` — PostgreSQL case-insensitive regex not-match (binary). Must appear before `!~` and `~*`.
+    #[token("!~*")]
+    BangTildeAsterisk,
+    /// `!~` — PostgreSQL case-sensitive regex not-match (binary). Must appear before `~`.
+    #[token("!~")]
+    BangTilde,
+    /// `~*` — PostgreSQL case-insensitive regex match (binary). Must appear before `~`.
+    #[token("~*")]
+    TildeAsterisk,
+    /// `~` — bitwise NOT (unary) or PostgreSQL case-sensitive regex match (binary, in parse_predicate).
     #[token("~")]
     Tilde,
     #[token(".")]

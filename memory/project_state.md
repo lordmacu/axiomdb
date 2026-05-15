@@ -3,19 +3,18 @@
 ## Current (2026-05-15)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.5 — COPY FROM/TO COMPLETE.
-Phase 20.5 added `COPY table FROM 'path' [WITH (FORMAT CSV|JSON|JSONL, HEADER, DELIMITER, NULL)]`
-and `COPY table TO 'path' [WITH (...)]`. Server-side bulk import/export using the `csv` crate
-(CSV), `serde_json` (JSON array + JSONL). COPY FROM routes through `execute_insert_ctx` for
-full INSERT semantics (FK, triggers, coercion). 10 parser tests, 14 executor tests, 4 wire
-assertions (538/538).
+**Active subphase:** Phase 20.15 — Regex operators COMPLETE.
+PostgreSQL POSIX regex binary operators `~`, `~*`, `!~`, `!~*` + scalar functions
+`REGEXP_LIKE` and `REGEXP_REPLACE`. New lexer tokens, BinaryOp variants, parser arms,
+eval_regexp_tilde, NULL propagation. 37 integration tests, 7 wire assertions (571/571),
+4032/4032 workspace tests.
 
-**Last verified gates:** Phase 20.5 closeout passed 3892/3892 tests, clippy clean,
-fmt clean, wire test 538/538.
+**Last verified gates:** Phase 20.15 closeout passed 4032/4032 tests, clippy clean,
+fmt clean, wire test 571/571.
 
-**Recently completed:** 20.4 — Arrays (2026-05-14). 20.5 — COPY FROM/TO (2026-05-15).
+**Recently completed:** 20.7 — Incremental backup (2026-05-15). 20.8 — COPY streaming (2026-05-15). 20.15 — Regex operators (2026-05-15).
 
-**Next:** Phase 20.5b (SELECT … INTO OUTFILE) or Phase 20.6 (Parquet) or Phase 21 Advanced SQL.
+**Next:** Phase 20.11 (TABLESAMPLE) or Phase 20.12 (ORDER BY RANDOM()).
 
 ### Phase 21 subphase status
 
@@ -74,8 +73,13 @@ fmt clean, wire test 538/538.
 | 20.3 ENUMs | ✅ closed |
 | 20.4 Arrays | ✅ closed |
 | **20.5 COPY FROM/TO** | ✅ closed |
-| 20.5b SELECT INTO OUTFILE | ⏳ pending |
-| 20.14 UNNEST | ⏳ pending |
+| 20.5b SELECT INTO OUTFILE | ✅ closed |
+| 20.6 Parquet READ_PARQUET + COPY TO PARQUET | ✅ closed |
+| **20.7 Incremental backup** | ✅ closed |
+| **20.8 COPY streaming** | ✅ closed |
+| **20.15 Regex operators** | ✅ closed |
+| 20.10 GENERATE_SERIES | ✅ closed |
+| 20.14 UNNEST in SELECT list | ✅ closed |
 
 ### Completed phases
 
