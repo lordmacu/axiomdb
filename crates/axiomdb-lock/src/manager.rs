@@ -626,6 +626,53 @@ impl LockManager {
     }
 
     /// Synchronous variant of [`acquire_table_lock`].
+    /// Non-blocking try-acquire for a record lock (SKIP LOCKED path).
+    ///
+    /// Returns `Ok(true)` if the lock was granted immediately.
+    /// Returns `Ok(false)` if a conflicting lock is held by another transaction
+    /// or if there are waiters ahead in the FIFO queue — the row should be skipped.
+    /// Never enqueues a waiter, never blocks, never runs deadlock detection.
+    pub fn try_acquire_record_lock_sync(
+        &self,
+        txn_id: TxnId,
+        page_id: u64,
+        slot_id: u16,
+        mode: LockMode,
+    ) -> Result<bool, DbError> {
+        let shard_idx = page_id as usize % RECORD_SHARDS;
+        let mut shard = self.record_shards[shard_idx].lock().unwrap();
+        let queue = shard.entry(page_id).or_default();
+
+        // Fast path: same txn already holds a compatible lock on this page.
+        if let Some(idx) = queue.find_granted_idx(txn_id, mode) {
+            if let Some(ref mut bm) = queue.granted[idx].bitmap {
+                bm.set(slot_id);
+            }
+            return Ok(true);
+        }
+
+        // Check conflict with granted locks for this specific slot.
+        let blocking_txn = queue.find_conflict(txn_id, mode, Some(slot_id));
+
+        // Skip if conflicting lock held or FIFO waiters are ahead.
+        if blocking_txn.is_some() || !queue.waiting.is_empty() {
+            if queue.is_empty() {
+                shard.remove(&page_id);
+            }
+            return Ok(false);
+        }
+
+        // Grant immediately.
+        queue.granted.push(LockEntry {
+            txn_id,
+            mode,
+            flags: LockFlags::NONE,
+            requested_at: Instant::now(),
+            bitmap: Some(SlotBitmap::with_slot(slot_id)),
+        });
+        Ok(true)
+    }
+
     pub fn acquire_table_lock_sync(
         &self,
         txn_id: TxnId,
@@ -1283,5 +1330,53 @@ mod tests {
         let shard = lm.record_shards[100 % RECORD_SHARDS].lock().unwrap();
         let queue = shard.get(&100).unwrap();
         assert!(queue.waiting.is_empty(), "waiter must be removed on NOWAIT");
+    }
+
+    // ── try_acquire_record_lock_sync (SKIP LOCKED) ────────────────────────
+
+    #[test]
+    fn try_acquire_granted_when_no_conflict() {
+        let lm = LockManager::new();
+        assert!(lm.try_acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive).unwrap());
+    }
+
+    #[test]
+    fn try_acquire_returns_false_when_conflicting_exclusive_held() {
+        let lm = LockManager::new();
+        lm.acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        // txn 2 wants shared — conflicts with exclusive held by txn 1
+        assert!(!lm.try_acquire_record_lock_sync(2, 100, 0, LockMode::Shared).unwrap());
+    }
+
+    #[test]
+    fn try_acquire_returns_true_for_compatible_shared_locks() {
+        let lm = LockManager::new();
+        lm.acquire_record_lock_sync(1, 100, 0, LockMode::Shared, LockFlags::NONE)
+            .unwrap();
+        // txn 2 also wants shared — compatible, no conflict
+        assert!(lm.try_acquire_record_lock_sync(2, 100, 0, LockMode::Shared).unwrap());
+    }
+
+    #[test]
+    fn try_acquire_returns_true_when_same_txn_already_holds() {
+        let lm = LockManager::new();
+        lm.acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        // same txn tries again — idempotent fast path
+        assert!(lm.try_acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive).unwrap());
+    }
+
+    #[test]
+    fn try_acquire_does_not_enqueue_waiter() {
+        let lm = LockManager::new();
+        lm.acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
+            .unwrap();
+        // txn 2 tries — conflict, returns false without enqueueing
+        let _ = lm.try_acquire_record_lock_sync(2, 100, 0, LockMode::Exclusive);
+        // release txn 1
+        lm.release_all_for_txn(1);
+        // txn 3 should get the lock cleanly (no phantom waiter from txn 2)
+        assert!(lm.try_acquire_record_lock_sync(3, 100, 0, LockMode::Exclusive).unwrap());
     }
 }
