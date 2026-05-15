@@ -909,9 +909,10 @@ The combined sort ensures that within each DISTINCT ON group, the "first" row is
 exactly the row that sorts first according to ORDER BY — identical to PostgreSQL's semantics.
 The result is already in correct ORDER BY sequence; no second sort is needed.
 
-`apply_distinct_on` is wired into all five SELECT executor paths
+`apply_distinct_on` is wired into all six SELECT executor paths
 (`execute_select_derived`, `execute_select_json_table_source`,
 `execute_select_jsonb_srf_source`, `execute_select_values_source`,
+`execute_select_generate_series_source`,
 the main table-scan path, and `execute_select_with_joins`). When `distinct_on` is
 non-empty, it replaces both `apply_order_by` and `apply_distinct_with_session`.
 

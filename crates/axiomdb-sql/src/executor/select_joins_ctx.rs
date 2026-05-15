@@ -308,10 +308,22 @@ fn execute_select_with_joins_first_materialized(
                     }
                 }
                 // Phase 20.10 — GENERATE_SERIES JOIN right-side.
-                FromClause::GenerateSeries(_) => {
-                    return Err(DbError::NotImplemented {
-                        feature: "GENERATE_SERIES JOIN via the ctx executor path".into(),
-                    });
+                FromClause::GenerateSeries(gs) => {
+                    let column_metas = crate::generate_series::column_metas_for_generate_series(gs);
+                    let alias = gs
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| "generate_series".into());
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&alias, column_metas));
+                    // GENERATE_SERIES args are constant — no outer correlation.
+                    let rows = crate::generate_series::materialize_from_clause(gs, &[])?;
+                    scanned.push(rows);
+                    correlated_unnest.push(None);
+                    correlated_jt.push(None);
+                    correlated_srf.push(None);
+                    correlated_sub.push(None);
                 }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {

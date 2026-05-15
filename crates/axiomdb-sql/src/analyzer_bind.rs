@@ -480,10 +480,23 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
-        // Phase 20.10 — GENERATE_SERIES virtual table (full impl in Step 2).
-        FromClause::GenerateSeries(_) => Err(DbError::NotImplemented {
-            feature: "GENERATE_SERIES".into(),
-        }),
+        // Phase 20.10 — GENERATE_SERIES virtual table.
+        FromClause::GenerateSeries(gs) => {
+            let virtual_cols = crate::generate_series::column_defs_for_generate_series(gs);
+            let n = virtual_cols.len();
+            let alias = gs
+                .alias
+                .clone()
+                .unwrap_or_else(|| "generate_series".into());
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 
@@ -658,43 +671,72 @@ fn fdw_columns_to_column_defs(ft: &ForeignTableDef) -> Vec<ColumnDef> {
 
 /// Build virtual ColumnDef list from the SELECT list of an analyzed subquery.
 fn virtual_columns_from_select(select: &SelectStmt) -> Vec<ColumnDef> {
-    use axiomdb_catalog::schema::{ColumnType, TableId};
-    select
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let name = match item {
-                SelectItem::Expr { alias: Some(a), .. } => a.clone(),
-                SelectItem::Expr {
-                    expr: Expr::Column { name, .. },
-                    ..
-                } => {
-                    // Use the unqualified column name if no alias
-                    split_name(name).1.to_string()
+    let mut out: Vec<ColumnDef> = Vec::with_capacity(select.columns.len());
+    for (i, item) in select.columns.iter().enumerate() {
+        match item {
+            // Wildcards: try to expand using SRF column shapes when FROM is known.
+            SelectItem::Wildcard => {
+                let srf_cols = srf_wildcard_columns(&select.from);
+                if let Some(cols) = srf_cols {
+                    out.extend(cols);
+                } else {
+                    out.push(make_virtual_col(i as u16, format!("*{i}")));
                 }
-                SelectItem::Expr { .. } => format!("col{i}"),
-                SelectItem::Wildcard => format!("*{i}"),
-                SelectItem::QualifiedWildcard(t) => format!("{t}.*{i}"),
-            };
-            ColumnDef {
-                table_id: 0 as TableId,
-                col_idx: i as u16,
-                name,
-                col_type: ColumnType::Text, // type unknown without full type inference
-                nullable: true,
-                auto_increment: false,
-                type_len: 0,
-                is_fixed_len: false,
-                default_expr: None,
-                on_update_expr: None,
-                generated_expr: None,
-                collation: None,
-                generated_stored: false,
-                enum_type_name: None,
-                array_element_type: None,
-                array_ndims: None,
             }
-        })
-        .collect()
+            SelectItem::QualifiedWildcard(t) => {
+                out.push(make_virtual_col(i as u16, format!("{t}.*{i}")));
+            }
+            SelectItem::Expr { alias: Some(a), .. } => {
+                out.push(make_virtual_col(i as u16, a.clone()));
+            }
+            SelectItem::Expr {
+                expr: Expr::Column { name, .. },
+                ..
+            } => {
+                out.push(make_virtual_col(i as u16, split_name(name).1.to_string()));
+            }
+            SelectItem::Expr { .. } => {
+                out.push(make_virtual_col(i as u16, format!("col{i}")));
+            }
+        }
+    }
+    out
+}
+
+fn make_virtual_col(col_idx: u16, name: String) -> axiomdb_catalog::schema::ColumnDef {
+    use axiomdb_catalog::schema::ColumnType;
+    axiomdb_catalog::schema::ColumnDef {
+        table_id: 0,
+        col_idx,
+        name,
+        col_type: ColumnType::Text,
+        nullable: true,
+        auto_increment: false,
+        type_len: 0,
+        is_fixed_len: false,
+        default_expr: None,
+        on_update_expr: None,
+        generated_expr: None,
+        collation: None,
+        generated_stored: false,
+        enum_type_name: None,
+        array_element_type: None,
+        array_ndims: None,
+    }
+}
+
+/// Expand a wildcard `SELECT *` to concrete column defs for known SRF FROM clauses.
+/// Returns `None` for regular table references (let caller fall back to `*N` names).
+fn srf_wildcard_columns(
+    from: &Option<crate::ast::FromClause>,
+) -> Option<Vec<axiomdb_catalog::schema::ColumnDef>> {
+    match from {
+        Some(crate::ast::FromClause::GenerateSeries(gs)) => {
+            Some(crate::generate_series::column_defs_for_generate_series(gs))
+        }
+        Some(crate::ast::FromClause::Unnest(un)) => {
+            Some(crate::unnest::column_defs_for_unnest(un))
+        }
+        _ => None,
+    }
 }
