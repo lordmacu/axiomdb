@@ -3,19 +3,19 @@
 ## Current (2026-05-15)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.5 — COPY FROM/TO COMPLETE.
-Phase 20.5 added `COPY table FROM 'path' [WITH (FORMAT CSV|JSON|JSONL, HEADER, DELIMITER, NULL)]`
-and `COPY table TO 'path' [WITH (...)]`. Server-side bulk import/export using the `csv` crate
-(CSV), `serde_json` (JSON array + JSONL). COPY FROM routes through `execute_insert_ctx` for
-full INSERT semantics (FK, triggers, coercion). 10 parser tests, 14 executor tests, 4 wire
-assertions (538/538).
+**Active subphase:** Phase 20.7 — Incremental backup COMPLETE.
+Phase 20.7 added `BACKUP DATABASE TO` (full + incremental) and `RESTORE DATABASE FROM`.
+Custom `.axbk` binary format with 128-byte header; incremental diff via CRC32c page checksum;
+`read_page_raw` added to `StorageEngine` trait for checksum-bypass reads; BACKUP/RESTORE
+intercepted before transaction wrappers in `execute_with_ctx_locked`. 8 parser tests, 8 wire
+assertions (562/562).
 
-**Last verified gates:** Phase 20.5 closeout passed 3892/3892 tests, clippy clean,
-fmt clean, wire test 538/538.
+**Last verified gates:** Phase 20.7 closeout passed 3990/3990 tests, clippy clean,
+fmt clean, wire test 562/562.
 
-**Recently completed:** 20.4 — Arrays (2026-05-14). 20.5 — COPY FROM/TO (2026-05-15).
+**Recently completed:** 20.6 — Parquet (2026-05-15). 20.7 — Incremental backup (2026-05-15).
 
-**Next:** Phase 20.5b (SELECT … INTO OUTFILE) or Phase 20.6 (Parquet) or Phase 21 Advanced SQL.
+**Next:** Phase 20.8 (COPY streaming) or Phase 20.11 (TABLESAMPLE) or continue Phase 20 backlog.
 
 ### Phase 21 subphase status
 
@@ -74,8 +74,11 @@ fmt clean, wire test 538/538.
 | 20.3 ENUMs | ✅ closed |
 | 20.4 Arrays | ✅ closed |
 | **20.5 COPY FROM/TO** | ✅ closed |
-| 20.5b SELECT INTO OUTFILE | ⏳ pending |
-| 20.14 UNNEST | ⏳ pending |
+| 20.5b SELECT INTO OUTFILE | ✅ closed |
+| 20.6 Parquet READ_PARQUET + COPY TO PARQUET | ✅ closed |
+| **20.7 Incremental backup** | ✅ closed |
+| 20.10 GENERATE_SERIES | ✅ closed |
+| 20.14 UNNEST in SELECT list | ✅ closed |
 
 ### Completed phases
 

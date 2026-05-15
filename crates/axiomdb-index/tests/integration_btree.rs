@@ -370,6 +370,12 @@ impl axiomdb_storage::StorageEngine for CountingStorage {
     fn flush(&self) -> Result<(), axiomdb_core::error::DbError> {
         self.inner.flush()
     }
+    fn read_page_raw(
+        &self,
+        page_id: u64,
+    ) -> Result<[u8; axiomdb_storage::PAGE_SIZE], axiomdb_core::error::DbError> {
+        self.inner.read_page_raw(page_id)
+    }
     fn page_lock_table(&self) -> &axiomdb_storage::page_lock::PageLockTable {
         self.inner.page_lock_table()
     }
@@ -409,6 +415,12 @@ impl StorageEngine for SharedMemoryStorage {
     }
     fn flush(&self) -> Result<(), axiomdb_core::error::DbError> {
         self.inner.flush()
+    }
+    fn read_page_raw(
+        &self,
+        page_id: u64,
+    ) -> Result<[u8; axiomdb_storage::PAGE_SIZE], axiomdb_core::error::DbError> {
+        self.inner.read_page_raw(page_id)
     }
     fn page_lock_table(&self) -> &axiomdb_storage::page_lock::PageLockTable {
         self.inner.page_lock_table()

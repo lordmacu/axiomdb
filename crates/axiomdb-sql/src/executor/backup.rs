@@ -171,8 +171,8 @@ fn backup_full(
         if page_id % 64 == 0 {
             storage.prefetch_hint(page_id, 64);
         }
-        let page_ref = storage.read_page(page_id)?;
-        write_page_entry(&mut w, page_id, page_ref.as_bytes())?;
+        let raw = storage.read_page_raw(page_id)?;
+        write_page_entry(&mut w, page_id, &raw)?;
         written += 1;
     }
     w.flush().map_err(DbError::Io)?;
@@ -210,19 +210,21 @@ fn backup_incremental(
 
     // 4. Find changed pages.
     let mut changed_pages: Vec<u64> = Vec::new();
+    let mut raw_cache: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
     for page_id in 0..page_count {
         if page_id % 64 == 0 {
             storage.prefetch_hint(page_id, 64);
         }
-        let page_ref = storage.read_page(page_id)?;
+        let raw = storage.read_page_raw(page_id)?;
         let current_cksum = u32::from_le_bytes(
-            page_ref.as_bytes()[PAGE_CHECKSUM_OFFSET..PAGE_CHECKSUM_OFFSET + 4]
+            raw[PAGE_CHECKSUM_OFFSET..PAGE_CHECKSUM_OFFSET + 4]
                 .try_into()
                 .unwrap(),
         );
         let base_cksum = base_checksums.get(&page_id).copied().unwrap_or(u32::MAX);
         if current_cksum != base_cksum {
             changed_pages.push(page_id);
+            raw_cache.push((page_id, raw));
         }
     }
 
@@ -254,9 +256,8 @@ fn backup_incremental(
         delta_count,
         &base_abs,
     )?;
-    for &page_id in &changed_pages {
-        let page_ref = storage.read_page(page_id)?;
-        write_page_entry(&mut w, page_id, page_ref.as_bytes())?;
+    for (page_id, raw) in &raw_cache {
+        write_page_entry(&mut w, *page_id, raw)?;
     }
     w.flush().map_err(DbError::Io)?;
 

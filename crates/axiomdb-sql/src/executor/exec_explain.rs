@@ -204,9 +204,9 @@ fn dispatch(
         Stmt::CopyFrom(_) | Stmt::CopyTo(_) => Err(DbError::NotImplemented {
             feature: "COPY requires session context — use execute_with_ctx".into(),
         }),
-        // Phase 20.7: BACKUP/RESTORE — not EXPLAINable
+        // Phase 20.7: BACKUP/RESTORE run outside any transaction — cannot be dispatched here.
         Stmt::Backup(_) | Stmt::Restore(_) => Err(DbError::NotImplemented {
-            feature: "EXPLAIN BACKUP/RESTORE is not supported".into(),
+            feature: "BACKUP/RESTORE must not be called inside a transaction — use execute_with_ctx".into(),
         }),
         // G5.5: CREATE TABLE LIKE
         Stmt::CreateTableLike(s) => {

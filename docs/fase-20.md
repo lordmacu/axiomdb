@@ -240,3 +240,82 @@ ensures the decoder always finds enum bytes at the correct offset without ambigu
 - `array_dims()` returning text format like `[1:3][1:2]`.
 - `ARRAY(SELECT …)` subquery-to-array constructor.
 - Updatable array subscript assignment (`UPDATE t SET a[1] = 42`).
+
+## 20.7 — Incremental backup (2026-05-15)
+
+### What was built
+
+**BACKUP DATABASE TO** and **RESTORE DATABASE FROM** SQL commands with full and incremental backup modes backed by a custom `.axbk` binary format.
+
+### SQL syntax
+
+```sql
+-- Full backup
+BACKUP DATABASE TO '/path/to/backup.axbk';
+
+-- Incremental (page-diff from a previous full backup)
+BACKUP DATABASE TO '/path/inc.axbk' INCREMENTAL FROM '/path/full.axbk';
+
+-- Restore (full or incremental automatically resolved)
+RESTORE DATABASE FROM '/path/backup.axbk' TO '/path/restore.db';
+```
+
+### Binary format (`.axbk`)
+
+```
+Offset  Size  Field
+0       8     magic = 0x4158494F4D424B01 ("AXIOMBK\x01")
+8       1     kind  = 0 (Full) | 1 (Incremental)
+9       7     _pad
+16      8     backup_lsn   (checkpoint LSN at backup time)
+24      8     page_count   (storage.page_count() at backup time)
+32      4     page_size    (always PAGE_SIZE = 16384)
+36      4     _pad2
+40      8     base_lsn     (Full: 0; Incremental: base backup_lsn)
+48      8     delta_count  (Full: page_count; Incremental: # changed pages)
+56      72    base_path    (NUL-terminated UTF-8; max 71 chars + NUL)
+128+    ...   page entries: { page_id: u64, page_bytes: [u8; PAGE_SIZE] }
+```
+
+### Architecture
+
+#### StorageEngine trait (`axiomdb-storage`)
+
+- `read_page_raw(&self, page_id: u64) -> Result<[u8; PAGE_SIZE], DbError>` added to `StorageEngine` trait — reads raw page bytes without checksum validation.
+  - `MmapStorage`: delegates to existing `copy_raw_page_from_mmap`.
+  - `MemoryStorage`: copies from the flat page array.
+  - All test implementors (`SharedMemoryStorage`, `CountingStorage`, `CountingPrefetchStorage`) delegate to their inner `MemoryStorage`.
+- Raw reads are semantically correct for backup paths where all pages must be captured regardless of checksum state (e.g., during an ongoing write epoch on macOS where mmap and pwrite can show different checksum bytes).
+
+#### Parser / AST (`axiomdb-sql`)
+
+- `BackupStmt { dest: String, incremental_from: Option<String> }` — AST node.
+- `RestoreStmt { source: String, dest_path: String }` — AST node.
+- `parse_backup` / `parse_restore` in `parser/dml.rs` handle `TOKEN::Database` (reserved keyword, not ident).
+- `Stmt::Backup` / `Stmt::Restore` wired through all 14 match sites (dispatch, explain, analyzer no-op, etc.).
+
+#### Executor (`axiomdb-sql/src/executor/backup.rs`)
+
+Included directly into `executor/mod.rs` via `include!()`.
+
+- `execute_backup` — checks destination doesn't exist, dispatches to `backup_full` or `backup_incremental`.
+- `backup_full` — checkpoints via `txn.checkpoint(storage)`, streams all pages with 64-page prefetch hints.
+- `backup_incremental` — validates base backup is Full kind, builds `HashMap<page_id → checksum>` by scanning the base file, checkpoints, reads all current pages and diffs CRC32c (stored at header offset 12 in each page), writes only changed pages.
+- `restore_from_source` — auto-detects kind; Full: streams all pages directly; Incremental: restores base first via `write_pages_to_dest`, then applies delta on top.
+- `write_pages_to_dest` — uses `write_at` (POSIX `pwrite64`) for sparse writes; syncs with `sync_all` after all pages written.
+
+#### Dispatcher (`executor/exec_with_ctx.rs`)
+
+BACKUP/RESTORE intercepted at the **top** of `execute_with_ctx_locked` before all transaction-wrapping logic, mirroring the CHECKPOINT pattern. This avoids the engine from trying to wrap a self-checkpointing operation inside an active transaction.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_backup_parser.rs` — 8 parser tests (full/incremental syntax, case-insensitive, error cases).
+- Wire smoke block `[20.7 backup/restore]` in `tools/wire-test.py` — 8 assertions (562/562).
+
+### Deferred to later phases
+
+- Chains of 3+ incremental backups (incremental-from-incremental).
+- Streaming backup over a network socket without writing a temp file.
+- `base_path` > 71 bytes (documented workaround: use a symlink to shorten the path).
+- Backup encryption / compression wrappers.

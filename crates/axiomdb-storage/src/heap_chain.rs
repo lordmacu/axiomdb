@@ -146,6 +146,10 @@ mod tests {
             self.inner.page_count()
         }
 
+        fn read_page_raw(&self, page_id: u64) -> Result<[u8; crate::PAGE_SIZE], DbError> {
+            self.inner.read_page_raw(page_id)
+        }
+
         fn page_lock_table(&self) -> &crate::page_lock::PageLockTable {
             self.inner.page_lock_table()
         }

@@ -45,6 +45,11 @@ pub trait StorageEngine: Send + Sync {
     /// Verifies the checksum before returning.
     fn read_page(&self, page_id: u64) -> Result<PageRef, DbError>;
 
+    /// Returns the raw bytes of page `page_id` without checksum validation.
+    /// Use only for backup/export paths where all pages must be captured
+    /// regardless of checksum validity.
+    fn read_page_raw(&self, page_id: u64) -> Result<[u8; crate::PAGE_SIZE], DbError>;
+
     /// Writes `page` to `page_id`. The page must have a valid checksum.
     ///
     /// General entry point for callers that do not already hold the page's

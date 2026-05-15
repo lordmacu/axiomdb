@@ -45,7 +45,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table),
             13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking),
             13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns),
-            20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip)
+            20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip),
+            20.7 (BACKUP DATABASE TO / RESTORE DATABASE FROM: full + incremental + restore)
 """
 import os
 import signal
@@ -5172,6 +5173,77 @@ count_pq = cur.fetchone()[0]
 ok("[20.6 read_parquet_count_star] COUNT(*) on READ_PARQUET returns 2",
    count_pq == 2,
    count_pq)
+
+
+# ── 20.7 — BACKUP / RESTORE ───────────────────────────────────────────────────
+
+import tempfile as _tempfile, os as _os
+
+_bk_full = _os.path.join(_tempfile.gettempdir(), "axm_wire_full.axbk")
+_bk_inc  = _os.path.join(_tempfile.gettempdir(), "axm_wire_inc.axbk")
+_bk_rest = _os.path.join(_tempfile.gettempdir(), "axm_wire_rest.db")
+for _p in [_bk_full, _bk_inc, _bk_rest]:
+    if _os.path.exists(_p):
+        _os.remove(_p)
+
+# 20.7a: full backup returns a status row
+cur.execute(f"BACKUP DATABASE TO '{_bk_full}'")
+_bk_row = cur.fetchone()
+ok("[20.7a full_backup_status] BACKUP DATABASE returns status row",
+   _bk_row is not None and "Full backup" in str(_bk_row[0]),
+   _bk_row)
+
+# 20.7b: .axbk file created on disk
+ok("[20.7b full_backup_file_exists] Full .axbk file created on disk",
+   _os.path.isfile(_bk_full),
+   _bk_full)
+
+# 20.7c: duplicate destination rejected
+try:
+    cur.execute(f"BACKUP DATABASE TO '{_bk_full}'")
+    cur.fetchall()
+    ok("[20.7c full_backup_dup_rejected] Duplicate destination must error", False, "no error raised")
+except Exception as _e:
+    ok("[20.7c full_backup_dup_rejected] Duplicate destination rejected with error",
+       True, str(_e))
+
+# 20.7d: incremental backup
+cur.execute(f"BACKUP DATABASE TO '{_bk_inc}' INCREMENTAL FROM '{_bk_full}'")
+_inc_row = cur.fetchone()
+ok("[20.7d inc_backup_status] INCREMENTAL BACKUP returns status row",
+   _inc_row is not None and "Incremental backup" in str(_inc_row[0]),
+   _inc_row)
+
+# 20.7e: incremental .axbk file created
+ok("[20.7e inc_backup_file_exists] Incremental .axbk file created on disk",
+   _os.path.isfile(_bk_inc),
+   _bk_inc)
+
+# 20.7f: restore full backup
+cur.execute(f"RESTORE DATABASE FROM '{_bk_full}' TO '{_bk_rest}'")
+_rest_row = cur.fetchone()
+ok("[20.7f restore_status] RESTORE DATABASE returns status row",
+   _rest_row is not None and "Restored" in str(_rest_row[0]),
+   _rest_row)
+
+# 20.7g: restored file created on disk
+ok("[20.7g restore_file_exists] Restored file created on disk",
+   _os.path.isfile(_bk_rest),
+   _bk_rest)
+
+# 20.7h: restore to existing path rejected
+try:
+    cur.execute(f"RESTORE DATABASE FROM '{_bk_full}' TO '{_bk_rest}'")
+    cur.fetchall()
+    ok("[20.7h restore_dup_rejected] Restore to existing path must error", False, "no error raised")
+except Exception as _e:
+    ok("[20.7h restore_dup_rejected] Restore to existing path rejected with error",
+       True, str(_e))
+
+# cleanup
+for _p in [_bk_full, _bk_inc, _bk_rest]:
+    if _os.path.exists(_p):
+        _os.remove(_p)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────

@@ -565,6 +565,13 @@ impl StorageEngine for MmapStorage {
         Self::read_page_from_mmap(&mmap, page_id)
     }
 
+    fn read_page_raw(&self, page_id: u64) -> Result<[u8; crate::PAGE_SIZE], DbError> {
+        if page_id >= self.page_count.load(Ordering::Acquire) {
+            return Err(DbError::PageNotFound { page_id });
+        }
+        self.copy_raw_page_from_mmap(page_id)
+    }
+
     fn write_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
         // Acquire per-page exclusive lock.
         // Two threads writing DIFFERENT pages: different locks → full parallelism.
