@@ -115,6 +115,8 @@ fn execute_select(
             "already handled None, Subquery, JsonTable, JsonbSrf, Values, Unnest, GenerateSeries, ReadParquet above"
         ),
     };
+    // Phase 20.11: save TABLESAMPLE spec before from_table_ref is borrowed.
+    let tablesample = from_table_ref.tablesample.clone();
 
     // INFORMATION_SCHEMA virtual tables (4.20c).
     if from_table_ref
@@ -228,11 +230,45 @@ fn execute_select(
                 fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns, &fdw_pushed, fdw_pushed_limit)?
             }
             crate::planner::AccessMethod::Scan if resolved.def.is_clustered() => {
-                crate::table::scan_clustered_table(storage, &resolved.def, &resolved.columns, snap)?
+                let mut rows = crate::table::scan_clustered_table(
+                    storage,
+                    &resolved.def,
+                    &resolved.columns,
+                    snap,
+                )?;
+                // Phase 20.11: post-scan Bernoulli filter for clustered tables.
+                if let Some(s) = &tablesample {
+                    if s.percent <= 0.0 {
+                        rows.clear();
+                    } else if s.percent < 100.0 {
+                        use rand::Rng;
+                        let threshold = s.percent / 100.0;
+                        let mut rng = rand::thread_rng();
+                        rows.retain(|_| rng.gen::<f64>() < threshold);
+                    }
+                }
+                rows
             }
             crate::planner::AccessMethod::Scan => {
-                // Full sequential scan — existing behavior.
-                TableEngine::scan_table(storage, &resolved.def, &resolved.columns, snap, None)?
+                // Phase 20.11: use sampled scan when TABLESAMPLE is present.
+                if let Some(s) = &tablesample {
+                    TableEngine::scan_table_sampled(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        snap,
+                        None,
+                        s,
+                    )?
+                } else {
+                    TableEngine::scan_table(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        snap,
+                        None,
+                    )?
+                }
             }
             crate::planner::AccessMethod::IndexLookup { index_def, key }
                 if resolved.def.is_clustered() && index_def.is_primary =>

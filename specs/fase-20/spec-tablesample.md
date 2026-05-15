@@ -2,7 +2,7 @@
 
 Phase: 20 — Types + import/export
 Task: TABLESAMPLE — page-level and row-level random sampling
-Status: approved
+Status: implemented
 
 ## Context
 

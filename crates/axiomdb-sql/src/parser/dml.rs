@@ -1024,9 +1024,18 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
 
     // Optional alias: `AS name` or implicit `name` (if next is a plain identifier,
     // not a keyword like JOIN, WHERE, ON, etc.)
-    if p.eat(&Token::As) || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p)) {
+    // Exclude `TABLESAMPLE` from implicit alias detection so `t TABLESAMPLE SYSTEM(10)`
+    // doesn't treat TABLESAMPLE as the alias for t.
+    if p.eat(&Token::As)
+        || (is_implicit_alias_token(p.peek())
+            && !is_pivot_clause_start(p)
+            && !is_tablesample_start(p))
+    {
         table_ref.alias = Some(p.parse_identifier()?);
     }
+
+    // Optional TABLESAMPLE clause (after alias, before PIVOT).
+    table_ref.tablesample = parse_optional_tablesample(p)?;
 
     parse_optional_pivot_clause(p, FromClause::Table(table_ref))
 }
@@ -1416,6 +1425,89 @@ fn peek_ident_ci_at(p: &Parser, offset: usize, keyword: &str) -> bool {
         Token::Ident(s) => s.eq_ignore_ascii_case(keyword),
         _ => false,
     }
+}
+
+fn is_tablesample_start(p: &Parser) -> bool {
+    peek_ident_ci_at(p, 0, "TABLESAMPLE")
+}
+
+fn parse_optional_tablesample(p: &mut Parser) -> Result<Option<crate::ast::TableSample>, DbError> {
+    use crate::ast::{TableSample, TableSampleMethod};
+    if !is_tablesample_start(p) {
+        return Ok(None);
+    }
+    p.advance(); // consume TABLESAMPLE
+
+    let method_name = p.parse_identifier()?;
+    let method = match method_name.to_ascii_uppercase().as_str() {
+        "SYSTEM" => TableSampleMethod::System,
+        "BERNOULLI" => TableSampleMethod::Bernoulli,
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "unknown TABLESAMPLE method '{}'; expected SYSTEM or BERNOULLI",
+                    other
+                ),
+                position: None,
+            })
+        }
+    };
+
+    p.expect(&Token::LParen)?;
+    let pct_expr = parse_expr(p)?;
+    p.expect(&Token::RParen)?;
+
+    let percent = match pct_expr {
+        crate::expr::Expr::Literal(axiomdb_types::Value::Int(n)) => n as f64,
+        crate::expr::Expr::Literal(axiomdb_types::Value::BigInt(n)) => n as f64,
+        crate::expr::Expr::Literal(axiomdb_types::Value::Real(f)) => f,
+        // Handle negated literals: -1, -0.5, etc.
+        crate::expr::Expr::UnaryOp {
+            op: crate::expr::UnaryOp::Neg,
+            operand,
+        } => match *operand {
+            crate::expr::Expr::Literal(axiomdb_types::Value::Int(n)) => -(n as f64),
+            crate::expr::Expr::Literal(axiomdb_types::Value::BigInt(n)) => -(n as f64),
+            crate::expr::Expr::Literal(axiomdb_types::Value::Real(f)) => -f,
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "TABLESAMPLE percent must be a numeric literal, got {:?}",
+                        other
+                    ),
+                    position: None,
+                })
+            }
+        },
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "TABLESAMPLE percent must be a numeric literal, got {:?}",
+                    other
+                ),
+                position: None,
+            })
+        }
+    };
+
+    if !(0.0..=100.0).contains(&percent) {
+        return Err(DbError::InvalidValue {
+            reason: "TABLESAMPLE percent must be in [0, 100]".into(),
+        });
+    }
+
+    // REPEATABLE(seed) — parser accepts, executor rejects.
+    if peek_ident_ci_at(p, 0, "REPEATABLE") {
+        p.advance(); // consume REPEATABLE
+        p.expect(&Token::LParen)?;
+        parse_expr(p)?; // discard seed
+        p.expect(&Token::RParen)?;
+        return Err(DbError::NotImplemented {
+            feature: "TABLESAMPLE REPEATABLE".into(),
+        });
+    }
+
+    Ok(Some(TableSample { method, percent }))
 }
 
 /// Parse the argument list inside `ROLLUP(...)` or `CUBE(...)`.

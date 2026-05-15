@@ -109,6 +109,89 @@ impl TableEngine {
         Ok(result)
     }
 
+    /// Scans a heap table with TABLESAMPLE sampling (Phase 20.11).
+    ///
+    /// SYSTEM: for each page, flip a coin — include all visible rows or skip all.
+    /// BERNOULLI: for each visible row, flip a coin — include or skip.
+    /// Shortcuts: percent >= 100 → full scan; percent <= 0 → empty immediately.
+    pub fn scan_table_sampled(
+        storage: &dyn StorageEngine,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        snap: TransactionSnapshot,
+        column_mask: Option<&[bool]>,
+        sample: &crate::ast::TableSample,
+    ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+        use crate::ast::TableSampleMethod;
+        use rand::Rng;
+
+        if sample.percent <= 0.0 {
+            return Ok(Vec::new());
+        }
+        if sample.percent >= 100.0 {
+            return Self::scan_table_direct(storage, table_def, columns, snap, column_mask);
+        }
+
+        ensure_heap_table(table_def, "TABLESAMPLE on clustered table — caller applies filter")?;
+
+        let threshold = sample.percent / 100.0;
+        let col_types = column_data_types(columns);
+        let masked_decode = column_mask.filter(|mask| !mask.iter().all(|&b| b));
+        let mut result = Vec::new();
+        let mut rng = rand::thread_rng();
+        let mut current = table_def.root_page_id;
+
+        while current != 0 {
+            let raw = *storage.read_page(current)?.as_bytes();
+            let page = Page::from_bytes(raw)?;
+            let next = heap_chain::chain_next_page(&page);
+
+            // SYSTEM: skip entire page with probability (1 - threshold).
+            if sample.method == TableSampleMethod::System && rng.gen::<f64>() >= threshold {
+                current = next;
+                continue;
+            }
+
+            if next != 0 {
+                storage.prefetch_hint(next, 8);
+            }
+
+            let num = num_slots(&page);
+            for slot_id in 0..num {
+                let entry = read_slot(&page, slot_id);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset as usize;
+                let len = entry.length as usize;
+                let bytes = &page.as_bytes()[off..off + len];
+                let header: &RowHeader =
+                    bytemuck::from_bytes(&bytes[..size_of::<RowHeader>()]);
+                if !header.is_visible(&snap) {
+                    continue;
+                }
+                // BERNOULLI: skip row with probability (1 - threshold).
+                if sample.method == TableSampleMethod::Bernoulli
+                    && rng.gen::<f64>() >= threshold
+                {
+                    continue;
+                }
+                let row_data = &bytes[size_of::<RowHeader>()..];
+                let mut values = if let Some(mask) = masked_decode {
+                    decode_row_masked(row_data, &col_types, mask)?
+                } else {
+                    decode_row(row_data, &col_types)?
+                };
+                detoast_row(&mut values, storage);
+                result.push((RecordId { page_id: current, slot_id }, values));
+            }
+
+            current = next;
+        }
+
+        Ok(result)
+    }
+
     /// Scan with inline WHERE filter (Phase 8.1 — vectorized filter).
     ///
     /// Like `scan_table_direct` but evaluates the WHERE predicate INSIDE the

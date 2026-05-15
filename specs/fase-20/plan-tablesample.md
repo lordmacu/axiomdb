@@ -3,7 +3,7 @@
 Phase: 20 — Types + import/export
 Task: TABLESAMPLE — page-level and row-level random sampling
 Spec: specs/fase-20/spec-tablesample.md
-Status: in-progress
+Status: done
 
 ## Summary
 

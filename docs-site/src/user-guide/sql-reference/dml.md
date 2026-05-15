@@ -2683,3 +2683,63 @@ not a result set.
 | Source | Any SELECT query | Full table scan |
 | Format options | FIELDS/LINES | FORMAT CSV/JSON/JSONL |
 | Header row | Never | Optional (`HEADER TRUE`) |
+
+---
+
+## TABLESAMPLE
+
+`TABLESAMPLE` returns a random subset of rows from a table without scanning the whole table.
+It is useful for statistical analysis, A/B testing, and ML train/test splits on large tables.
+
+### Syntax
+
+```sql
+SELECT col [, ...] FROM table TABLESAMPLE method(percent)
+```
+
+| Clause | Description |
+|---|---|
+| `method` | `SYSTEM` (page-level) or `BERNOULLI` (row-level) |
+| `percent` | Sampling percentage in the range `[0, 100]` |
+
+### Methods
+
+| Method | Granularity | Speed | Use when |
+|---|---|---|---|
+| `SYSTEM` | Per heap page | Fast — skips entire pages | Approximate counts, large tables |
+| `BERNOULLI` | Per row | Accurate — checks every row | Smaller tables, unbiased samples |
+
+### Examples
+
+```sql
+-- Return roughly 1% of orders (page-level, very fast)
+SELECT * FROM orders TABLESAMPLE SYSTEM(1);
+
+-- Return roughly 10% of users (row-level, unbiased)
+SELECT COUNT(*) FROM users TABLESAMPLE BERNOULLI(10);
+
+-- Works with aliases
+SELECT u.name FROM users AS u TABLESAMPLE SYSTEM(5);
+
+-- Combine with WHERE and LIMIT
+SELECT id FROM events TABLESAMPLE BERNOULLI(100) WHERE type = 'click' LIMIT 1000;
+
+-- Exact edge cases
+SELECT * FROM t TABLESAMPLE SYSTEM(0);   -- always empty
+SELECT * FROM t TABLESAMPLE SYSTEM(100); -- always all rows
+```
+
+### Notes
+
+- The `percent` argument is evaluated at query time. `0` always returns an empty set;
+  `100` always returns all rows.
+- `SYSTEM` uses a per-page coin flip. For clustered (B+ tree) tables, it falls back to a
+  post-scan row-level filter to preserve index ordering.
+- `REPEATABLE(seed)` is **not yet implemented** — it will be added in Phase 28.8.
+- `TABLESAMPLE` in `JOIN` clauses is not yet supported; apply sampling in a subquery instead.
+
+<div class="callout-design">
+<strong>Design:</strong> AxiomDB's SYSTEM method performs one random check per heap page,
+skipping the entire page if the coin comes up tails. This means sampling 1% of a 10 GB
+table reads only ~100 MB of data on average.
+</div>

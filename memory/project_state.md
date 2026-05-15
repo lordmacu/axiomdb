@@ -3,19 +3,19 @@
 ## Current (2026-05-15)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.12 — ORDER BY RANDOM() COMPLETE.
-Fixed `RAND()`/`RANDOM()` to use `rand::random::<f64>()` (replaces LCG PRNG); arity
-validated. `apply_order_by` pure-random path uses Fisher-Yates shuffle; mixed
-`ORDER BY col, RANDOM()` pre-materializes random keys; `apply_order_by_top_n` falls
-back to full shuffle for RANDOM() cases. 12 integration tests, 3 wire assertions
-(574/574), 4044/4044 workspace tests.
+**Active subphase:** Phase 20.11 — TABLESAMPLE COMPLETE.
+AST: `TableSampleMethod` enum + `TableSample { method, percent: f64 }` added to `TableRef`
+(f64 required removing `Eq` derive cascade in 4 structs). Parser: `parse_optional_tablesample`
+with implicit-alias guard + negated-literal handling + REPEATABLE→NotImplemented. Scan:
+`scan_table_sampled` in `TableEngine` (SYSTEM=page-level, BERNOULLI=row-level, 0/100 shortcuts,
+clustered fallback). Executor: `select_core.rs` branches to sampled scan. 16 integration tests,
+3 wire assertions, 4060/4060 workspace tests, clippy+fmt clean.
 
-**Last verified gates:** Phase 20.12 closeout passed 4044/4044 tests, clippy clean,
-fmt clean, wire test 574/574.
+**Last verified gates:** Phase 20.11 closeout passed 4060/4060 tests, clippy clean, fmt clean.
 
-**Recently completed:** 20.15 — Regex operators (2026-05-15). 20.12 — ORDER BY RANDOM() (2026-05-15).
+**Recently completed:** 20.11 — TABLESAMPLE (2026-05-15). 20.12 — ORDER BY RANDOM() (2026-05-15). 20.15 — Regex operators (2026-05-15).
 
-**Next:** Phase 20.11 (TABLESAMPLE).
+**Next:** Phase 20.13 (Range types) or next pending Phase 20 subphase.
 
 ### Phase 21 subphase status
 
@@ -80,6 +80,7 @@ fmt clean, wire test 574/574.
 | **20.8 COPY streaming** | ✅ closed |
 | **20.15 Regex operators** | ✅ closed |
 | **20.12 ORDER BY RANDOM()** | ✅ closed |
+| **20.11 TABLESAMPLE** | ✅ closed |
 | 20.10 GENERATE_SERIES | ✅ closed |
 | 20.14 UNNEST in SELECT list | ✅ closed |
 
