@@ -85,6 +85,8 @@ impl LockFlags {
     pub const INSERT_INTENTION: Self = Self(0x0008);
     /// Table-level lock (vs row-level). Set for IS/IX/AI/table-X.
     pub const TABLE_LOCK: Self = Self(0x0010);
+    /// Skip Condvar wait; return LockTimeout immediately on conflict.
+    pub const NOWAIT: Self = Self(0x0020);
 
     #[inline]
     pub const fn empty() -> Self {
