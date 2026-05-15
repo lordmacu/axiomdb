@@ -138,10 +138,10 @@ Today that means:
 - mutating statements (`INSERT`, `UPDATE`, `DELETE`, DDL, `BEGIN`/`COMMIT`/`ROLLBACK`)
   are serialized at whole-database granularity
 - a read that is already running keeps its snapshot while another session commits
-- `SELECT ... FOR UPDATE / FOR SHARE [NOWAIT]` row-level pessimistic locking
-  is available as of Phase 13.7 (see [Row-Level Locking](#row-level-locking) below)
+- `SELECT ... FOR UPDATE / FOR SHARE [NOWAIT | SKIP LOCKED]` row-level
+  pessimistic locking is available as of Phase 13.7–13.8b
+  (see [Row-Level Locking](#row-level-locking) below)
 - deadlock detection is built into the lock manager
-- `SKIP LOCKED` is planned for a follow-up subphase
 
 This is good for read-heavy workloads, but it is still below MySQL/InnoDB and
 PostgreSQL for write concurrency because they already lock at row granularity.
@@ -197,19 +197,17 @@ the server queues mutating statements behind the database-wide write guard.
 This means you should not yet build on assumptions such as:
 
 - `40001 serialization_failure` retries for ordinary write-write conflicts
-- `SELECT ... FOR UPDATE SKIP LOCKED` job-queue patterns (SKIP LOCKED planned)
-
-Row-level deadlock detection and `SELECT ... FOR UPDATE / FOR SHARE [NOWAIT]`
-are implemented as of Phase 13.7.
+Row-level pessimistic locking (`FOR UPDATE / FOR SHARE`) with `NOWAIT` and
+`SKIP LOCKED` is implemented as of Phases 13.7–13.8b, including deadlock detection.
 
 ---
 
 ## Row-Level Locking
 
-`SELECT ... FOR UPDATE / FOR SHARE [NOWAIT]` acquires **pessimistic row-level
-locks** on the rows returned by the query. This prevents other transactions
-from modifying (or, for shared locks, exclusively locking) those rows until
-your transaction commits or rolls back.
+`SELECT ... FOR UPDATE / FOR SHARE` acquires **pessimistic row-level locks**
+on the rows returned by the query. This prevents other transactions from
+modifying (or, for shared locks, exclusively locking) those rows until your
+transaction commits or rolls back.
 
 ### Syntax
 
@@ -217,10 +215,10 @@ your transaction commits or rolls back.
 SELECT ... FROM table
 [WHERE ...]
 [ORDER BY ...] [LIMIT n]
-FOR UPDATE [NOWAIT]
-| FOR NO KEY UPDATE [NOWAIT]
-| FOR SHARE [NOWAIT]
-| FOR KEY SHARE [NOWAIT]
+FOR UPDATE          [NOWAIT | SKIP LOCKED]
+| FOR NO KEY UPDATE [NOWAIT | SKIP LOCKED]
+| FOR SHARE         [NOWAIT | SKIP LOCKED]
+| FOR KEY SHARE     [NOWAIT | SKIP LOCKED]
 | LOCK IN SHARE MODE   -- MySQL alias for FOR SHARE
 ```
 
@@ -240,11 +238,35 @@ Appending `NOWAIT` causes the statement to fail immediately with
 another transaction. Without `NOWAIT`, the statement waits until the
 conflicting lock is released (or until `lock_timeout` fires).
 
+### SKIP LOCKED
+
+Appending `SKIP LOCKED` silently omits rows that cannot be locked — no error,
+no waiting. Rows are evaluated *before* `LIMIT` is applied, so
+`LIMIT 1 FOR UPDATE SKIP LOCKED` always returns one *available* row even when
+other rows are locked ahead of it.
+
+```sql
+-- Multiple workers can run concurrently without blocking each other.
+BEGIN;
+
+SELECT id, payload
+FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;  -- skip rows already claimed by other workers
+
+UPDATE jobs SET status = 'running' WHERE id = ?;
+
+COMMIT;
+```
+
 ### When Locks Are Acquired
 
-Locks are acquired **after** `WHERE`, `ORDER BY`, and `LIMIT` are applied —
-only the rows in the final result set are locked. This makes `LIMIT 1 FOR UPDATE`
-efficient for job-queue patterns: a single row is locked without scanning the rest.
+- **`NOWAIT` / `Block`**: locks are acquired after `WHERE`, `ORDER BY`, and
+  `LIMIT` — only rows in the final result set are locked.
+- **`SKIP LOCKED`**: locking happens after `WHERE` and `ORDER BY` but *before*
+  `LIMIT` — `LIMIT` is applied to the already-filtered (lockable) set.
 
 ### Deadlock Detection
 
@@ -283,7 +305,6 @@ COMMIT;
 
 - `FOR UPDATE` is not supported on foreign tables (HTTP FDW).
 - `FOR UPDATE` on clustered tables is not yet supported; use heap tables.
-- `SKIP LOCKED` is planned for a follow-up subphase.
 
 ---
 

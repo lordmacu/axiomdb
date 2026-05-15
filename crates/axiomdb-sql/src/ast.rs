@@ -898,6 +898,10 @@ pub enum LockWaitPolicy {
     Block,
     /// `NOWAIT`: fail immediately on conflict.
     NoWait,
+    /// `SKIP LOCKED`: silently omit rows whose lock cannot be acquired.
+    /// LIMIT is applied *after* skip-filtering so `LIMIT n` always returns
+    /// up to n unlocked rows.
+    SkipLocked,
 }
 
 /// Combined locking clause (`FOR UPDATE [NOWAIT]`, etc.) on a `SELECT` statement.

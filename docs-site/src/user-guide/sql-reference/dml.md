@@ -19,7 +19,7 @@ FROM table_ref [AS alias]
 [HAVING condition]
 [ORDER BY column_list [ASC|DESC] [NULLS FIRST|LAST]]
 [LIMIT n [OFFSET m]]
-[FOR {UPDATE | NO KEY UPDATE | SHARE | KEY SHARE} [NOWAIT]
+[FOR {UPDATE | NO KEY UPDATE | SHARE | KEY SHARE} [NOWAIT | SKIP LOCKED]
  | LOCK IN SHARE MODE];
 ```
 
@@ -116,40 +116,31 @@ or rolls back.
 
 **NOWAIT:**
 
-Append `NOWAIT` to any `FOR …` clause to fail immediately instead of waiting
-if a conflicting lock is already held.
+Append `NOWAIT` to fail immediately instead of waiting if a conflicting lock
+is already held.
 
 ```sql
 BEGIN;
 
--- Lock the account row for exclusive update; fail immediately if locked.
 SELECT id, balance
 FROM accounts
 WHERE id = 42
 FOR UPDATE NOWAIT;
 
--- Safe to update — no other session can change the row.
 UPDATE accounts SET balance = balance - 100 WHERE id = 42;
 
 COMMIT;
 ```
 
-**Locking rules:**
+**SKIP LOCKED:**
 
-- Locks are acquired **after** `WHERE`, `ORDER BY`, and `LIMIT` are applied —
-  only the rows in the final result set are locked.
-- Locking is silently skipped in autocommit mode (no active transaction).
-- `FOR UPDATE` is not supported on foreign tables (HTTP FDW and similar).
-- `FOR UPDATE` on clustered tables is not yet supported.
-- Compatible locks: two sessions can both hold `FOR SHARE` on the same row.
-- Deadlock detection: the lock manager runs a cycle-detection DFS on the
-  wait-for graph; if a cycle is found, the later transaction is aborted with
-  `DbError::DeadlockDetected`.
-
-**Job-queue pattern:**
+Append `SKIP LOCKED` to silently omit rows that cannot be locked rather than
+waiting or erroring. Rows are skipped at the record level — `LIMIT` is applied
+*after* filtering, so `LIMIT 1 SKIP LOCKED` always returns one *available* row.
 
 ```sql
--- Reserve one pending job; no other worker can claim the same row.
+-- Reliable job-queue worker: multiple workers run concurrently without
+-- blocking each other or returning already-claimed rows.
 BEGIN;
 
 SELECT id, payload
@@ -157,14 +148,27 @@ FROM jobs
 WHERE status = 'pending'
 ORDER BY created_at
 LIMIT 1
-FOR UPDATE NOWAIT;
+FOR UPDATE SKIP LOCKED;
 
--- If the above returns a row, mark it as in-progress.
-UPDATE jobs SET status = 'running', started_at = NOW()
-WHERE id = ?;  -- use the id from the SELECT result
+-- If the above returns a row, claim it.
+UPDATE jobs SET status = 'running' WHERE id = ?;
 
 COMMIT;
 ```
+
+**Locking rules:**
+
+- For `NOWAIT` / `Block`: locks are acquired after `WHERE`, `ORDER BY`, and
+  `LIMIT`; only the rows in the final result set are locked.
+- For `SKIP LOCKED`: locking happens after `WHERE` and `ORDER BY` but *before*
+  `LIMIT`; `LIMIT` is applied to the already-filtered (lockable) set.
+- Locking is silently skipped in autocommit mode (no active transaction).
+- `FOR UPDATE` is not supported on foreign tables (HTTP FDW and similar).
+- `FOR UPDATE` on clustered tables is not yet supported.
+- Compatible locks: two sessions can both hold `FOR SHARE` on the same row.
+- Deadlock detection: the lock manager runs a cycle-detection DFS on the
+  wait-for graph; if a cycle is found, the later transaction is aborted with
+  `DbError::DeadlockDetected`.
 
 ---
 

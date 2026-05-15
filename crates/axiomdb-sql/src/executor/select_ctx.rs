@@ -808,44 +808,92 @@ fn execute_select_ctx(
                     }
                 }
 
-                // Step 3: LIMIT/OFFSET — lock only the rows that will be returned.
-                let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
-                if offset_n > 0 {
-                    let skip = offset_n.min(rid_pairs.len());
-                    rid_pairs = rid_pairs[skip..].to_vec();
-                }
-                if let Some(n) = limit_n {
-                    rid_pairs.truncate(n);
-                }
+                // Determine lock modes.
+                let (table_mode, row_mode) = match lc.strength {
+                    LockStrength::ForKeyShare | LockStrength::ForShare => (
+                        axiomdb_lock::LockMode::IntentionShared,
+                        axiomdb_lock::LockMode::Shared,
+                    ),
+                    LockStrength::ForNoKeyUpdate | LockStrength::ForUpdate => (
+                        axiomdb_lock::LockMode::IntentionExclusive,
+                        axiomdb_lock::LockMode::Exclusive,
+                    ),
+                };
 
-                // Step 4: Acquire table-intention + row-level locks.
-                if let (Some(lm), Some(ct)) = (exec_ctx.lock_manager(), conn_txn) {
-                    let (table_mode, row_mode) = match lc.strength {
-                        LockStrength::ForKeyShare | LockStrength::ForShare => (
-                            axiomdb_lock::LockMode::IntentionShared,
-                            axiomdb_lock::LockMode::Shared,
-                        ),
-                        LockStrength::ForNoKeyUpdate | LockStrength::ForUpdate => (
-                            axiomdb_lock::LockMode::IntentionExclusive,
-                            axiomdb_lock::LockMode::Exclusive,
-                        ),
-                    };
-                    let mut row_flags = axiomdb_lock::LockFlags::REC_NOT_GAP;
-                    if lc.wait_policy == LockWaitPolicy::NoWait {
-                        row_flags = row_flags.union(axiomdb_lock::LockFlags::NOWAIT);
+                if lc.wait_policy == LockWaitPolicy::SkipLocked {
+                    // SkipLocked pipeline: ORDER BY already done; no LIMIT yet.
+                    // Try-lock each candidate row, keep only granted ones, then apply LIMIT.
+                    if let (Some(lm), Some(ct)) = (exec_ctx.lock_manager(), conn_txn) {
+                        lm.acquire_table_lock_sync(ct.txn_id, resolved.def.id, table_mode)?;
+                        let mut locked_pairs: Vec<(RecordId, Row)> =
+                            Vec::with_capacity(rid_pairs.len());
+                        for (rid, row) in rid_pairs {
+                            if lm.try_acquire_record_lock_sync(
+                                ct.txn_id,
+                                rid.page_id,
+                                rid.slot_id,
+                                row_mode,
+                            )? {
+                                locked_pairs.push((rid, row));
+                            }
+                            // Ok(false) → silently skip this row
+                        }
+                        // Apply LIMIT/OFFSET on the filtered (locked) set.
+                        let (limit_n, offset_n) =
+                            eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+                        if offset_n > 0 {
+                            let skip = offset_n.min(locked_pairs.len());
+                            locked_pairs = locked_pairs[skip..].to_vec();
+                        }
+                        if let Some(n) = limit_n {
+                            locked_pairs.truncate(n);
+                        }
+                        rid_pairs = locked_pairs;
                     }
-                    lm.acquire_table_lock_sync(ct.txn_id, resolved.def.id, table_mode)?;
-                    for (rid, _) in &rid_pairs {
-                        lm.acquire_record_lock_sync(
-                            ct.txn_id,
-                            rid.page_id,
-                            rid.slot_id,
-                            row_mode,
-                            row_flags,
-                        )?;
+                    // No lock_manager or no conn_txn → fall through with full rid_pairs.
+                    // Apply LIMIT normally in that case.
+                    if exec_ctx.lock_manager().is_none() || conn_txn.is_none() {
+                        let (limit_n, offset_n) =
+                            eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+                        if offset_n > 0 {
+                            let skip = offset_n.min(rid_pairs.len());
+                            rid_pairs = rid_pairs[skip..].to_vec();
+                        }
+                        if let Some(n) = limit_n {
+                            rid_pairs.truncate(n);
+                        }
                     }
+                } else {
+                    // Block / NoWait pipeline: LIMIT first, then acquire all.
+                    // Step 3: LIMIT/OFFSET — lock only the rows that will be returned.
+                    let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+                    if offset_n > 0 {
+                        let skip = offset_n.min(rid_pairs.len());
+                        rid_pairs = rid_pairs[skip..].to_vec();
+                    }
+                    if let Some(n) = limit_n {
+                        rid_pairs.truncate(n);
+                    }
+
+                    // Step 4: Acquire table-intention + row-level locks.
+                    if let (Some(lm), Some(ct)) = (exec_ctx.lock_manager(), conn_txn) {
+                        let mut row_flags = axiomdb_lock::LockFlags::REC_NOT_GAP;
+                        if lc.wait_policy == LockWaitPolicy::NoWait {
+                            row_flags = row_flags.union(axiomdb_lock::LockFlags::NOWAIT);
+                        }
+                        lm.acquire_table_lock_sync(ct.txn_id, resolved.def.id, table_mode)?;
+                        for (rid, _) in &rid_pairs {
+                            lm.acquire_record_lock_sync(
+                                ct.txn_id,
+                                rid.page_id,
+                                rid.slot_id,
+                                row_mode,
+                                row_flags,
+                            )?;
+                        }
+                    }
+                    // No lock_manager or no active txn → silently skip (autocommit path).
                 }
-                // No lock_manager or no active txn → silently skip (autocommit path).
 
                 // Step 5: Project and return (ORDER BY + LIMIT already applied above).
                 let locked_rows: Vec<Row> = rid_pairs.into_iter().map(|(_, r)| r).collect();
