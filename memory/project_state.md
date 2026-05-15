@@ -3,19 +3,19 @@
 ## Current (2026-05-15)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.7 — Incremental backup COMPLETE.
+**Active subphase:** Phase 20.8 — COPY streaming COMPLETE.
 Phase 20.7 added `BACKUP DATABASE TO` (full + incremental) and `RESTORE DATABASE FROM`.
 Custom `.axbk` binary format with 128-byte header; incremental diff via CRC32c page checksum;
 `read_page_raw` added to `StorageEngine` trait for checksum-bypass reads; BACKUP/RESTORE
 intercepted before transaction wrappers in `execute_with_ctx_locked`. 8 parser tests, 8 wire
 assertions (562/562).
 
-**Last verified gates:** Phase 20.7 closeout passed 3990/3990 tests, clippy clean,
-fmt clean, wire test 562/562.
+**Last verified gates:** Phase 20.8 closeout passed 3995/3995 tests, clippy clean,
+fmt clean, wire test 564/564.
 
-**Recently completed:** 20.6 — Parquet (2026-05-15). 20.7 — Incremental backup (2026-05-15).
+**Recently completed:** 20.7 — Incremental backup (2026-05-15). 20.8 — COPY streaming (2026-05-15).
 
-**Next:** Phase 20.8 (COPY streaming) or Phase 20.11 (TABLESAMPLE) or continue Phase 20 backlog.
+**Next:** Phase 20.11 (TABLESAMPLE) or Phase 20.12 (ORDER BY RANDOM()) or Phase 20.15 (Regex operators).
 
 ### Phase 21 subphase status
 
@@ -77,6 +77,7 @@ fmt clean, wire test 562/562.
 | 20.5b SELECT INTO OUTFILE | ✅ closed |
 | 20.6 Parquet READ_PARQUET + COPY TO PARQUET | ✅ closed |
 | **20.7 Incremental backup** | ✅ closed |
+| **20.8 COPY streaming** | ✅ closed |
 | 20.10 GENERATE_SERIES | ✅ closed |
 | 20.14 UNNEST in SELECT list | ✅ closed |
 

@@ -46,7 +46,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking),
             13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns),
             20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip),
-            20.7 (BACKUP DATABASE TO / RESTORE DATABASE FROM: full + incremental + restore)
+            20.7 (BACKUP DATABASE TO / RESTORE DATABASE FROM: full + incremental + restore),
+            20.8 (COPY FROM streaming: CSV batch loop + JSONL schema-first, O(batch_size) memory)
 """
 import os
 import signal
@@ -5244,6 +5245,45 @@ except Exception as _e:
 for _p in [_bk_full, _bk_inc, _bk_rest]:
     if _os.path.exists(_p):
         _os.remove(_p)
+
+
+# ── 20.8 — COPY FROM streaming ───────────────────────────────────────────────
+
+import csv as _csv, io as _io
+
+# 20.8a: COPY FROM CSV with 2000 rows (>1 batch)
+_csv_path = _os.path.join(_tempfile.gettempdir(), "axm_wire_stream.csv")
+with open(_csv_path, "w", newline="") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["id", "val"])
+    for _i in range(2000):
+        _w.writerow([_i, f"v{_i}"])
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_copy_stream (id INT, val TEXT)")
+cur.execute("DELETE FROM _wire_copy_stream")
+cur.execute(f"COPY _wire_copy_stream FROM '{_csv_path}' WITH (FORMAT CSV, HEADER TRUE)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM _wire_copy_stream")
+_stream_cnt = cur.fetchone()[0]
+ok("[20.8a csv_streaming_count] COPY FROM 2000-row CSV inserts all rows across batches",
+   int(_stream_cnt) == 2000,
+   _stream_cnt)
+_os.remove(_csv_path)
+
+# 20.8b: COPY FROM JSONL with unknown/missing keys
+_jsonl_path = _os.path.join(_tempfile.gettempdir(), "axm_wire_stream.jsonl")
+with open(_jsonl_path, "w") as _f:
+    _f.write('{"id":1,"val":"hi","extra":"ignored"}\n')   # unknown key
+    _f.write('{"id":2}\n')                                 # missing val → NULL
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_copy_jsonl (id INT, val TEXT)")
+cur.execute("DELETE FROM _wire_copy_jsonl")
+cur.execute(f"COPY _wire_copy_jsonl FROM '{_jsonl_path}' WITH (FORMAT JSONL)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM _wire_copy_jsonl")
+_jsonl_cnt = cur.fetchone()[0]
+ok("[20.8b jsonl_streaming_schema_first] COPY FROM JSONL unknown/missing keys → 2 rows inserted",
+   int(_jsonl_cnt) == 2,
+   _jsonl_cnt)
+_os.remove(_jsonl_path)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────

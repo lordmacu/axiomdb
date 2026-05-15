@@ -319,3 +319,62 @@ BACKUP/RESTORE intercepted at the **top** of `execute_with_ctx_locked` before al
 - Streaming backup over a network socket without writing a temp file.
 - `base_path` > 71 bytes (documented workaround: use a symlink to shorten the path).
 - Backup encryption / compression wrappers.
+
+## 20.8 — COPY FROM streaming (2026-05-15)
+
+### What was built
+
+`COPY table FROM 'path'` now processes CSV and JSONL files in O(batch_size) memory
+regardless of file size. A 10 GB CSV with 200 M rows no longer requires 200 GB RSS
+before the first insert.
+
+### Architecture
+
+#### Constant
+
+```rust
+const COPY_BATCH_SIZE: usize = 1024;
+```
+
+#### CSV streaming (`stream_copy_csv`)
+
+The `csv::Reader` already iterates records lazily. The change is that `stream_copy_csv`
+no longer collects into `Vec<Vec<Value>>` — instead it accumulates up to `COPY_BATCH_SIZE`
+rows, then calls `flush_batch` → `execute_insert_ctx`. Repeat until EOF; flush any partial
+final batch.
+
+Memory: at most `COPY_BATCH_SIZE × cols × ~64 B` ≈ 320 KB per batch for a 5-column table.
+
+#### JSONL schema-first streaming (`stream_copy_jsonl`)
+
+The old JSONL implementation did two passes: collect all lines to discover column names,
+then emit rows. The new implementation:
+
+1. Calls `resolve_table_cached` once to get the table's column list.
+2. Builds `col_index: HashMap<String, usize>` from the schema.
+3. Iterates `reader.lines()`, parses each non-empty line as a JSON object, maps keys
+   through `col_index` into a fixed-width `row = vec![Value::Null; col_count]`.
+4. Unknown keys → silently ignored. Missing keys → `Value::Null`.
+5. Batches of 1024 flushed via `flush_batch`.
+
+#### JSON array
+
+`parse_json_file` unchanged. JSON arrays (`[{...}]`) require full load.
+Users should use JSONL format for files that exceed available RAM.
+
+#### Transaction semantics
+
+All batches share the same `ConnectionTxn`. A parse error or FK violation on any batch
+returns `Err` to the caller, which rolls back all previously inserted batches. Atomicity
+is preserved — identical to PostgreSQL COPY FROM behavior.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_copy.rs` — 5 new streaming tests.
+- Wire smoke block `[20.8 COPY streaming]` in `tools/wire-test.py` — 2 assertions (564/564).
+
+### Deferred to later phases
+
+- JSONL: strict unknown-column error mode (opt-in flag).
+- JSON array streaming via `serde_json::StreamDeserializer`.
+- Configurable `COPY_BATCH_SIZE` via WITH options.

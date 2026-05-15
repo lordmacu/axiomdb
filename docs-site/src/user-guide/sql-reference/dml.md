@@ -2264,6 +2264,23 @@ COPY t FROM '/data/t.csv' WITH (FORMAT CSV, NULL '');
 
 `Affected { count }` — number of rows inserted.
 
+#### Memory usage
+
+CSV and JSONL are processed in a streaming batch loop (`COPY_BATCH_SIZE = 1024` rows at a time).
+Files larger than available RAM can be imported without out-of-memory errors.
+
+JSON array format (`[{...}]`) loads the entire file into memory — use JSONL for files that exceed RAM.
+
+JSONL key mapping is schema-first: column names are resolved from the table definition once before
+streaming begins. Unknown keys in each JSON object are silently ignored; missing keys are inserted
+as `NULL`.
+
+#### Atomicity
+
+The entire `COPY FROM` runs inside a single transaction. If any row causes an error (parse
+failure, FK violation, type coercion error), the whole import is rolled back — no partial
+inserts are committed.
+
 ### COPY TO
 
 ```sql
