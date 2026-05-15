@@ -465,6 +465,14 @@ pub enum BinaryOp {
     // Pattern matching
     /// `REGEXP` / `RLIKE` — regular-expression match.
     Regexp,
+    /// `~`  — PostgreSQL POSIX regex match, case-sensitive.
+    RegexpTilde,
+    /// `~*` — PostgreSQL POSIX regex match, case-insensitive.
+    RegexpITilde,
+    /// `!~` — PostgreSQL POSIX regex not-match, case-sensitive.
+    RegexpNotTilde,
+    /// `!~*` — PostgreSQL POSIX regex not-match, case-insensitive.
+    RegexpNotITilde,
 
     // JSON operators (Phase 11.16 / 11.17)
     /// `->` — JSON sub-document extraction returning `Value::Jsonb`.

@@ -5286,6 +5286,41 @@ ok("[20.8b jsonl_streaming_schema_first] COPY FROM JSONL unknown/missing keys �
 _os.remove(_jsonl_path)
 
 
+# ── 20.15 — PostgreSQL regex operators + REGEXP_LIKE + REGEXP_REPLACE ────────
+
+# 20.15a: ~ case-sensitive match
+cur.execute("SELECT 'hello' ~ 'h.*'")
+ok("[20.15a ~_match] 'hello' ~ 'h.*' → true", cur.fetchone()[0] == 1)
+
+# 20.15b: ~* case-insensitive match
+cur.execute("SELECT 'Hello' ~* 'hello'")
+ok("[20.15b ~*_ci] 'Hello' ~* 'hello' → true", cur.fetchone()[0] == 1)
+
+# 20.15c: !~ negation
+cur.execute("SELECT 'hello' !~ 'world'")
+ok("[20.15c !~_neg] 'hello' !~ 'world' → true", cur.fetchone()[0] == 1)
+
+# 20.15d: !~* case-insensitive negation (matches, so negation → false)
+cur.execute("SELECT 'Hello' !~* 'HELLO'")
+ok("[20.15d !~*_ci_neg] 'Hello' !~* 'HELLO' → false", cur.fetchone()[0] == 0)
+
+# 20.15e: REGEXP_LIKE with 'i' flag
+cur.execute("SELECT REGEXP_LIKE('Hello World', 'hello', 'i')")
+ok("[20.15e regexp_like_ci] REGEXP_LIKE('Hello World','hello','i') → true",
+   cur.fetchone()[0] == 1)
+
+# 20.15f: REGEXP_REPLACE with backreference (using [0-9] to avoid SQL string escape issues)
+cur.execute("SELECT REGEXP_REPLACE('2024-01-15', '([0-9]{4})-([0-9]{2})-([0-9]{2})', '$3/$2/$1')")
+_repl_result = cur.fetchone()[0]
+ok("[20.15f regexp_replace_backref] REGEXP_REPLACE date reformat → '15/01/2024'",
+   _repl_result == "15/01/2024", _repl_result)
+
+# 20.15g: NULL propagation — NULL ~ pattern → NULL
+cur.execute("SELECT NULL ~ 'x'")
+_null_tilde = cur.fetchone()[0]
+ok("[20.15g null_tilde_propagates] NULL ~ 'x' → NULL", _null_tilde is None, _null_tilde)
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

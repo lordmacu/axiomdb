@@ -3,6 +3,131 @@ use axiomdb_types::Value;
 
 use crate::expr::Expr;
 
+pub(super) fn eval_regexp_like(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(DbError::InvalidValue {
+            reason: "REGEXP_LIKE requires 2 or 3 arguments".into(),
+        });
+    }
+    let text_val = crate::eval::eval(&args[0], row)?;
+    let pat_val = crate::eval::eval(&args[1], row)?;
+    if matches!(text_val, Value::Null) || matches!(pat_val, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let text = match text_val {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let pat = match pat_val {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let flags = if args.len() == 3 {
+        match crate::eval::eval(&args[2], row)? {
+            Value::Null => String::new(),
+            Value::Text(s) => s,
+            other => {
+                return Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                })
+            }
+        }
+    } else {
+        String::new()
+    };
+    let case_insensitive = flags.contains('i');
+    let re = regex::RegexBuilder::new(&pat)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| DbError::InvalidValue {
+            reason: format!("invalid regex pattern: {e}"),
+        })?;
+    Ok(Value::Bool(re.is_match(&text)))
+}
+
+pub(super) fn eval_regexp_replace(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(DbError::InvalidValue {
+            reason: "REGEXP_REPLACE requires 3 or 4 arguments".into(),
+        });
+    }
+    let text_val = crate::eval::eval(&args[0], row)?;
+    let pat_val = crate::eval::eval(&args[1], row)?;
+    let repl_val = crate::eval::eval(&args[2], row)?;
+    if matches!(text_val, Value::Null)
+        || matches!(pat_val, Value::Null)
+        || matches!(repl_val, Value::Null)
+    {
+        return Ok(Value::Null);
+    }
+    let text = match text_val {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let pat = match pat_val {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let repl = match repl_val {
+        Value::Text(s) => s,
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    let flags = if args.len() == 4 {
+        match crate::eval::eval(&args[3], row)? {
+            Value::Null => String::new(),
+            Value::Text(s) => s,
+            other => {
+                return Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                })
+            }
+        }
+    } else {
+        String::new()
+    };
+    let replace_all = flags.contains('g');
+    let case_insensitive = flags.contains('i');
+    let re = regex::RegexBuilder::new(&pat)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| DbError::InvalidValue {
+            reason: format!("invalid regex pattern: {e}"),
+        })?;
+    let result = if replace_all {
+        re.replace_all(&text, repl.as_str()).into_owned()
+    } else {
+        re.replace(&text, repl.as_str()).into_owned()
+    };
+    Ok(Value::Text(result))
+}
+
 pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
     match name {
         // ── String functions (4.19) ──────────────────────────────────────────

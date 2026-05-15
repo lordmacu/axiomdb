@@ -631,7 +631,16 @@ pub enum Token<'src> {
     /// `^` — bitwise XOR.
     #[token("^")]
     Caret,
-    /// `~` — bitwise NOT (unary).
+    /// `!~*` — PostgreSQL case-insensitive regex not-match (binary). Must appear before `!~` and `~*`.
+    #[token("!~*")]
+    BangTildeAsterisk,
+    /// `!~` — PostgreSQL case-sensitive regex not-match (binary). Must appear before `~`.
+    #[token("!~")]
+    BangTilde,
+    /// `~*` — PostgreSQL case-insensitive regex match (binary). Must appear before `~`.
+    #[token("~*")]
+    TildeAsterisk,
+    /// `~` — bitwise NOT (unary) or PostgreSQL case-sensitive regex match (binary, in parse_predicate).
     #[token("~")]
     Tilde,
     #[token(".")]

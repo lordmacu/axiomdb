@@ -292,6 +292,28 @@ fn parse_predicate(p: &mut Parser) -> Result<Expr, DbError> {
                 Ok(op_expr)
             }
         }
+        // Phase 20.15: PostgreSQL POSIX regex tilde operators (binary position only).
+        // Token::Tilde in *prefix* position is still parsed as unary BitNot in parse_unary.
+        Token::Tilde if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::RegexpTilde, left, right))
+        }
+        Token::TildeAsterisk if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::RegexpITilde, left, right))
+        }
+        Token::BangTilde if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::RegexpNotTilde, left, right))
+        }
+        Token::BangTildeAsterisk if !negated => {
+            p.advance();
+            let right = parse_bitor(p)?;
+            Ok(binop(BinaryOp::RegexpNotITilde, left, right))
+        }
         // Phase 11.17: `@>` JSONB containment — same precedence level as comparisons.
         Token::JsonContains if !negated => {
             p.advance();
