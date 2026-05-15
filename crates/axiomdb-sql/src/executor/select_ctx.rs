@@ -736,6 +736,155 @@ fn execute_select_ctx(
             } => gin_scan_rows(storage, &resolved, index_def, query_terms, snap.clone())?,
         };
 
+        // ── Phase 13.7: SELECT … FOR UPDATE / FOR SHARE row-level locking ──────
+        // Handled BEFORE the normal combined_rows pipeline so we can keep RecordIds
+        // through WHERE → ORDER BY → LIMIT and lock exactly the returned rows.
+        // Only active when lock_clause is Some AND no GROUP BY/aggregates
+        // (GROUP BY + FOR UPDATE is semantically undefined; fall through to non-lock path).
+        if let Some(ref lc) = stmt.lock_clause {
+            if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
+                return Err(DbError::NotImplemented {
+                    feature: "FOR UPDATE is not supported on foreign tables".into(),
+                });
+            }
+            if resolved.def.is_clustered() {
+                return Err(DbError::NotImplemented {
+                    feature: "FOR UPDATE on clustered tables not yet supported".into(),
+                });
+            }
+
+            // Only take the locking fast path for non-aggregate queries.
+            if stmt.group_by.is_empty() && !has_aggregates(&stmt.columns, &stmt.having) {
+                // Step 1: WHERE filter, keeping RecordIds.
+                let mut rid_pairs: Vec<(RecordId, Row)> = if !where_already_applied {
+                    if let Some(ref wc) = stmt.where_clause {
+                        let mut filtered = Vec::new();
+                        let mut sq_cache_lk: SubqueryCache = HashMap::new();
+                        let mut in_set_lk: InSetCache = HashMap::new();
+                        let mut corr_lk: CorrelatedCache = HashMap::new();
+                        let mut mat_lk: MaterializedCache = HashMap::new();
+                        for (rid, values) in raw_rows {
+                            let mut runner = ExecSubqueryRunner {
+                                storage: exec_ctx.storage(),
+                                txn: exec_ctx.coord(),
+                                bloom: exec_ctx.bloom(),
+                                ctx,
+                                outer_row: &values,
+                                cache: Some(&mut sq_cache_lk),
+                                in_set_cache: Some(&mut in_set_lk),
+                                correlated_cache: Some(&mut corr_lk),
+                                materialized: Some(&mut mat_lk),
+                            };
+                            if is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                                filtered.push((rid, values));
+                            }
+                        }
+                        filtered
+                    } else {
+                        raw_rows
+                    }
+                } else {
+                    raw_rows
+                };
+
+                // Step 2: ORDER BY — sort pairs by the value component.
+                let resolved_ob_lk = resolve_positional_order_by(&stmt.order_by, &stmt.columns);
+                if !resolved_ob_lk.is_empty() {
+                    let mut sort_err: Option<DbError> = None;
+                    rid_pairs.sort_by(|(_, a), (_, b)| {
+                        if sort_err.is_some() {
+                            return std::cmp::Ordering::Equal;
+                        }
+                        match compare_rows_for_sort(a, b, &resolved_ob_lk) {
+                            Ok(ord) => ord,
+                            Err(e) => {
+                                sort_err = Some(e);
+                                std::cmp::Ordering::Equal
+                            }
+                        }
+                    });
+                    if let Some(e) = sort_err {
+                        return Err(e);
+                    }
+                }
+
+                // Step 3: LIMIT/OFFSET — lock only the rows that will be returned.
+                let (limit_n, offset_n) = eval_limit_offset_usize(&stmt.limit, &stmt.offset)?;
+                if offset_n > 0 {
+                    let skip = offset_n.min(rid_pairs.len());
+                    rid_pairs = rid_pairs[skip..].to_vec();
+                }
+                if let Some(n) = limit_n {
+                    rid_pairs.truncate(n);
+                }
+
+                // Step 4: Acquire table-intention + row-level locks.
+                if let (Some(lm), Some(ct)) = (exec_ctx.lock_manager(), conn_txn) {
+                    let (table_mode, row_mode) = match lc.strength {
+                        LockStrength::ForKeyShare | LockStrength::ForShare => (
+                            axiomdb_lock::LockMode::IntentionShared,
+                            axiomdb_lock::LockMode::Shared,
+                        ),
+                        LockStrength::ForNoKeyUpdate | LockStrength::ForUpdate => (
+                            axiomdb_lock::LockMode::IntentionExclusive,
+                            axiomdb_lock::LockMode::Exclusive,
+                        ),
+                    };
+                    let mut row_flags = axiomdb_lock::LockFlags::REC_NOT_GAP;
+                    if lc.wait_policy == LockWaitPolicy::NoWait {
+                        row_flags = row_flags.union(axiomdb_lock::LockFlags::NOWAIT);
+                    }
+                    lm.acquire_table_lock_sync(ct.txn_id, resolved.def.id, table_mode)?;
+                    for (rid, _) in &rid_pairs {
+                        lm.acquire_record_lock_sync(
+                            ct.txn_id,
+                            rid.page_id,
+                            rid.slot_id,
+                            row_mode,
+                            row_flags,
+                        )?;
+                    }
+                }
+                // No lock_manager or no active txn → silently skip (autocommit path).
+
+                // Step 5: Project and return (ORDER BY + LIMIT already applied above).
+                let locked_rows: Vec<Row> = rid_pairs.into_iter().map(|(_, r)| r).collect();
+                let out_cols =
+                    build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
+                let mut proj_cache_lk: SubqueryCache = HashMap::new();
+                let mut proj_in_set_lk: InSetCache = HashMap::new();
+                let mut proj_corr_lk: CorrelatedCache = HashMap::new();
+                let mut proj_mat_lk: MaterializedCache = HashMap::new();
+                let rows =
+                    project_rows_with_window_support(&stmt.columns, &locked_rows, |expr, v| {
+                        let mut runner = ExecSubqueryRunner {
+                            storage: exec_ctx.storage(),
+                            txn: exec_ctx.coord(),
+                            bloom: exec_ctx.bloom(),
+                            ctx,
+                            outer_row: v,
+                            cache: Some(&mut proj_cache_lk),
+                            in_set_cache: Some(&mut proj_in_set_lk),
+                            correlated_cache: Some(&mut proj_corr_lk),
+                            materialized: Some(&mut proj_mat_lk),
+                        };
+                        eval_with(expr, v, &mut runner)
+                    })?;
+                let rows = expand_unnest_rows(&stmt.columns, rows);
+                let rows = if stmt.distinct {
+                    apply_distinct_with_session(rows)
+                } else {
+                    rows
+                };
+                return Ok(QueryResult::Rows {
+                    columns: out_cols,
+                    rows,
+                });
+            }
+            // GROUP BY or aggregate + FOR UPDATE: fall through to normal pipeline
+            // (locking is skipped — semantically undefined for aggregates).
+        }
+
         // ── EXISTS decorrelation fast-path ────────────────────────────────────
         let mut combined_rows: Vec<Row> = if !where_already_applied {
             if let Some(ref wc) = stmt.where_clause {
