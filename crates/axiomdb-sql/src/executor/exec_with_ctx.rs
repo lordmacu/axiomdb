@@ -295,13 +295,28 @@ pub fn execute_with_ctx_locked(
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
+                        let tid = ctx
+                            .conn_txn
+                            .as_ref()
+                            .expect("conn_txn: set by begin() on preceding line")
+                            .txn_id;
                         commit_active_txn(txn, storage, bloom, ctx)?;
+                        if let Some(lm) = lock_mgr {
+                            lm.release_all_for_txn(tid);
+                        }
                         Ok(result)
                     }
                     Err(e) => {
                         ctx.clear_deferred_fk_constraints();
-                        let conn = ctx.conn_txn.take().expect("conn_txn: set by begin() on preceding line");
+                        let conn = ctx
+                            .conn_txn
+                            .take()
+                            .expect("conn_txn: set by begin() on preceding line");
+                        let tid = conn.txn_id;
                         let _ = rollback_with_index_undo(txn, conn, storage, bloom);
+                        if let Some(lm) = lock_mgr {
+                            lm.release_all_for_txn(tid);
+                        }
                         Err(e)
                     }
                 }

@@ -42,7 +42,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             20.1 (regular views: CREATE/DROP/REPLACE VIEW, view expansion, SHOW CREATE VIEW, IS.VIEWS),
             22b.4 (schema namespacing: CREATE/DROP SCHEMA, schema.table, search_path, SHOW SCHEMAS, IS.SCHEMATA),
             22b.1 (scheduled jobs: cron_schedule/unschedule/enable/disable, IS.scheduled_jobs),
-            22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table)
+            22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table),
+            13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking)
 """
 import os
 import signal
@@ -4842,6 +4843,78 @@ cur.execute("DROP SERVER fdw_local")
 cur.fetchall()
 cur.execute("DROP SERVER fdw_mock2")
 cur.fetchall()
+
+# ── 13.7 SELECT FOR UPDATE / FOR SHARE ────────────────────────────────────────
+
+print("\n[13.7] SELECT FOR UPDATE / FOR SHARE row-level locking")
+
+# Commit any pending implicit transaction left by previous section
+conn.commit()
+
+# Use a heap table (no PRIMARY KEY) — FOR UPDATE on clustered tables is not yet supported
+cur.execute("CREATE TABLE wire_accounts (id INT, balance INT)")
+conn.commit()
+cur.execute("INSERT INTO wire_accounts VALUES (1, 1000), (2, 2000)")
+conn.commit()
+
+# FOR UPDATE inside explicit transaction returns rows
+cur.execute("SELECT id, balance FROM wire_accounts WHERE id = 1 FOR UPDATE")
+rows = cur.fetchall()
+ok("[13.7 for_update] FOR UPDATE returns the locked row",
+   len(rows) == 1 and int(rows[0][0]) == 1 and int(rows[0][1]) == 1000,
+   rows)
+conn.commit()
+
+# FOR SHARE inside explicit transaction returns all rows
+cur.execute("SELECT id, balance FROM wire_accounts FOR SHARE")
+rows = cur.fetchall()
+ok("[13.7 for_share] FOR SHARE returns all rows",
+   len(rows) == 2,
+   rows)
+conn.commit()
+
+# LOCK IN SHARE MODE (MySQL alias for FOR SHARE)
+cur.execute("SELECT id FROM wire_accounts WHERE id = 2 LOCK IN SHARE MODE")
+rows = cur.fetchall()
+ok("[13.7 lock_in_share_mode] LOCK IN SHARE MODE returns the row",
+   len(rows) == 1 and int(rows[0][0]) == 2,
+   rows)
+conn.commit()
+
+# FOR UPDATE with LIMIT — only the limited rows returned/locked
+cur.execute("SELECT id FROM wire_accounts ORDER BY id LIMIT 1 FOR UPDATE")
+rows = cur.fetchall()
+ok("[13.7 for_update_limit] FOR UPDATE + LIMIT 1 returns 1 row",
+   len(rows) == 1 and int(rows[0][0]) == 1,
+   rows)
+conn.commit()
+
+# FOR NO KEY UPDATE
+cur.execute("SELECT id FROM wire_accounts WHERE id = 2 FOR NO KEY UPDATE")
+rows = cur.fetchall()
+ok("[13.7 for_no_key_update] FOR NO KEY UPDATE returns the row",
+   len(rows) == 1 and int(rows[0][0]) == 2,
+   rows)
+conn.commit()
+
+# FOR KEY SHARE
+cur.execute("SELECT id FROM wire_accounts FOR KEY SHARE")
+rows = cur.fetchall()
+ok("[13.7 for_key_share] FOR KEY SHARE returns all rows",
+   len(rows) == 2,
+   rows)
+conn.commit()
+
+# NOWAIT — in autocommit-equivalent context (no competing lock), succeeds
+cur.execute("SELECT id FROM wire_accounts WHERE id = 1 FOR UPDATE NOWAIT")
+rows = cur.fetchall()
+ok("[13.7 nowait_no_conflict] FOR UPDATE NOWAIT succeeds when no conflict",
+   len(rows) == 1 and int(rows[0][0]) == 1,
+   rows)
+conn.commit()
+
+cur.execute("DROP TABLE wire_accounts")
+conn.commit()
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
