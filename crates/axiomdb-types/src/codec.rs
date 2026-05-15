@@ -164,7 +164,9 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
             Value::Array(_) => {
                 return crate::types::DataType::Array(Box::new(crate::types::DataType::Int))
             }
-            Value::Range(_) => return crate::types::DataType::Range(Box::new(crate::types::DataType::Int)),
+            Value::Range(_) => {
+                return crate::types::DataType::Range(Box::new(crate::types::DataType::Int))
+            }
         }
     }
     crate::types::DataType::Int // default
@@ -885,11 +887,7 @@ fn encode_bound(buf: &mut Vec<u8>, val: &Value, elem_dt: &DataType) -> Result<()
 }
 
 /// Decodes one bound value from `bytes[pos..]`.
-fn decode_bound(
-    bytes: &[u8],
-    pos: &mut usize,
-    elem_dt: &DataType,
-) -> Result<Value, DbError> {
+fn decode_bound(bytes: &[u8], pos: &mut usize, elem_dt: &DataType) -> Result<Value, DbError> {
     match elem_dt {
         DataType::Int => {
             ensure_bytes(bytes, *pos, 4)?;

@@ -105,20 +105,25 @@ impl RangeValue {
         upper_inc: bool,
         increment_fn: impl Fn(&Value) -> Result<Value, DbError>,
     ) -> Result<Self, DbError> {
-        // Canonicalize inclusive upper → exclusive
+        // Canonicalize exclusive lower → inclusive (PG: (1,5) → [2,5))
+        let (canon_lower, canon_lower_inc) = match (lower, lower_inc) {
+            (Some(ref lo), false) => (Some(increment_fn(lo)?), true),
+            (l, inc) => (l, inc),
+        };
+
+        // Canonicalize inclusive upper → exclusive (PG: [1,5] → [1,6))
         let (canon_upper, canon_upper_inc) = match (upper, upper_inc) {
             (Some(ref hi), true) => (Some(increment_fn(hi)?), false),
             (u, inc) => (u, inc),
         };
 
         // After canonicalization: check for empty
-        if let (Some(ref lo), Some(ref hi)) = (&lower, &canon_upper) {
+        if let (Some(ref lo), Some(ref hi)) = (&canon_lower, &canon_upper) {
             match compare_bounds(lo, hi) {
                 Some(std::cmp::Ordering::Greater) => {
                     return Ok(Self::empty());
                 }
                 Some(std::cmp::Ordering::Equal) if !canon_upper_inc => {
-                    // lower == upper with exclusive upper → empty
                     return Ok(Self::empty());
                 }
                 _ => {}
@@ -126,9 +131,9 @@ impl RangeValue {
         }
 
         Ok(Self {
-            lower,
+            lower: canon_lower,
             upper: canon_upper,
-            lower_inc,
+            lower_inc: canon_lower_inc,
             upper_inc: canon_upper_inc,
             is_empty: false,
         })
@@ -182,7 +187,7 @@ impl RangeValue {
 
         // Check lower: self.lower <= other.lower
         let lower_ok = match (&self.lower, &other.lower) {
-            (None, _) => true, // self is unbounded below
+            (None, _) => true,        // self is unbounded below
             (Some(_), None) => false, // other is unbounded but self isn't
             (Some(sl), Some(ol)) => match compare_bounds(sl, ol) {
                 Some(std::cmp::Ordering::Less) => true,
@@ -299,65 +304,68 @@ impl RangeValue {
         if self.is_empty {
             return Some(RangeValue::empty());
         }
-        if other.is_empty {
-            return Some(self.clone());
-        }
-        if !self.overlaps(other) {
+        if other.is_empty || !self.overlaps(other) {
             return Some(self.clone());
         }
 
-        // Check if other is strictly interior (would produce two disjoint pieces)
+        // `other` fully swallows `self`
         if other.contains_range(self) {
             return Some(RangeValue::empty());
         }
 
-        // Check if other is truly interior (has both bounds inside self)
-        let other_lower_inside = other
-            .lower
-            .as_ref()
-            .map(|lo| self.contains_value(lo))
-            .unwrap_or(false);
-        let other_upper_inside = other
-            .upper
-            .as_ref()
-            .map(|hi| self.contains_value(hi))
-            .unwrap_or(false);
-
-        // If other cuts self in two pieces, return None
-        if other_lower_inside && other_upper_inside && !other.contains_range(self) {
-            // other is strictly interior — result non-contiguous
-            return None;
-        }
-
-        // other overlaps from the left: result is [other.upper, self.upper)
-        if other_lower_inside && !other_upper_inside {
-            // other starts before self ends, but other.upper is at/beyond self.upper
-            // This means other eats the right portion → result is left piece
-            let (new_upper, new_upper_inc) = match &other.lower {
-                None => return Some(RangeValue::empty()),
-                Some(lo) => (Some(lo.clone()), !other.lower_inc),
-            };
-            return Some(RangeValue {
-                lower: self.lower.clone(),
-                upper: new_upper,
-                lower_inc: self.lower_inc,
-                upper_inc: new_upper_inc,
-                is_empty: false,
-            });
-        }
-
-        // other overlaps from the right: result is [self.lower, other.lower)
-        let (new_lower, new_lower_inc) = match &other.upper {
-            None => return Some(RangeValue::empty()),
-            Some(hi) => (Some(hi.clone()), !other.upper_inc),
+        // Does `other` reach at or below `self`'s lower bound?
+        // I.e., does self's lower point fall inside `other` (or other starts at -∞)?
+        let other_eats_from_left = match (&other.lower, &self.lower) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(ol), Some(sl)) => match compare_bounds(ol, sl) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => other.lower_inc || !self.lower_inc,
+                _ => false,
+            },
         };
-        Some(RangeValue {
-            lower: new_lower,
-            upper: self.upper.clone(),
-            lower_inc: new_lower_inc,
-            upper_inc: self.upper_inc,
-            is_empty: false,
-        })
+
+        // Does `other` reach at or above `self`'s upper bound?
+        let other_eats_from_right = match (&other.upper, &self.upper) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(ou), Some(su)) => match compare_bounds(ou, su) {
+                Some(std::cmp::Ordering::Greater) => true,
+                Some(std::cmp::Ordering::Equal) => other.upper_inc || !self.upper_inc,
+                _ => false,
+            },
+        };
+
+        if other_eats_from_left {
+            // other removes left part → result is right side: [other.upper, self.upper)
+            return match &other.upper {
+                None => Some(RangeValue::empty()),
+                Some(hi) => Some(RangeValue {
+                    lower: Some(hi.clone()),
+                    upper: self.upper.clone(),
+                    lower_inc: !other.upper_inc,
+                    upper_inc: self.upper_inc,
+                    is_empty: false,
+                }),
+            };
+        }
+
+        if other_eats_from_right {
+            // other removes right part → result is left side: [self.lower, other.lower)
+            return match &other.lower {
+                None => Some(RangeValue::empty()),
+                Some(lo) => Some(RangeValue {
+                    lower: self.lower.clone(),
+                    upper: Some(lo.clone()),
+                    lower_inc: self.lower_inc,
+                    upper_inc: !other.lower_inc,
+                    is_empty: false,
+                }),
+            };
+        }
+
+        // `other` is strictly interior to `self` — result would be two disjoint pieces
+        None
     }
 
     /// Canonical string representation (PostgreSQL format): `[lower,upper)`.
@@ -409,11 +417,22 @@ pub(crate) fn compare_bounds(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
 
 // ── Bound helpers ─────────────────────────────────────────────────────────────
 
-fn ranges_adjacent(_a: &RangeValue, _b: &RangeValue) -> bool {
-    // For now: two ranges are adjacent if one's upper == other's lower
-    // and exactly one of (upper_inc, lower_inc) is true (exclusive/inclusive meet).
-    // Conservative: for non-discrete ranges we don't attempt adjacency detection.
-    false
+fn ranges_adjacent(a: &RangeValue, b: &RangeValue) -> bool {
+    // Two ranges are adjacent when one's upper touches the other's lower at the same
+    // point and at least one side includes that point (no gap between them).
+    // Example: [1,5) and [5,10) — upper=5 (excl) meets lower=5 (incl) → adjacent.
+    // [1.0,5.0) and (5.0,10.0) — both exclude 5.0 → NOT adjacent (gap at 5.0).
+    let touches =
+        |upper: &Option<Value>, upper_inc: bool, lower: &Option<Value>, lower_inc: bool| {
+            if let (Some(u), Some(l)) = (upper, lower) {
+                if compare_bounds(u, l) == Some(std::cmp::Ordering::Equal) {
+                    return upper_inc || lower_inc;
+                }
+            }
+            false
+        };
+    touches(&a.upper, a.upper_inc, &b.lower, b.lower_inc)
+        || touches(&b.upper, b.upper_inc, &a.lower, a.lower_inc)
 }
 
 fn pick_lower_bound(a: &RangeValue, b: &RangeValue) -> (Option<Value>, bool) {
@@ -479,13 +498,25 @@ impl PartialOrd for RangeValue {
         }
 
         // Compare lower bounds (unbounded = −∞ = smallest)
-        let lo = compare_option_bounds(&self.lower, self.lower_inc, &other.lower, other.lower_inc, true);
+        let lo = compare_option_bounds(
+            &self.lower,
+            self.lower_inc,
+            &other.lower,
+            other.lower_inc,
+            true,
+        );
         if lo != std::cmp::Ordering::Equal {
             return Some(lo);
         }
 
         // Compare upper bounds (unbounded = +∞ = largest)
-        Some(compare_option_bounds(&self.upper, self.upper_inc, &other.upper, other.upper_inc, false))
+        Some(compare_option_bounds(
+            &self.upper,
+            self.upper_inc,
+            &other.upper,
+            other.upper_inc,
+            false,
+        ))
     }
 }
 
@@ -527,6 +558,124 @@ fn compare_option_bounds(
     }
 }
 
+// ── Range literal parsing (for CAST / ::rangetype) ───────────────────────────
+
+/// Parse a PostgreSQL range literal string into a `RangeValue`.
+///
+/// Accepts: `"empty"`, `"[lo,hi)"`, `"(lo,hi]"`, `"[,hi)"` (lower unbounded),
+/// `"[lo,)"` (upper unbounded), `"(,)"` (all-inclusive unbounded).
+///
+/// `inner_type` is the element type (`DataType::Int`, `DataType::BigInt`, etc.).
+/// `is_discrete` should be true for Int, BigInt, Date (canonical form required).
+pub fn parse_range_literal_text(
+    s: &str,
+    inner_type: &crate::types::DataType,
+) -> Result<RangeValue, DbError> {
+    let is_discrete = matches!(
+        inner_type,
+        crate::types::DataType::Int | crate::types::DataType::BigInt | crate::types::DataType::Date
+    );
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("empty") {
+        return Ok(RangeValue::empty());
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 {
+        return Err(DbError::ParseError {
+            message: format!("invalid range literal '{s}'"),
+            position: None,
+        });
+    }
+    let lower_inc = match bytes[0] {
+        b'[' => true,
+        b'(' => false,
+        _ => {
+            return Err(DbError::ParseError {
+                message: format!("range literal must start with '[' or '(': '{s}'"),
+                position: None,
+            })
+        }
+    };
+    let upper_inc = match bytes[bytes.len() - 1] {
+        b']' => true,
+        b')' => false,
+        _ => {
+            return Err(DbError::ParseError {
+                message: format!("range literal must end with ']' or ')': '{s}'"),
+                position: None,
+            })
+        }
+    };
+    let inner = &s[1..s.len() - 1];
+    let comma_pos = inner
+        .as_bytes()
+        .iter()
+        .position(|&b| b == b',')
+        .ok_or_else(|| DbError::ParseError {
+            message: format!("range literal missing comma: '{s}'"),
+            position: None,
+        })?;
+    let lo_str = inner[..comma_pos].trim();
+    let hi_str = inner[comma_pos + 1..].trim();
+    let lower = if lo_str.is_empty() {
+        None
+    } else {
+        Some(parse_range_bound(lo_str, inner_type)?)
+    };
+    let upper = if hi_str.is_empty() {
+        None
+    } else {
+        Some(parse_range_bound(hi_str, inner_type)?)
+    };
+    if is_discrete {
+        RangeValue::new_discrete(lower, upper, lower_inc, upper_inc, |v| {
+            increment_range_bound(v, inner_type)
+        })
+    } else {
+        RangeValue::new(lower, upper, lower_inc, upper_inc)
+    }
+}
+
+fn parse_range_bound(s: &str, inner_type: &crate::types::DataType) -> Result<Value, DbError> {
+    use crate::coerce::{coerce, CoercionMode};
+    coerce(
+        Value::Text(s.to_string()),
+        inner_type.clone(),
+        CoercionMode::Strict,
+    )
+    .map_err(|_| DbError::ParseError {
+        message: format!("invalid range bound '{s}' for type {}", inner_type.name()),
+        position: None,
+    })
+}
+
+fn increment_range_bound(v: &Value, inner_type: &crate::types::DataType) -> Result<Value, DbError> {
+    match (v, inner_type) {
+        (Value::Int(n), crate::types::DataType::Int) => n
+            .checked_add(1)
+            .map(Value::Int)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: "int4range upper bound overflow".to_string(),
+            }),
+        (Value::BigInt(n), crate::types::DataType::BigInt) => n
+            .checked_add(1)
+            .map(Value::BigInt)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: "int8range upper bound overflow".to_string(),
+            }),
+        (Value::Date(d), crate::types::DataType::Date) => d
+            .checked_add(1)
+            .map(Value::Date)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: "daterange upper bound overflow".to_string(),
+            }),
+        _ => Err(DbError::TypeMismatch {
+            expected: "discrete range element (INT, BIGINT, DATE)".to_string(),
+            got: v.variant_name().to_string(),
+        }),
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -545,20 +694,15 @@ mod tests {
 
     #[test]
     fn range_int4_discrete_canonicalization() {
-        let r = RangeValue::new_discrete(
-            Some(Value::Int(1)),
-            Some(Value::Int(5)),
-            true,
-            true,
-            |v| {
+        let r =
+            RangeValue::new_discrete(Some(Value::Int(1)), Some(Value::Int(5)), true, true, |v| {
                 if let Value::Int(n) = v {
                     Ok(Value::Int(n + 1))
                 } else {
                     unreachable!()
                 }
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(r.upper, Some(Value::Int(6)));
         assert!(!r.upper_inc);
         assert_eq!(r.lower, Some(Value::Int(1)));
@@ -568,13 +712,7 @@ mod tests {
     #[test]
     fn range_exclusive_bounds_empty() {
         // (3,3) is empty even for continuous types
-        let r = RangeValue::new(
-            Some(Value::Int(3)),
-            Some(Value::Int(3)),
-            false,
-            false,
-        )
-        .unwrap();
+        let r = RangeValue::new(Some(Value::Int(3)), Some(Value::Int(3)), false, false).unwrap();
         assert!(r.is_empty);
     }
 
@@ -604,7 +742,8 @@ mod tests {
     #[test]
     fn range_contains_range() {
         let big = RangeValue::new(Some(Value::Int(1)), Some(Value::Int(20)), true, false).unwrap();
-        let small = RangeValue::new(Some(Value::Int(5)), Some(Value::Int(10)), true, false).unwrap();
+        let small =
+            RangeValue::new(Some(Value::Int(5)), Some(Value::Int(10)), true, false).unwrap();
         assert!(big.contains_range(&small));
         assert!(!small.contains_range(&big));
     }

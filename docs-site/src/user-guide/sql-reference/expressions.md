@@ -628,6 +628,41 @@ Use <code>JSON_EXTRACT(data, '$.field')</code> when targeting MySQL-compatible c
 </div>
 </div>
 
+### Range Functions
+
+Range types (`INT4RANGE`, `INT8RANGE`, `NUMRANGE`, `DATERANGE`, `TSRANGE`) support
+constructor functions, scalar accessors, and operators. See [Range Types](data-types.md#range-types)
+for the full type reference.
+
+| Function / Operator | Returns | Description |
+|---------------------|---------|-------------|
+| `int4range(lo, hi [, bounds])` | `INT4RANGE` | Construct integer range; bounds default `'[)'` |
+| `int8range(lo, hi [, bounds])` | `INT8RANGE` | Construct bigint range |
+| `numrange(lo, hi [, bounds])` | `NUMRANGE` | Construct numeric range |
+| `daterange(lo, hi [, bounds])` | `DATERANGE` | Construct date range |
+| `tsrange(lo, hi [, bounds])` | `TSRANGE` | Construct timestamp range |
+| `lower(r)` | element or NULL | Lower bound; NULL if unbounded or empty |
+| `upper(r)` | element or NULL | Upper bound; NULL if unbounded or empty |
+| `isempty(r)` | BOOL | TRUE if range is empty |
+| `lowerinc(r)` | BOOL | TRUE if lower bound is inclusive |
+| `upperinc(r)` | BOOL | TRUE if upper bound is inclusive |
+| `r @> point` | BOOL | Range contains element |
+| `r @> r2` | BOOL | Range contains range |
+| `point <@ r` | BOOL | Element is contained by range |
+| `r && r2` | BOOL | Ranges overlap |
+| `r + r2` | range | Union (ranges must overlap or be adjacent) |
+| `r * r2` | range | Intersection |
+| `r - r2` | range | Difference (error if result is non-contiguous) |
+
+`lower()` and `upper()` also work on strings (case conversion). The engine
+dispatches to range accessors when the argument is a range type, and to string
+functions otherwise.
+
+```sql
+SELECT lower(int4range(2, 8));   -- 2   (range lower bound)
+SELECT lower('HELLO');           -- 'hello'  (string lower-case)
+```
+
 ### Conditional Functions
 
 | Function                          | Description                                        |
