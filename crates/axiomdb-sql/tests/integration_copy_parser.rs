@@ -90,11 +90,9 @@ fn parse_copy_header_bare_true() {
 
 #[test]
 fn parse_copy_unknown_format_errors() {
-    let err = parse("COPY t FROM '/f.csv' WITH (FORMAT PARQUET)", None);
-    assert!(err.is_err(), "expected error for unknown format PARQUET");
+    // PARQUET is now a valid format; use a genuinely unknown format instead
+    let err = parse("COPY t FROM '/f.csv' WITH (FORMAT FOOBAR)", None);
+    assert!(err.is_err(), "expected error for unknown format FOOBAR");
     let msg = err.unwrap_err().to_string();
-    assert!(
-        msg.contains("PARQUET"),
-        "error should mention PARQUET: {msg}"
-    );
+    assert!(msg.contains("FOOBAR"), "error should mention FOOBAR: {msg}");
 }

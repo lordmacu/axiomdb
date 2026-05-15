@@ -44,7 +44,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             22b.1 (scheduled jobs: cron_schedule/unschedule/enable/disable, IS.scheduled_jobs),
             22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table),
             13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking),
-            13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns)
+            13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns),
+            20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip)
 """
 import os
 import signal
@@ -5140,6 +5141,37 @@ null_content = open('/tmp/axm_wire_null.csv').read().strip()
 ok("[20.5b into_outfile_null] NULL value written as \\N",
    null_content == r'\N',
    repr(null_content))
+
+
+# ── [20.6] Parquet COPY TO + READ_PARQUET ──────────────────────────────────────
+
+cur.execute("CREATE TABLE wire_pq_t (id INT, name TEXT, active BOOL)")
+cur.execute("INSERT INTO wire_pq_t VALUES (1, 'alice', TRUE), (2, 'bob', FALSE)")
+conn.commit()
+cur.execute("COPY wire_pq_t TO '/tmp/axm_wire_pq.parquet' WITH (FORMAT PARQUET)")
+conn.commit()
+ok("[20.6 copy_to_parquet] COPY TO parquet returns 2 affected rows",
+   cur.rowcount == 2,
+   cur.rowcount)
+import os as _os
+ok("[20.6 copy_to_parquet_file_exists] parquet file written to disk",
+   _os.path.exists('/tmp/axm_wire_pq.parquet'),
+   '/tmp/axm_wire_pq.parquet')
+
+cur.execute("SELECT id, name, active FROM READ_PARQUET('/tmp/axm_wire_pq.parquet') ORDER BY id")
+rows_pq = cur.fetchall()
+ok("[20.6 read_parquet_rowcount] READ_PARQUET returns 2 rows",
+   len(rows_pq) == 2,
+   rows_pq)
+ok("[20.6 read_parquet_values] READ_PARQUET round-trip values correct",
+   rows_pq[0] == (1, 'alice', True) and rows_pq[1] == (2, 'bob', False),
+   rows_pq)
+
+cur.execute("SELECT COUNT(*) FROM READ_PARQUET('/tmp/axm_wire_pq.parquet')")
+count_pq = cur.fetchone()[0]
+ok("[20.6 read_parquet_count_star] COUNT(*) on READ_PARQUET returns 2",
+   count_pq == 2,
+   count_pq)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────

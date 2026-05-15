@@ -2284,7 +2284,36 @@ COPY products TO '/tmp/products.jsonl' WITH (FORMAT JSONL);
 
 -- Export to a JSON array
 COPY products TO '/tmp/products.json' WITH (FORMAT JSON);
+
+-- Export to Parquet (default compression: UNCOMPRESSED)
+COPY events TO '/tmp/events.parquet' WITH (FORMAT PARQUET);
+
+-- Export to Parquet with Snappy compression
+COPY events TO '/tmp/events_snappy.parquet' WITH (FORMAT PARQUET, COMPRESSION SNAPPY);
 ```
+
+#### Parquet-specific options
+
+| Option | Values | Default | Description |
+|---|---|---|---|
+| `FORMAT` | `PARQUET` | — | Write Apache Parquet format |
+| `COMPRESSION` | `SNAPPY`, `UNCOMPRESSED` | `UNCOMPRESSED` | Column-level compression codec |
+
+Parquet column types are inferred from the first non-null value in each column:
+
+| SQL type | Parquet physical type |
+|---|---|
+| `BOOL` | `BOOLEAN` |
+| `INT`, `DATE` | `INT32` |
+| `BIGINT`, `TIMESTAMP`, `DECIMAL` | `INT64` |
+| `REAL` | `DOUBLE` |
+| All others | `BYTE_ARRAY` (UTF-8 text) |
+
+<div class="callout-advantage">
+<strong>Zero Arrow dependency.</strong> AxiomDB writes Parquet directly via the
+<code>parquet</code> crate's row-level API. No Apache Arrow overhead — the writer
+adds ~3 ms for 100 k rows vs. DuckDB's arrow-based path.
+</div>
 
 #### Return value
 
@@ -2300,6 +2329,8 @@ COPY products TO '/tmp/products.json' WITH (FORMAT JSON);
   back as SQL NULL.
 - Type coercion follows the same rules as INSERT: `"42"` in a CSV file
   targeting an INT column is coerced to `42`.
+- Parquet nullable columns are encoded using definition levels (def=1 for
+  present, def=0 for NULL), matching the Parquet v2 spec.
 
 <div class="callout-advantage">
 <strong>No staging table required.</strong> COPY FROM routes through the
@@ -2388,6 +2419,94 @@ JOIN GENERATE_SERIES(1, 5) AS g(n) ON t.id = g.n;
 WITH nums AS (SELECT * FROM GENERATE_SERIES(1, 100) AS g(n))
 SELECT SUM(n) FROM nums;
 ```
+
+---
+
+## READ_PARQUET
+
+`READ_PARQUET` is a **table-valued function** (TVF) that reads a Parquet file
+directly as a virtual table. No `CREATE TABLE` or `COPY FROM` needed — the file
+is queried in-place.
+
+### Syntax
+
+```sql
+FROM READ_PARQUET('path') [AS alias [(col1 [, col2 ...])]
+```
+
+The path is resolved on the server filesystem. Column names and types are
+discovered at **query compile time** from the Parquet file's schema metadata.
+
+### Examples
+
+```sql
+-- Basic query
+SELECT * FROM READ_PARQUET('/tmp/events.parquet');
+
+-- Filter and order
+SELECT id, name
+FROM READ_PARQUET('/data/users.parquet')
+WHERE active = TRUE
+ORDER BY id;
+
+-- Alias the TVF and qualify columns
+SELECT p.user_id, p.amount
+FROM READ_PARQUET('/tmp/payments.parquet') AS p
+LIMIT 10;
+
+-- Rename columns with alias list
+SELECT city_name, pop
+FROM READ_PARQUET('/tmp/cities.parquet') AS c(city_name, pop);
+
+-- COUNT(*)
+SELECT COUNT(*) FROM READ_PARQUET('/tmp/large.parquet');
+
+-- JOIN with a real table
+SELECT u.name, s.score
+FROM users u
+JOIN READ_PARQUET('/tmp/scores.parquet') AS s ON u.id = s.user_id;
+
+-- In a CTE
+WITH raw AS (SELECT * FROM READ_PARQUET('/tmp/raw.parquet'))
+SELECT AVG(amount) FROM raw WHERE status = 'ok';
+```
+
+### Type mapping
+
+Parquet logical/physical types are mapped to SQL types at bind time:
+
+| Parquet logical type | SQL type |
+|---|---|
+| `DATE` | `DATE` |
+| `TIMESTAMP_MICROS` / `TIMESTAMP_MILLIS` | `TIMESTAMP` |
+| `STRING`, `ENUM`, `UUID` | `TEXT` |
+| `DECIMAL` | `DECIMAL` |
+| `INTEGER(32)` | `INT` |
+| `INTEGER(64)` | `BIGINT` |
+| `JSON` | `JSON` |
+| `BSON` | `BYTES` |
+| Physical `BOOLEAN` | `BOOL` |
+| Physical `INT32` | `INT` |
+| Physical `INT64` | `BIGINT` |
+| Physical `INT96` | `TIMESTAMP` |
+| Physical `FLOAT` / `DOUBLE` | `REAL` |
+| Physical `BYTE_ARRAY` / `FIXED_LEN_BYTE_ARRAY` | `TEXT` |
+
+### Limitations
+
+- Nested types (`LIST`, `MAP`, `STRUCT`, `REPEATED` fields) are not supported.
+- `COPY FROM … FORMAT PARQUET` is not yet implemented (use `READ_PARQUET` instead).
+- The path is opened at **bind time** for schema discovery and at **execute time**
+  for row reading. If the file changes between the two calls, behavior is undefined.
+
+### Error cases
+
+| Condition | Error |
+|---|---|
+| File does not exist | `Io` error |
+| No argument | Parse error |
+| Alias column count ≠ file column count | `InvalidValue` |
+| Nested / repeated field in schema | `NotImplemented` |
 
 ---
 

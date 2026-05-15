@@ -7,7 +7,6 @@
 /// Load all rows from a Parquet file. Returns (col_names, rows).
 fn read_parquet_rows(path: &str) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
-    use parquet::record::Field;
     use parquet::schema::types::Type;
 
     let file = std::fs::File::open(path).map_err(|e| {
@@ -87,6 +86,24 @@ fn parquet_field_to_value(field: &parquet::record::Field) -> Value {
     }
 }
 
+fn infer_data_type_from_parquet_col(col: usize, rows: &[Vec<Value>]) -> DataType {
+    for row in rows {
+        if let Some(v) = row.get(col) {
+            match v {
+                Value::Bool(_) => return DataType::Bool,
+                Value::Int(_) | Value::Date(_) => return DataType::Int,
+                Value::BigInt(_) | Value::Timestamp(_) => return DataType::BigInt,
+                Value::Real(_) => return DataType::Real,
+                Value::Decimal(_, _) => return DataType::Decimal,
+                Value::Text(_) | Value::Bytes(_) => return DataType::Text,
+                Value::Null => continue,
+                _ => return DataType::Text,
+            }
+        }
+    }
+    DataType::Text
+}
+
 /// Execute `SELECT … FROM READ_PARQUET('path') …`.
 /// Mirrors the GENERATE_SERIES TVF pattern in select_core.rs.
 fn execute_select_read_parquet_source(
@@ -111,9 +128,10 @@ fn execute_select_read_parquet_source(
 
     let derived_cols: Vec<ColumnMeta> = final_names
         .iter()
-        .map(|name| ColumnMeta {
+        .enumerate()
+        .map(|(i, name)| ColumnMeta {
             name: name.clone(),
-            data_type: DataType::Text,
+            data_type: infer_data_type_from_parquet_col(i, &derived_rows),
             nullable: true,
             table_name: Some(alias.clone()),
         })
@@ -180,7 +198,16 @@ fn execute_select_read_parquet_source(
         combined_rows = apply_order_by(combined_rows, &resolved_ob)?;
     }
 
-    let out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
+    let mut out_cols = build_derived_output_columns(&stmt.columns, &derived_cols)?;
+    // build_derived_output_columns defaults to DataType::Text for column expressions;
+    // propagate proper Parquet-inferred types by matching output column names to derived_cols.
+    for oc in &mut out_cols {
+        if oc.data_type == DataType::Text {
+            if let Some(dc) = derived_cols.iter().find(|dc| dc.name == oc.name) {
+                oc.data_type = dc.data_type.clone();
+            }
+        }
+    }
     let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, row| {
         eval(expr, row)
     })?;

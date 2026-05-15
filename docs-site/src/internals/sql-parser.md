@@ -1397,3 +1397,78 @@ After `execute_select_ctx` returns `QueryResult::Rows`, `handle_into_outfile`
 `Bool → 1/0`, integers/reals via `Display`, `Text` as-is. When `enclosure` is
 set, each field string is wrapped in the enclosure character and any occurrence of
 the enclosure char within the value is doubled.
+
+---
+
+## Phase 20.6 — Parquet TVF + COPY TO PARQUET
+
+Phase 20.6 adds two Parquet capabilities:
+
+1. **`READ_PARQUET('path')`** — table-valued function that reads any Parquet file as
+   a virtual table, with full SELECT support (WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, CTE).
+2. **`COPY table TO 'path' WITH (FORMAT PARQUET [, COMPRESSION SNAPPY|UNCOMPRESSED])`** —
+   exports a full table scan to a Parquet file.
+
+The implementation uses `parquet = { version = "54", features = ["snap"] }` with
+`default-features = false` (no Arrow dependency).
+
+### AST additions
+
+```rust
+// New FromClause variant
+FromClause::ReadParquet(Box<ReadParquetClause>)
+
+pub struct ReadParquetClause {
+    pub path: String,
+    pub alias: Option<String>,
+    pub column_aliases: Vec<String>,
+}
+
+// CopyFormat extension
+CopyFormat::Parquet
+
+// Compression option
+pub enum ParquetCompression { Snappy, Uncompressed }
+
+// CopyOptions extension
+pub compression: Option<ParquetCompression>,
+```
+
+### Parser (`parser/dml.rs`)
+
+`parse_from_item` detects `READ_PARQUET` as a case-insensitive identifier followed
+by `(`. The string literal path is parsed, then optional `AS alias [(col1, col2 ...)]`
+column rename syntax.
+
+`parse_copy_options` recognizes `FORMAT PARQUET` and `COMPRESSION SNAPPY|UNCOMPRESSED`.
+
+### Bind-time schema discovery (`analyzer_bind.rs`)
+
+`parquet_schema_to_column_defs` opens the Parquet file at **bind time** using
+`SerializedFileReader` to read schema metadata only (no rows). It maps each
+primitive field's `LogicalType`/`ConvertedType`/physical type to `ColumnType` and
+returns a `Vec<ColumnDef>`. Column aliases are validated here.
+
+`srf_wildcard_columns` was extended to handle `FromClause::ReadParquet` so that
+`SELECT *` in CTEs resolves to proper column names rather than positional `*0`, `*1`.
+
+### READ_PARQUET executor (`executor/parquet_read.rs`)
+
+`read_parquet_rows` materializes a Parquet file into `Vec<Vec<Value>>` using
+`row.get_column_iter()` and `parquet_field_to_value` for type conversion.
+
+`execute_select_read_parquet_source` mirrors `execute_select_generate_series_source`:
+handles JOINs via `execute_select_with_joins_first_materialized`, then applies
+WHERE / GROUP BY / ORDER BY / LIMIT inline.
+
+Column types for wire protocol metadata are inferred from the actual values via
+`infer_data_type_from_parquet_col` (scans first non-null value per column), then
+patched into output column metadata by name after `build_derived_output_columns`.
+
+### COPY TO PARQUET (`executor/copy_to.rs`)
+
+`write_parquet` infers a `ColKind` for each column from the first non-null row
+(`Bool`, `Int32`, `Int64`, `Double`, `ByteArray`). It builds a Parquet group-type
+schema with `OPTIONAL` repetition for every column, writes one row group using
+`SerializedFileWriter`, and handles NULLs via definition levels (def=1 present,
+def=0 null).

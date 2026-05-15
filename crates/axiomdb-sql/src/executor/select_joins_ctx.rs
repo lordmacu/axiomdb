@@ -336,7 +336,13 @@ fn execute_select_with_joins_first_materialized(
                     let alias = rp.alias.clone().unwrap_or_else(|| "read_parquet".into());
                     let column_metas: Vec<ColumnMeta> = final_names
                         .iter()
-                        .map(|name| ColumnMeta::computed(name.clone(), DataType::Text))
+                        .enumerate()
+                        .map(|(i, name)| {
+                            ColumnMeta::computed(
+                                name.clone(),
+                                infer_data_type_from_parquet_col(i, &rows),
+                            )
+                        })
                         .collect();
                     col_offsets.push(running_offset);
                     running_offset += column_metas.len();

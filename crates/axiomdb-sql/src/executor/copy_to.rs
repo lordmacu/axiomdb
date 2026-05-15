@@ -262,11 +262,9 @@ fn write_parquet(
     rows: &[Vec<Value>],
     compression: Option<parquet::basic::Compression>,
 ) -> Result<QueryResult, DbError> {
-    use parquet::basic::{Compression, ConvertedType, LogicalType, Repetition, Type as Physical};
+    use parquet::basic::{Compression, ConvertedType, Repetition, Type as Physical};
     use parquet::column::writer::ColumnWriter;
-    use parquet::data_type::{
-        BoolType, ByteArray, ByteArrayType, DoubleType, FloatType, Int32Type, Int64Type,
-    };
+    use parquet::data_type::ByteArray;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::types::Type;

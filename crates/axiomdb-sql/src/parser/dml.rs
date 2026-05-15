@@ -10,8 +10,8 @@ use crate::{
         GroupByClause, InsertSource, InsertStmt, IntoOutfile, JoinClause, JoinCondition, JoinType,
         LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition, MergeActionKind,
         MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, ParquetCompression,
-        SelectHint, SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt,
-        UpdateStmt,
+        SelectHint, SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder,
+        Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -986,11 +986,13 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
                 vec![]
             };
 
-            return Ok(FromClause::ReadParquet(Box::new(crate::ast::ReadParquetClause {
-                path,
-                alias,
-                column_aliases,
-            })));
+            return Ok(FromClause::ReadParquet(Box::new(
+                crate::ast::ReadParquetClause {
+                    path,
+                    alias,
+                    column_aliases,
+                },
+            )));
         }
     }
 

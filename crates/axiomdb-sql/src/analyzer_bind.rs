@@ -520,8 +520,8 @@ fn parquet_schema_to_column_defs(
     path: &str,
     column_aliases: &[String],
 ) -> Result<Vec<axiomdb_catalog::schema::ColumnDef>, DbError> {
-    use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableId};
-    use parquet::basic::{ConvertedType, Repetition, Type as PhysicalType};
+    use axiomdb_catalog::schema::{ColumnDef, TableId};
+    use parquet::basic::Repetition;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::schema::types::Type;
 
@@ -907,6 +907,11 @@ fn srf_wildcard_columns(
         }
         Some(crate::ast::FromClause::Unnest(un)) => {
             Some(crate::unnest::column_defs_for_unnest(un))
+        }
+        // Phase 20.6 — READ_PARQUET: re-read schema from metadata (file exists
+        // because bind already validated it; metadata read is fast).
+        Some(crate::ast::FromClause::ReadParquet(rp)) => {
+            parquet_schema_to_column_defs(&rp.path, &rp.column_aliases).ok()
         }
         _ => None,
     }
