@@ -3,7 +3,7 @@
 Phase: 20 — Types + import/export
 Task: Bulk data import and export via COPY
 Spec: specs/fase-20/spec-20.5-copy-from-to.md
-Status: in-progress
+Status: done
 
 ## Summary
 
