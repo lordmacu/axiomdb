@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 146/442 subphases (33.0%) — Phase 11 complete; Phase 13 complete**
+> **MySQL+PG parity path: 146/442 subphases (33.0%) — Phase 11 complete; Phase 13 complete; Phase 22b complete**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
@@ -400,14 +400,14 @@ Partitioning baseline, schemas, cross-database queries, migrations CLI, FDW, sch
 - [ ] 14.1 ⏳ Table partitioning — `PARTITION BY RANGE/HASH/LIST`
 - [ ] 14.2 ⏳ Partition pruning — query planner skips irrelevant partitions
 
-### Phase 22b — Platform features `🔄` week 55-58
+### Phase 22b — Platform features `✅` week 55-58
 - [x] 22b.1 ✅ Scheduled jobs — `cron_schedule/unschedule/enable/disable()`, persistent catalog, background tokio scheduler, `information_schema.scheduled_jobs`
 - [x] 22b.2 ✅ HTTP Foreign Data Wrappers — `CREATE/DROP SERVER`, `CREATE/DROP FOREIGN TABLE`, HTTP JSON scan, `information_schema.foreign_servers/foreign_tables`, 26 integration tests + 11 wire scenarios
 - [x] 22b.3a ✅ Database catalog + `CREATE/DROP DATABASE` — persisted `axiom_databases`, catalog-backed `SHOW DATABASES`, validated `USE` / `COM_INIT_DB`, legacy tables default to `axiomdb`
 - [x] 22b.3b ✅ Cross-database queries — `database.schema.table`, cross-db SELECT / JOIN / DML; 9 integration tests + 8 wire scenarios
 - [x] 22b.4 ✅ Schema namespacing — `CREATE SCHEMA [IF NOT EXISTS]`, `DROP SCHEMA [IF EXISTS] [CASCADE|RESTRICT]`, `schema.table` qualified names, `SET search_path`, `SHOW SCHEMAS [LIKE]`, `information_schema.schemata`
 - [x] 22b.5 ✅ Schema migrations CLI — `axiomdb-server migrate up/down/status/create`, `axiomdb_migrations` state table, UP+DOWN sections, 18 tests
-- [ ] 22b.6 ⏳ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows
+- [x] 22b.6 ✅ FDW pushdown — push SQL predicates to remote origin when possible; avoid fetching unnecessary rows — completed 2026-05-14
 
 ### Phase 23 — Backwards compatibility `⏳` week 68-71
 - [ ] 23.1 ⏳ Native SQLite reader — parse binary `.db`/`.sqlite` format
