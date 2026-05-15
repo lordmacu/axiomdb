@@ -404,6 +404,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Decimal => Ok(ColumnType::Decimal),
         DataType::Date => Ok(ColumnType::Date),
         DataType::Array(_elem) => Ok(ColumnType::Array),
+        DataType::Range(_) => Ok(ColumnType::Range),
     }
 }
 
@@ -423,6 +424,7 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Decimal => DataType::Decimal,
         ColumnType::Date => DataType::Date,
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
+        ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
     }
 }
 
@@ -457,6 +459,7 @@ fn datatype_of_value(v: &Value) -> DataType {
             let elem_dt = elems.iter().find(|e| !matches!(e, Value::Null)).map(datatype_of_value).unwrap_or(DataType::Int);
             DataType::Array(Box::new(elem_dt))
         }
+        Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
     }
 }
 

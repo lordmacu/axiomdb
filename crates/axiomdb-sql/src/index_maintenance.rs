@@ -191,6 +191,9 @@ fn flatten_array_elements(arr: &[Value], out: &mut Vec<Vec<u8>>) {
                 // Flatten nested arrays recursively
                 flatten_array_elements(nested, out);
             }
+            Value::Range(_) => {
+                // Range values are not GIN-indexable as array elements; skip.
+            }
         }
     }
 }

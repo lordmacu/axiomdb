@@ -532,6 +532,9 @@ impl Hash for HashableValue {
                     HashableValue(elem.clone()).hash(state);
                 }
             }
+            Value::Range(rv) => {
+                rv.to_display_string().hash(state);
+            }
         }
     }
 }
@@ -1161,6 +1164,7 @@ enum ArrayElemType {
     Timestamp,
     Uuid,
     Array,
+    Range,
 }
 
 impl ArrayElemType {
@@ -1180,6 +1184,7 @@ impl ArrayElemType {
             Value::Timestamp(_) => Self::Timestamp,
             Value::Uuid(_) => Self::Uuid,
             Value::Array(_) => Self::Array,
+            Value::Range(_) => Self::Range,
         }
     }
 
@@ -1199,6 +1204,7 @@ impl ArrayElemType {
             Self::Timestamp => Some(DataType::Timestamp),
             Self::Uuid => Some(DataType::Uuid),
             Self::Array => None, // Nested arrays handled separately
+            Self::Range => None, // Range types not supported as array elements
         }
     }
 }

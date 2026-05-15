@@ -199,6 +199,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Uuid => DataType::Uuid,
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
+        ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
     }
 }
 
@@ -226,6 +227,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
                 let elem_dt = column_type_to_data_type(elem_ct);
                 DataType::Array(Box::new(elem_dt))
             }
+            ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
         })
         .collect()
 }
@@ -744,6 +746,7 @@ pub(crate) fn coerce_values(
                     let elem_dt = column_type_to_data_type(elem_ct);
                     DataType::Array(Box::new(elem_dt))
                 }
+                ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -787,6 +790,7 @@ pub(crate) fn coerce_values_with_ctx(
                 let elem_dt = column_type_to_data_type(elem_ct);
                 DataType::Array(Box::new(elem_dt))
             }
+            ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
         };
 
         if ctx.strict_mode {

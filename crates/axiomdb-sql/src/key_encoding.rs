@@ -55,7 +55,7 @@ pub const MAX_INDEX_KEY: usize = 768;
 pub fn encode_index_key(values: &[Value]) -> Result<Vec<u8>, DbError> {
     let mut buf = Vec::with_capacity(32);
     for v in values {
-        encode_value(v, &mut buf);
+        encode_value(v, &mut buf)?;
     }
     if buf.len() > MAX_INDEX_KEY {
         return Err(DbError::IndexKeyTooLong {
@@ -68,7 +68,7 @@ pub fn encode_index_key(values: &[Value]) -> Result<Vec<u8>, DbError> {
 
 // ── Per-value encoding ────────────────────────────────────────────────────────
 
-fn encode_value(v: &Value, buf: &mut Vec<u8>) {
+fn encode_value(v: &Value, buf: &mut Vec<u8>) -> Result<(), DbError> {
     match v {
         Value::Null => {
             buf.push(0x00);
@@ -134,7 +134,13 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) {
             // For now, encode as empty placeholder.
             buf.push(0x0D);
         }
+        Value::Range(_) => {
+            return Err(DbError::InvalidValue {
+                reason: "Range values cannot be used as index keys".to_string(),
+            });
+        }
     }
+    Ok(())
 }
 
 /// Encodes an f64 into 8 bytes that preserve comparison order.

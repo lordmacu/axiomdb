@@ -965,6 +965,7 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
         ColumnType::Array => "ARRAY", // actual reconstruction done in column_sql_type_display
+        ColumnType::Range => "RANGE",
     }
 }
 
@@ -984,6 +985,7 @@ fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "TIMESTAMP",
         ColumnType::Uuid => "UUID",
         ColumnType::Array => "ARRAY",
+        ColumnType::Range => "RANGE",
     }
 }
 

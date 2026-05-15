@@ -41,7 +41,24 @@
       "Bash(/Users/cristian/nexusdb/target/debug/axiomdb-server --data /tmp/axiomdb-wire-test.db)",
       "Skill(brainstorm)",
       "Bash(./tools/vm.sh fmt *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(ssh axiomdb *)",
+      "Bash(./tools/vm.sh shell *)",
+      "Bash(./tools/vm.sh nextest *)",
+      "Bash(pkill -f axiomdb-server 2>/dev/null; rm -f /Users/cristian/nexusdb/target/release/axiomdb-server; echo \"cleaned\")",
+      "Bash(limactl copy *)",
+      "Bash(AXIOMDB_SERVER_BIN=/Users/cristian/nexusdb/target/release/axiomdb-server python3 /Users/cristian/nexusdb/tools/wire-test.py)",
+      "Bash(AXIOMDB_SERVER_BIN=/Users/cristian/nexusdb/.claude/worktrees/beautiful-babbage-88f474/target/release/axiomdb-server python3 /Users/cristian/nexusdb/tools/wire-test.py)",
+      "Bash(pkill -f \"axiomdb-server\")",
+      "Bash(AXIOMDB_SERVER_BIN=/Users/cristian/nexusdb/.claire/worktrees/beautiful-babbage-88f474/target/release/axiomdb-server python3 /Users/cristian/nexusdb/tools/wire-test.py)",
+      "Bash(wait)",
+      "Bash(sed -n '560,575p' /Users/cristian/nexusdb/.claude/worktrees/beautiful-babbage-88f474/crates/axiomdb-sql/src/lexer.rs)",
+      "Bash(sed -n '630,645p' /Users/cristian/nexusdb/.claude/worktrees/beautiful-babbage-88f474/crates/axiomdb-sql/src/lexer.rs)",
+      "Bash(sed -n '275,300p' /Users/cristian/nexusdb/.claude/worktrees/beautiful-babbage-88f474/crates/axiomdb-sql/src/parser/expr.rs)",
+      "Bash(sed -n '1125,1160p' /Users/cristian/nexusdb/.claude/worktrees/beautiful-babbage-88f474/crates/axiomdb-sql/src/eval/ops.rs)",
+      "Bash(chmod +x target/release/axiomdb-server)",
+      "Bash(./tools/vm.sh fmt-check *)",
+      "Bash(cat >> *)"
     ],
     "additionalDirectories": [
       "/Users/cristian/nexusdb/docs"

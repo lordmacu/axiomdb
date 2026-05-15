@@ -115,6 +115,7 @@ fn outfile_field_str(v: &Value) -> String {
             let arr: Vec<serde_json::Value> = elems.iter().map(val_to_json).collect();
             serde_json::to_string(&arr).unwrap_or_default()
         }
+        Value::Range(rv) => rv.to_display_string(),
     }
 }
 

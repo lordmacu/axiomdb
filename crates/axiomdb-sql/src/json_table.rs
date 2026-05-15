@@ -377,6 +377,11 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
                 feature: "JSON_TABLE with array return type".into(),
             });
         }
+        DataType::Range(_) => {
+            return Err(DbError::NotImplemented {
+                feature: "JSON_TABLE with range return type".into(),
+            });
+        }
     })
 }
 

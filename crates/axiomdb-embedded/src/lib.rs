@@ -644,6 +644,10 @@ mod ffi {
                 // Array FFI deferred to Step 10.
                 CellValue::Text(CString::new("{}").unwrap_or_else(|_| CString::new("").unwrap()))
             }
+            Value::Range(rv) => {
+                let s = rv.to_display_string();
+                CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("empty").unwrap()))
+            }
         }
     }
 

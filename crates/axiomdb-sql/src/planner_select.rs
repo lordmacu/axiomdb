@@ -925,6 +925,10 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
             let elem_dt = crate::table::column_type_to_data_type(elem_ct);
             DataType::Array(Box::new(elem_dt))
         }
+        ColumnType::Range => {
+            // Range columns are not used as index scan keys; return value as-is.
+            return value;
+        }
     };
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }

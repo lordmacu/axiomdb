@@ -218,6 +218,12 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                 key.push(13);
                 key.push(0);
             }
+            Value::Range(rv) => {
+                key.push(14);
+                let s = rv.to_display_string();
+                key.extend_from_slice(s.as_bytes());
+                key.push(0);
+            }
         }
     }
     key

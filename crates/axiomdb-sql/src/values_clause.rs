@@ -82,6 +82,7 @@ fn datatype_to_column_type(dt: DataType) -> ColumnType {
         DataType::Json => ColumnType::Json,
         DataType::Jsonb => ColumnType::Jsonb,
         DataType::Array(_) => ColumnType::Array,
+        DataType::Range(_) => ColumnType::Range,
         _ => ColumnType::Text,
     }
 }
@@ -106,6 +107,7 @@ fn value_type(v: &Value) -> DataType {
         Value::Json(_) => DataType::Json,
         Value::Jsonb(_) => DataType::Jsonb,
         Value::Array(_) => DataType::Array(Box::new(DataType::Text)),
+        Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
         _ => DataType::Text,
     }
 }
