@@ -3,6 +3,7 @@
 Phase: 20 — Types + import/export
 Task: Range types — int4range, int8range, numrange, daterange, tsrange
 Spec: specs/fase-20/spec-range-types.md
+Status: done
 Status: in-progress
 
 ## Summary
