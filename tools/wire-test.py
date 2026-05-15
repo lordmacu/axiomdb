@@ -5321,6 +5321,28 @@ _null_tilde = cur.fetchone()[0]
 ok("[20.15g null_tilde_propagates] NULL ~ 'x' → NULL", _null_tilde is None, _null_tilde)
 
 
+# ── 20.12 — ORDER BY RANDOM() ─────────────────────────────────────────────────
+
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_random (v INT)")
+cur.execute("DELETE FROM _wire_random")
+for _i in range(10):
+    cur.execute(f"INSERT INTO _wire_random VALUES ({_i})")
+conn.commit()
+
+# 20.12a: ORDER BY RANDOM() returns all rows (count-based permutation check)
+cur.execute("SELECT COUNT(*) FROM (SELECT v FROM _wire_random ORDER BY RANDOM()) sub")
+ok("[20.12a order_by_random_count] ORDER BY RANDOM() returns all rows", cur.fetchone()[0] == 10)
+
+# 20.12b: ORDER BY RANDOM() LIMIT 3 returns exactly 3 rows
+cur.execute("SELECT COUNT(*) FROM (SELECT v FROM _wire_random ORDER BY RANDOM() LIMIT 3) sub")
+ok("[20.12b order_by_random_limit] ORDER BY RANDOM() LIMIT 3 → 3 rows", cur.fetchone()[0] == 3)
+
+# 20.12c: RAND() returns a Real in [0, 1)
+cur.execute("SELECT RAND()")
+_rand_val = cur.fetchone()[0]
+ok("[20.12c rand_scalar_range] RAND() returns value in [0,1)", 0.0 <= _rand_val < 1.0, _rand_val)
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

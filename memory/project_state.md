@@ -3,18 +3,19 @@
 ## Current (2026-05-15)
 
 **Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.15 — Regex operators COMPLETE.
-PostgreSQL POSIX regex binary operators `~`, `~*`, `!~`, `!~*` + scalar functions
-`REGEXP_LIKE` and `REGEXP_REPLACE`. New lexer tokens, BinaryOp variants, parser arms,
-eval_regexp_tilde, NULL propagation. 37 integration tests, 7 wire assertions (571/571),
-4032/4032 workspace tests.
+**Active subphase:** Phase 20.12 — ORDER BY RANDOM() COMPLETE.
+Fixed `RAND()`/`RANDOM()` to use `rand::random::<f64>()` (replaces LCG PRNG); arity
+validated. `apply_order_by` pure-random path uses Fisher-Yates shuffle; mixed
+`ORDER BY col, RANDOM()` pre-materializes random keys; `apply_order_by_top_n` falls
+back to full shuffle for RANDOM() cases. 12 integration tests, 3 wire assertions
+(574/574), 4044/4044 workspace tests.
 
-**Last verified gates:** Phase 20.15 closeout passed 4032/4032 tests, clippy clean,
-fmt clean, wire test 571/571.
+**Last verified gates:** Phase 20.12 closeout passed 4044/4044 tests, clippy clean,
+fmt clean, wire test 574/574.
 
-**Recently completed:** 20.7 — Incremental backup (2026-05-15). 20.8 — COPY streaming (2026-05-15). 20.15 — Regex operators (2026-05-15).
+**Recently completed:** 20.15 — Regex operators (2026-05-15). 20.12 — ORDER BY RANDOM() (2026-05-15).
 
-**Next:** Phase 20.11 (TABLESAMPLE) or Phase 20.12 (ORDER BY RANDOM()).
+**Next:** Phase 20.11 (TABLESAMPLE).
 
 ### Phase 21 subphase status
 
@@ -78,6 +79,7 @@ fmt clean, wire test 571/571.
 | **20.7 Incremental backup** | ✅ closed |
 | **20.8 COPY streaming** | ✅ closed |
 | **20.15 Regex operators** | ✅ closed |
+| **20.12 ORDER BY RANDOM()** | ✅ closed |
 | 20.10 GENERATE_SERIES | ✅ closed |
 | 20.14 UNNEST in SELECT list | ✅ closed |
 

@@ -486,6 +486,40 @@ SELECT flags & 0xFF FROM events;   -- bitmask with hex constant
 | `MOD(x, y)`       | Modulo                                   | `MOD(10, 3)` → `1`    |
 | `POWER(x, y)`     | x raised to the power y                  | `POWER(2, 8)` → `256` |
 | `SQRT(x)`         | Square root                              | `SQRT(16)` → `4`      |
+| `RAND()`          | Random float in `[0.0, 1.0)`            | `RAND()` → `0.7341…`  |
+| `RANDOM()`        | Alias for `RAND()`                       | `RANDOM()` → `0.2187…`|
+
+#### RAND() / RANDOM() and ORDER BY RANDOM()
+
+`RAND()` (alias `RANDOM()`) returns a uniformly distributed `REAL` value in the
+half-open interval `[0.0, 1.0)` using a cryptographically seeded PRNG. It accepts
+zero arguments — passing any argument is an error.
+
+```sql
+-- Random scalar
+SELECT RAND();           -- e.g. 0.7341592653589793
+
+-- Random row from a table
+SELECT * FROM products ORDER BY RANDOM() LIMIT 1;
+
+-- Random 5-row sample (loot drop, quiz randomization, A/B assignment)
+SELECT id, name FROM items WHERE rarity = 'epic' ORDER BY RANDOM() LIMIT 5;
+
+-- Sort by a column first, break ties randomly
+SELECT * FROM candidates ORDER BY score DESC, RANDOM();
+```
+
+**Implementation details:**
+
+- `ORDER BY RANDOM()` (single sort key) uses an in-place **Fisher-Yates shuffle**
+  — O(n), correct and uniform.
+- `ORDER BY col, RANDOM()` pre-materializes one random key per row before sorting
+  so the comparator sees stable values (avoids the transitivity violation that
+  occurs when RANDOM() is called inside the comparator).
+- `ORDER BY RANDOM() LIMIT N` shuffles the full result set first, then slices —
+  no heap-sort optimisation (heap requires repeated comparisons which break
+  pre-materialized keys).
+- `RAND(1)` with any argument returns an error: `RAND takes no arguments`.
 
 ### String Functions
 

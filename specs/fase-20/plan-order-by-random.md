@@ -3,7 +3,7 @@
 Phase: 20 — Types + import/export
 Task: ORDER BY RANDOM() — random row ordering
 Spec: specs/fase-20/spec-order-by-random.md
-Status: in-progress
+Status: done
 
 ## Summary
 
