@@ -68,36 +68,43 @@ pub fn normalize_select_srf(s: &mut SelectStmt) -> Result<(), DbError> {
         return Ok(());
     }
 
-    // ── Synthetic internal column names ───────────────────────────────────────
-    // Double-underscore prefix avoids collision with user-defined column names.
-    let col_names: Vec<String> = (0..srf_arrays.len())
-        .map(|i| format!("__srf_{i}__"))
+    // ── Determine output names (= UnnestClause column names = SelectItem alias) ──
+    // Using the user alias (or the PostgreSQL default "unnest"/"unnest_N") as the
+    // internal column name means ORDER BY can reference these names directly, since
+    // the BindContext exposes them under the injected `__srf__` table.
+    let output_names: Vec<String> = srf_user_aliases
+        .iter()
+        .enumerate()
+        .map(|(seq, alias)| {
+            alias.clone().unwrap_or_else(|| {
+                if seq == 0 {
+                    "unnest".into()
+                } else {
+                    format!("unnest_{seq}")
+                }
+            })
+        })
         .collect();
 
     // ── Build one UnnestClause for all collected arrays (zip semantics) ───────
     let unnest_clause = UnnestClause {
         exprs: srf_arrays,
         alias: Some("__srf__".into()),
-        column_names: col_names.clone(),
+        column_names: output_names.clone(), // output names == internal column names
         lateral: true, // may reference outer table columns
     };
 
-    // ── Replace UNNEST exprs with Column refs; assign output aliases ──────────
+    // ── Replace UNNEST exprs with Column refs; pin output aliases ────────────
     for (seq, &pos) in srf_positions.iter().enumerate() {
         if let SelectItem::Expr { expr, alias } = &mut s.columns[pos] {
-            // Point at the synthetic UNNEST output column.
+            // Column name matches what the BindContext exposes, so ORDER BY
+            // on the alias resolves without a special alias-lookup pass.
             *expr = Expr::Column {
                 col_idx: 0, // resolved to the correct offset by the analyzer
-                name: col_names[seq].clone(),
+                name: output_names[seq].clone(),
             };
-            // Preserve the user's alias; otherwise use PostgreSQL default names.
-            if alias.is_none() {
-                *alias = Some(if seq == 0 {
-                    "unnest".into()
-                } else {
-                    format!("unnest_{seq}")
-                });
-            }
+            // Override alias to the output name (normalizes user alias vs default).
+            *alias = Some(output_names[seq].clone());
         }
     }
 

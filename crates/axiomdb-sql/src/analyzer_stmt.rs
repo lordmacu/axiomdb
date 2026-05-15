@@ -303,6 +303,11 @@ fn analyze_select_with_outer(
         )?;
     }
 
+    // Phase 20.14 — rewrite UNNEST calls in the SELECT list to an implicit
+    // LATERAL UNNEST join before the bind context is built, so column resolution
+    // sees the injected join columns naturally.
+    crate::srf_normalize::normalize_select_srf(&mut s)?;
+
     // Build resolution context from FROM and JOINs.
     // Phase 21.9: Pass outer_scopes so LATERAL subqueries in JOINs can reference
     // outer tables (they become OuterColumn during analysis).
