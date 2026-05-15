@@ -11,8 +11,9 @@
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
 
-use crate::ast::{FromClause, JoinClause, JoinCondition, JoinType, SelectItem, SelectStmt,
-                  UnnestClause};
+use crate::ast::{
+    FromClause, JoinClause, JoinCondition, JoinType, SelectItem, SelectStmt, UnnestClause,
+};
 use crate::expr::Expr;
 
 /// Rewrite UNNEST calls in the SELECT list to an implicit LATERAL UNNEST join.
@@ -91,7 +92,7 @@ pub fn normalize_select_srf(s: &mut SelectStmt) -> Result<(), DbError> {
         exprs: srf_arrays,
         alias: Some("__srf__".into()),
         column_names: output_names.clone(), // output names == internal column names
-        lateral: true, // may reference outer table columns
+        lateral: true,                      // may reference outer table columns
     };
 
     // ── Replace UNNEST exprs with Column refs; pin output aliases ────────────

@@ -10,7 +10,10 @@ fn run(sql: &str) -> QueryResult {
 
 fn run_multi(stmts: &[&str]) -> QueryResult {
     let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
-    let mut last = QueryResult::Affected { count: 0, last_insert_id: None };
+    let mut last = QueryResult::Affected {
+        count: 0,
+        last_insert_id: None,
+    };
     for sql in stmts {
         last = common::run_ctx(sql, &mut storage, &mut txn, &mut bloom, &mut ctx)
             .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e:?}"));
@@ -20,8 +23,7 @@ fn run_multi(stmts: &[&str]) -> QueryResult {
 
 fn run_err(sql: &str) -> axiomdb_core::error::DbError {
     let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
-    common::run_ctx(sql, &mut storage, &mut txn, &mut bloom, &mut ctx)
-        .expect_err("expected error")
+    common::run_ctx(sql, &mut storage, &mut txn, &mut bloom, &mut ctx).expect_err("expected error")
 }
 
 fn affected(r: QueryResult) -> u64 {
@@ -40,9 +42,7 @@ fn file_str(path: &str) -> String {
 #[test]
 fn test_into_outfile_literal_tab_default() {
     let path = "/tmp/axm_test_outfile_tab.tsv";
-    let r = run(&format!(
-        "SELECT 1, 'hello' INTO OUTFILE '{path}'"
-    ));
+    let r = run(&format!("SELECT 1, 'hello' INTO OUTFILE '{path}'"));
     assert_eq!(affected(r), 1);
     let content = file_str(path);
     assert_eq!(content, "1\thello\n");
@@ -85,9 +85,8 @@ fn test_into_outfile_optionally_enclosed_by() {
 fn test_into_outfile_enclosure_doubled_in_value() {
     let path = "/tmp/axm_test_outfile_double_enc.csv";
     // Use | as enclosure; value contains | which must be doubled inside the enclosure
-    let sql = format!(
-        "SELECT 'a|b' INTO OUTFILE '{path}' FIELDS TERMINATED BY ',' ENCLOSED BY '|'"
-    );
+    let sql =
+        format!("SELECT 'a|b' INTO OUTFILE '{path}' FIELDS TERMINATED BY ',' ENCLOSED BY '|'");
     let r = run(&sql);
     assert_eq!(affected(r), 1);
     let content = file_str(path);
@@ -110,9 +109,7 @@ fn test_into_outfile_lines_terminated_crlf() {
 #[test]
 fn test_into_outfile_null_value() {
     let path = "/tmp/axm_test_outfile_null.csv";
-    let r = run(&format!(
-        "SELECT NULL INTO OUTFILE '{path}'"
-    ));
+    let r = run(&format!("SELECT NULL INTO OUTFILE '{path}'"));
     assert_eq!(affected(r), 1);
     let content = file_str(path);
     assert_eq!(content.trim(), r"\N");
@@ -135,9 +132,7 @@ fn test_into_outfile_empty_result_empty_file() {
     // Use a condition that's always false to get 0 rows
     let stmts = &[
         "CREATE TABLE axm_outfile_empty (id INT)",
-        &format!(
-            "SELECT id FROM axm_outfile_empty INTO OUTFILE '{path}' FIELDS TERMINATED BY ','"
-        ),
+        &format!("SELECT id FROM axm_outfile_empty INTO OUTFILE '{path}' FIELDS TERMINATED BY ','"),
     ];
     let r = run_multi(stmts);
     assert_eq!(affected(r), 0);
@@ -183,9 +178,7 @@ fn test_into_outfile_order_by() {
     let stmts = &[
         "CREATE TABLE axm_outfile_order (id INT, score INT)",
         "INSERT INTO axm_outfile_order VALUES (3, 100), (1, 300), (2, 200)",
-        &format!(
-            "SELECT score FROM axm_outfile_order ORDER BY score INTO OUTFILE '{path}'"
-        ),
+        &format!("SELECT score FROM axm_outfile_order ORDER BY score INTO OUTFILE '{path}'"),
     ];
     let r = run_multi(stmts);
     assert_eq!(affected(r), 3);

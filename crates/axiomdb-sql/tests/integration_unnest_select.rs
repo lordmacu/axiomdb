@@ -110,7 +110,10 @@ fn unnest_select_two_unnests_different_lengths() {
     let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
     let r = common::run_ctx(
         "SELECT UNNEST(ARRAY[1,2,3]) AS a, UNNEST(ARRAY['x','y']) AS b",
-        &mut storage, &mut txn, &mut bloom, &mut ctx,
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
     );
     assert!(r.is_err(), "expected error for mismatched array lengths");
 }
@@ -204,7 +207,13 @@ fn unnest_select_in_subquery() {
 fn unnest_select_zero_arg_error() {
     // Parser rejects UNNEST() before our validator; any error is acceptable
     let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
-    let r = common::run_ctx("SELECT UNNEST() AS n", &mut storage, &mut txn, &mut bloom, &mut ctx);
+    let r = common::run_ctx(
+        "SELECT UNNEST() AS n",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
     assert!(r.is_err(), "expected error for zero-arg UNNEST");
 }
 
@@ -215,7 +224,13 @@ fn unnest_select_multi_arg_error() {
     let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();
     let r = common::run_ctx(
         "SELECT UNNEST(ARRAY[1], ARRAY[2]) AS n",
-        &mut storage, &mut txn, &mut bloom, &mut ctx,
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
     );
-    assert!(r.is_err(), "expected error for multi-arg UNNEST in SELECT list");
+    assert!(
+        r.is_err(),
+        "expected error for multi-arg UNNEST in SELECT list"
+    );
 }

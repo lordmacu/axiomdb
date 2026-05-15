@@ -1346,3 +1346,54 @@ UNNESTs into one clause preserves that zip semantics automatically.
 After the rewrite the analyzer and executor see a perfectly ordinary LATERAL
 UNNEST join — the same code paths used by `FROM UNNEST(arr) AS u(col)` (Phase 20.4)
 and `LATERAL UNNEST` correlation (GAP-20.4b). No new execution nodes were added.
+
+## Phase 20.5b — SELECT INTO OUTFILE
+
+### Overview
+
+`SELECT … INTO OUTFILE 'path' [FIELDS …] [LINES …]` extends the `SelectStmt` AST
+with an optional `IntoOutfile` field and adds a parser clause that appears after the
+lock clause at the end of a SELECT body.
+
+### AST
+
+```rust
+pub struct IntoOutfile {
+    pub path: String,
+    pub field_sep: char,       // default: '\t'
+    pub enclosure: Option<char>,
+    pub line_term: String,     // default: "\n"
+}
+
+pub struct SelectStmt {
+    // ... existing fields ...
+    pub into_outfile: Option<IntoOutfile>,
+}
+```
+
+### Parser
+
+The parser function `parse_into_outfile` (in `parser/dml.rs`) runs at the end of
+`parse_select_body`, after the lock clause. It uses a **two-token lookahead**
+(`Token::Into` followed by `Ident("OUTFILE")`) to avoid consuming `INTO` tokens
+that belong to other constructs (e.g., `INSERT INTO`). Non-reserved keywords
+(`OUTFILE`, `FIELDS`, `TERMINATED`, `ENCLOSED`, `OPTIONALLY`, `LINES`) are matched
+via `p.eat_ident_ci()`; the reserved keyword `BY` uses `p.expect(&Token::By)`.
+
+### Execution
+
+The `IntoOutfile` field is extracted at the two top-level dispatch points
+(`exec_entry.rs` and `exec_dispatch.rs`) **before** the `SelectStmt` is passed to
+`execute_select_ctx`. This guarantees that all internal callers (subqueries, CTEs,
+joins) always see `into_outfile = None`.
+
+After `execute_select_ctx` returns `QueryResult::Rows`, `handle_into_outfile`
+(in `executor/select_into_outfile.rs`) writes the file and returns
+`QueryResult::Affected { count: rows.len() }` to the client.
+
+### Value serialization
+
+`outfile_field_str` maps each `Value` variant to a string: `Null → \N`,
+`Bool → 1/0`, integers/reals via `Display`, `Text` as-is. When `enclosure` is
+set, each field string is wrapped in the enclosure character and any occurrence of
+the enclosure char within the value is doubled.

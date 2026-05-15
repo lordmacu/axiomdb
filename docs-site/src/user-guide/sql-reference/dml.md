@@ -2469,3 +2469,81 @@ SELECT UNNEST(ARRAY[1,2,3]) AS n, UNNEST(ARRAY['a','b','c']) AS s;
 | Explicit column names | via alias | via `AS u(col)` |
 | Multi-array zip | multiple calls (equal length) | `UNNEST(a, b) AS u(x, y)` |
 | Added in phase | 20.14 | 20.4 |
+
+## SELECT INTO OUTFILE
+
+`SELECT … INTO OUTFILE 'path'` exports a query result directly to a file on the
+server filesystem. This is the MySQL-compatible syntax for query-result export;
+see `COPY TO` for the PostgreSQL-compatible alternative.
+
+### Syntax
+
+```sql
+SELECT col1, col2, ...
+FROM table
+[WHERE ...]
+[ORDER BY ...]
+[LIMIT n]
+INTO OUTFILE 'path'
+[FIELDS [TERMINATED BY 'char']
+        [OPTIONALLY ENCLOSED BY 'char']]
+[LINES  [TERMINATED BY 'string']]
+```
+
+**Defaults (MySQL-compatible):**
+
+| Option | Default |
+|---|---|
+| FIELDS TERMINATED BY | `\t` (TAB) |
+| ENCLOSED BY | none (no quoting) |
+| LINES TERMINATED BY | `\n` |
+
+### Examples
+
+```sql
+-- TAB-separated (MySQL default format)
+SELECT id, name FROM users INTO OUTFILE '/tmp/users.tsv';
+
+-- Comma-separated CSV
+SELECT id, name FROM users
+INTO OUTFILE '/tmp/users.csv'
+FIELDS TERMINATED BY ',';
+
+-- Quoted CSV (OPTIONALLY ENCLOSED BY wraps all fields)
+SELECT id, name FROM users
+INTO OUTFILE '/tmp/users.csv'
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"';
+
+-- Full options: comma-separated, quoted, Windows line endings
+SELECT id, score FROM results ORDER BY score DESC
+INTO OUTFILE '/tmp/top.csv'
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\r\n';
+
+-- With WHERE and ORDER BY (applied before writing)
+SELECT id, score FROM results WHERE score > 90 ORDER BY score DESC
+INTO OUTFILE '/tmp/top.csv' FIELDS TERMINATED BY ',';
+```
+
+### Output format rules
+
+- **No header row** is written (MySQL INTO OUTFILE never includes column names).
+- `NULL` values are written as `\N` (two characters: backslash + N).
+- Boolean values are written as `1` / `0`.
+- If an enclosure character appears inside a field value, it is **doubled** (e.g., `"` → `""`).
+- The output file is created (or truncated if it already exists). The server process must have write permission to the path.
+
+### Return value
+
+`INTO OUTFILE` returns an **affected-row count** (like MySQL's "Query OK, N rows affected"),
+not a result set.
+
+### Difference from COPY TO
+
+| Feature | `SELECT … INTO OUTFILE` | `COPY table TO 'path'` |
+|---|---|---|
+| Syntax origin | MySQL | PostgreSQL |
+| Source | Any SELECT query | Full table scan |
+| Format options | FIELDS/LINES | FORMAT CSV/JSON/JSONL |
+| Header row | Never | Optional (`HEADER TRUE`) |

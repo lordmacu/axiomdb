@@ -5112,6 +5112,35 @@ ok("[20.14 unnest_select_order_by] ORDER BY on UNNEST result sorts correctly",
 
 conn.commit()
 
+# ── Phase 20.5b — SELECT INTO OUTFILE ────────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS wire_outfile_t")
+cur.execute("CREATE TABLE wire_outfile_t (id INT, name VARCHAR(20))")
+cur.execute("INSERT INTO wire_outfile_t VALUES (1, 'alice'), (2, 'bob')")
+conn.commit()
+
+cur.execute("SELECT id, name FROM wire_outfile_t ORDER BY id INTO OUTFILE '/tmp/axm_wire_outfile.csv' FIELDS TERMINATED BY ','")
+conn.commit()
+import os
+outfile_lines = open('/tmp/axm_wire_outfile.csv').read().strip().split('\n')
+ok("[20.5b into_outfile_basic] SELECT INTO OUTFILE writes CSV with custom separator",
+   len(outfile_lines) == 2 and outfile_lines[0] == '1,alice' and outfile_lines[1] == '2,bob',
+   outfile_lines)
+
+cur.execute("SELECT name FROM wire_outfile_t ORDER BY id INTO OUTFILE '/tmp/axm_wire_outfile_q.csv' FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'")
+conn.commit()
+qlines = open('/tmp/axm_wire_outfile_q.csv').read().strip().split('\n')
+ok("[20.5b into_outfile_quoted] OPTIONALLY ENCLOSED BY wraps fields in quotes",
+   len(qlines) == 2 and qlines[0] == '"alice"' and qlines[1] == '"bob"',
+   qlines)
+
+cur.execute("SELECT NULL INTO OUTFILE '/tmp/axm_wire_null.csv'")
+conn.commit()
+null_content = open('/tmp/axm_wire_null.csv').read().strip()
+ok("[20.5b into_outfile_null] NULL value written as \\N",
+   null_content == r'\N',
+   repr(null_content))
+
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
