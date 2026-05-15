@@ -354,6 +354,142 @@ fn json_value_to_axiom(
     }
 }
 
+// ── Phase 22b.6: URL rendering ───────────────────────────────────────────────
+
+/// Constructs the final HTTP URL for an FDW GET request with predicate/LIMIT pushdown.
+///
+/// Processing order:
+///   1. Substitute `{col_name}` placeholders in `endpoint` from `bound`.
+///      Unbound placeholders remain as-is; consumed cols are tracked.
+///   2. For each col in `pushdown_cols` that is in `bound` AND NOT consumed by
+///      a placeholder, append `?col=percent_encoded_value`.
+///   3. If `limit_param` and `limit` are both set, append the limit param.
+fn render_fdw_url(
+    base_url: &str,
+    endpoint: &str,
+    bound: &HashMap<String, Value>,
+    pushdown_cols: &[&str],
+    limit_param: Option<&str>,
+    limit: Option<u64>,
+) -> String {
+    let mut consumed: HashSet<String> = HashSet::new();
+    let rendered_endpoint = substitute_placeholders(endpoint, bound, &mut consumed);
+
+    let base = format!("{}{}", base_url.trim_end_matches('/'), rendered_endpoint);
+
+    let mut params: Vec<(String, String)> = Vec::new();
+    for &col in pushdown_cols {
+        if !consumed.contains(col) {
+            if let Some(val) = bound.get(col) {
+                params.push((col.to_string(), value_to_url_string(val)));
+            }
+        }
+    }
+    if let (Some(param), Some(n)) = (limit_param, limit) {
+        params.push((param.to_string(), n.to_string()));
+    }
+
+    if params.is_empty() {
+        return base;
+    }
+    let already_has_query = base.contains('?');
+    let mut out = base;
+    for (i, (k, v)) in params.iter().enumerate() {
+        let sep = if i == 0 && !already_has_query { '?' } else { '&' };
+        out.push(sep);
+        out.push_str(k);
+        out.push('=');
+        out.push_str(&percent_encode(v));
+    }
+    out
+}
+
+/// Substitutes `{col_name}` placeholders in `endpoint`.
+/// Records the name of each column that was successfully substituted in `consumed`.
+fn substitute_placeholders(
+    endpoint: &str,
+    bound: &HashMap<String, Value>,
+    consumed: &mut HashSet<String>,
+) -> String {
+    let mut result = String::with_capacity(endpoint.len() + 32);
+    let bytes = endpoint.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Find the closing '}'
+            if let Some(close) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                let col_name = &endpoint[i + 1..i + 1 + close];
+                if let Some(val) = bound.get(col_name) {
+                    let s = value_to_url_string(val);
+                    result.push_str(&percent_encode(&s));
+                    consumed.insert(col_name.to_string());
+                } else {
+                    // Unbound — pass through literally
+                    result.push('{');
+                    result.push_str(col_name);
+                    result.push('}');
+                }
+                i += 1 + close + 1;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+/// Percent-encodes characters that have special meaning in URLs.
+/// Space→%20, &→%26, =→%3D, +→%2B, #→%23, %→%25.
+/// Non-ASCII bytes are percent-encoded byte-by-byte.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b' ' => out.push_str("%20"),
+            b'&' => out.push_str("%26"),
+            b'=' => out.push_str("%3D"),
+            b'+' => out.push_str("%2B"),
+            b'#' => out.push_str("%23"),
+            b'%' => out.push_str("%25"),
+            b if b.is_ascii() => out.push(b as char),
+            b => { out.push('%'); out.push_str(&format!("{b:02X}")); }
+        }
+    }
+    out
+}
+
+/// Converts an AxiomDB Value to its string representation for embedding in a URL.
+fn value_to_url_string(v: &Value) -> String {
+    match v {
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Real(f) => {
+            if f.is_nan() { return "NaN".into(); }
+            if f.is_infinite() {
+                return if *f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+            }
+            format!("{f}")
+        }
+        Value::Decimal(m, s) => format!("{m}e-{s}"),
+        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Bytes(b) => format!("{b:?}"),
+        Value::Date(d) => d.to_string(),
+        Value::Timestamp(ts) => ts.to_string(),
+        Value::Uuid(u) => {
+            let h = u.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
+            format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+        }
+        Value::Jsonb(b) => format!("{b:?}"),
+        Value::Array(items) => {
+            let inner = items.iter().map(value_to_url_string).collect::<Vec<_>>().join(",");
+            format!("[{inner}]")
+        }
+        Value::Null => String::new(),
+    }
+}
+
 // ── Phase 22b.6: unit tests for extract_fdw_pushable ─────────────────────────
 
 #[cfg(test)]
@@ -502,5 +638,145 @@ mod tests_extract {
         let (bound, residual) = extract_fdw_pushable(Some(&expr), &cols);
         assert_eq!(bound.get("status"), Some(&Value::Text("active".into())));
         assert!(residual.is_none());
+    }
+}
+
+// ── Phase 22b.6: unit tests for render_fdw_url ───────────────────────────────
+
+#[cfg(test)]
+mod tests_render {
+    use super::*;
+    use axiomdb_types::Value;
+
+    fn bound(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn render_no_pushdown() {
+        // No placeholders, no pushdown_cols, no limit → URL unchanged
+        let url = render_fdw_url("http://api.example.com", "/users", &bound(&[]), &[], None, None);
+        assert_eq!(url, "http://api.example.com/users");
+    }
+
+    #[test]
+    fn render_path_placeholder_int() {
+        // {id} in endpoint, bound id→5 → /users/5
+        let b = bound(&[("id", Value::Int(5))]);
+        let url = render_fdw_url("http://api.example.com", "/users/{id}", &b, &[], None, None);
+        assert_eq!(url, "http://api.example.com/users/5");
+    }
+
+    #[test]
+    fn render_path_placeholder_text() {
+        // {cat} in endpoint, bound cat→'shoes' → /products/shoes
+        let b = bound(&[("cat", Value::Text("shoes".into()))]);
+        let url = render_fdw_url("http://api.example.com", "/products/{cat}", &b, &[], None, None);
+        assert_eq!(url, "http://api.example.com/products/shoes");
+    }
+
+    #[test]
+    fn render_unbound_placeholder_left_as_literal() {
+        // {id} in endpoint, no id in bound → /users/{id} (literal)
+        let url = render_fdw_url("http://api.example.com", "/users/{id}", &bound(&[]), &[], None, None);
+        assert_eq!(url, "http://api.example.com/users/{id}");
+    }
+
+    #[test]
+    fn render_query_param_pushdown() {
+        // pushdown_cols ['status'], bound status→'active' → ?status=active
+        let b = bound(&[("status", Value::Text("active".into()))]);
+        let url = render_fdw_url("http://api.example.com", "/orders", &b, &["status"], None, None);
+        assert_eq!(url, "http://api.example.com/orders?status=active");
+    }
+
+    #[test]
+    fn render_limit_param() {
+        // limit_param 'per_page', limit=10 → ?per_page=10
+        let url = render_fdw_url(
+            "http://api.example.com", "/items", &bound(&[]),
+            &[], Some("per_page"), Some(10),
+        );
+        assert_eq!(url, "http://api.example.com/items?per_page=10");
+    }
+
+    #[test]
+    fn render_mixed_path_and_query() {
+        // {cat} in path, pushdown_cols ['brand'], limit_param 'limit', limit=5
+        let b = bound(&[
+            ("cat", Value::Text("shoes".into())),
+            ("brand", Value::Text("nike".into())),
+        ]);
+        let url = render_fdw_url(
+            "http://api.example.com", "/products/{cat}",
+            &b, &["brand"], Some("limit"), Some(5),
+        );
+        assert_eq!(url, "http://api.example.com/products/shoes?brand=nike&limit=5");
+    }
+
+    #[test]
+    fn render_placeholder_not_duplicated_in_query() {
+        // {id} in path AND in pushdown_cols → only substituted in path, NOT appended as param
+        let b = bound(&[("id", Value::Int(7))]);
+        let url = render_fdw_url(
+            "http://api.example.com", "/users/{id}",
+            &b, &["id"], None, None,
+        );
+        assert_eq!(url, "http://api.example.com/users/7");
+        assert!(!url.contains("id="), "id should not appear as query param");
+    }
+
+    #[test]
+    fn render_percent_encode_spaces() {
+        // Text with space → %20
+        let b = bound(&[("q", Value::Text("hello world".into()))]);
+        let url = render_fdw_url("http://api.example.com", "/search", &b, &["q"], None, None);
+        assert_eq!(url, "http://api.example.com/search?q=hello%20world");
+    }
+
+    #[test]
+    fn render_percent_encode_ampersand() {
+        // Text with '&' → %26
+        let b = bound(&[("q", Value::Text("a&b".into()))]);
+        let url = render_fdw_url("http://api.example.com", "/search", &b, &["q"], None, None);
+        assert_eq!(url, "http://api.example.com/search?q=a%26b");
+    }
+
+    #[test]
+    fn render_existing_query_string_appends_with_ampersand() {
+        // endpoint already has ?v=1 → new params appended with &
+        let b = bound(&[("status", Value::Text("ok".into()))]);
+        let url = render_fdw_url(
+            "http://api.example.com", "/items?v=1",
+            &b, &["status"], None, None,
+        );
+        assert_eq!(url, "http://api.example.com/items?v=1&status=ok");
+    }
+
+    #[test]
+    fn render_real_nan_infinity() {
+        let b_nan = bound(&[("x", Value::Real(f64::NAN))]);
+        let url_nan = render_fdw_url("http://api.example.com", "/f", &b_nan, &["x"], None, None);
+        assert!(url_nan.contains("NaN"));
+
+        let b_inf = bound(&[("x", Value::Real(f64::INFINITY))]);
+        let url_inf = render_fdw_url("http://api.example.com", "/f", &b_inf, &["x"], None, None);
+        assert!(url_inf.contains("Infinity"));
+    }
+
+    #[test]
+    fn render_bool_values() {
+        let b = bound(&[("active", Value::Bool(true))]);
+        let url = render_fdw_url("http://api.example.com", "/u", &b, &["active"], None, None);
+        assert_eq!(url, "http://api.example.com/u?active=true");
+    }
+
+    #[test]
+    fn render_limit_zero() {
+        let url = render_fdw_url(
+            "http://api.example.com", "/items", &bound(&[]),
+            &[], Some("limit"), Some(0),
+        );
+        assert_eq!(url, "http://api.example.com/items?limit=0");
     }
 }
