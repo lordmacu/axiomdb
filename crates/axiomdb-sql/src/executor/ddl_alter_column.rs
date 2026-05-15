@@ -1856,6 +1856,7 @@ fn alter_add_index(
             schema: Some(table_def.def.schema_name.clone()),
             name: table_def.def.table_name.clone(),
             alias: None,
+            tablesample: None,
         },
         columns: col_names
             .iter()

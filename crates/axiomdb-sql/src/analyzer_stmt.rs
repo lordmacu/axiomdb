@@ -1420,6 +1420,7 @@ fn expand_views(
                 schema: None,
                 name: String::new(),
                 alias: None,
+                tablesample: None,
             }),
         );
         join.table = substitute_view_ref(
@@ -1642,6 +1643,7 @@ fn expand_ctes(
                 schema: None,
                 name: String::new(),
                 alias: None,
+                tablesample: None,
             }),
         );
         join.table = substitute_cte_ref(taken, &dict, &recursive_dict);

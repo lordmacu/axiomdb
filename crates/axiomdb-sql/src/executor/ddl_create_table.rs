@@ -1956,6 +1956,7 @@ fn execute_refresh_materialized_view(
             schema: Some(resolved.def.schema_name.clone()),
             name: resolved.def.table_name.clone(),
             alias: None,
+            tablesample: None,
         },
     };
     let conn_txn = ctx.conn_txn.as_mut().expect("conn_txn set for DDL");

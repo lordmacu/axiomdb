@@ -23,6 +23,7 @@ fn find_table_for_index(
                 schema: None,
                 name: t.table_name,
                 alias: None,
+                tablesample: None,
             }));
         }
     }

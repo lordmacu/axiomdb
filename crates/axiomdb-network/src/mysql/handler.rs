@@ -241,6 +241,7 @@ async fn drop_session_temp_tables(
                     schema: Some(temp_schema.clone()),
                     name: table_name,
                     alias: None,
+                    tablesample: None,
                 })
                 .collect(),
             cascade: false,

@@ -34,6 +34,7 @@ fn alter_add_constraint(
                     schema: Some(schema.to_string()),
                     name: table_def.def.table_name.clone(),
                     alias: None,
+                    tablesample: None,
                 },
                 columns: col_names
                     .into_iter()
@@ -153,6 +154,7 @@ fn alter_add_constraint(
                     schema: Some(schema.to_string()),
                     name: table_def.def.table_name.clone(),
                     alias: None,
+                    tablesample: None,
                 },
                 columns: index_columns,
                 unique: true,
@@ -342,6 +344,7 @@ fn alter_add_constraint(
                     schema: Some(schema.to_string()),
                     name: table_def.def.table_name.clone(),
                     alias: None,
+                    tablesample: None,
                 },
                 columns: col_names
                     .into_iter()
