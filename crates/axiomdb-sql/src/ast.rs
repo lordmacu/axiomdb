@@ -401,6 +401,19 @@ pub enum FromClause {
     /// Phase 20.10 — `FROM GENERATE_SERIES(start, stop [, step]) [AS alias(col)]`.
     /// Produces a sequence of integer or date values.
     GenerateSeries(Box<GenerateSeriesClause>),
+    /// Phase 20.6 — `READ_PARQUET('path') [AS alias [(col1, col2, ...)]]`.
+    /// Schema is discovered at bind time from the Parquet file metadata.
+    ReadParquet(Box<ReadParquetClause>),
+}
+
+/// Phase 20.6 — `READ_PARQUET('path') [AS alias [(col1, col2, ...)]]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadParquetClause {
+    pub path: String,
+    /// Table alias (`AS p`). `None` = default alias "read_parquet".
+    pub alias: Option<String>,
+    /// Optional explicit column rename/reorder. Empty = use names from Parquet schema.
+    pub column_aliases: Vec<String>,
 }
 
 /// Phase 20.4, Step 7 — `UNNEST(expr1[, expr2, ...]) [AS alias(col1, col2, ...)]`.
@@ -783,12 +796,21 @@ pub enum CopyFormat {
     Csv,
     Json,
     Jsonl,
+    /// Phase 20.6 — Apache Parquet binary format.
+    Parquet,
+}
+
+/// Phase 20.6 — compression codec for `COPY TO FORMAT PARQUET`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParquetCompression {
+    Snappy,
+    Uncompressed,
 }
 
 /// Options for `COPY FROM` / `COPY TO`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CopyOptions {
-    /// `FORMAT CSV|JSON|JSONL`. `None` = auto-detect from file extension.
+    /// `FORMAT CSV|JSON|JSONL|PARQUET`. `None` = auto-detect from file extension.
     pub format: Option<CopyFormat>,
     /// `HEADER TRUE|FALSE`. `None` = default (true for CSV, ignored for JSON/JSONL).
     pub header: Option<bool>,
@@ -796,6 +818,8 @@ pub struct CopyOptions {
     pub delimiter: Option<char>,
     /// `NULL 'str'`. `None` = `\N` (CSV only).
     pub null_str: Option<String>,
+    /// Phase 20.6 — `COMPRESSION SNAPPY|UNCOMPRESSED` (Parquet only).
+    pub compression: Option<ParquetCompression>,
 }
 
 /// `COPY table FROM 'path' [WITH (...)]`

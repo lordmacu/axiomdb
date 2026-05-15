@@ -497,7 +497,178 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 20.6 — READ_PARQUET('path') TVF: schema discovery at bind time.
+        FromClause::ReadParquet(rp) => {
+            let cols = parquet_schema_to_column_defs(&rp.path, &rp.column_aliases)?;
+            let n = cols.len();
+            let alias = rp.alias.clone().unwrap_or_else(|| "read_parquet".into());
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
+}
+
+/// Open a Parquet file, read its schema, and produce a `ColumnDef` list.
+/// Called at bind time so the analyzer knows column names + types before execution.
+fn parquet_schema_to_column_defs(
+    path: &str,
+    column_aliases: &[String],
+) -> Result<Vec<axiomdb_catalog::schema::ColumnDef>, DbError> {
+    use axiomdb_catalog::schema::{ColumnDef, ColumnType, TableId};
+    use parquet::basic::{ConvertedType, Repetition, Type as PhysicalType};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::schema::types::Type;
+
+    let file = std::fs::File::open(path).map_err(|e| {
+        DbError::Io(std::io::Error::new(
+            e.kind(),
+            format!("READ_PARQUET: cannot open '{path}': {e}"),
+        ))
+    })?;
+    let reader = SerializedFileReader::new(file).map_err(|e| DbError::InvalidValue {
+        reason: format!("READ_PARQUET: cannot read Parquet metadata from '{path}': {e}"),
+    })?;
+    let schema = reader.metadata().file_metadata().schema_descr_ptr();
+    let root = schema.root_schema();
+    let fields = match root {
+        Type::GroupType { fields, .. } => fields,
+        Type::PrimitiveType { .. } => {
+            return Err(DbError::InvalidValue {
+                reason: format!("READ_PARQUET: unexpected non-group root schema in '{path}'"),
+            });
+        }
+    };
+
+    if !column_aliases.is_empty() && column_aliases.len() != fields.len() {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "READ_PARQUET column alias count ({}) does not match Parquet schema column count ({})",
+                column_aliases.len(),
+                fields.len()
+            ),
+        });
+    }
+
+    let mut cols = Vec::with_capacity(fields.len());
+    for (i, field) in fields.iter().enumerate() {
+        let name = if column_aliases.is_empty() {
+            field.name().to_string()
+        } else {
+            column_aliases[i].clone()
+        };
+        let col_type = match field.as_ref() {
+            Type::PrimitiveType {
+                basic_info,
+                physical_type,
+                ..
+            } => {
+                // Reject REPEATED fields (nested types not supported).
+                if basic_info.repetition() == Repetition::REPEATED {
+                    return Err(DbError::NotImplemented {
+                        feature: "Parquet nested types (REPEATED fields)".into(),
+                    });
+                }
+                let logical = basic_info.logical_type();
+                let converted = basic_info.converted_type();
+                parquet_type_to_column_type(*physical_type, logical.as_ref(), converted)?
+            }
+            Type::GroupType { basic_info, .. } => {
+                // Nested group types (LIST, MAP, STRUCT) not supported.
+                if basic_info.repetition() == Repetition::REPEATED {
+                    return Err(DbError::NotImplemented {
+                        feature: "Parquet nested types (group fields)".into(),
+                    });
+                }
+                return Err(DbError::NotImplemented {
+                    feature: "Parquet nested group types (LIST/MAP/STRUCT)".into(),
+                });
+            }
+        };
+        cols.push(ColumnDef {
+            table_id: 0 as TableId,
+            col_idx: i as u16,
+            name,
+            col_type,
+            nullable: true,
+            auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
+            on_update_expr: None,
+            generated_expr: None,
+            collation: None,
+            generated_stored: false,
+            enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
+        });
+    }
+    Ok(cols)
+}
+
+fn parquet_type_to_column_type(
+    physical: parquet::basic::Type,
+    logical: Option<&parquet::basic::LogicalType>,
+    converted: parquet::basic::ConvertedType,
+) -> Result<axiomdb_catalog::schema::ColumnType, DbError> {
+    use axiomdb_catalog::schema::ColumnType;
+    use parquet::basic::{ConvertedType, LogicalType, Type as Physical};
+
+    if let Some(lt) = logical {
+        match lt {
+            LogicalType::Date => return Ok(ColumnType::Date),
+            LogicalType::Timestamp { .. } => return Ok(ColumnType::Timestamp),
+            LogicalType::String | LogicalType::Enum | LogicalType::Uuid => {
+                return Ok(ColumnType::Text)
+            }
+            LogicalType::Decimal { .. } => return Ok(ColumnType::Decimal),
+            LogicalType::Integer { .. } => {
+                return Ok(match physical {
+                    Physical::INT32 => ColumnType::Int,
+                    _ => ColumnType::BigInt,
+                });
+            }
+            LogicalType::Json => return Ok(ColumnType::Json),
+            LogicalType::Bson => return Ok(ColumnType::Bytes),
+            _ => {}
+        }
+    }
+
+    // Fall back to converted type (legacy Parquet files).
+    match converted {
+        ConvertedType::DATE => return Ok(ColumnType::Date),
+        ConvertedType::TIMESTAMP_MICROS | ConvertedType::TIMESTAMP_MILLIS => {
+            return Ok(ColumnType::Timestamp)
+        }
+        ConvertedType::UTF8 | ConvertedType::ENUM => return Ok(ColumnType::Text),
+        ConvertedType::DECIMAL => return Ok(ColumnType::Decimal),
+        ConvertedType::INT_8
+        | ConvertedType::INT_16
+        | ConvertedType::INT_32
+        | ConvertedType::UINT_8
+        | ConvertedType::UINT_16
+        | ConvertedType::UINT_32 => return Ok(ColumnType::Int),
+        ConvertedType::INT_64 | ConvertedType::UINT_64 => return Ok(ColumnType::BigInt),
+        ConvertedType::JSON => return Ok(ColumnType::Json),
+        ConvertedType::BSON => return Ok(ColumnType::Bytes),
+        _ => {}
+    }
+
+    // Physical type fallback (INT96 is a deprecated Impala timestamp type).
+    Ok(match physical {
+        Physical::BOOLEAN => ColumnType::Bool,
+        Physical::INT32 => ColumnType::Int,
+        Physical::INT64 => ColumnType::BigInt,
+        Physical::INT96 => ColumnType::Timestamp,
+        Physical::FLOAT | Physical::DOUBLE => ColumnType::Float,
+        Physical::BYTE_ARRAY | Physical::FIXED_LEN_BYTE_ARRAY => ColumnType::Text,
+    })
 }
 
 fn bound_table_ref(

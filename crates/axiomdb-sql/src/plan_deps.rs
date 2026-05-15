@@ -404,6 +404,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            // Phase 20.6 — READ_PARQUET TVF (path is a literal, no subexpressions).
+            FromClause::ReadParquet(_) => Ok(()),
         }
     }
 

@@ -9,8 +9,8 @@ use crate::{
         Assignment, CopyFormat, CopyFromStmt, CopyOptions, CopyToStmt, DeleteStmt, FromClause,
         GroupByClause, InsertSource, InsertStmt, IntoOutfile, JoinClause, JoinCondition, JoinType,
         LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition, MergeActionKind,
-        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, SelectHint,
-        SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt,
+        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, ParquetCompression,
+        SelectHint, SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt,
         UpdateStmt,
     },
     expr::Expr,
@@ -943,6 +943,54 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
                     column_name,
                 })),
             );
+        }
+    }
+
+    // Phase 20.6 — `FROM READ_PARQUET('path') [AS alias [(col1, col2, ...)]]`.
+    if let Token::Ident(s) = p.peek() {
+        if s.eq_ignore_ascii_case("READ_PARQUET") && matches!(p.peek_at(1), Token::LParen) {
+            p.advance(); // consume READ_PARQUET ident
+            p.expect(&Token::LParen)?;
+            let path = match p.peek().clone() {
+                Token::StringLit(s) => {
+                    p.advance();
+                    s
+                }
+                other => {
+                    return Err(DbError::ParseError {
+                        message: format!(
+                            "READ_PARQUET expects a string literal path, found {other:?}"
+                        ),
+                        position: Some(p.current_pos()),
+                    });
+                }
+            };
+            p.expect(&Token::RParen)?;
+
+            // Optional: [AS alias [(col1, col2, ...)]]
+            let alias = if p.eat(&Token::As)
+                || (is_implicit_alias_token(p.peek()) && !is_pivot_clause_start(p))
+            {
+                Some(p.parse_identifier()?)
+            } else {
+                None
+            };
+            let column_aliases = if p.eat(&Token::LParen) {
+                let mut cols = vec![p.parse_identifier()?];
+                while p.eat(&Token::Comma) {
+                    cols.push(p.parse_identifier()?);
+                }
+                p.expect(&Token::RParen)?;
+                cols
+            } else {
+                vec![]
+            };
+
+            return Ok(FromClause::ReadParquet(Box::new(crate::ast::ReadParquetClause {
+                path,
+                alias,
+                column_aliases,
+            })));
         }
     }
 
@@ -1948,7 +1996,8 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         | FromClause::RecursiveCte(_)
         | FromClause::Pivot(_)
         | FromClause::Unnest(_)
-        | FromClause::GenerateSeries(_) => {
+        | FromClause::GenerateSeries(_)
+        | FromClause::ReadParquet(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -2165,7 +2214,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::RecursiveCte(_)
             | FromClause::Pivot(_)
             | FromClause::Unnest(_)
-            | FromClause::GenerateSeries(_) => {
+            | FromClause::GenerateSeries(_)
+            | FromClause::ReadParquet(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -2186,7 +2236,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::RecursiveCte(_)
             | FromClause::Pivot(_)
             | FromClause::Unnest(_)
-            | FromClause::GenerateSeries(_) => {
+            | FromClause::GenerateSeries(_)
+            | FromClause::ReadParquet(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),
@@ -2317,10 +2368,11 @@ fn parse_copy_options(p: &mut Parser) -> Result<CopyOptions, DbError> {
                     "CSV" => CopyFormat::Csv,
                     "JSON" => CopyFormat::Json,
                     "JSONL" | "NDJSON" => CopyFormat::Jsonl,
+                    "PARQUET" => CopyFormat::Parquet,
                     other => {
                         return Err(DbError::ParseError {
                             message: format!(
-                                "unknown COPY FORMAT '{}'; expected CSV, JSON, or JSONL",
+                                "unknown COPY FORMAT '{}'; expected CSV, JSON, JSONL, or PARQUET",
                                 other
                             ),
                             position: Some(p.current_pos()),
@@ -2396,10 +2448,26 @@ fn parse_copy_options(p: &mut Parser) -> Result<CopyOptions, DbError> {
                     }
                 });
             }
+            "COMPRESSION" => {
+                let comp_str = p.parse_identifier()?.to_ascii_uppercase();
+                opts.compression = Some(match comp_str.as_str() {
+                    "SNAPPY" => ParquetCompression::Snappy,
+                    "UNCOMPRESSED" => ParquetCompression::Uncompressed,
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "unknown COMPRESSION '{}'; expected SNAPPY or UNCOMPRESSED",
+                                other
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                });
+            }
             other => {
                 return Err(DbError::ParseError {
                     message: format!(
-                        "unknown COPY option '{}'; expected FORMAT, HEADER, DELIMITER, or NULL",
+                        "unknown COPY option '{}'; expected FORMAT, HEADER, DELIMITER, NULL, or COMPRESSION",
                         other
                     ),
                     position: Some(p.current_pos()),

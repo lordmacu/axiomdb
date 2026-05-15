@@ -58,10 +58,15 @@ fn execute_select_ctx(
         return execute_select(stmt, storage, txn, conn_txn);
     }
 
+    // READ_PARQUET in FROM (Phase 20.6): delegate to execute_select which handles it.
+    if matches!(stmt.from, Some(FromClause::ReadParquet(_))) {
+        return execute_select(stmt, storage, txn, conn_txn);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
         _ => unreachable!(
-            "already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte, GenerateSeries above"
+            "already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte, GenerateSeries, ReadParquet above"
         ),
     };
 

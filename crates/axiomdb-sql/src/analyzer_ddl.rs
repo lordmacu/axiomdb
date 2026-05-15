@@ -582,6 +582,10 @@ fn analyze_merge_source(
         FromClause::GenerateSeries(_) => Err(DbError::NotImplemented {
             feature: "GENERATE_SERIES in subquery/DDL context".into(),
         }),
+        // Phase 20.6 — READ_PARQUET not allowed in DDL context.
+        FromClause::ReadParquet(_) => Err(DbError::NotImplemented {
+            feature: "READ_PARQUET in subquery/DDL context".into(),
+        }),
     }
 }
 

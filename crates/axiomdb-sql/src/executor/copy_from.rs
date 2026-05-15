@@ -33,6 +33,12 @@ fn execute_copy_from(
         CopyFormat::Csv => parse_csv_file(file, use_header, delimiter, &null_str, &stmt.path)?,
         CopyFormat::Json => parse_json_file(file, &stmt.path)?,
         CopyFormat::Jsonl => parse_jsonl_file(file, &stmt.path)?,
+        CopyFormat::Parquet => {
+            return Err(DbError::NotImplemented {
+                feature: "COPY FROM FORMAT PARQUET (use READ_PARQUET() TVF to read Parquet files)"
+                    .into(),
+            });
+        }
     };
 
     if value_rows.is_empty() {
@@ -284,6 +290,7 @@ fn resolve_copy_format(opts: &crate::ast::CopyOptions, path: &str) -> crate::ast
         Some("csv") => CopyFormat::Csv,
         Some("json") => CopyFormat::Json,
         Some("jsonl") | Some("ndjson") => CopyFormat::Jsonl,
+        Some("parquet") => CopyFormat::Parquet,
         _ => CopyFormat::Csv,
     }
 }

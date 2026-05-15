@@ -103,11 +103,16 @@ fn execute_select(
         return execute_select_generate_series_source(stmt, storage, txn, conn_txn);
     }
 
+    // Phase 20.6 — READ_PARQUET TVF in FROM.
+    if matches!(stmt.from, Some(FromClause::ReadParquet(_))) {
+        return execute_select_read_parquet_source(stmt, storage, txn, conn_txn);
+    }
+
     // Extract the FROM table reference.
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
         _ => unreachable!(
-            "already handled None, Subquery, JsonTable, JsonbSrf, Values, Unnest, GenerateSeries above"
+            "already handled None, Subquery, JsonTable, JsonbSrf, Values, Unnest, GenerateSeries, ReadParquet above"
         ),
     };
 

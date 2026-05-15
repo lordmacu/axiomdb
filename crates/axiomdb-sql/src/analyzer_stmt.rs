@@ -511,6 +511,10 @@ fn analyze_select_with_outer(
                 }
                 join.table = FromClause::GenerateSeries(gs);
             }
+            // Phase 20.6 — READ_PARQUET: path is a literal; no sub-expressions to resolve.
+            FromClause::ReadParquet(rp) => {
+                join.table = FromClause::ReadParquet(rp);
+            }
         }
         // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
         // the accumulated left-side scope and this join's right-side BoundTable,

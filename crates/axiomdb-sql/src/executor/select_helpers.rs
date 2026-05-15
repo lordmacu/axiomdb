@@ -106,6 +106,12 @@ fn execute_select_with_joins(
                         feature: "GENERATE_SERIES JOIN via the non-ctx executor path".into(),
                     });
                 }
+                // Phase 20.6 — READ_PARQUET via the non-ctx executor path.
+                FromClause::ReadParquet(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "READ_PARQUET JOIN via the non-ctx executor path".into(),
+                    });
+                }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
                         message: "unlowered PIVOT reached non-ctx join executor".into(),

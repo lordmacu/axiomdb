@@ -133,6 +133,7 @@ include!("ddl_fdw.rs");
 include!("fdw_http.rs");
 include!("copy_from.rs");
 include!("copy_to.rs");
+include!("parquet_read.rs");
 include!("select_into_outfile.rs");
 include!("ddl_show.rs");
 include!("ddl_alter_column.rs");

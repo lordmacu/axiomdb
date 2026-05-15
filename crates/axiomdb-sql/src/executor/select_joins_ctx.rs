@@ -325,6 +325,28 @@ fn execute_select_with_joins_first_materialized(
                     correlated_srf.push(None);
                     correlated_sub.push(None);
                 }
+                // Phase 20.6 — READ_PARQUET as JOIN right-side source.
+                FromClause::ReadParquet(rp) => {
+                    let (col_names, rows) = read_parquet_rows(&rp.path)?;
+                    let final_names = if rp.column_aliases.is_empty() {
+                        col_names
+                    } else {
+                        rp.column_aliases.clone()
+                    };
+                    let alias = rp.alias.clone().unwrap_or_else(|| "read_parquet".into());
+                    let column_metas: Vec<ColumnMeta> = final_names
+                        .iter()
+                        .map(|name| ColumnMeta::computed(name.clone(), DataType::Text))
+                        .collect();
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&alias, column_metas));
+                    scanned.push(rows);
+                    correlated_unnest.push(None);
+                    correlated_jt.push(None);
+                    correlated_srf.push(None);
+                    correlated_sub.push(None);
+                }
                 FromClause::Pivot(_) => {
                     return Err(DbError::Internal {
                         message: "unlowered PIVOT reached join executor".into(),

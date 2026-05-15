@@ -55,6 +55,18 @@ fn execute_copy_to(
         CopyFormat::Csv => write_csv(&mut writer, &col_names, &rows, use_header, delimiter)?,
         CopyFormat::Json => write_json_array(&mut writer, &col_names, &rows)?,
         CopyFormat::Jsonl => write_jsonl(&mut writer, &col_names, &rows)?,
+        CopyFormat::Parquet => {
+            drop(writer);
+            let compression = stmt.options.compression.as_ref().map(|c| match c {
+                crate::ast::ParquetCompression::Snappy => {
+                    parquet::basic::Compression::SNAPPY
+                }
+                crate::ast::ParquetCompression::Uncompressed => {
+                    parquet::basic::Compression::UNCOMPRESSED
+                }
+            });
+            return write_parquet(&stmt.path, &col_names, &rows, compression);
+        }
     }
 
     {
@@ -240,4 +252,277 @@ fn value_to_json_val(v: &Value) -> serde_json::Value {
             serde_json::Value::Array(elems.iter().map(value_to_json_val).collect())
         }
     }
+}
+
+// ── Parquet writer ────────────────────────────────────────────────────────────
+
+fn write_parquet(
+    path: &str,
+    col_names: &[String],
+    rows: &[Vec<Value>],
+    compression: Option<parquet::basic::Compression>,
+) -> Result<QueryResult, DbError> {
+    use parquet::basic::{Compression, ConvertedType, LogicalType, Repetition, Type as Physical};
+    use parquet::column::writer::ColumnWriter;
+    use parquet::data_type::{
+        BoolType, ByteArray, ByteArrayType, DoubleType, FloatType, Int32Type, Int64Type,
+    };
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::types::Type;
+    use std::sync::Arc;
+
+    let compression = compression.unwrap_or(Compression::UNCOMPRESSED);
+    let count = rows.len() as u64;
+
+    // ── Infer schema from first non-null row ─────────────────────────────────
+    #[derive(Clone, Copy)]
+    enum ColKind {
+        Bool,
+        Int32,
+        Int64,
+        Double,
+        ByteArray,
+    }
+    let n_cols = col_names.len();
+    let mut kinds: Vec<ColKind> = vec![ColKind::ByteArray; n_cols];
+    'outer: for row in rows {
+        for (i, val) in row.iter().enumerate() {
+            if matches!(kinds[i], ColKind::ByteArray) && !matches!(val, Value::Null) {
+                kinds[i] = match val {
+                    Value::Bool(_) => ColKind::Bool,
+                    Value::Int(_) => ColKind::Int32,
+                    Value::BigInt(_) | Value::Timestamp(_) | Value::Decimal(_, _) => ColKind::Int64,
+                    Value::Date(_) => ColKind::Int32,
+                    Value::Real(_) => ColKind::Double,
+                    _ => ColKind::ByteArray,
+                };
+            }
+        }
+        // If all columns have been resolved, stop scanning.
+        if kinds.iter().all(|k| !matches!(k, ColKind::ByteArray)) {
+            break 'outer;
+        }
+    }
+
+    // ── Build Parquet schema ─────────────────────────────────────────────────
+    let mut fields: Vec<Arc<Type>> = Vec::with_capacity(n_cols);
+    for (i, name) in col_names.iter().enumerate() {
+        let field = match kinds[i] {
+            ColKind::Bool => Type::primitive_type_builder(name, Physical::BOOLEAN)
+                .with_repetition(Repetition::OPTIONAL)
+                .build(),
+            ColKind::Int32 => Type::primitive_type_builder(name, Physical::INT32)
+                .with_repetition(Repetition::OPTIONAL)
+                .build(),
+            ColKind::Int64 => Type::primitive_type_builder(name, Physical::INT64)
+                .with_repetition(Repetition::OPTIONAL)
+                .build(),
+            ColKind::Double => Type::primitive_type_builder(name, Physical::DOUBLE)
+                .with_repetition(Repetition::OPTIONAL)
+                .build(),
+            ColKind::ByteArray => Type::primitive_type_builder(name, Physical::BYTE_ARRAY)
+                .with_repetition(Repetition::OPTIONAL)
+                .with_converted_type(ConvertedType::UTF8)
+                .build(),
+        }
+        .map_err(|e| DbError::Io(std::io::Error::other(format!("Parquet schema error: {e}"))))?;
+        fields.push(Arc::new(field));
+    }
+    let schema = Arc::new(
+        Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .map_err(|e| {
+                DbError::Io(std::io::Error::other(format!(
+                    "Parquet root schema error: {e}"
+                )))
+            })?,
+    );
+
+    // ── Create writer ────────────────────────────────────────────────────────
+    let file = std::fs::File::create(path).map_err(|e| {
+        DbError::Io(std::io::Error::new(
+            e.kind(),
+            format!("COPY TO PARQUET: cannot create '{path}': {e}"),
+        ))
+    })?;
+    let props = Arc::new(
+        WriterProperties::builder()
+            .set_compression(compression)
+            .build(),
+    );
+    let mut file_writer = SerializedFileWriter::new(file, schema, props).map_err(|e| {
+        DbError::Io(std::io::Error::other(format!(
+            "COPY TO PARQUET: writer init error: {e}"
+        )))
+    })?;
+
+    if !rows.is_empty() {
+        let mut row_group = file_writer.next_row_group().map_err(|e| {
+            DbError::Io(std::io::Error::other(format!(
+                "COPY TO PARQUET: row group error: {e}"
+            )))
+        })?;
+
+        for col_idx in 0..n_cols {
+            let Some(mut scw) = row_group.next_column().map_err(|e| {
+                DbError::Io(std::io::Error::other(format!(
+                    "COPY TO PARQUET: column writer error col {col_idx}: {e}"
+                )))
+            })?
+            else {
+                break;
+            };
+
+            let pq_err = |e: parquet::errors::ParquetError| {
+                DbError::Io(std::io::Error::other(format!(
+                    "COPY TO PARQUET: write error col {col_idx}: {e}"
+                )))
+            };
+
+            // def_level=1 → value present, def_level=0 → null.
+            match kinds[col_idx] {
+                ColKind::Bool => {
+                    let mut vals: Vec<bool> = Vec::new();
+                    let mut defs: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match &row[col_idx] {
+                            Value::Null => defs.push(0),
+                            Value::Bool(b) => {
+                                vals.push(*b);
+                                defs.push(1);
+                            }
+                            other => {
+                                vals.push(!matches!(other, Value::Int(0)));
+                                defs.push(1);
+                            }
+                        }
+                    }
+                    if let ColumnWriter::BoolColumnWriter(ref mut w) = scw.untyped() {
+                        w.write_batch(&vals, Some(&defs), None).map_err(pq_err)?;
+                    }
+                }
+                ColKind::Int32 => {
+                    let mut vals: Vec<i32> = Vec::new();
+                    let mut defs: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match &row[col_idx] {
+                            Value::Null => defs.push(0),
+                            Value::Int(n) => {
+                                vals.push(*n);
+                                defs.push(1);
+                            }
+                            Value::Date(d) => {
+                                vals.push(*d);
+                                defs.push(1);
+                            }
+                            Value::Bool(b) => {
+                                vals.push(*b as i32);
+                                defs.push(1);
+                            }
+                            _ => defs.push(0),
+                        }
+                    }
+                    if let ColumnWriter::Int32ColumnWriter(ref mut w) = scw.untyped() {
+                        w.write_batch(&vals, Some(&defs), None).map_err(pq_err)?;
+                    }
+                }
+                ColKind::Int64 => {
+                    let mut vals: Vec<i64> = Vec::new();
+                    let mut defs: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match &row[col_idx] {
+                            Value::Null => defs.push(0),
+                            Value::BigInt(n) => {
+                                vals.push(*n);
+                                defs.push(1);
+                            }
+                            Value::Timestamp(ts) => {
+                                vals.push(*ts);
+                                defs.push(1);
+                            }
+                            Value::Decimal(m, _) => {
+                                vals.push(*m as i64);
+                                defs.push(1);
+                            }
+                            Value::Int(n) => {
+                                vals.push(*n as i64);
+                                defs.push(1);
+                            }
+                            _ => defs.push(0),
+                        }
+                    }
+                    if let ColumnWriter::Int64ColumnWriter(ref mut w) = scw.untyped() {
+                        w.write_batch(&vals, Some(&defs), None).map_err(pq_err)?;
+                    }
+                }
+                ColKind::Double => {
+                    let mut vals: Vec<f64> = Vec::new();
+                    let mut defs: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match &row[col_idx] {
+                            Value::Null => defs.push(0),
+                            Value::Real(f) => {
+                                vals.push(*f);
+                                defs.push(1);
+                            }
+                            Value::Int(n) => {
+                                vals.push(*n as f64);
+                                defs.push(1);
+                            }
+                            Value::BigInt(n) => {
+                                vals.push(*n as f64);
+                                defs.push(1);
+                            }
+                            _ => defs.push(0),
+                        }
+                    }
+                    if let ColumnWriter::DoubleColumnWriter(ref mut w) = scw.untyped() {
+                        w.write_batch(&vals, Some(&defs), None).map_err(pq_err)?;
+                    }
+                }
+                ColKind::ByteArray => {
+                    let mut vals: Vec<ByteArray> = Vec::new();
+                    let mut defs: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match &row[col_idx] {
+                            Value::Null => defs.push(0),
+                            other => {
+                                let s = value_to_csv_field(other);
+                                vals.push(ByteArray::from(s.into_bytes()));
+                                defs.push(1);
+                            }
+                        }
+                    }
+                    if let ColumnWriter::ByteArrayColumnWriter(ref mut w) = scw.untyped() {
+                        w.write_batch(&vals, Some(&defs), None).map_err(pq_err)?;
+                    }
+                }
+            }
+
+            scw.close().map_err(|e| {
+                DbError::Io(std::io::Error::other(format!(
+                    "COPY TO PARQUET: close col {col_idx}: {e}"
+                )))
+            })?;
+        }
+
+        row_group.close().map_err(|e| {
+            DbError::Io(std::io::Error::other(format!(
+                "COPY TO PARQUET: row group close error: {e}"
+            )))
+        })?;
+    }
+
+    file_writer.close().map_err(|e| {
+        DbError::Io(std::io::Error::other(format!(
+            "COPY TO PARQUET: file close error: {e}"
+        )))
+    })?;
+
+    Ok(QueryResult::Affected {
+        count,
+        last_insert_id: None,
+    })
 }

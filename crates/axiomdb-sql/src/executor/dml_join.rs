@@ -509,6 +509,12 @@ fn collect_dml_join_candidates_ctx(
                     feature: "GENERATE_SERIES on the right side of a DML JOIN".into(),
                 });
             }
+            // Phase 20.6 — READ_PARQUET as DML JOIN right-side source.
+            FromClause::ReadParquet(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "READ_PARQUET on the right side of a DML JOIN".into(),
+                });
+            }
             FromClause::Pivot(_) => {
                 return Err(DbError::Internal {
                     message: "unlowered PIVOT reached DML join executor".into(),

@@ -351,6 +351,12 @@ fn explain_select(
                 "EXPLAIN for GENERATE_SERIES FROM not yet supported".into(),
             ))
         }
+        // Phase 20.6 — READ_PARQUET as FROM source.
+        crate::ast::FromClause::ReadParquet(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for READ_PARQUET FROM not yet supported".into(),
+            ))
+        }
         crate::ast::FromClause::RecursiveCte(_) => {
             return Err(DbError::Other(
                 "EXPLAIN for recursive CTE FROM not yet supported".into(),
