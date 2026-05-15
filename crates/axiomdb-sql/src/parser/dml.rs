@@ -277,9 +277,17 @@ fn parse_lock_clause(p: &mut Parser) -> Result<Option<SelectLockClause>, DbError
         });
     };
 
-    // NOWAIT is not a reserved keyword — use eat_ident_ci.
+    // NOWAIT and SKIP LOCKED are not reserved keywords — use eat_ident_ci.
     let wait_policy = if eat_ident_ci(p, "NOWAIT") {
         LockWaitPolicy::NoWait
+    } else if eat_ident_ci(p, "SKIP") {
+        if !eat_ident_ci(p, "LOCKED") {
+            return Err(DbError::ParseError {
+                message: "expected LOCKED after SKIP".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        LockWaitPolicy::SkipLocked
     } else {
         LockWaitPolicy::Block
     };
