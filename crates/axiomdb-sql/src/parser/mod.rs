@@ -1027,9 +1027,18 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_index(self, false)
             }
+            Token::Foreign => {
+                self.advance(); // consume FOREIGN
+                self.expect(&Token::Table)?; // consume TABLE
+                ddl::parse_create_foreign_table(self)
+            }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("server") => {
+                self.advance();
+                ddl::parse_create_server(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE or INDEX after CREATE, found {:?}",
+                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, INDEX, FOREIGN TABLE, or SERVER after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1080,9 +1089,18 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_schema(self)
             }
+            Token::Foreign => {
+                self.advance(); // consume FOREIGN
+                self.expect(&Token::Table)?; // consume TABLE
+                ddl::parse_drop_foreign_table(self)
+            }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("server") => {
+                self.advance();
+                ddl::parse_drop_server(self)
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA or INDEX after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA, INDEX, FOREIGN TABLE, or SERVER after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

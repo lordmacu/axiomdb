@@ -2039,3 +2039,162 @@ pub(crate) fn parse_alter_table(p: &mut Parser) -> Result<Stmt, DbError> {
 
     Ok(Stmt::AlterTable(AlterTableStmt { table, operations }))
 }
+
+// ── FDW DDL parsers (Phase 22b.2) ─────────────────────────────────────────────
+
+/// Parses `OPTIONS (key 'val', ...)` and returns a vec of `(key, value)` pairs.
+/// Assumes the `OPTIONS` keyword has already been consumed.
+fn parse_fdw_options(p: &mut Parser) -> Result<Vec<(String, String)>, DbError> {
+    p.expect(&Token::LParen)?;
+    let mut opts = Vec::new();
+    loop {
+        if matches!(p.peek(), Token::RParen | Token::Eof) {
+            break;
+        }
+        let key = p.parse_identifier()?;
+        let val = p.parse_string_literal()?;
+        opts.push((key, val));
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+    Ok(opts)
+}
+
+fn fdw_datatype_to_column_type(
+    dt: &axiomdb_types::DataType,
+) -> Result<axiomdb_catalog::ColumnType, DbError> {
+    use axiomdb_catalog::ColumnType;
+    use axiomdb_types::DataType;
+    match dt {
+        DataType::Bool => Ok(ColumnType::Bool),
+        DataType::Int => Ok(ColumnType::Int),
+        DataType::BigInt => Ok(ColumnType::BigInt),
+        DataType::Real => Ok(ColumnType::Float),
+        DataType::Text => Ok(ColumnType::Text),
+        DataType::Bytes => Ok(ColumnType::Bytes),
+        DataType::Timestamp => Ok(ColumnType::Timestamp),
+        DataType::Uuid => Ok(ColumnType::Uuid),
+        DataType::Json => Ok(ColumnType::Json),
+        DataType::Jsonb => Ok(ColumnType::Jsonb),
+        DataType::Decimal => Ok(ColumnType::Decimal),
+        DataType::Date => Ok(ColumnType::Date),
+        DataType::Array(_) => Ok(ColumnType::Array),
+    }
+}
+
+/// Parses everything after `CREATE SERVER` has been consumed.
+///
+/// Syntax: `name [IF NOT EXISTS] FOREIGN DATA WRAPPER fdw_name [OPTIONS (key 'val', ...)]`
+pub(crate) fn parse_create_server(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_not_exists = eat_if_not_exists(p)?;
+    let name = p.parse_identifier()?;
+    // Expect: FOREIGN DATA WRAPPER fdw_name
+    p.expect(&Token::Foreign)?;
+    if !p.eat_ident_ci("DATA") {
+        return Err(DbError::ParseError {
+            message: "expected DATA after FOREIGN in CREATE SERVER".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    if !p.eat_ident_ci("WRAPPER") {
+        return Err(DbError::ParseError {
+            message: "expected WRAPPER after FOREIGN DATA in CREATE SERVER".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    let fdw_name = p.parse_identifier()?;
+    let options = if p.eat_ident_ci("OPTIONS") {
+        parse_fdw_options(p)?
+    } else {
+        Vec::new()
+    };
+    Ok(Stmt::CreateServer(crate::ast::CreateServerStmt {
+        name,
+        if_not_exists,
+        fdw_name,
+        options,
+    }))
+}
+
+/// Parses everything after `DROP SERVER` has been consumed.
+///
+/// Syntax: `[IF EXISTS] name`
+pub(crate) fn parse_drop_server(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let name = p.parse_identifier()?;
+    Ok(Stmt::DropServer(crate::ast::DropServerStmt {
+        name,
+        if_exists,
+    }))
+}
+
+/// Parses everything after `CREATE FOREIGN TABLE` has been consumed.
+///
+/// Syntax: `[IF NOT EXISTS] [schema.]name (col type [NOT NULL], ...) SERVER sname [OPTIONS (...)]`
+pub(crate) fn parse_create_foreign_table(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_not_exists = eat_if_not_exists(p)?;
+    let table = p.parse_table_ref()?;
+
+    p.expect(&Token::LParen)?;
+    let mut columns = Vec::new();
+    loop {
+        if matches!(p.peek(), Token::RParen | Token::Eof) {
+            break;
+        }
+        let col_name = p.parse_identifier()?;
+        let parsed_type = parse_data_type(p)?;
+        let col_type = fdw_datatype_to_column_type(&parsed_type.data_type)?;
+        let nullable = !matches!(p.peek(), Token::Not) || {
+            p.advance(); // consume NOT
+            p.expect(&Token::Null)?;
+            false
+        };
+        columns.push(crate::ast::FdwColumnDef {
+            name: col_name,
+            col_type,
+            nullable,
+        });
+        if !p.eat(&Token::Comma) {
+            break;
+        }
+    }
+    p.expect(&Token::RParen)?;
+
+    if !p.eat_ident_ci("SERVER") {
+        return Err(DbError::ParseError {
+            message: "expected SERVER after column list in CREATE FOREIGN TABLE".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    let server_name = p.parse_identifier()?;
+
+    let options = if p.eat_ident_ci("OPTIONS") {
+        parse_fdw_options(p)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Stmt::CreateForeignTable(
+        crate::ast::CreateForeignTableStmt {
+            table,
+            if_not_exists,
+            columns,
+            server_name,
+            options,
+        },
+    ))
+}
+
+/// Parses everything after `DROP FOREIGN TABLE` has been consumed.
+///
+/// Syntax: `[IF EXISTS] [schema.]name`
+pub(crate) fn parse_drop_foreign_table(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let table = p.parse_table_ref()?;
+    Ok(Stmt::DropForeignTable(crate::ast::DropForeignTableStmt {
+        table,
+        if_exists,
+    }))
+}

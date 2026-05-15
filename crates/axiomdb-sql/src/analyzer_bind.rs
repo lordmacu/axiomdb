@@ -531,35 +531,62 @@ fn bound_table_ref(
         found
     } else {
         reader.get_table_in_database(database, schema, &table_ref.name)?
-    }
-    .ok_or_else(|| DbError::TableNotFound {
-        name: table_ref.name.clone(),
-    })?;
-
-    let database_default_collation = reader
-        .get_database(database)?
-        .and_then(|db| db.default_collation);
-    let columns = reader
-        .list_columns(table_def.id)?
-        .into_iter()
-        .map(|mut col| {
-            col.collation = effective_bound_collation(
-                &col,
-                table_def.default_collation.as_deref(),
-                database_default_collation.as_deref(),
-            );
-            col
-        })
-        .collect::<Vec<_>>();
-    let n = columns.len();
-    let bound = BoundTable {
-        alias: table_ref.alias.clone(),
-        name: table_ref.name.clone(),
-        columns,
-        col_offset: *col_offset,
     };
-    *col_offset += n;
-    Ok(bound)
+
+    if let Some(table_def) = table_def {
+        let database_default_collation = reader
+            .get_database(database)?
+            .and_then(|db| db.default_collation);
+        let columns = reader
+            .list_columns(table_def.id)?
+            .into_iter()
+            .map(|mut col| {
+                col.collation = effective_bound_collation(
+                    &col,
+                    table_def.default_collation.as_deref(),
+                    database_default_collation.as_deref(),
+                );
+                col
+            })
+            .collect::<Vec<_>>();
+        let n = columns.len();
+        let bound = BoundTable {
+            alias: table_ref.alias.clone(),
+            name: table_ref.name.clone(),
+            columns,
+            col_offset: *col_offset,
+        };
+        *col_offset += n;
+        return Ok(bound);
+    }
+
+    // Regular table not found — try foreign table catalog (FDW, Phase 22b.2).
+    let ftable = if table_ref.schema.is_none() {
+        let mut found = reader.get_foreign_table(schema, &table_ref.name)?;
+        if found.is_none() && schema != "public" {
+            found = reader.get_foreign_table("public", &table_ref.name)?;
+        }
+        found
+    } else {
+        reader.get_foreign_table(schema, &table_ref.name)?
+    };
+
+    if let Some(ft) = ftable {
+        let columns = fdw_columns_to_column_defs(&ft);
+        let n = columns.len();
+        let bound = BoundTable {
+            alias: table_ref.alias.clone(),
+            name: table_ref.name.clone(),
+            columns,
+            col_offset: *col_offset,
+        };
+        *col_offset += n;
+        return Ok(bound);
+    }
+
+    Err(DbError::TableNotFound {
+        name: table_ref.name.clone(),
+    })
 }
 
 /// Resolves a table for DML statements, trying the default schema first and
@@ -594,6 +621,35 @@ fn resolve_dml_table(
                 name: table_ref.name.clone(),
             })
     }
+}
+
+/// Convert ForeignTableDef columns to ColumnDef for binder binding (Phase 22b.2).
+/// Uses the foreign table's own table_id (>= FOREIGN_TABLE_ID_BASE) so the
+/// executor can detect and route to fdw_scan_table.
+fn fdw_columns_to_column_defs(ft: &ForeignTableDef) -> Vec<ColumnDef> {
+    use axiomdb_catalog::schema::TableId;
+    ft.columns
+        .iter()
+        .enumerate()
+        .map(|(i, fc)| ColumnDef {
+            table_id: ft.table_id as TableId,
+            col_idx: i as u16,
+            name: fc.name.clone(),
+            col_type: fc.col_type,
+            nullable: fc.nullable,
+            auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
+            on_update_expr: None,
+            generated_expr: None,
+            collation: None,
+            generated_stored: false,
+            enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
+        })
+        .collect()
 }
 
 /// Build virtual ColumnDef list from the SELECT list of an analyzed subquery.

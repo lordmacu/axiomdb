@@ -147,6 +147,52 @@ fn dispatch_ctx(
                 &db,
             )
         }
+        Stmt::CreateServer(s) => {
+            ctx.invalidate_all();
+            execute_create_server(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+            )
+        }
+        Stmt::DropServer(s) => {
+            ctx.invalidate_all();
+            execute_drop_server(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+            )
+        }
+        Stmt::CreateForeignTable(s) => {
+            ctx.invalidate_all();
+            let db = ctx.effective_database().to_string();
+            execute_create_foreign_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &db,
+            )
+        }
+        Stmt::DropForeignTable(s) => {
+            ctx.invalidate_all();
+            execute_drop_foreign_table(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+            )
+        }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
             let search_path = ctx.search_path.clone();

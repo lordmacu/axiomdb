@@ -1218,6 +1218,50 @@ pub struct ShowSchemasStmt {
     pub like_pattern: Option<String>,
 }
 
+/// `CREATE SERVER name FOREIGN DATA WRAPPER fdw OPTIONS (key 'val', ...)`  (Phase 22b.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateServerStmt {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub fdw_name: String,
+    /// Raw key-value options from the `OPTIONS (...)` clause.
+    pub options: Vec<(String, String)>,
+}
+
+/// `DROP SERVER [IF EXISTS] name` (Phase 22b.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropServerStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// A single column in a `CREATE FOREIGN TABLE` statement (Phase 22b.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FdwColumnDef {
+    pub name: String,
+    pub col_type: axiomdb_catalog::ColumnType,
+    pub nullable: bool,
+}
+
+/// `CREATE FOREIGN TABLE [IF NOT EXISTS] [schema.]name (...) SERVER sname OPTIONS (...)`
+/// (Phase 22b.2)
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateForeignTableStmt {
+    pub table: TableRef,
+    pub if_not_exists: bool,
+    pub columns: Vec<FdwColumnDef>,
+    pub server_name: String,
+    /// Raw key-value options from the `OPTIONS (...)` clause (e.g. endpoint, method).
+    pub options: Vec<(String, String)>,
+}
+
+/// `DROP FOREIGN TABLE [IF EXISTS] [schema.]name` (Phase 22b.2)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropForeignTableStmt {
+    pub table: TableRef,
+    pub if_exists: bool,
+}
+
 /// `DECLARE name CURSOR FOR <query>`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeclareCursorStmt {
@@ -1414,6 +1458,10 @@ pub enum Stmt {
     DropAggregate(DropAggregateStmt),
     DropSequence(DropSequenceStmt),
     DropSchema(DropSchemaStmt),
+    CreateServer(CreateServerStmt),
+    DropServer(DropServerStmt),
+    CreateForeignTable(CreateForeignTableStmt),
+    DropForeignTable(DropForeignTableStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),

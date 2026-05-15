@@ -19,7 +19,8 @@ use axiomdb_storage::{
     PageType, StorageEngine, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET,
     CATALOG_DATABASES_ROOT_BODY_OFFSET, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET,
-    CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
+    CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET,
+    CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
     CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
     CATALOG_SEQUENCES_ROOT_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
     CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
@@ -76,6 +77,12 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_cron_jobs` heap (Phase 22b.1).
     /// Zero on legacy databases; lazily initialized on first `cron_schedule()`.
     pub cron_jobs: u64,
+    /// Root page of the `axiom_foreign_servers` heap (Phase 22b.2).
+    /// Zero on legacy databases; lazily initialized on first `CREATE SERVER`.
+    pub foreign_servers: u64,
+    /// Root page of the `axiom_foreign_tables` heap (Phase 22b.2).
+    /// Zero on legacy databases; lazily initialized on first `CREATE FOREIGN TABLE`.
+    pub foreign_tables: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -200,6 +207,26 @@ impl CatalogBootstrap {
         storage.write_page(cron_jobs_root, &cron_jobs_page)?;
         write_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET, cron_jobs_root)?;
 
+        // Allocate the foreign servers root (Phase 22b.2).
+        let foreign_servers_root = storage.alloc_page(PageType::Data)?;
+        let foreign_servers_page = Page::new(PageType::Data, foreign_servers_root);
+        storage.write_page(foreign_servers_root, &foreign_servers_page)?;
+        write_meta_u64(
+            storage,
+            CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET,
+            foreign_servers_root,
+        )?;
+
+        // Allocate the foreign tables root (Phase 22b.2).
+        let foreign_tables_root = storage.alloc_page(PageType::Data)?;
+        let foreign_tables_page = Page::new(PageType::Data, foreign_tables_root);
+        storage.write_page(foreign_tables_root, &foreign_tables_page)?;
+        write_meta_u64(
+            storage,
+            CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET,
+            foreign_tables_root,
+        )?;
+
         // Seed the default logical database so fresh databases and upgraded
         // ones share the same catalog shape.
         let default_db = DatabaseDef {
@@ -231,6 +258,8 @@ impl CatalogBootstrap {
             sequences: sequences_root,
             enum_types: enum_types_root,
             cron_jobs: cron_jobs_root,
+            foreign_servers: foreign_servers_root,
+            foreign_tables: foreign_tables_root,
         })
     }
 
@@ -260,6 +289,8 @@ impl CatalogBootstrap {
         let sequences = read_meta_u64(storage, CATALOG_SEQUENCES_ROOT_BODY_OFFSET)?;
         let enum_types = read_meta_u64(storage, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET)?;
         let cron_jobs = read_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET)?;
+        let foreign_servers = read_meta_u64(storage, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET)?;
+        let foreign_tables = read_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -274,6 +305,8 @@ impl CatalogBootstrap {
             sequences,
             enum_types,
             cron_jobs,
+            foreign_servers,
+            foreign_tables,
         })
     }
 
@@ -359,6 +392,22 @@ impl CatalogBootstrap {
             ids.cron_jobs = root;
         }
 
+        if ids.foreign_servers == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET, root)?;
+            ids.foreign_servers = root;
+        }
+
+        if ids.foreign_tables == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, root)?;
+            ids.foreign_tables = root;
+        }
+
         storage.flush()?;
         Ok(ids)
     }
@@ -429,6 +478,38 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_foreign_servers` root page exists (Phase 22b.2).
+    ///
+    /// Lazily initialized on first `CREATE SERVER` statement.
+    pub fn ensure_foreign_servers_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_foreign_tables` root page exists (Phase 22b.2).
+    ///
+    /// Lazily initialized on first `CREATE FOREIGN TABLE` statement.
+    pub fn ensure_foreign_tables_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }

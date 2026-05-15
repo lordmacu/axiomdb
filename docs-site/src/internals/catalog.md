@@ -24,7 +24,7 @@ executor through a consistent, MVCC-aware reader interface.
 
 ## System Tables
 
-The catalog consists of eight logical heaps rooted from the meta page. User-facing
+The catalog consists of ten logical heaps rooted from the meta page. User-facing
 introspection is documented in [Catalog & Schema](../user-guide/features/catalog.md).
 
 | Table                   | Meta offset | Contents                                         |
@@ -38,6 +38,8 @@ introspection is documented in [Catalog & Schema](../user-guide/features/catalog
 | `axiom_databases`       | 104         | One row per logical database                     |
 | `axiom_table_databases` | 112         | Optional table ownership binding by database     |
 | `axiom_cron_jobs`       | 160         | One row per scheduled job (`cron_schedule`)      |
+| `axiom_foreign_servers` | 168         | One row per `CREATE SERVER` definition (Phase 22b.2) |
+| `axiom_foreign_tables`  | 176         | One row per `CREATE FOREIGN TABLE` definition (Phase 22b.2) |
 
 Each root page is stored at the corresponding u64 body offset in the meta page
 (page 0). Older database files may have `0` in the new database offsets; the
@@ -624,3 +626,54 @@ Views are expanded at analysis time, not execution time. In `analyzer_stmt.rs`:
 5. Circular references are detected via an `expanding: HashSet<String>` that tracks which views are currently being expanded.
 
 This means the executor never observes view references — they are fully rewritten before execution begins.
+
+### `axiom_foreign_servers` row format (`ForeignServerDef`)
+
+```text
+[name_len:    1 byte u8]
+[name:        name_len UTF-8 bytes]
+[fdw_len:     1 byte u8]
+[fdw_name:    fdw_len UTF-8 bytes]  ("http", ...)
+[opts_len:    2 bytes LE u16]
+[options:     opts_len UTF-8 bytes] (JSON: {"url":"http://...","timeout_ms":"5000"})
+```
+
+The `options` field stores all `OPTIONS (key 'val', ...)` pairs as a JSON object.
+All values are stored as strings regardless of their semantic type.
+
+### `axiom_foreign_tables` row format (`ForeignTableDef`)
+
+```text
+[table_id:      4 bytes LE u32]       — always >= FOREIGN_TABLE_ID_BASE (0x8000_0000)
+[table_name_len: 1 byte u8]
+[table_name:    table_name_len UTF-8 bytes]
+[schema_name_len: 1 byte u8]
+[schema_name:   schema_name_len UTF-8 bytes]
+[server_name_len: 1 byte u8]
+[server_name:   server_name_len UTF-8 bytes]
+[col_count:     2 bytes LE u16]
+for each column:
+  [name_len:  1 byte u8]
+  [name:      name_len UTF-8 bytes]
+  [col_type:  1 byte u8]             — ColumnType discriminant
+  [nullable:  1 byte u8]             — 0 = NOT NULL, 1 = NULL
+[opts_len:    2 bytes LE u16]
+[options:     opts_len UTF-8 bytes]  (JSON: {"endpoint":"/users","method":"GET"})
+```
+
+Foreign table IDs are allocated by scanning all existing foreign tables and returning
+`max_id + 1`, starting from `FOREIGN_TABLE_ID_BASE + 1`. This ensures they never
+collide with physical table IDs (which always remain below `0x8000_0000`).
+
+### FDW execution path
+
+When the analyzer encounters a `SELECT` from an unknown regular table, it falls back
+to the foreign table catalog and builds a synthetic `BoundTable` from `ForeignTableDef`
+column definitions. The columns carry the foreign `table_id`, which propagates into the
+`ResolvedTable` used by the executor.
+
+At execution time, when `resolved.def.id >= FOREIGN_TABLE_ID_BASE`, both the
+session-aware path (`select_ctx.rs`) and the legacy dispatch path (`select_core.rs`)
+skip the storage engine and call `fdw_scan_table()` instead, which issues an HTTP GET,
+parses the JSON response, and materializes rows before passing them through the normal
+WHERE/projection pipeline.

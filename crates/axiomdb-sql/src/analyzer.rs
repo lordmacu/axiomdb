@@ -24,7 +24,7 @@
 
 use axiomdb_catalog::{
     schema::{ColumnDef, DEFAULT_DATABASE_NAME},
-    CatalogReader,
+    CatalogReader, ForeignTableDef,
 };
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 use axiomdb_storage::StorageEngine;

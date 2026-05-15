@@ -97,6 +97,24 @@ fn execute_select_ctx(
             txn.snapshot()
         };
 
+        // Phase 22b.2: if this is a foreign table, hand off to the FDW scan path
+        // which issues an HTTP request and materialises the result. The full query
+        // plan (WHERE, ORDER BY, LIMIT, etc.) is applied after materialisation by
+        // the joins executor which handles already-materialised first sources.
+        if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
+            let fdw_rows = fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns)?;
+            let first_source = join_source_schema_from_resolved(&from_table_ref, &resolved);
+            let first_rows: Vec<Row> = fdw_rows.into_iter().map(|(_, r)| r).collect();
+            return execute_select_with_joins_first_materialized(
+                stmt,
+                first_source,
+                first_rows,
+                exec_ctx,
+                conn_txn,
+                ctx,
+            );
+        }
+
         // ── COUNT(*) fast path (Phase 8) ─────────────────────────────────
         // Detect `SELECT COUNT(*) FROM table` with no WHERE, no GROUP BY,
         // no HAVING, no JOIN. For heap tables use HeapChain::count_visible().

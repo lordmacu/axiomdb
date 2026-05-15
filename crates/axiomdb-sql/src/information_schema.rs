@@ -162,6 +162,22 @@ pub static IS_SCHEDULED_JOBS_COLS: &[(&str, ColumnType)] = &[
     ("LAST_STATUS", ColumnType::Text),
 ];
 
+/// Column names and types for `information_schema.FOREIGN_SERVERS` (Phase 22b.2).
+pub static IS_FOREIGN_SERVERS_COLS: &[(&str, ColumnType)] = &[
+    ("SERVER_NAME", ColumnType::Text),
+    ("FDW_NAME", ColumnType::Text),
+    ("OPTIONS", ColumnType::Text),
+];
+
+/// Column names and types for `information_schema.FOREIGN_TABLES` (Phase 22b.2).
+pub static IS_FOREIGN_TABLES_COLS: &[(&str, ColumnType)] = &[
+    ("TABLE_SCHEMA", ColumnType::Text),
+    ("TABLE_NAME", ColumnType::Text),
+    ("SERVER_NAME", ColumnType::Text),
+    ("COLUMN_COUNT", ColumnType::Int),
+    ("OPTIONS", ColumnType::Text),
+];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Returns the column schema for the given IS virtual table name
@@ -177,6 +193,8 @@ pub fn is_table_cols(table_name: &str) -> Option<&'static [(&'static str, Column
         "views" => Some(IS_VIEWS_COLS),
         "schemata" => Some(IS_SCHEMATA_COLS),
         "scheduled_jobs" => Some(IS_SCHEDULED_JOBS_COLS),
+        "foreign_servers" => Some(IS_FOREIGN_SERVERS_COLS),
+        "foreign_tables" => Some(IS_FOREIGN_TABLES_COLS),
         _ => None,
     }
 }

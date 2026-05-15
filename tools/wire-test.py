@@ -41,7 +41,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             13.14 (custom aggregate functions smoke),
             20.1 (regular views: CREATE/DROP/REPLACE VIEW, view expansion, SHOW CREATE VIEW, IS.VIEWS),
             22b.4 (schema namespacing: CREATE/DROP SCHEMA, schema.table, search_path, SHOW SCHEMAS, IS.SCHEMATA),
-            22b.1 (scheduled jobs: cron_schedule/unschedule/enable/disable, IS.scheduled_jobs)
+            22b.1 (scheduled jobs: cron_schedule/unschedule/enable/disable, IS.scheduled_jobs),
+            22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table)
 """
 import os
 import signal
@@ -4723,6 +4724,123 @@ ok("[22b.1 cron] cron_unschedule returns 0 for nonexistent job",
 
 # cleanup
 cur.execute("SELECT cron_unschedule('wire_hourly')")
+cur.fetchall()
+
+# ── 22b.2 HTTP FDW ───────────────────────────────────────────────────────────
+
+import socket as _socket
+
+def _start_mock_http(json_body: str):
+    """Bind a TCP server on an ephemeral port, serve ONE HTTP request, then stop.
+    Returns the port number; the server runs in a daemon thread."""
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _serve():
+        try:
+            conn_s, _ = srv.accept()
+            conn_s.recv(4096)       # drain the HTTP request
+            resp = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(json_body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                + json_body
+            )
+            conn_s.sendall(resp.encode())
+            conn_s.close()
+        finally:
+            srv.close()
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    return port
+
+# CREATE SERVER and DROP SERVER
+cur.execute("CREATE SERVER fdw_api FOREIGN DATA WRAPPER http OPTIONS (url 'http://127.0.0.1:1')")
+cur.fetchall()
+ok("[22b.2 fdw] CREATE SERVER succeeds", True, None)
+
+cur.execute("SELECT SERVER_NAME, FDW_NAME FROM information_schema.foreign_servers WHERE SERVER_NAME = 'fdw_api'")
+rows = cur.fetchall()
+ok("[22b.2 fdw] IS.foreign_servers lists created server",
+   len(rows) == 1 and (rows[0][0] in ('fdw_api', b'fdw_api')),
+   rows)
+
+cur.execute("DROP SERVER fdw_api")
+cur.fetchall()
+cur.execute("SELECT SERVER_NAME FROM information_schema.foreign_servers WHERE SERVER_NAME = 'fdw_api'")
+rows = cur.fetchall()
+ok("[22b.2 fdw] DROP SERVER removes server from IS",
+   len(rows) == 0,
+   rows)
+
+# CREATE FOREIGN TABLE and DROP FOREIGN TABLE
+cur.execute("CREATE SERVER fdw_local FOREIGN DATA WRAPPER http OPTIONS (url 'http://127.0.0.1:1')")
+cur.fetchall()
+cur.execute("CREATE FOREIGN TABLE wire_ft_users (id INT, name TEXT) SERVER fdw_local OPTIONS (endpoint '/users')")
+cur.fetchall()
+ok("[22b.2 fdw] CREATE FOREIGN TABLE succeeds", True, None)
+
+cur.execute("SELECT TABLE_NAME, SERVER_NAME, COLUMN_COUNT FROM information_schema.foreign_tables WHERE TABLE_NAME = 'wire_ft_users'")
+rows = cur.fetchall()
+ok("[22b.2 fdw] IS.foreign_tables shows new table",
+   len(rows) == 1 and int(rows[0][2]) == 2,
+   rows)
+
+cur.execute("DROP FOREIGN TABLE wire_ft_users")
+cur.fetchall()
+cur.execute("SELECT TABLE_NAME FROM information_schema.foreign_tables WHERE TABLE_NAME = 'wire_ft_users'")
+rows = cur.fetchall()
+ok("[22b.2 fdw] DROP FOREIGN TABLE removes from IS",
+   len(rows) == 0,
+   rows)
+
+# SELECT from foreign table via live mock HTTP
+_mock_port = _start_mock_http('[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]')
+cur.execute(f"CREATE SERVER fdw_mock FOREIGN DATA WRAPPER http OPTIONS (url 'http://127.0.0.1:{_mock_port}')")
+cur.fetchall()
+cur.execute("CREATE FOREIGN TABLE wire_people (id INT, name TEXT) SERVER fdw_mock OPTIONS (endpoint '/')")
+cur.fetchall()
+
+cur.execute("SELECT id, name FROM wire_people ORDER BY id")
+rows = cur.fetchall()
+ok("[22b.2 fdw] SELECT from foreign table returns 2 rows",
+   len(rows) == 2,
+   rows)
+ok("[22b.2 fdw] first row id=1 name=Alice",
+   len(rows) >= 1 and int(rows[0][0]) == 1 and (rows[0][1] in ('Alice', b'Alice')),
+   rows[0] if rows else None)
+ok("[22b.2 fdw] second row id=2 name=Bob",
+   len(rows) >= 2 and int(rows[1][0]) == 2 and (rows[1][1] in ('Bob', b'Bob')),
+   rows[1] if rows else None)
+
+# WHERE filter on FDW data — needs a fresh mock server (serves one request)
+_mock_port2 = _start_mock_http('[{"id":10,"score":5},{"id":20,"score":99}]')
+cur.execute(f"DROP SERVER fdw_mock")
+cur.fetchall()
+cur.execute(f"CREATE SERVER fdw_mock2 FOREIGN DATA WRAPPER http OPTIONS (url 'http://127.0.0.1:{_mock_port2}')")
+cur.fetchall()
+cur.execute("CREATE FOREIGN TABLE wire_scores (id INT, score INT) SERVER fdw_mock2 OPTIONS (endpoint '/')")
+cur.fetchall()
+cur.execute("SELECT id FROM wire_scores WHERE score > 50")
+rows = cur.fetchall()
+ok("[22b.2 fdw] WHERE filter on FDW data returns filtered rows",
+   len(rows) == 1 and int(rows[0][0]) == 20,
+   rows)
+
+# Cleanup
+cur.execute("DROP FOREIGN TABLE wire_people")
+cur.fetchall()
+cur.execute("DROP FOREIGN TABLE wire_scores")
+cur.fetchall()
+cur.execute("DROP SERVER fdw_local")
+cur.fetchall()
+cur.execute("DROP SERVER fdw_mock2")
 cur.fetchall()
 
 # ── Result ────────────────────────────────────────────────────────────────────
