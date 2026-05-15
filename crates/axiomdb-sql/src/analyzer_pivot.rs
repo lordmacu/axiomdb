@@ -238,6 +238,7 @@ fn lower_pivot_clause_to_subquery(
         offset: None,
         lock_clause: None,
         set_op_rest: vec![],
+        into_outfile: None,
     };
 
     let analyzed = analyze_select_with_outer(

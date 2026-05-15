@@ -753,6 +753,26 @@ pub struct SelectStmt {
     /// Top-level set operations still use `Stmt::SetOp`; this field handles
     /// `(SELECT ... UNION ALL SELECT ...) AS alias` inside FROM/JOIN.
     pub set_op_rest: Vec<SetOpTail>,
+    /// Phase 20.5b — `INTO OUTFILE 'path' [FIELDS ...] [LINES ...]`.
+    /// `None` for ordinary SELECT statements (the common case).
+    pub into_outfile: Option<IntoOutfile>,
+}
+
+// ── SELECT INTO OUTFILE ───────────────────────────────────────────────────────
+
+/// Options for `SELECT … INTO OUTFILE 'path' [FIELDS ...] [LINES ...]`.
+/// Phase 20.5b — MySQL-compatible query result export.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntoOutfile {
+    /// Filesystem path for the output file.
+    pub path: String,
+    /// Field separator character. MySQL default: `\t` (TAB).
+    pub field_sep: char,
+    /// Enclosure character; `None` = no quoting.
+    /// Both `ENCLOSED BY` and `OPTIONALLY ENCLOSED BY` set this field.
+    pub enclosure: Option<char>,
+    /// Line terminator string. MySQL default: `"\n"`.
+    pub line_term: String,
 }
 
 // ── COPY statements ───────────────────────────────────────────────────────────
@@ -1660,6 +1680,7 @@ mod tests {
             offset: Some(Expr::int(0)),
             lock_clause: None,
             set_op_rest: vec![],
+            into_outfile: None,
         });
         assert!(matches!(stmt, Stmt::Select(_)));
     }
@@ -1687,6 +1708,7 @@ mod tests {
             offset: None,
             lock_clause: None,
             set_op_rest: vec![],
+            into_outfile: None,
         });
         if let Stmt::Select(s) = stmt {
             assert!(s.from.is_none());
@@ -1911,6 +1933,7 @@ mod tests {
             offset: None,
             lock_clause: None,
             set_op_rest: vec![],
+            into_outfile: None,
         };
         let from = FromClause::Subquery {
             query: Box::new(subquery),

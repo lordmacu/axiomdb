@@ -231,6 +231,7 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         offset,
         lock_clause,
         set_op_rest: vec![],
+        into_outfile: None,
     })
 }
 
