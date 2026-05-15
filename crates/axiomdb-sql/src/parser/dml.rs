@@ -7,10 +7,10 @@ use axiomdb_types::Value;
 use crate::{
     ast::{
         Assignment, CopyFormat, CopyFromStmt, CopyOptions, CopyToStmt, DeleteStmt, FromClause,
-        GroupByClause, InsertSource, InsertStmt, JoinClause, JoinCondition, JoinType, LockStrength,
-        LockWaitPolicy, MergeAction, MergeActionCondition, MergeActionKind, MergeStmt, NullsOrder,
-        OnConflictAction, OnConflictClause, OrderByItem, SelectHint, SelectItem, SelectLockClause,
-        SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
+        GroupByClause, InsertSource, InsertStmt, IntoOutfile, JoinClause, JoinCondition, JoinType,
+        LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition, MergeActionKind,
+        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, SelectHint,
+        SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -214,6 +214,9 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
     // and MySQL alias: LOCK IN SHARE MODE
     let lock_clause = parse_lock_clause(p)?;
 
+    // Phase 20.5b — MySQL: SELECT … INTO OUTFILE 'path' [FIELDS …] [LINES …]
+    let into_outfile = parse_into_outfile(p)?;
+
     Ok(SelectStmt {
         with_ctes: Vec::new(),
         distinct,
@@ -231,8 +234,123 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         offset,
         lock_clause,
         set_op_rest: vec![],
-        into_outfile: None,
+        into_outfile,
     })
+}
+
+/// Phase 20.5b — Parse `INTO OUTFILE 'path' [FIELDS TERMINATED BY 'x'
+/// [OPTIONALLY ENCLOSED BY 'y' | ENCLOSED BY 'y']] [LINES TERMINATED BY 'z']`.
+/// Returns `None` when the keyword sequence is absent.
+fn parse_into_outfile(p: &mut Parser) -> Result<Option<IntoOutfile>, DbError> {
+    // Lookahead: INTO OUTFILE (Ident) — do not consume if next token after INTO
+    // is not the OUTFILE identifier (avoids ambiguity with other INTO uses).
+    if !matches!(p.peek(), Token::Into) {
+        return Ok(None);
+    }
+    if !matches!(p.peek_at(1), Token::Ident(s) if s.eq_ignore_ascii_case("OUTFILE")) {
+        return Ok(None);
+    }
+    p.advance(); // consume INTO
+    p.advance(); // consume OUTFILE
+
+    let path = match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        _ => {
+            return Err(DbError::ParseError {
+                message: "INTO OUTFILE expects a file path string literal".into(),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+
+    let mut field_sep: char = '\t'; // MySQL default
+    let mut enclosure: Option<char> = None;
+    let mut line_term: String = "\n".into(); // MySQL default
+
+    // Parse optional FIELDS / LINES clauses in any order.
+    loop {
+        if p.eat_ident_ci("FIELDS") || p.eat_ident_ci("COLUMNS") {
+            // TERMINATED BY
+            if p.eat_ident_ci("TERMINATED") {
+                expect_ident_ci(p, "BY")?;
+                field_sep = parse_single_char_lit(p, "FIELDS TERMINATED BY")?;
+            }
+            // OPTIONALLY ENCLOSED BY or ENCLOSED BY
+            if p.eat_ident_ci("OPTIONALLY") {
+                p.eat_ident_ci("ENCLOSED");
+                expect_ident_ci(p, "BY")?;
+                enclosure = Some(parse_single_char_lit(p, "ENCLOSED BY")?);
+            } else if p.eat_ident_ci("ENCLOSED") {
+                expect_ident_ci(p, "BY")?;
+                enclosure = Some(parse_single_char_lit(p, "ENCLOSED BY")?);
+            }
+            // ESCAPED BY — consume and ignore (not implemented)
+            if p.eat_ident_ci("ESCAPED") {
+                p.eat_ident_ci("BY");
+                if matches!(p.peek(), Token::StringLit(_)) {
+                    p.advance();
+                }
+            }
+        } else if p.eat_ident_ci("LINES") {
+            // STARTING BY — consume and ignore
+            if p.eat_ident_ci("STARTING") {
+                p.eat_ident_ci("BY");
+                if matches!(p.peek(), Token::StringLit(_)) {
+                    p.advance();
+                }
+            }
+            if p.eat_ident_ci("TERMINATED") {
+                expect_ident_ci(p, "BY")?;
+                line_term = match p.peek().clone() {
+                    Token::StringLit(s) => {
+                        p.advance();
+                        s
+                    }
+                    _ => {
+                        return Err(DbError::ParseError {
+                            message: "LINES TERMINATED BY expects a string literal".into(),
+                            position: Some(p.current_pos()),
+                        })
+                    }
+                };
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(Some(IntoOutfile {
+        path,
+        field_sep,
+        enclosure,
+        line_term,
+    }))
+}
+
+/// Parse a string literal that must decode to exactly one character.
+fn parse_single_char_lit(p: &mut Parser, ctx: &str) -> Result<char, DbError> {
+    match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            let mut chars = s.chars();
+            let c = chars.next().ok_or_else(|| DbError::InvalidValue {
+                reason: format!("{ctx} requires a single character, got empty string"),
+            })?;
+            if chars.next().is_some() {
+                return Err(DbError::InvalidValue {
+                    reason: format!("{ctx} requires a single character, got {s:?}"),
+                });
+            }
+            Ok(c)
+        }
+        _ => Err(DbError::ParseError {
+            message: format!("{ctx} expects a string literal"),
+            position: Some(p.current_pos()),
+        }),
+    }
 }
 
 /// Parse `FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE [NOWAIT]`
