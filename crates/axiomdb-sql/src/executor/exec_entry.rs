@@ -27,11 +27,12 @@ pub fn execute_read_only_with_ctx(
 ) -> Result<QueryResult, DbError> {
     let exec_ctx = ExecutionContext::new(storage, txn, bloom, None);
     match stmt {
-        Stmt::Select(s) => {
+        Stmt::Select(mut s) => {
+            let into_outfile = s.into_outfile.take();
             let conn = ctx.conn_txn.take();
             let r = execute_select_ctx(s, &exec_ctx, conn.as_ref(), ctx);
             ctx.conn_txn = conn;
-            r
+            handle_into_outfile(r, into_outfile)
         }
         Stmt::SetOp { first, rest } => {
             let conn = ctx.conn_txn.take();

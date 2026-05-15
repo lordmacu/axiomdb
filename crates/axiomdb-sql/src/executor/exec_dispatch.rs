@@ -23,11 +23,12 @@ fn dispatch_ctx(
     // take() separates the mutable borrow so both conn_txn and ctx can be
     // passed without violating the borrow-checker. Restored after each call.
     let result = match stmt {
-        Stmt::Select(s) => {
+        Stmt::Select(mut s) => {
+            let into_outfile = s.into_outfile.take();
             let conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_select_ctx(s, exec_ctx, Some(&conn), ctx);
             ctx.conn_txn = Some(conn);
-            r
+            handle_into_outfile(r, into_outfile)
         }
         Stmt::SetOp { first, rest } => {
             let conn = ctx.conn_txn.take().expect("conn_txn set");

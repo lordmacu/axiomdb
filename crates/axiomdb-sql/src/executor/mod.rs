@@ -59,8 +59,8 @@ use crate::{
         AlterTableOp, AlterTableStmt, Assignment, ColumnConstraint, CreateAggregateStmt,
         CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt,
         DropAggregateStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, DropTriggerStmt,
-        FromClause, GeneratedColumnKind, GroupByClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, LockStrength, LockWaitPolicy, MergeActionCondition,
+        FromClause, GeneratedColumnKind, GroupByClause, InsertSource, InsertStmt, IntoOutfile,
+        JoinClause, JoinCondition, JoinType, LockStrength, LockWaitPolicy, MergeActionCondition,
         MergeActionKind, MergeStmt, NullsOrder, OnConflictAction, OrderByItem, SelectItem,
         SelectStmt, SetOpKind, SetOpTail, SetStmt, SetValue, ShowCreateTriggerStmt,
         ShowDatabasesStmt, SortOrder, Stmt, TableRef, TriggerEvent, UpdateStmt, UseDatabaseStmt,
@@ -133,6 +133,7 @@ include!("ddl_fdw.rs");
 include!("fdw_http.rs");
 include!("copy_from.rs");
 include!("copy_to.rs");
+include!("select_into_outfile.rs");
 include!("ddl_show.rs");
 include!("ddl_alter_column.rs");
 include!("ddl_alter_constraint.rs");
