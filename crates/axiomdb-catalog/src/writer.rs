@@ -51,6 +51,8 @@ use crate::{
         IndexDef, RelationKind, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
         TablePersistence, TableStorageLayout,
     },
+    schema_foreign_server::ForeignServerDef,
+    schema_foreign_table::ForeignTableDef,
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -81,6 +83,10 @@ pub const SYSTEM_TABLE_SEQUENCES: u32 = u32::MAX - 10;
 pub const SYSTEM_TABLE_ENUM_TYPES: u32 = u32::MAX - 11;
 /// WAL `table_id` used for inserts/deletes into `axiom_cron_jobs` (Phase 22b.1).
 pub const SYSTEM_TABLE_CRON_JOBS: u32 = u32::MAX - 12;
+/// WAL `table_id` used for inserts/deletes into `axiom_foreign_servers` (Phase 22b.2).
+pub const SYSTEM_TABLE_FOREIGN_SERVERS: u32 = u32::MAX - 13;
+/// WAL `table_id` used for inserts/deletes into `axiom_foreign_tables` (Phase 22b.2).
+pub const SYSTEM_TABLE_FOREIGN_TABLES: u32 = u32::MAX - 14;
 
 fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
     if def.labels.is_empty() {
@@ -1861,6 +1867,136 @@ impl<'a> CatalogWriter<'a> {
                     &new_data,
                     np,
                     ns,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // ── Foreign server operations (Phase 22b.2) ───────────────────────────────
+
+    /// Inserts or replaces a foreign server definition in `axiom_foreign_servers`.
+    ///
+    /// Upsert semantics: an existing server with the same name is replaced.
+    pub fn upsert_foreign_server(&mut self, def: ForeignServerDef) -> Result<(), DbError> {
+        let root = CatalogBootstrap::ensure_foreign_servers_root(self.storage)?;
+        self.page_ids.foreign_servers = root;
+
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (existing, _) = ForeignServerDef::from_bytes(&data)?;
+            if existing.name.eq_ignore_ascii_case(&def.name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_FOREIGN_SERVERS,
+                    existing.name.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                break;
+            }
+        }
+
+        let data = def.to_bytes();
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_FOREIGN_SERVERS,
+            def.name.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a foreign server by name. Returns `true` if found and deleted.
+    pub fn delete_foreign_server(&mut self, name: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.foreign_servers;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = ForeignServerDef::from_bytes(&data)?;
+            if def.name.eq_ignore_ascii_case(name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_FOREIGN_SERVERS,
+                    def.name.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // ── Foreign table operations (Phase 22b.2) ────────────────────────────────
+
+    /// Inserts a new foreign table definition in `axiom_foreign_tables`.
+    ///
+    /// `def.table_id` must already be set to a valid foreign table ID
+    /// (`>= FOREIGN_TABLE_ID_BASE`) before calling this method.
+    pub fn insert_foreign_table(&mut self, def: ForeignTableDef) -> Result<(), DbError> {
+        let root = CatalogBootstrap::ensure_foreign_tables_root(self.storage)?;
+        self.page_ids.foreign_tables = root;
+
+        let txn_id = self.conn.txn_id;
+        let data = def.to_bytes();
+        let key = format!("{}.{}", def.schema_name, def.table_name);
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_FOREIGN_TABLES,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a foreign table by schema + table name. Returns `true` if found.
+    pub fn delete_foreign_table(
+        &mut self,
+        schema: &str,
+        table_name: &str,
+    ) -> Result<bool, DbError> {
+        let root = self.page_ids.foreign_tables;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = ForeignTableDef::from_bytes(&data)?;
+            if def.schema_name.eq_ignore_ascii_case(schema)
+                && def.table_name.eq_ignore_ascii_case(table_name)
+            {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", def.schema_name, def.table_name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_FOREIGN_TABLES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
                 )?;
                 return Ok(true);
             }

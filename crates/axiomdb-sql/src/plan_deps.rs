@@ -270,6 +270,11 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 }
                 Ok(())
             }
+            // FDW DDL (Phase 22b.2) — no table deps to track.
+            Stmt::CreateServer(_)
+            | Stmt::DropServer(_)
+            | Stmt::CreateForeignTable(_)
+            | Stmt::DropForeignTable(_) => Ok(()),
         }
     }
 

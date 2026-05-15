@@ -1,6 +1,6 @@
 # Phase 22b — Platform Features
 
-## Subphases completed: 22b.1, 22b.3a, 22b.3b, 22b.4, 22b.5
+## Subphases completed: 22b.1, 22b.2, 22b.3a, 22b.3b, 22b.4, 22b.5
 
 ## What was built
 
@@ -160,6 +160,90 @@ for all 5 fields (min hour dom month dow). Aliases: `@hourly`, `@daily`,
 - `crates/axiomdb-sql/tests/integration_scheduled_jobs.rs` — 11 unit tests
 - `tools/wire-test.py` section `[22b.1 cron]` — 9 wire scenarios
 
+### 22b.2 — HTTP Foreign Data Wrappers
+
+AxiomDB now supports querying external HTTP JSON APIs as if they were local tables,
+using a PostgreSQL-compatible Foreign Data Wrapper (FDW) SQL interface.
+
+**SQL surface:**
+
+```sql
+-- Register an external HTTP service as a server
+CREATE SERVER myapi FOREIGN DATA WRAPPER http
+  OPTIONS (url 'http://api.example.com', timeout_ms '5000');
+
+-- Map a remote endpoint to a local schema
+CREATE FOREIGN TABLE ft_users (
+    id     INT,
+    name   TEXT,
+    active BOOLEAN
+) SERVER myapi OPTIONS (endpoint '/users');
+
+-- Query transparently — AxiomDB fetches JSON and maps rows
+SELECT id, name FROM ft_users WHERE active = TRUE;
+SELECT COUNT(*) FROM ft_users;
+
+-- Lifecycle management
+DROP FOREIGN TABLE ft_users;
+DROP SERVER myapi;
+
+-- Idempotent creation
+CREATE SERVER IF NOT EXISTS myapi FOREIGN DATA WRAPPER http OPTIONS (url 'http://...');
+CREATE FOREIGN TABLE IF NOT EXISTS ft_users (...) SERVER myapi OPTIONS (...);
+DROP SERVER IF EXISTS myapi;
+DROP FOREIGN TABLE IF EXISTS ft_users;
+
+-- Catalog introspection
+SELECT * FROM information_schema.foreign_servers;
+SELECT * FROM information_schema.foreign_tables;
+```
+
+**HTTP connector:** Implemented in `fdw_http.rs` using `std::net::TcpStream` — no
+`ureq` or `reqwest` dependency. The connector:
+
+1. Parses the URL via the `url` crate (already in the workspace).
+2. Opens a plain TCP connection (`http://` only; HTTPS deferred to a later phase).
+3. Sends a minimal HTTP/1.1 GET request with `Accept: application/json`.
+4. Reads the response and strips headers to extract the JSON body.
+5. Parses the JSON body as an array of objects using `serde_json`.
+6. Maps each JSON object to an AxiomDB row, coercing values to declared column types.
+7. Missing fields and JSON `null` both map to `Value::Null`.
+
+**Catalog:** Two new system heaps:
+
+| Heap | Meta page offset | Content |
+|---|---|---|
+| `axiom_foreign_servers` | 168 | `ForeignServerDef` binary rows |
+| `axiom_foreign_tables` | 176 | `ForeignTableDef` binary rows with inline columns |
+
+Foreign table IDs are allocated from the range `>= 0x8000_0000` (`FOREIGN_TABLE_ID_BASE`)
+so they never collide with physical table IDs.
+
+**Execution model:** Both SELECT paths (with and without `SessionContext`) detect
+`table_id >= FOREIGN_TABLE_ID_BASE` and route to the FDW connector instead of the
+storage engine. The analyzer binder also resolves foreign tables via the catalog,
+allowing `SELECT col FROM ft_users` to bind column indices correctly.
+
+**Information schema:**
+
+- `information_schema.foreign_servers` — `SERVER_NAME`, `FDW_NAME`, `OPTIONS`
+- `information_schema.foreign_tables` — `TABLE_SCHEMA`, `TABLE_NAME`, `SERVER_NAME`,
+  `COLUMN_COUNT`, `OPTIONS`
+
+**Tests:**
+
+- `crates/axiomdb-sql/tests/integration_fdw.rs` — 26 unit tests covering DDL lifecycle,
+  IS introspection, live HTTP scan (mock TcpListener), WHERE filtering, COUNT(*),
+  null/missing field handling, and connection-refused error propagation.
+- `tools/wire-test.py` section `[22b.2 fdw]` — 11 wire scenarios.
+
+**Closure gates passed:**
+
+- `cargo nextest run --workspace` (`3805/3805` passed)
+- `cargo clippy --workspace -- -D warnings` — clean
+- `cargo fmt --check` — clean
+- `python3 tools/wire-test.py` (`521/521` passed)
+
 ### 22b.5 — Schema migrations CLI
 
 AxiomDB ships a built-in migrations CLI as a subcommand of `axiomdb-server`.
@@ -216,6 +300,6 @@ and `create` generation.
 
 ## Deferred
 
-- 22b.2 — Foreign Data Wrappers (HTTP + PostgreSQL as external sources)
-- 22b.6 — FDW pushdown (push SQL predicates to remote origin)
+- 22b.6 — FDW pushdown (push SQL predicates to remote origin; depends on 22b.2)
+- HTTPS support — deferred; current FDW only supports `http://` URLs
 - later platform phases — per-database COMPAT, encryption, quotas, ownership

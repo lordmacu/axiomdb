@@ -21,6 +21,8 @@ use crate::{
         IndexDef, SchemaDef, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
         DEFAULT_DATABASE_NAME,
     },
+    schema_foreign_server::ForeignServerDef,
+    schema_foreign_table::ForeignTableDef,
 };
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
@@ -743,5 +745,141 @@ impl<'a> CatalogReader<'a> {
             }
         }
         Ok(None)
+    }
+
+    // ── Foreign servers (Phase 22b.2) ─────────────────────────────────────────
+
+    /// Returns all visible foreign server definitions, sorted by name.
+    pub fn list_foreign_servers(&mut self) -> Result<Vec<ForeignServerDef>, DbError> {
+        let root = self.page_ids.foreign_servers;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = ForeignServerDef::from_bytes(&data)?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Returns a single foreign server by name, or `None` if not found.
+    pub fn get_foreign_server(&mut self, name: &str) -> Result<Option<ForeignServerDef>, DbError> {
+        let root = self.page_ids.foreign_servers;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = ForeignServerDef::from_bytes(&data)?;
+            if def.name.eq_ignore_ascii_case(name) {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    // ── Foreign tables (Phase 22b.2) ──────────────────────────────────────────
+
+    /// Returns all visible foreign table definitions across all schemas.
+    pub fn list_all_foreign_tables(&mut self) -> Result<Vec<ForeignTableDef>, DbError> {
+        let root = self.page_ids.foreign_tables;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = ForeignTableDef::from_bytes(&data)?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| {
+            a.schema_name
+                .cmp(&b.schema_name)
+                .then_with(|| a.table_name.cmp(&b.table_name))
+        });
+        Ok(out)
+    }
+
+    /// Returns all visible foreign table definitions in the given schema.
+    pub fn list_foreign_tables_in_schema(
+        &mut self,
+        schema: &str,
+    ) -> Result<Vec<ForeignTableDef>, DbError> {
+        let root = self.page_ids.foreign_tables;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = ForeignTableDef::from_bytes(&data)?;
+            if def.schema_name.eq_ignore_ascii_case(schema) {
+                out.push(def);
+            }
+        }
+        out.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+        Ok(out)
+    }
+
+    /// Returns a foreign table by schema + table name, or `None` if not found.
+    pub fn get_foreign_table(
+        &mut self,
+        schema: &str,
+        table_name: &str,
+    ) -> Result<Option<ForeignTableDef>, DbError> {
+        let root = self.page_ids.foreign_tables;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = ForeignTableDef::from_bytes(&data)?;
+            if def.schema_name.eq_ignore_ascii_case(schema)
+                && def.table_name.eq_ignore_ascii_case(table_name)
+            {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns a foreign table by its synthetic table ID.
+    pub fn get_foreign_table_by_id(
+        &mut self,
+        table_id: u32,
+    ) -> Result<Option<ForeignTableDef>, DbError> {
+        let root = self.page_ids.foreign_tables;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = ForeignTableDef::from_bytes(&data)?;
+            if def.table_id == table_id {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns the next available foreign table ID (max existing + 1, or BASE + 1).
+    pub fn next_foreign_table_id(&mut self) -> Result<u32, DbError> {
+        use crate::schema_foreign_table::FOREIGN_TABLE_ID_BASE;
+        let root = self.page_ids.foreign_tables;
+        if root == 0 {
+            return Ok(FOREIGN_TABLE_ID_BASE + 1);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut max_id = FOREIGN_TABLE_ID_BASE;
+        for (_, _, data) in rows {
+            let (def, _) = ForeignTableDef::from_bytes(&data)?;
+            if def.table_id > max_id {
+                max_id = def.table_id;
+            }
+        }
+        Ok(max_id + 1)
     }
 }

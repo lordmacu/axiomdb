@@ -41,7 +41,8 @@ use axiomdb_catalog::{
         ColumnDef as CatalogColumnDef, ColumnType, IndexColumnDef, IndexDef,
         SortOrder as CatalogSortOrder, TableDef, DEFAULT_DATABASE_NAME,
     },
-    CatalogReader, CatalogWriter, ResolvedTable, SchemaResolver,
+    CatalogReader, CatalogWriter, ForeignColumnDef, ForeignServerDef, ForeignTableDef,
+    ResolvedTable, SchemaResolver, FOREIGN_TABLE_ID_BASE,
 };
 use axiomdb_core::{error::DbError, RecordId, TransactionSnapshot};
 use axiomdb_index::{page_layout::encode_rid, BTree};
@@ -128,6 +129,8 @@ include!("ddl_drop_table.rs");
 include!("ddl_create_index.rs");
 include!("ddl_drop_index.rs");
 include!("ddl_analyze.rs");
+include!("ddl_fdw.rs");
+include!("fdw_http.rs");
 include!("ddl_show.rs");
 include!("ddl_alter_column.rs");
 include!("ddl_alter_constraint.rs");

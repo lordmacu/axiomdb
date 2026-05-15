@@ -163,6 +163,16 @@ pub const CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET: usize = 152;
 /// databases; lazily initialized on first `cron_schedule()` call.
 pub const CATALOG_CRON_JOBS_ROOT_BODY_OFFSET: usize = 160;
 
+/// body offset of `catalog_foreign_servers_root: u64` — root heap page for
+/// `axiom_foreign_servers` (Phase 22b.2). Value 0 = not yet allocated; lazily
+/// initialized on first `CREATE SERVER` statement.
+pub const CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET: usize = 168;
+
+/// body offset of `catalog_foreign_tables_root: u64` — root heap page for
+/// `axiom_foreign_tables` (Phase 22b.2). Value 0 = not yet allocated; lazily
+/// initialized on first `CREATE FOREIGN TABLE` statement.
+pub const CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET: usize = 176;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
@@ -196,6 +206,16 @@ const _: () = assert!(
 const _: () = assert!(
     HEADER_SIZE + CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
     "enum type catalog root must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "foreign servers catalog root must fit within page 0"
+);
+
+const _: () = assert!(
+    HEADER_SIZE + CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "foreign tables catalog root must fit within page 0"
 );
 
 /// Reads a single `u64` from the meta page at `body_offset`.

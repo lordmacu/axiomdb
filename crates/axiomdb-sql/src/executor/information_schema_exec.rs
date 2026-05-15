@@ -132,6 +132,8 @@ fn generate_is_rows(
         "views" => generate_is_views_rows(&mut reader, temp_schema)?,
         "schemata" => generate_is_schemata_rows(&mut reader, default_database)?,
         "scheduled_jobs" => generate_is_scheduled_jobs_rows(&mut reader)?,
+        "foreign_servers" => generate_is_foreign_servers_rows(&mut reader)?,
+        "foreign_tables" => generate_is_foreign_tables_rows(&mut reader)?,
         _ => {
             return Err(DbError::TableNotFound {
                 name: format!("information_schema.{table_name}"),
@@ -774,4 +776,38 @@ fn days_to_ymd(mut days: u32) -> (u32, u32, u32) {
 
 fn is_leap(y: u32) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+/// `information_schema.FOREIGN_SERVERS` — one row per foreign server (Phase 22b.2).
+fn generate_is_foreign_servers_rows(
+    reader: &mut axiomdb_catalog::CatalogReader,
+) -> Result<Vec<Row>, DbError> {
+    let servers = reader.list_foreign_servers()?;
+    let mut rows = Vec::with_capacity(servers.len());
+    for srv in servers {
+        rows.push(vec![
+            Value::Text(srv.name),
+            Value::Text(srv.fdw_name),
+            Value::Text(srv.options),
+        ]);
+    }
+    Ok(rows)
+}
+
+/// `information_schema.FOREIGN_TABLES` — one row per foreign table (Phase 22b.2).
+fn generate_is_foreign_tables_rows(
+    reader: &mut axiomdb_catalog::CatalogReader,
+) -> Result<Vec<Row>, DbError> {
+    let tables = reader.list_all_foreign_tables()?;
+    let mut rows = Vec::with_capacity(tables.len());
+    for ft in tables {
+        rows.push(vec![
+            Value::Text(ft.schema_name),
+            Value::Text(ft.table_name),
+            Value::Text(ft.server_name),
+            Value::Int(ft.columns.len() as i32),
+            Value::Text(ft.options),
+        ]);
+    }
+    Ok(rows)
 }

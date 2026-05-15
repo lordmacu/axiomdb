@@ -11,8 +11,11 @@ fn execute_select_with_joins_ctx(
         .map(|c| txn.active_snapshot(c))
         .unwrap_or_else(|| txn.snapshot());
     let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, &from_ref)?;
-    let from_rows =
-        crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap)?;
+    let from_rows = if from_t.def.id >= FOREIGN_TABLE_ID_BASE {
+        fdw_scan_table(storage, snap.clone(), from_t.def.id, &from_t.columns)?
+    } else {
+        crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap)?
+    };
     let first_source = join_source_schema_from_resolved(&from_ref, &from_t);
     let first_rows: Vec<Row> = from_rows.into_iter().map(|(_, r)| r).collect();
     execute_select_with_joins_first_materialized(
@@ -86,12 +89,16 @@ fn execute_select_with_joins_first_materialized(
             match &join.table {
                 FromClause::Table(tref) => {
                     let jt = resolve_table_cached(storage, txn, ctx, conn_txn, tref)?;
-                    let rows = crate::table::scan_table_any_layout(
-                        storage,
-                        &jt.def,
-                        &jt.columns,
-                        snap.clone(),
-                    )?;
+                    let rows = if jt.def.id >= FOREIGN_TABLE_ID_BASE {
+                        fdw_scan_table(storage, snap.clone(), jt.def.id, &jt.columns)?
+                    } else {
+                        crate::table::scan_table_any_layout(
+                            storage,
+                            &jt.def,
+                            &jt.columns,
+                            snap.clone(),
+                        )?
+                    };
                     col_offsets.push(running_offset);
                     running_offset += jt.columns.len();
                     all_sources.push(join_source_schema_from_resolved(tref, &jt));

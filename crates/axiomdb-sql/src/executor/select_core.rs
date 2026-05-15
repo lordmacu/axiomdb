@@ -138,7 +138,24 @@ fn execute_select(
         let resolved = {
             let mut resolver =
                 make_resolver_with_database(storage, txn, conn_txn, DEFAULT_DATABASE_NAME)?;
-            resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name)?
+            match resolver.resolve_table(from_table_ref.schema.as_deref(), &from_table_ref.name) {
+                Ok(r) => r,
+                Err(DbError::TableNotFound { .. }) => {
+                    // Phase 22b.2: fall back to foreign table catalog.
+                    let schema = from_table_ref.schema.as_deref().unwrap_or("public");
+                    let snap = conn_txn
+                        .map(|c| txn.active_snapshot(c))
+                        .unwrap_or_else(|| txn.snapshot());
+                    let mut reader = CatalogReader::new(storage, snap)?;
+                    reader
+                        .get_foreign_table(schema, &from_table_ref.name)?
+                        .map(fdw_resolved_table)
+                        .ok_or_else(|| DbError::TableNotFound {
+                            name: from_table_ref.name.clone(),
+                        })?
+                }
+                Err(e) => return Err(e),
+            }
         };
         let snap = conn_txn
             .map(|c| txn.active_snapshot(c))
@@ -177,6 +194,10 @@ fn execute_select(
 
         // ── Fetch rows via the chosen access method ───────────────────────
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
+            // Phase 22b.2: foreign table — call HTTP FDW connector.
+            _ if resolved.def.id >= FOREIGN_TABLE_ID_BASE => {
+                fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns)?
+            }
             crate::planner::AccessMethod::Scan if resolved.def.is_clustered() => {
                 crate::table::scan_clustered_table(storage, &resolved.def, &resolved.columns, snap)?
             }

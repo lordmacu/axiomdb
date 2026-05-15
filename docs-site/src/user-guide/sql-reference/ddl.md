@@ -1462,3 +1462,120 @@ SHOW CREATE VIEW active_orders;
 | active_orders | CREATE VIEW \`active_orders\` AS SELECT id, user_id, amount FROM orders WHERE status = 'active' |
 
 `SHOW CREATE VIEW` fails if the name refers to a base table rather than a view.
+
+---
+
+## CREATE SERVER
+
+Registers an external data source as a foreign server. Required before creating
+any `FOREIGN TABLE` that uses that source.
+
+```sql
+CREATE SERVER name
+  FOREIGN DATA WRAPPER fdw_type
+  OPTIONS (key 'value' [, key 'value'] ...);
+
+CREATE SERVER IF NOT EXISTS name
+  FOREIGN DATA WRAPPER http
+  OPTIONS (url 'http://api.example.com', timeout_ms '5000');
+```
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `name` | Unique server name in the catalog |
+| `FOREIGN DATA WRAPPER fdw_type` | FDW type; currently only `http` is supported |
+| `OPTIONS` | Key-value pairs specific to the FDW type |
+
+### HTTP server OPTIONS
+
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `url` | Yes | — | Base URL of the remote service. Must start with `http://`. |
+| `timeout_ms` | No | `10000` | Request timeout in milliseconds. |
+
+---
+
+## DROP SERVER
+
+Removes a registered foreign server.
+
+```sql
+DROP SERVER name;
+DROP SERVER IF EXISTS name;
+```
+
+`DROP SERVER` does not automatically drop foreign tables that reference the server.
+Drop those first, or the behavior of any subsequent queries on them is undefined.
+
+---
+
+## CREATE FOREIGN TABLE
+
+Maps a remote data source endpoint to a local table-like schema that can be
+queried with `SELECT`.
+
+```sql
+CREATE FOREIGN TABLE [IF NOT EXISTS] [schema.]name (
+    col_name data_type [NOT NULL],
+    ...
+)
+SERVER server_name
+OPTIONS (key 'value' [, key 'value'] ...);
+```
+
+### Example
+
+```sql
+CREATE SERVER analytics_api FOREIGN DATA WRAPPER http
+  OPTIONS (url 'http://analytics.internal', timeout_ms '3000');
+
+CREATE FOREIGN TABLE ft_daily_events (
+    event_date  TEXT,
+    event_name  TEXT,
+    user_id     INT,
+    properties  TEXT
+)
+SERVER analytics_api
+OPTIONS (endpoint '/events/daily');
+
+SELECT event_name, COUNT(*) AS cnt
+FROM ft_daily_events
+GROUP BY event_name
+ORDER BY cnt DESC;
+```
+
+### HTTP table OPTIONS
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `endpoint` | `/` | Path appended to the server URL for GET requests. |
+
+### JSON mapping
+
+The remote endpoint must return a JSON **array of objects**. Each object becomes
+one row. Field names are matched case-insensitively to column names. Missing
+fields and JSON `null` both produce SQL `NULL`.
+
+Type coercions:
+
+| SQL type | JSON source | Coercion |
+|----------|-------------|----------|
+| `INT` | number / string / bool | `as_i64` → `i32`; string `parse`; bool → 0/1 |
+| `BIGINT` | number / string / bool | `as_i64`; string `parse`; bool → 0/1 |
+| `FLOAT` | number / string / bool | `as_f64`; string `parse`; bool → 0.0/1.0 |
+| `BOOLEAN` | bool / string / number | `true`/`"true"`/`"1"`/non-zero → true |
+| `TEXT` / others | any | `to_string()` (JSON serialized for non-strings) |
+
+---
+
+## DROP FOREIGN TABLE
+
+Removes a foreign table definition from the catalog. The remote data source is
+unaffected.
+
+```sql
+DROP FOREIGN TABLE name;
+DROP FOREIGN TABLE IF EXISTS name;
+```

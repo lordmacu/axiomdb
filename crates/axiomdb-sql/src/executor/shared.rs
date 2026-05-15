@@ -55,11 +55,77 @@ fn resolve_table_cached(
             }
             return Ok(resolved);
         }
+
+        // Phase 22b.2: fall back to foreign table catalog when not in regular catalog.
+        let snap = conn_txn
+            .map(|c| txn.active_snapshot(c))
+            .unwrap_or_else(|| txn.snapshot());
+        let mut reader = CatalogReader::new(storage, snap)?;
+        if let Some(ftable) = reader.get_foreign_table(schema, &tref.name)? {
+            return Ok(fdw_resolved_table(ftable));
+        }
     }
-    // None of the search_path schemas had the table.
+    // None of the search_path schemas had the table (regular or foreign).
     Err(DbError::TableNotFound {
         name: tref.name.clone(),
     })
+}
+
+/// Builds a synthetic `ResolvedTable` for a foreign table.
+///
+/// The `TableDef.id` is set to the foreign table ID (`>= FOREIGN_TABLE_ID_BASE`),
+/// which signals to the scan layer that it should call the FDW connector rather
+/// than `scan_table_any_layout`.
+fn fdw_resolved_table(ftable: ForeignTableDef) -> ResolvedTable {
+    use axiomdb_catalog::schema::{
+        RelationKind, TablePersistence, TableStorageLayout, DEFAULT_DATABASE_NAME,
+    };
+    let table_id = ftable.table_id;
+    let columns: Vec<CatalogColumnDef> = ftable
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, fc)| CatalogColumnDef {
+            table_id,
+            col_idx: i as u16,
+            name: fc.name.clone(),
+            col_type: fc.col_type,
+            nullable: fc.nullable,
+            auto_increment: false,
+            type_len: 0,
+            is_fixed_len: false,
+            default_expr: None,
+            on_update_expr: None,
+            generated_expr: None,
+            collation: None,
+            generated_stored: false,
+            enum_type_name: None,
+            array_element_type: None,
+            array_ndims: None,
+        })
+        .collect();
+    let def = TableDef {
+        id: table_id,
+        root_page_id: 0,
+        storage_layout: TableStorageLayout::Heap,
+        schema_name: ftable.schema_name,
+        table_name: ftable.table_name,
+        schema_version: 1,
+        immutable: false,
+        persistence: TablePersistence::Permanent,
+        relation_kind: RelationKind::Table,
+        defining_query: None,
+        default_collation: None,
+        triggers: Vec::new(),
+    };
+    let _ = DEFAULT_DATABASE_NAME; // suppress unused-import warning
+    ResolvedTable {
+        def,
+        columns,
+        indexes: Vec::new(),
+        constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+    }
 }
 
 /// Compute the effective database for a `TableRef`: if the ref has an explicit

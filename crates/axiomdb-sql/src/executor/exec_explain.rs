@@ -228,6 +228,13 @@ fn dispatch(
         Stmt::ShowWarnings { .. } | Stmt::ShowNotifications | Stmt::ShowErrors { .. } => {
             Ok(show_warnings_result(&[]))
         }
+        // FDW DDL (Phase 22b.2)
+        Stmt::CreateServer(s) => execute_create_server(s, storage, txn, conn_txn),
+        Stmt::DropServer(s) => execute_drop_server(s, storage, txn, conn_txn),
+        Stmt::CreateForeignTable(s) => {
+            execute_create_foreign_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+        }
+        Stmt::DropForeignTable(s) => execute_drop_foreign_table(s, storage, txn, conn_txn),
     }
 }
 
