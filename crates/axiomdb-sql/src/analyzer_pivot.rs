@@ -233,7 +233,7 @@ fn lower_pivot_clause_to_subquery(
         order_by: vec![],
         limit: None,
         offset: None,
-        lock_mode: None,
+        lock_clause: None,
         set_op_rest: vec![],
     };
 

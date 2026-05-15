@@ -7,9 +7,10 @@ use axiomdb_types::Value;
 use crate::{
     ast::{
         Assignment, DeleteStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinClause,
-        JoinCondition, JoinType, LockMode, MergeAction, MergeActionCondition, MergeActionKind,
-        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, SelectHint,
-        SelectItem, SelectStmt, SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
+        JoinCondition, JoinType, LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition,
+        MergeActionKind, MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem,
+        SelectHint, SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder,
+        Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -209,19 +210,9 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
 
     let (limit, offset) = parse_limit_offset(p)?;
 
-    // `FOR UPDATE` or `LOCK IN SHARE MODE` (row-level lock hint, ignored until Phase 13.7)
-    let lock_mode = if p.eat(&Token::For) {
-        p.expect(&Token::Update)?;
-        Some(LockMode::ForUpdate)
-    } else if matches!(p.peek(), Token::Lock) {
-        p.advance(); // LOCK
-        p.expect(&Token::In)?;
-        p.expect(&Token::Share)?;
-        p.expect(&Token::Mode)?;
-        Some(LockMode::ShareMode)
-    } else {
-        None
-    };
+    // Phase 13.7 — locking clause: FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE [NOWAIT]
+    // and MySQL alias: LOCK IN SHARE MODE
+    let lock_clause = parse_lock_clause(p)?;
 
     Ok(SelectStmt {
         with_ctes: Vec::new(),
@@ -238,9 +229,62 @@ pub(crate) fn parse_select(p: &mut Parser) -> Result<SelectStmt, DbError> {
         order_by,
         limit,
         offset,
-        lock_mode,
+        lock_clause,
         set_op_rest: vec![],
     })
+}
+
+/// Parse `FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE [NOWAIT]`
+/// and the MySQL alias `LOCK IN SHARE MODE`.
+/// Returns `None` when no locking clause is present.
+fn parse_lock_clause(p: &mut Parser) -> Result<Option<SelectLockClause>, DbError> {
+    // MySQL alias: LOCK IN SHARE MODE
+    if matches!(p.peek(), Token::Lock) {
+        p.advance(); // LOCK
+        p.expect(&Token::In)?;
+        p.expect(&Token::Share)?;
+        p.expect(&Token::Mode)?;
+        return Ok(Some(SelectLockClause {
+            strength: LockStrength::ForShare,
+            wait_policy: LockWaitPolicy::Block,
+        }));
+    }
+
+    if !p.eat(&Token::For) {
+        return Ok(None);
+    }
+
+    // Peek at the keyword sequence after FOR.
+    let strength = if p.eat(&Token::Update) {
+        LockStrength::ForUpdate
+    } else if matches!(p.peek(), Token::No) {
+        p.advance(); // NO
+        p.expect(&Token::Key)?;
+        p.expect(&Token::Update)?;
+        LockStrength::ForNoKeyUpdate
+    } else if matches!(p.peek(), Token::Key) {
+        p.advance(); // KEY
+        p.expect(&Token::Share)?;
+        LockStrength::ForKeyShare
+    } else if matches!(p.peek(), Token::Share) {
+        p.advance(); // SHARE
+        LockStrength::ForShare
+    } else {
+        let pos = p.current_pos();
+        return Err(DbError::ParseError {
+            message: "expected UPDATE, SHARE, NO KEY UPDATE, or KEY SHARE after FOR".into(),
+            position: Some(pos),
+        });
+    };
+
+    // NOWAIT is not a reserved keyword — use eat_ident_ci.
+    let wait_policy = if eat_ident_ci(p, "NOWAIT") {
+        LockWaitPolicy::NoWait
+    } else {
+        LockWaitPolicy::Block
+    };
+
+    Ok(Some(SelectLockClause { strength, wait_policy }))
 }
 
 fn parse_optimizer_hints(p: &mut Parser) -> Result<Vec<SelectHint>, DbError> {
