@@ -3,7 +3,7 @@
 Phase: 13 — Advanced PostgreSQL
 Task: SKIP LOCKED pessimistic-locking wait policy
 Spec: specs/fase-13/spec-13.8b-skip-locked.md
-Status: in-progress
+Status: done
 
 ## Summary
 
