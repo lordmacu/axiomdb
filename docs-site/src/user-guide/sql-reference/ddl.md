@@ -1579,3 +1579,50 @@ unaffected.
 DROP FOREIGN TABLE name;
 DROP FOREIGN TABLE IF EXISTS name;
 ```
+
+---
+
+## BACKUP DATABASE
+
+Creates a physical backup of the database in AxiomDB's `.axbk` binary format.
+The engine checkpoints the WAL before writing, so the backup always reflects a
+consistent, crash-safe state.
+
+```sql
+-- Full backup
+BACKUP DATABASE TO '/path/to/backup.axbk';
+
+-- Incremental backup — only pages that changed since the base backup
+BACKUP DATABASE TO '/path/to/inc.axbk'
+    INCREMENTAL FROM '/path/to/full.axbk';
+```
+
+**Notes:**
+- The destination path must not exist; the command fails if it does.
+- An incremental backup requires a **full** backup as its base; chaining
+  incremental → incremental is not supported.
+- Incremental diff is based on page-level CRC32c checksums: only pages whose
+  checksum differs from the base are written.
+- The base path stored in an incremental file must be ≤ 71 bytes. Use a symlink
+  if your path is longer.
+
+**Result column:** `status TEXT` — a human-readable progress message.
+
+---
+
+## RESTORE DATABASE
+
+Reconstructs a database file on disk from a `.axbk` backup file.
+
+```sql
+RESTORE DATABASE FROM '/path/to/backup.axbk'
+    TO '/path/to/restored.db';
+```
+
+- The destination path must not exist.
+- If `backup.axbk` is an incremental backup, the engine automatically locates
+  and applies the base full backup first, then overlays the delta pages.
+- The restored file is a raw page store identical to the original; point
+  `axiomdb-server` at it to bring the database online.
+
+**Result column:** `status TEXT` — page count and path information.

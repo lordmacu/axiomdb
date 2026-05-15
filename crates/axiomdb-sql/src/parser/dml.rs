@@ -6,12 +6,12 @@ use axiomdb_types::Value;
 
 use crate::{
     ast::{
-        Assignment, CopyFormat, CopyFromStmt, CopyOptions, CopyToStmt, DeleteStmt, FromClause,
-        GroupByClause, InsertSource, InsertStmt, IntoOutfile, JoinClause, JoinCondition, JoinType,
-        LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition, MergeActionKind,
-        MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem, ParquetCompression,
-        SelectHint, SelectItem, SelectLockClause, SelectStmt, SetOpKind, SetOpTail, SortOrder,
-        Stmt, UpdateStmt,
+        Assignment, BackupStmt, CopyFormat, CopyFromStmt, CopyOptions, CopyToStmt, DeleteStmt,
+        FromClause, GroupByClause, InsertSource, InsertStmt, IntoOutfile, JoinClause,
+        JoinCondition, JoinType, LockStrength, LockWaitPolicy, MergeAction, MergeActionCondition,
+        MergeActionKind, MergeStmt, NullsOrder, OnConflictAction, OnConflictClause, OrderByItem,
+        ParquetCompression, RestoreStmt, SelectHint, SelectItem, SelectLockClause, SelectStmt,
+        SetOpKind, SetOpTail, SortOrder, Stmt, UpdateStmt,
     },
     expr::Expr,
     lexer::Token,
@@ -2480,4 +2480,76 @@ fn parse_copy_options(p: &mut Parser) -> Result<CopyOptions, DbError> {
         p.eat(&Token::Comma);
     }
     Ok(opts)
+}
+
+// ── BACKUP / RESTORE (Phase 20.7) ─────────────────────────────────────────────
+
+/// Parse `BACKUP DATABASE TO 'dest' [INCREMENTAL FROM 'base']`.
+///
+/// Called after `BACKUP` has been consumed by the top-level dispatcher.
+pub(crate) fn parse_backup(p: &mut Parser) -> Result<Stmt, DbError> {
+    // DATABASE keyword (required) — Token::Database is a reserved keyword token.
+    if !p.eat(&Token::Database) && !eat_ident_ci(p, "DATABASE") {
+        return Err(DbError::ParseError {
+            message: format!("expected DATABASE after BACKUP, found {:?}", p.peek()),
+            position: Some(p.current_pos()),
+        });
+    }
+    // TO 'dest'
+    if !p.eat(&Token::To) {
+        return Err(DbError::ParseError {
+            message: format!("expected TO after BACKUP DATABASE, found {:?}", p.peek()),
+            position: Some(p.current_pos()),
+        });
+    }
+    let dest = p.parse_string_literal()?;
+
+    // [INCREMENTAL FROM 'base']
+    let incremental_from = if eat_ident_ci(p, "INCREMENTAL") {
+        if !p.eat(&Token::From) {
+            return Err(DbError::ParseError {
+                message: "expected FROM after INCREMENTAL".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        Some(p.parse_string_literal()?)
+    } else {
+        None
+    };
+
+    Ok(Stmt::Backup(BackupStmt {
+        dest,
+        incremental_from,
+    }))
+}
+
+/// Parse `RESTORE DATABASE FROM 'source' TO 'dest_path'`.
+///
+/// Called after `RESTORE` has been consumed by the top-level dispatcher.
+pub(crate) fn parse_restore(p: &mut Parser) -> Result<Stmt, DbError> {
+    // DATABASE keyword (required) — Token::Database is a reserved keyword token.
+    if !p.eat(&Token::Database) && !eat_ident_ci(p, "DATABASE") {
+        return Err(DbError::ParseError {
+            message: format!("expected DATABASE after RESTORE, found {:?}", p.peek()),
+            position: Some(p.current_pos()),
+        });
+    }
+    if !p.eat(&Token::From) {
+        return Err(DbError::ParseError {
+            message: format!("expected FROM after RESTORE DATABASE, found {:?}", p.peek()),
+            position: Some(p.current_pos()),
+        });
+    }
+    let source = p.parse_string_literal()?;
+    if !p.eat(&Token::To) {
+        return Err(DbError::ParseError {
+            message: format!(
+                "expected TO after RESTORE DATABASE FROM 'source', found {:?}",
+                p.peek()
+            ),
+            position: Some(p.current_pos()),
+        });
+    }
+    let dest_path = p.parse_string_literal()?;
+    Ok(Stmt::Restore(RestoreStmt { source, dest_path }))
 }

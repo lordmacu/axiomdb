@@ -692,3 +692,4 @@ In degraded mode, all read traffic continues uninterrupted. Applications can con
 | `08S01`  | connection_failure (MySQL ext)| Incoming packet exceeds max_allowed_packet|
 | `53100`  | disk_full                     | Storage volume is full                    |
 | `58030`  | io_error                      | OS-level I/O failure (disk, permissions)  |
+| `58030`  | backup_error                  | BACKUP/RESTORE failed (bad path, invalid file, base path too long) |

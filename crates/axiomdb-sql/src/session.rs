@@ -414,7 +414,8 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         | DbError::InvalidDsn { .. }
         | DbError::LockTimeout
         | DbError::Internal { .. }
-        | DbError::Other(_) => false,
+        | DbError::Other(_)
+        | DbError::BackupError { .. } => false,
     }
 }
 

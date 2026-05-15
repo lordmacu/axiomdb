@@ -150,6 +150,10 @@ pub enum Token<'src> {
     Vacuum,
     #[token("CHECKPOINT", ignore(ascii_case))]
     Checkpoint,
+    #[token("BACKUP", ignore(ascii_case))]
+    Backup,
+    #[token("RESTORE", ignore(ascii_case))]
+    Restore,
     #[token("SAVEPOINT", ignore(ascii_case))]
     SavepointKw,
     #[token("RELEASE", ignore(ascii_case))]
