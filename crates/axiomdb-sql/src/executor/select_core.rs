@@ -192,11 +192,28 @@ fn execute_select(
         let access_method =
             normalize_clustered_access_method(access_method, resolved.def.is_clustered());
 
+        // ── Phase 22b.6: FDW predicate + LIMIT pushdown ──────────────────
+        // Extract equality predicates for URL construction. The full WHERE clause
+        // is always preserved for local filtering (correctness guarantee: if the
+        // remote over-returns, local filter still catches it).
+        let (fdw_pushed, fdw_pushed_limit) = if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
+            let (pushed, _) =
+                extract_fdw_pushable(stmt.where_clause.as_ref(), &resolved.columns);
+            let lim = stmt.limit.as_ref().and_then(|e| match e {
+                Expr::Literal(Value::Int(n)) if *n >= 0 => Some(*n as u64),
+                Expr::Literal(Value::BigInt(n)) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            });
+            (pushed, lim)
+        } else {
+            (HashMap::new(), None)
+        };
+
         // ── Fetch rows via the chosen access method ───────────────────────
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
-            // Phase 22b.2: foreign table — call HTTP FDW connector.
+            // Phase 22b.2 + 22b.6: foreign table — call HTTP FDW connector with pushdown.
             _ if resolved.def.id >= FOREIGN_TABLE_ID_BASE => {
-                fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns)?
+                fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns, &fdw_pushed, fdw_pushed_limit)?
             }
             crate::planner::AccessMethod::Scan if resolved.def.is_clustered() => {
                 crate::table::scan_clustered_table(storage, &resolved.def, &resolved.columns, snap)?

@@ -97,14 +97,32 @@ fn execute_select_ctx(
             txn.snapshot()
         };
 
-        // Phase 22b.2: if this is a foreign table, hand off to the FDW scan path
-        // which issues an HTTP request and materialises the result. The full query
-        // plan (WHERE, ORDER BY, LIMIT, etc.) is applied after materialisation by
-        // the joins executor which handles already-materialised first sources.
+        // Phase 22b.2 + 22b.6: if this is a foreign table, hand off to the FDW
+        // scan path which issues an HTTP GET and materialises the result.
+        // Phase 22b.6 extracts equality predicates for URL construction. The full
+        // WHERE is always preserved for local filtering (correctness guarantee).
         if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
-            let fdw_rows = fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns)?;
+            let (pushed, _) =
+                extract_fdw_pushable(stmt.where_clause.as_ref(), &resolved.columns);
+
+            let pushed_limit: Option<u64> = stmt.limit.as_ref().and_then(|e| match e {
+                Expr::Literal(Value::Int(n)) if *n >= 0 => Some(*n as u64),
+                Expr::Literal(Value::BigInt(n)) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            });
+
+            let fdw_rows = fdw_scan_table(
+                storage,
+                snap,
+                resolved.def.id,
+                &resolved.columns,
+                &pushed,
+                pushed_limit,
+            )?;
+
             let first_source = join_source_schema_from_resolved(&from_table_ref, &resolved);
             let first_rows: Vec<Row> = fdw_rows.into_iter().map(|(_, r)| r).collect();
+
             return execute_select_with_joins_first_materialized(
                 stmt,
                 first_source,
