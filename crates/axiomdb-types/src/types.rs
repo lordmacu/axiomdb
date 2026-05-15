@@ -46,6 +46,10 @@ pub enum DataType {
     /// The inner `DataType` is the element type. Nested arrays use
     /// `Array(Box::new(Array(Box::new(T))))`.
     Array(Box<DataType>),
+    /// SQL range type (Phase 20.13). Inner type is Int/BigInt/Decimal/Date/Timestamp.
+    /// Maps to: Int→INT4RANGE, BigInt→INT8RANGE, Decimal→NUMRANGE,
+    /// Date→DATERANGE, Timestamp→TSRANGE.
+    Range(Box<DataType>),
 }
 
 impl DataType {
@@ -53,6 +57,7 @@ impl DataType {
     ///
     /// For array types, returns `"TYPE[]"` with the inner element type name.
     /// Nested arrays produce `"TYPE[][]"` etc.
+    /// For range types, returns the PostgreSQL range type name.
     pub fn name(&self) -> String {
         match self {
             Self::Bool => "BOOL".into(),
@@ -68,6 +73,14 @@ impl DataType {
             Self::Json => "JSON".into(),
             Self::Jsonb => "JSONB".into(),
             Self::Array(elem) => format!("{}[]", elem.name()),
+            Self::Range(inner) => match inner.as_ref() {
+                DataType::Int => "INT4RANGE".into(),
+                DataType::BigInt => "INT8RANGE".into(),
+                DataType::Decimal => "NUMRANGE".into(),
+                DataType::Date => "DATERANGE".into(),
+                DataType::Timestamp => "TSRANGE".into(),
+                other => format!("RANGE({})", other.name()),
+            },
         }
     }
 }

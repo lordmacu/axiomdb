@@ -48,6 +48,7 @@ pub enum ColumnType {
     Decimal = 11,  // i128 mantissa + u8 scale
     Date = 12,     // i32 days since 1970-01-01
     Array = 13,    // PostgreSQL array
+    Range = 14,    // SQL range type
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -67,6 +68,7 @@ impl TryFrom<u8> for ColumnType {
             11 => Ok(Self::Decimal),
             12 => Ok(Self::Date),
             13 => Ok(Self::Array),
+            14 => Ok(Self::Range),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -111,6 +113,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Decimal => ColumnType::Decimal,
         crate::types::DataType::Date => ColumnType::Date,
         crate::types::DataType::Array(_) => ColumnType::Array,
+        crate::types::DataType::Range(_) => ColumnType::Range,
     }
 }
 
@@ -296,6 +299,11 @@ fn encode_element(
                     .to_string(),
             });
         }
+        ColumnType::Range => {
+            return Err(DbError::InvalidValue {
+                reason: "Range type cannot be used as an array element type".to_string(),
+            });
+        }
     }
     Ok(buf.len() - start_len)
 }
@@ -469,6 +477,10 @@ fn decode_element(
         }
         ColumnType::Array => Err(DbError::ParseError {
             message: "Array element type not supported as leaf element".to_string(),
+            position: None,
+        }),
+        ColumnType::Range => Err(DbError::ParseError {
+            message: "Range element type not supported as array element".to_string(),
             position: None,
         }),
     }

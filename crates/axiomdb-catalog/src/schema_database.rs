@@ -271,6 +271,7 @@ pub enum ColumnType {
     Decimal = 11,  // i128 mantissa + u8 scale
     Date = 12,     // i32 days since 1970-01-01
     Array = 13,    // PostgreSQL array (Phase 20.4)
+    Range = 14,    // SQL range type (Phase 20.13)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -291,6 +292,7 @@ impl TryFrom<u8> for ColumnType {
             11 => Ok(Self::Decimal),
             12 => Ok(Self::Date),
             13 => Ok(Self::Array),
+            14 => Ok(Self::Range),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,

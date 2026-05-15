@@ -129,6 +129,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Timestamp(_), DataType::Timestamp)
             | (Value::Uuid(_), DataType::Uuid)
             | (Value::Array(_), DataType::Array(_))
+            | (Value::Range(_), DataType::Range(_))
     );
     if ok {
         Ok(())
@@ -163,6 +164,7 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
             Value::Array(_) => {
                 return crate::types::DataType::Array(Box::new(crate::types::DataType::Int))
             }
+            Value::Range(_) => return crate::types::DataType::Range(Box::new(crate::types::DataType::Int)),
         }
     }
     crate::types::DataType::Int // default
@@ -205,6 +207,11 @@ pub fn encoded_len(values: &[Value]) -> usize {
                 let blob =
                     array_codec::encode_array(&array_value, elem_type).unwrap_or_else(|_| vec![]);
                 3 + blob.len()
+            }
+            Value::Range(rv) => {
+                // 1-byte flags + optional lower + optional upper (u24 length prefix)
+                let payload = range_payload_len(rv);
+                3 + payload
             }
         })
         .sum();
@@ -336,6 +343,18 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 } else {
                     return Err(DbError::TypeMismatch {
                         expected: "Array".to_string(),
+                        got: schema[i].name(),
+                    });
+                }
+            }
+            Value::Range(rv) => {
+                if let DataType::Range(ref elem_dt) = schema[i] {
+                    let payload = encode_range_payload(rv, elem_dt)?;
+                    write_u24(&mut buf, payload.len());
+                    buf.extend_from_slice(&payload);
+                } else {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Range".to_string(),
                         got: schema[i].name(),
                     });
                 }
@@ -542,6 +561,14 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                     arr
                 }
             }
+            DataType::Range(elem_dt) => {
+                let len = read_u24(bytes, pos)?;
+                pos += 3;
+                ensure_bytes(bytes, pos, len)?;
+                let blob = &bytes[pos..pos + len];
+                pos += len;
+                Value::Range(Box::new(decode_range_payload(blob, elem_dt)?))
+            }
         };
         values.push(v);
     }
@@ -735,6 +762,14 @@ pub fn decode_row_masked(
                         arr
                     }
                 }
+                DataType::Range(elem_dt) => {
+                    let len = read_u24(bytes, pos)?;
+                    pos += 3;
+                    ensure_bytes(bytes, pos, len)?;
+                    let blob = &bytes[pos..pos + len];
+                    pos += len;
+                    Value::Range(Box::new(decode_range_payload(blob, elem_dt)?))
+                }
             };
             values.push(v);
         } else {
@@ -764,7 +799,8 @@ pub fn decode_row_masked(
                 | DataType::Json
                 | DataType::Jsonb
                 | DataType::Bytes
-                | DataType::Array(_) => {
+                | DataType::Array(_)
+                | DataType::Range(_) => {
                     let len = read_u24(bytes, pos)?;
                     pos += 3;
                     if is_toast_sentinel(len) {
@@ -797,6 +833,180 @@ fn ensure_bytes(bytes: &[u8], pos: usize, need: usize) -> Result<(), DbError> {
     } else {
         Ok(())
     }
+}
+
+// ── Range codec helpers (Phase 20.13) ─────────────────────────────────────────
+
+use crate::range_value::{
+    RangeValue, RANGE_EMPTY, RANGE_LOWER_BOUNDED, RANGE_LOWER_INC, RANGE_UPPER_BOUNDED,
+    RANGE_UPPER_INC,
+};
+
+/// Fixed encoded size of one bound value for a given element DataType.
+fn range_bound_size(elem_dt: &DataType) -> usize {
+    match elem_dt {
+        DataType::Int | DataType::Date => 4,
+        DataType::BigInt | DataType::Timestamp => 8,
+        DataType::Decimal => 17,
+        _ => 0,
+    }
+}
+
+/// Returns the byte length of the range payload (flags + optional bounds).
+fn range_payload_len(rv: &RangeValue) -> usize {
+    if rv.is_empty {
+        return 1; // just the EMPTY flags byte
+    }
+    // We need to know elem_dt to compute bound sizes, but encoded_len is
+    // schema-free. Use a conservative upper bound of 17 bytes per bound.
+    // This may over-estimate but won't under-estimate.
+    1 + if rv.lower.is_some() { 17 } else { 0 } + if rv.upper.is_some() { 17 } else { 0 }
+}
+
+/// Encodes one bound value into the buffer according to elem_dt.
+fn encode_bound(buf: &mut Vec<u8>, val: &Value, elem_dt: &DataType) -> Result<(), DbError> {
+    match (val, elem_dt) {
+        (Value::Int(n), DataType::Int) => buf.extend_from_slice(&n.to_le_bytes()),
+        (Value::Date(d), DataType::Date) => buf.extend_from_slice(&d.to_le_bytes()),
+        (Value::BigInt(n), DataType::BigInt) => buf.extend_from_slice(&n.to_le_bytes()),
+        (Value::Timestamp(t), DataType::Timestamp) => buf.extend_from_slice(&t.to_le_bytes()),
+        (Value::Decimal(m, s), DataType::Decimal) => {
+            buf.extend_from_slice(&m.to_le_bytes());
+            buf.push(*s);
+        }
+        _ => {
+            return Err(DbError::TypeMismatch {
+                expected: elem_dt.name(),
+                got: val.variant_name().to_string(),
+            })
+        }
+    }
+    Ok(())
+}
+
+/// Decodes one bound value from `bytes[pos..]`.
+fn decode_bound(
+    bytes: &[u8],
+    pos: &mut usize,
+    elem_dt: &DataType,
+) -> Result<Value, DbError> {
+    match elem_dt {
+        DataType::Int => {
+            ensure_bytes(bytes, *pos, 4)?;
+            let v = i32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(Value::Int(v))
+        }
+        DataType::Date => {
+            ensure_bytes(bytes, *pos, 4)?;
+            let v = i32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(Value::Date(v))
+        }
+        DataType::BigInt => {
+            ensure_bytes(bytes, *pos, 8)?;
+            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Ok(Value::BigInt(v))
+        }
+        DataType::Timestamp => {
+            ensure_bytes(bytes, *pos, 8)?;
+            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Ok(Value::Timestamp(v))
+        }
+        DataType::Decimal => {
+            ensure_bytes(bytes, *pos, 17)?;
+            let m = i128::from_le_bytes(bytes[*pos..*pos + 16].try_into().unwrap());
+            let s = bytes[*pos + 16];
+            *pos += 17;
+            Ok(Value::Decimal(m, s))
+        }
+        _ => Err(DbError::ParseError {
+            message: format!("unsupported range element type: {}", elem_dt.name()),
+            position: None,
+        }),
+    }
+}
+
+/// Encodes a `RangeValue` into a binary payload blob.
+pub(crate) fn encode_range_payload(
+    rv: &RangeValue,
+    elem_dt: &DataType,
+) -> Result<Vec<u8>, DbError> {
+    let bound_sz = range_bound_size(elem_dt);
+    let cap = 1
+        + if rv.lower.is_some() { bound_sz } else { 0 }
+        + if rv.upper.is_some() { bound_sz } else { 0 };
+    let mut buf = Vec::with_capacity(cap);
+
+    let mut flags: u8 = 0;
+    if rv.is_empty {
+        flags |= RANGE_EMPTY;
+        buf.push(flags);
+        return Ok(buf);
+    }
+    if rv.lower.is_some() {
+        flags |= RANGE_LOWER_BOUNDED;
+    }
+    if rv.upper.is_some() {
+        flags |= RANGE_UPPER_BOUNDED;
+    }
+    if rv.lower_inc {
+        flags |= RANGE_LOWER_INC;
+    }
+    if rv.upper_inc {
+        flags |= RANGE_UPPER_INC;
+    }
+    buf.push(flags);
+
+    if let Some(ref lo) = rv.lower {
+        encode_bound(&mut buf, lo, elem_dt)?;
+    }
+    if let Some(ref hi) = rv.upper {
+        encode_bound(&mut buf, hi, elem_dt)?;
+    }
+    Ok(buf)
+}
+
+/// Decodes a binary range payload back into a `RangeValue`.
+pub(crate) fn decode_range_payload(
+    bytes: &[u8],
+    elem_dt: &DataType,
+) -> Result<RangeValue, DbError> {
+    if bytes.is_empty() {
+        return Err(DbError::ParseError {
+            message: "empty range payload".into(),
+            position: None,
+        });
+    }
+    let flags = bytes[0];
+    let mut pos = 1usize;
+
+    if flags & RANGE_EMPTY != 0 {
+        return Ok(RangeValue::empty());
+    }
+
+    let lower = if flags & RANGE_LOWER_BOUNDED != 0 {
+        Some(decode_bound(bytes, &mut pos, elem_dt)?)
+    } else {
+        None
+    };
+    let upper = if flags & RANGE_UPPER_BOUNDED != 0 {
+        Some(decode_bound(bytes, &mut pos, elem_dt)?)
+    } else {
+        None
+    };
+    let lower_inc = flags & RANGE_LOWER_INC != 0;
+    let upper_inc = flags & RANGE_UPPER_INC != 0;
+
+    Ok(RangeValue {
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+        is_empty: false,
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

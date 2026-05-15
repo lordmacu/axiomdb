@@ -202,6 +202,7 @@ fn data_type_tag(ty: DataType) -> u8 {
         DataType::Decimal => 11,
         DataType::Date => 12,
         DataType::Array(_) => 13,
+        DataType::Range(_) => 14,
     }
 }
 
@@ -220,6 +221,7 @@ fn data_type_from_tag(tag: u8) -> Result<DataType, DbError> {
         11 => Ok(DataType::Decimal),
         12 => Ok(DataType::Date),
         13 => Ok(DataType::Array(Box::new(DataType::Text))),
+        14 => Ok(DataType::Range(Box::new(DataType::Int))),
         other => Err(DbError::ParseError {
             message: format!("invalid aggregate arg type byte {other}"),
             position: None,

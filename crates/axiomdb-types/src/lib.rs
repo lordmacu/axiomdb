@@ -11,6 +11,7 @@ pub mod codec;
 pub mod coerce;
 pub mod field_patch;
 pub mod jsonb;
+pub mod range_value;
 pub mod types;
 pub mod value;
 
@@ -22,5 +23,6 @@ pub use jsonb::{
     jsonb_contains, jsonb_merge_patch, jsonb_overlaps, JsonbDecoder, JsonbEncoder, JsonbRef,
     JsonbValue,
 };
+pub use range_value::RangeValue;
 pub use types::DataType;
 pub use value::Value;

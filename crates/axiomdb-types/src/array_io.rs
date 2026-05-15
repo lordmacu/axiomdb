@@ -222,6 +222,7 @@ fn format_element_text(elem: &crate::value::Value) -> String {
             // This shouldn't happen at leaf level
             "{}".to_string()
         }
+        crate::value::Value::Range(rv) => rv.to_display_string(),
     }
 }
 
@@ -802,6 +803,9 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
         }
         ColumnType::Array => Err(DbError::InvalidValue {
             reason: "array element type cannot be array".to_string(),
+        }),
+        ColumnType::Range => Err(DbError::InvalidValue {
+            reason: "array element type cannot be range".to_string(),
         }),
     }
 }
