@@ -18,7 +18,9 @@ FROM table_ref [AS alias]
 [GROUP BY column_list]
 [HAVING condition]
 [ORDER BY column_list [ASC|DESC] [NULLS FIRST|LAST]]
-[LIMIT n [OFFSET m]];
+[LIMIT n [OFFSET m]]
+[FOR {UPDATE | NO KEY UPDATE | SHARE | KEY SHARE} [NOWAIT]
+ | LOCK IN SHARE MODE];
 ```
 
 ### Basic Projections
@@ -93,6 +95,76 @@ ORDER BY LOWER(email), created_at ASC;
 or MariaDB. AxiomDB implements it with a single sort pass — O(n log n) — identical to PostgreSQL's
 approach, with no extra planning overhead.
 </div>
+
+---
+
+### FOR UPDATE / FOR SHARE (Row-Level Locking)
+
+`SELECT ... FOR UPDATE` and its siblings acquire **pessimistic row-level locks**
+on the rows returned by the query. Locks are held until the transaction commits
+or rolls back.
+
+**Syntax variants:**
+
+| Clause | Lock acquired | Blocks |
+|---|---|---|
+| `FOR UPDATE` | Exclusive row lock + IX table intent | Any other lock on the same rows |
+| `FOR NO KEY UPDATE` | Exclusive row lock + IX table intent | Shared locks and updates; allows FK lookups |
+| `FOR SHARE` | Shared row lock + IS table intent | Exclusive locks only |
+| `FOR KEY SHARE` | Shared row lock + IS table intent | `FOR UPDATE` only; allows FK references |
+| `LOCK IN SHARE MODE` | Shared row lock (MySQL alias for `FOR SHARE`) | Exclusive locks only |
+
+**NOWAIT:**
+
+Append `NOWAIT` to any `FOR …` clause to fail immediately instead of waiting
+if a conflicting lock is already held.
+
+```sql
+BEGIN;
+
+-- Lock the account row for exclusive update; fail immediately if locked.
+SELECT id, balance
+FROM accounts
+WHERE id = 42
+FOR UPDATE NOWAIT;
+
+-- Safe to update — no other session can change the row.
+UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+
+COMMIT;
+```
+
+**Locking rules:**
+
+- Locks are acquired **after** `WHERE`, `ORDER BY`, and `LIMIT` are applied —
+  only the rows in the final result set are locked.
+- Locking is silently skipped in autocommit mode (no active transaction).
+- `FOR UPDATE` is not supported on foreign tables (HTTP FDW and similar).
+- `FOR UPDATE` on clustered tables is not yet supported.
+- Compatible locks: two sessions can both hold `FOR SHARE` on the same row.
+- Deadlock detection: the lock manager runs a cycle-detection DFS on the
+  wait-for graph; if a cycle is found, the later transaction is aborted with
+  `DbError::DeadlockDetected`.
+
+**Job-queue pattern:**
+
+```sql
+-- Reserve one pending job; no other worker can claim the same row.
+BEGIN;
+
+SELECT id, payload
+FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE NOWAIT;
+
+-- If the above returns a row, mark it as in-progress.
+UPDATE jobs SET status = 'running', started_at = NOW()
+WHERE id = ?;  -- use the id from the SELECT result
+
+COMMIT;
+```
 
 ---
 

@@ -138,8 +138,10 @@ Today that means:
 - mutating statements (`INSERT`, `UPDATE`, `DELETE`, DDL, `BEGIN`/`COMMIT`/`ROLLBACK`)
   are serialized at whole-database granularity
 - a read that is already running keeps its snapshot while another session commits
-- row-level locking, deadlock detection, and `SELECT ... FOR UPDATE` are planned
-  for Phases 13.7, 13.8, and 13.8b
+- `SELECT ... FOR UPDATE / FOR SHARE [NOWAIT]` row-level pessimistic locking
+  is available as of Phase 13.7 (see [Row-Level Locking](#row-level-locking) below)
+- deadlock detection is built into the lock manager
+- `SKIP LOCKED` is planned for a follow-up subphase
 
 This is good for read-heavy workloads, but it is still below MySQL/InnoDB and
 PostgreSQL for write concurrency because they already lock at row granularity.
@@ -147,11 +149,11 @@ PostgreSQL for write concurrency because they already lock at row granularity.
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Current Concurrency Cut</span>
+<span class="callout-label">Current Concurrency Model</span>
 MySQL InnoDB and PostgreSQL allow multiple writers to proceed concurrently when
-they touch different rows. AxiomDB's current runtime intentionally keeps a
-database-wide write guard while Phase 13.7 introduces row-level locking, then
-adds deadlock detection and `FOR UPDATE` syntax in follow-up subphases.
+they touch different rows. AxiomDB's current runtime keeps a database-wide write
+guard for mutations, but row-level pessimistic locks (`FOR UPDATE / FOR SHARE`)
+are now fully tracked in the `axiomdb-lock` crate and released on COMMIT/ROLLBACK.
 </div>
 </div>
 
@@ -194,11 +196,94 @@ the server queues mutating statements behind the database-wide write guard.
 
 This means you should not yet build on assumptions such as:
 
-- row-level deadlock detection
 - `40001 serialization_failure` retries for ordinary write-write conflicts
-- `SELECT ... FOR UPDATE` / `SKIP LOCKED` job-queue patterns
+- `SELECT ... FOR UPDATE SKIP LOCKED` job-queue patterns (SKIP LOCKED planned)
 
-Those behaviors are planned, but not implemented yet.
+Row-level deadlock detection and `SELECT ... FOR UPDATE / FOR SHARE [NOWAIT]`
+are implemented as of Phase 13.7.
+
+---
+
+## Row-Level Locking
+
+`SELECT ... FOR UPDATE / FOR SHARE [NOWAIT]` acquires **pessimistic row-level
+locks** on the rows returned by the query. This prevents other transactions
+from modifying (or, for shared locks, exclusively locking) those rows until
+your transaction commits or rolls back.
+
+### Syntax
+
+```sql
+SELECT ... FROM table
+[WHERE ...]
+[ORDER BY ...] [LIMIT n]
+FOR UPDATE [NOWAIT]
+| FOR NO KEY UPDATE [NOWAIT]
+| FOR SHARE [NOWAIT]
+| FOR KEY SHARE [NOWAIT]
+| LOCK IN SHARE MODE   -- MySQL alias for FOR SHARE
+```
+
+### Lock Modes
+
+| Mode | Strength | Blocks |
+|---|---|---|
+| `FOR UPDATE` | Exclusive row + IX table intent | All other locking reads and writes |
+| `FOR NO KEY UPDATE` | Exclusive row + IX table intent | Shared reads; allows FK existence checks |
+| `FOR SHARE` / `LOCK IN SHARE MODE` | Shared row + IS table intent | Exclusive locks only |
+| `FOR KEY SHARE` | Shared row + IS table intent | `FOR UPDATE` only; allows FK references |
+
+### NOWAIT
+
+Appending `NOWAIT` causes the statement to fail immediately with
+`DbError::LockTimeout` if any of the target rows is already locked by
+another transaction. Without `NOWAIT`, the statement waits until the
+conflicting lock is released (or until `lock_timeout` fires).
+
+### When Locks Are Acquired
+
+Locks are acquired **after** `WHERE`, `ORDER BY`, and `LIMIT` are applied —
+only the rows in the final result set are locked. This makes `LIMIT 1 FOR UPDATE`
+efficient for job-queue patterns: a single row is locked without scanning the rest.
+
+### Deadlock Detection
+
+The lock manager tracks the wait-for graph across all active transactions. If
+a cycle is detected (transaction A waits for B, B waits for A), the later
+transaction is aborted with `DbError::DeadlockDetected` and its locks are
+released so the surviving transaction can proceed.
+
+### Lock Release
+
+All row-level locks acquired by a transaction are released atomically on
+`COMMIT` or `ROLLBACK`. There is no way to release individual locks early
+(use `SAVEPOINT` / `ROLLBACK TO` for partial rollback, but note that this
+does not release locks acquired after the savepoint).
+
+### Example — Job Queue
+
+```sql
+BEGIN;
+
+-- Claim one pending job; if none is available or if another worker
+-- has already claimed it, fail immediately.
+SELECT id, payload
+FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE NOWAIT;
+
+UPDATE jobs SET status = 'running' WHERE id = ?;
+
+COMMIT;
+```
+
+### Limitations
+
+- `FOR UPDATE` is not supported on foreign tables (HTTP FDW).
+- `FOR UPDATE` on clustered tables is not yet supported; use heap tables.
+- `SKIP LOCKED` is planned for a follow-up subphase.
 
 ---
 
@@ -274,10 +359,11 @@ run Serializable Snapshot Isolation conflict tracking.
 
 ---
 
-## E-commerce Checkout — Current Safe Pattern
+## E-commerce Checkout — Stock Reservation Pattern
 
-Until row-level locking lands, the supported stock-reservation pattern is a
-guarded `UPDATE ... WHERE stock >= ?` plus affected-row checks.
+A safe stock-reservation pattern uses a guarded `UPDATE ... WHERE stock >= ?`
+plus affected-row checks. For stricter serialization, combine with
+`SELECT ... FOR UPDATE` to hold the row before updating.
 
 ```sql
 BEGIN;
@@ -309,10 +395,12 @@ transaction back before releasing the session.
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
 <div class="callout-body">
-<span class="callout-label">`FOR UPDATE` Not Yet Available</span>
-`SELECT ... FOR UPDATE`, `FOR SHARE`, `NOWAIT`, and `SKIP LOCKED` are planned
-for the row-locking phases and are not implemented in the current runtime. Use
-guarded `UPDATE ... WHERE ...` statements plus affected-row checks today.
+<span class="callout-label">Combining UPDATE-guard with FOR UPDATE</span>
+For the highest consistency, open the reservation with
+`SELECT id, stock FROM products WHERE id = ? FOR UPDATE` to prevent concurrent
+readers from seeing a stale value, then apply the `UPDATE ... WHERE stock >= ?`
+check. Both approaches are safe; `FOR UPDATE` adds strictness at the cost of
+holding a lock for the transaction duration.
 </div>
 </div>
 
