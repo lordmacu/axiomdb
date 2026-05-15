@@ -643,15 +643,9 @@ impl LockManager {
         let mut shard = self.record_shards[shard_idx].lock().unwrap();
         let queue = shard.entry(page_id).or_default();
 
-        // Fast path: same txn already holds a compatible lock on this page.
-        if let Some(idx) = queue.find_granted_idx(txn_id, mode) {
-            if let Some(ref mut bm) = queue.granted[idx].bitmap {
-                bm.set(slot_id);
-            }
-            return Ok(true);
-        }
-
-        // Check conflict with granted locks for this specific slot.
+        // Always check slot-level conflict first — even if this txn already
+        // holds a lock on another slot of the same page, another txn may hold
+        // a conflicting lock on this specific slot.
         let blocking_txn = queue.find_conflict(txn_id, mode, Some(slot_id));
 
         // Skip if conflicting lock held or FIFO waiters are ahead.
@@ -662,14 +656,20 @@ impl LockManager {
             return Ok(false);
         }
 
-        // Grant immediately.
-        queue.granted.push(LockEntry {
-            txn_id,
-            mode,
-            flags: LockFlags::NONE,
-            requested_at: Instant::now(),
-            bitmap: Some(SlotBitmap::with_slot(slot_id)),
-        });
+        // No conflict: extend existing entry (idempotent re-lock) or create new one.
+        if let Some(idx) = queue.find_granted_idx(txn_id, mode) {
+            if let Some(ref mut bm) = queue.granted[idx].bitmap {
+                bm.set(slot_id);
+            }
+        } else {
+            queue.granted.push(LockEntry {
+                txn_id,
+                mode,
+                flags: LockFlags::NONE,
+                requested_at: Instant::now(),
+                bitmap: Some(SlotBitmap::with_slot(slot_id)),
+            });
+        }
         Ok(true)
     }
 
@@ -1337,7 +1337,9 @@ mod tests {
     #[test]
     fn try_acquire_granted_when_no_conflict() {
         let lm = LockManager::new();
-        assert!(lm.try_acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive).unwrap());
+        assert!(lm
+            .try_acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive)
+            .unwrap());
     }
 
     #[test]
@@ -1346,7 +1348,9 @@ mod tests {
         lm.acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
             .unwrap();
         // txn 2 wants shared — conflicts with exclusive held by txn 1
-        assert!(!lm.try_acquire_record_lock_sync(2, 100, 0, LockMode::Shared).unwrap());
+        assert!(!lm
+            .try_acquire_record_lock_sync(2, 100, 0, LockMode::Shared)
+            .unwrap());
     }
 
     #[test]
@@ -1355,7 +1359,9 @@ mod tests {
         lm.acquire_record_lock_sync(1, 100, 0, LockMode::Shared, LockFlags::NONE)
             .unwrap();
         // txn 2 also wants shared — compatible, no conflict
-        assert!(lm.try_acquire_record_lock_sync(2, 100, 0, LockMode::Shared).unwrap());
+        assert!(lm
+            .try_acquire_record_lock_sync(2, 100, 0, LockMode::Shared)
+            .unwrap());
     }
 
     #[test]
@@ -1363,8 +1369,10 @@ mod tests {
         let lm = LockManager::new();
         lm.acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive, LockFlags::NONE)
             .unwrap();
-        // same txn tries again — idempotent fast path
-        assert!(lm.try_acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive).unwrap());
+        // same txn tries again — idempotent
+        assert!(lm
+            .try_acquire_record_lock_sync(1, 100, 0, LockMode::Exclusive)
+            .unwrap());
     }
 
     #[test]
@@ -1377,6 +1385,8 @@ mod tests {
         // release txn 1
         lm.release_all_for_txn(1);
         // txn 3 should get the lock cleanly (no phantom waiter from txn 2)
-        assert!(lm.try_acquire_record_lock_sync(3, 100, 0, LockMode::Exclusive).unwrap());
+        assert!(lm
+            .try_acquire_record_lock_sync(3, 100, 0, LockMode::Exclusive)
+            .unwrap());
     }
 }
