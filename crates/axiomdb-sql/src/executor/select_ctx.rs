@@ -99,10 +99,10 @@ fn execute_select_ctx(
 
         // Phase 22b.2 + 22b.6: if this is a foreign table, hand off to the FDW
         // scan path which issues an HTTP GET and materialises the result.
-        // Phase 22b.6 extracts pushable equality predicates from WHERE and forwards
-        // them to the remote via URL; the residual WHERE is applied locally.
+        // Phase 22b.6 extracts equality predicates for URL construction. The full
+        // WHERE is always preserved for local filtering (correctness guarantee).
         if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
-            let (pushed, residual_where) =
+            let (pushed, _) =
                 extract_fdw_pushable(stmt.where_clause.as_ref(), &resolved.columns);
 
             let pushed_limit: Option<u64> = stmt.limit.as_ref().and_then(|e| match e {
@@ -123,14 +123,8 @@ fn execute_select_ctx(
             let first_source = join_source_schema_from_resolved(&from_table_ref, &resolved);
             let first_rows: Vec<Row> = fdw_rows.into_iter().map(|(_, r)| r).collect();
 
-            // Use residual WHERE only — pushed predicates are handled by the remote.
-            // LIMIT is kept in stmt2: the executor applies it locally too (idempotent,
-            // guarantees correctness even if remote over-returns).
-            let mut stmt2 = stmt.clone();
-            stmt2.where_clause = residual_where;
-
             return execute_select_with_joins_first_materialized(
-                stmt2,
+                stmt,
                 first_source,
                 first_rows,
                 exec_ctx,
