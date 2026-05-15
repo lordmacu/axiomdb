@@ -43,7 +43,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             22b.4 (schema namespacing: CREATE/DROP SCHEMA, schema.table, search_path, SHOW SCHEMAS, IS.SCHEMATA),
             22b.1 (scheduled jobs: cron_schedule/unschedule/enable/disable, IS.scheduled_jobs),
             22b.2 (HTTP FDW: CREATE SERVER, CREATE FOREIGN TABLE, SELECT from foreign table),
-            13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking)
+            13.7 (SELECT FOR UPDATE / FOR SHARE [NOWAIT] + LOCK IN SHARE MODE row-level locking),
+            13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns)
 """
 import os
 import signal
@@ -4914,6 +4915,86 @@ ok("[13.7 nowait_no_conflict] FOR UPDATE NOWAIT succeeds when no conflict",
 conn.commit()
 
 cur.execute("DROP TABLE wire_accounts")
+conn.commit()
+
+# ── 13.8b SELECT FOR UPDATE / FOR SHARE SKIP LOCKED ───────────────────────────
+
+print("\n[13.8b] SELECT FOR UPDATE SKIP LOCKED")
+
+conn.commit()
+cur.execute("CREATE TABLE wire_skip (id INT, val TEXT)")
+conn.commit()
+cur.execute("INSERT INTO wire_skip VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+conn.commit()
+
+# Basic SKIP LOCKED — no competing lock, returns all rows
+cur.execute("SELECT id FROM wire_skip ORDER BY id FOR UPDATE SKIP LOCKED")
+rows = cur.fetchall()
+ok("[13.8b basic] SKIP LOCKED returns all rows when none locked",
+   len(rows) == 3 and int(rows[0][0]) == 1 and int(rows[2][0]) == 3,
+   rows)
+conn.commit()
+
+# FOR SHARE SKIP LOCKED parses and executes
+cur.execute("SELECT id FROM wire_skip FOR SHARE SKIP LOCKED")
+rows = cur.fetchall()
+ok("[13.8b for_share] FOR SHARE SKIP LOCKED returns all rows",
+   len(rows) == 3,
+   rows)
+conn.commit()
+
+# FOR NO KEY UPDATE SKIP LOCKED parses
+cur.execute("SELECT id FROM wire_skip FOR NO KEY UPDATE SKIP LOCKED")
+rows = cur.fetchall()
+ok("[13.8b for_no_key_update] FOR NO KEY UPDATE SKIP LOCKED returns all rows",
+   len(rows) == 3,
+   rows)
+conn.commit()
+
+# FOR KEY SHARE SKIP LOCKED parses
+cur.execute("SELECT id FROM wire_skip FOR KEY SHARE SKIP LOCKED")
+rows = cur.fetchall()
+ok("[13.8b for_key_share] FOR KEY SHARE SKIP LOCKED returns all rows",
+   len(rows) == 3,
+   rows)
+conn.commit()
+
+# Two-connection test: conn1 holds an explicit txn locking id=1.
+# conn (conn2) uses SKIP LOCKED — should return id=2 and id=3 only.
+conn1 = connect()
+cur1 = conn1.cursor()
+cur1.execute("BEGIN")
+cur1.execute("SELECT id FROM wire_skip WHERE id = 1 FOR UPDATE")
+cur1.fetchall()
+# conn1 holds the lock; conn now uses SKIP LOCKED inside its own txn
+cur.execute("BEGIN")
+cur.execute("SELECT id FROM wire_skip ORDER BY id FOR UPDATE SKIP LOCKED")
+rows = cur.fetchall()
+ok("[13.8b skip_conflict] SKIP LOCKED omits the row locked by another txn",
+   len(rows) == 2 and int(rows[0][0]) == 2 and int(rows[1][0]) == 3,
+   rows)
+cur.execute("COMMIT")
+conn1.commit()
+conn1.close()
+
+# SKIP LOCKED + LIMIT: LIMIT applied after filtering — returns first available row.
+# Lock id=1 with conn1; LIMIT 1 SKIP LOCKED should return id=2 (not id=1).
+conn1 = connect()
+cur1 = conn1.cursor()
+cur1.execute("BEGIN")
+cur1.execute("SELECT id FROM wire_skip WHERE id = 1 FOR UPDATE")
+cur1.fetchall()
+cur.execute("BEGIN")
+cur.execute("SELECT id FROM wire_skip ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED")
+rows = cur.fetchall()
+ok("[13.8b skip_limit] LIMIT 1 SKIP LOCKED returns first unlocked row",
+   len(rows) == 1 and int(rows[0][0]) == 2,
+   rows)
+cur.execute("COMMIT")
+conn1.commit()
+conn1.close()
+
+cur.execute("DROP TABLE wire_skip")
 conn.commit()
 
 # ── Result ────────────────────────────────────────────────────────────────────
