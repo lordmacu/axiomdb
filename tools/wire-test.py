@@ -5082,6 +5082,36 @@ ok("[20.10 gs_date_monthly] GENERATE_SERIES date monthly produces 3 rows",
 
 conn.commit()
 
+# ── Phase 20.14 — UNNEST in SELECT list ──────────────────────────────────────
+
+cur.execute("SELECT UNNEST(ARRAY[1, 2, 3]) AS n")
+gs_unnest_rows = cur.fetchall()
+ok("[20.14 unnest_select_literal] UNNEST in SELECT list produces one row per element",
+   len(gs_unnest_rows) == 3 and int(gs_unnest_rows[0][0]) == 1 and int(gs_unnest_rows[2][0]) == 3,
+   gs_unnest_rows)
+
+cur.execute("SELECT UNNEST(ARRAY[1,2,3]) AS a, UNNEST(ARRAY[4,5,6]) AS b")
+gs_zip_rows = cur.fetchall()
+ok("[20.14 unnest_select_zip] Multiple UNNESTs zip (not cross-join)",
+   len(gs_zip_rows) == 3
+   and (int(gs_zip_rows[0][0]), int(gs_zip_rows[0][1])) == (1, 4)
+   and (int(gs_zip_rows[2][0]), int(gs_zip_rows[2][1])) == (3, 6),
+   gs_zip_rows)
+
+cur.execute("SELECT UNNEST(NULL::INT[]) AS n")
+gs_null_rows = cur.fetchall()
+ok("[20.14 unnest_select_null] NULL array produces 0 rows",
+   len(gs_null_rows) == 0,
+   gs_null_rows)
+
+cur.execute("SELECT UNNEST(ARRAY[3,1,2]) AS n ORDER BY n")
+gs_ordered = [int(r[0]) for r in cur.fetchall()]
+ok("[20.14 unnest_select_order_by] ORDER BY on UNNEST result sorts correctly",
+   gs_ordered == [1, 2, 3],
+   gs_ordered)
+
+conn.commit()
+
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

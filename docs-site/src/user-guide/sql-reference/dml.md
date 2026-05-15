@@ -2388,3 +2388,84 @@ JOIN GENERATE_SERIES(1, 5) AS g(n) ON t.id = g.n;
 WITH nums AS (SELECT * FROM GENERATE_SERIES(1, 100) AS g(n))
 SELECT SUM(n) FROM nums;
 ```
+
+---
+
+## UNNEST in SELECT list
+
+`UNNEST(array_expr)` can appear directly in the `SELECT` projection list to
+expand an array column into individual rows. Each non-UNNEST column is
+repeated for every expanded row — the table grows vertically, not horizontally.
+
+### Syntax
+
+```sql
+SELECT [scalar_cols,] UNNEST(array_expr) [AS alias] [, UNNEST(array2) [AS alias2], ...]
+FROM table
+[WHERE ...]
+[ORDER BY ...]
+[LIMIT n]
+```
+
+### Examples
+
+```sql
+-- Expand tags column: one row per tag per post
+SELECT id, UNNEST(tags) AS tag FROM posts;
+
+-- No FROM needed for a literal array
+SELECT UNNEST(ARRAY[1, 2, 3]) AS n;
+
+-- Scalar columns repeat for each expanded row
+SELECT 'prefix', UNNEST(ARRAY['a', 'b', 'c']) AS letter;
+
+-- ORDER BY on the expanded column
+SELECT UNNEST(ARRAY[3, 1, 2]) AS n ORDER BY n;
+
+-- Filter before expansion (WHERE applies to the base table)
+SELECT id, UNNEST(tags) AS tag FROM posts WHERE id > 5;
+
+-- In a CTE
+WITH expanded AS (
+  SELECT id, UNNEST(tags) AS tag FROM posts
+)
+SELECT * FROM expanded WHERE tag = 'rust';
+```
+
+### Multiple UNNESTs — zip semantics
+
+When two or more `UNNEST` calls appear in the same SELECT list they are
+**zipped together** (not cross-joined). Both arrays must have the same length.
+
+```sql
+-- Produces (1,'a'), (2,'b'), (3,'c') — 3 rows, not 9
+SELECT UNNEST(ARRAY[1,2,3]) AS n, UNNEST(ARRAY['a','b','c']) AS s;
+```
+
+> **Note:** For zipping arrays with explicit column names use
+> `FROM UNNEST(a, b) AS u(x, y)` (Phase 20.4 FROM form).
+
+### Column naming
+
+| Projection form | Output column name |
+|---|---|
+| `UNNEST(arr) AS tag` | `tag` |
+| `UNNEST(arr)` — first, no alias | `unnest` |
+| `UNNEST(arr)` — second, no alias | `unnest_1` |
+
+### NULL and empty arrays
+
+| Input | Result |
+|---|---|
+| `UNNEST(NULL::INT[])` | 0 rows |
+| `UNNEST(ARRAY[]::INT[])` | 0 rows |
+| `UNNEST(ARRAY[NULL])` | 1 row, `NULL` value |
+
+### Comparison with FROM UNNEST
+
+| Feature | `SELECT UNNEST(arr)` | `FROM UNNEST(arr) AS u(col)` |
+|---|---|---|
+| Position | projection list | FROM / JOIN clause |
+| Explicit column names | via alias | via `AS u(col)` |
+| Multi-array zip | multiple calls (equal length) | `UNNEST(a, b) AS u(x, y)` |
+| Added in phase | 20.14 | 20.4 |

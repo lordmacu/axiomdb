@@ -1307,3 +1307,42 @@ serde_json::Value&gt;</code> built once per JSON_TABLE invocation and
 shared by every filter evaluation at every nesting depth.
 </div>
 </div>
+
+---
+
+## Phase 20.14 — UNNEST in SELECT list (`srf_normalize.rs`)
+
+### Overview
+
+`SELECT id, UNNEST(tags) AS tag FROM posts` is implemented via a pre-analysis
+AST rewrite pass in `crates/axiomdb-sql/src/srf_normalize.rs`.  The function
+`normalize_select_srf(&mut SelectStmt)` runs inside `analyze_select_with_outer`
+**after** `expand_ctes` and **before** `build_context`, so the injected join
+participates in normal column resolution without any special-casing downstream.
+
+### Rewrite algorithm
+
+1. Scan `SelectStmt.columns` for `SelectItem::Expr { Expr::Function { name: "unnest", args: [one] } }`.
+2. Collect all UNNEST calls (in projection order) into `srf_arrays` and `srf_user_aliases`.
+3. Compute `output_names`: user alias or `"unnest"` / `"unnest_1"` defaults.
+4. Build one `UnnestClause { exprs: srf_arrays, alias: "__srf__", column_names: output_names, lateral: true }`.
+5. Replace each UNNEST projection with `Expr::Column { name: output_name }`.
+6. Inject the `UnnestClause`:
+   - `from.is_none()` → set as the sole `FromClause::Unnest`
+   - `from.is_some()` → push a `JoinType::Inner` with `condition: On(true)` into `s.joins`
+
+**Why output names as column names:** ORDER BY expressions that reference a
+SELECT alias (e.g., `ORDER BY tag`) resolve via the BindContext, which only
+exposes real column names from FROM/JOIN tables. Using the output alias as the
+internal column name means `ORDER BY tag` finds the `__srf__.tag` column
+without a second alias-lookup pass.
+
+**Why one UnnestClause for all UNNEST calls:** The existing `materialize_unnest`
+executor zips multiple array expressions together. Collapsing all SELECT-list
+UNNESTs into one clause preserves that zip semantics automatically.
+
+### Execution
+
+After the rewrite the analyzer and executor see a perfectly ordinary LATERAL
+UNNEST join — the same code paths used by `FROM UNNEST(arr) AS u(col)` (Phase 20.4)
+and `LATERAL UNNEST` correlation (GAP-20.4b). No new execution nodes were added.
