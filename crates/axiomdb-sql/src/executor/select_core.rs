@@ -196,7 +196,7 @@ fn execute_select(
         let raw_rows: Vec<(RecordId, Vec<Value>)> = match &access_method {
             // Phase 22b.2: foreign table — call HTTP FDW connector.
             _ if resolved.def.id >= FOREIGN_TABLE_ID_BASE => {
-                fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns)?
+                fdw_scan_table(storage, snap, resolved.def.id, &resolved.columns, &HashMap::new(), None)?
             }
             crate::planner::AccessMethod::Scan if resolved.def.is_clustered() => {
                 crate::table::scan_clustered_table(storage, &resolved.def, &resolved.columns, snap)?

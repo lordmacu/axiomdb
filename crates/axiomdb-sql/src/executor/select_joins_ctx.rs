@@ -12,7 +12,7 @@ fn execute_select_with_joins_ctx(
         .unwrap_or_else(|| txn.snapshot());
     let from_t = resolve_table_cached(storage, txn, ctx, conn_txn, &from_ref)?;
     let from_rows = if from_t.def.id >= FOREIGN_TABLE_ID_BASE {
-        fdw_scan_table(storage, snap.clone(), from_t.def.id, &from_t.columns)?
+        fdw_scan_table(storage, snap.clone(), from_t.def.id, &from_t.columns, &HashMap::new(), None)?
     } else {
         crate::table::scan_table_any_layout(storage, &from_t.def, &from_t.columns, snap)?
     };
@@ -90,7 +90,7 @@ fn execute_select_with_joins_first_materialized(
                 FromClause::Table(tref) => {
                     let jt = resolve_table_cached(storage, txn, ctx, conn_txn, tref)?;
                     let rows = if jt.def.id >= FOREIGN_TABLE_ID_BASE {
-                        fdw_scan_table(storage, snap.clone(), jt.def.id, &jt.columns)?
+                        fdw_scan_table(storage, snap.clone(), jt.def.id, &jt.columns, &HashMap::new(), None)?
                     } else {
                         crate::table::scan_table_any_layout(
                             storage,
