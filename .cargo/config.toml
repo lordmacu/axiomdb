@@ -6,4 +6,4 @@ linker = "/Users/cristian/nexusdb/tools/linker-macos.sh"  # macOS only — uses 
 
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
