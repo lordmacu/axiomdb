@@ -387,6 +387,11 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
                 feature: "JSON_TABLE with money return type".into(),
             });
         }
+        DataType::Composite(_) => {
+            return Err(DbError::NotImplemented {
+                feature: "JSON_TABLE with composite return type".into(),
+            });
+        }
     })
 }
 

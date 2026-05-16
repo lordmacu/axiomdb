@@ -77,6 +77,12 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
             buf.push(*s);
             buf.extend_from_slice(c);
         }
+        Value::Composite(fields) => {
+            buf.push(0x10);
+            let s = Value::Composite(fields.clone()).to_string();
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
     }
     buf
 }

@@ -65,6 +65,10 @@ pub enum Value {
     /// Stored as `mantissa × 10^(-scale)` plus a 3-byte ASCII currency code.
     /// Example: `Money(10050, 2, *b"USD")` = 100.50 USD.
     Money(i128, u8, [u8; 3]),
+    /// SQL composite (user-defined) type value (Phase 20.18).
+    /// Fields are in declaration order; a NULL field slot is `Value::Null`.
+    /// Displays as `(v1,v2,…)` — parenthesized, comma-separated.
+    Composite(Vec<Value>),
 }
 
 impl Value {
@@ -87,6 +91,7 @@ impl Value {
             Self::Array(_) => "Array",
             Self::Range(_) => "Range",
             Self::Money(..) => "Money",
+            Self::Composite(_) => "Composite",
         }
     }
 
@@ -153,6 +158,16 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
             Self::Range(rv) => write!(f, "{}", rv.to_display_string()),
+            Self::Composite(fields) => {
+                write!(f, "(")?;
+                for (i, v) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                write!(f, ")")
+            }
             Self::Money(m, s, c) => {
                 let currency = std::str::from_utf8(c)
                     .unwrap_or("???")

@@ -59,6 +59,7 @@ mod tests {
             ColumnType::Array,
             ColumnType::Range,
             ColumnType::Money,
+            ColumnType::Composite,
         ];
         for v in variants {
             let byte: u8 = v.into();
@@ -67,12 +68,20 @@ mod tests {
         }
     }
 
-    // Discriminants 0, 16-254, and 255 are invalid; 1-15 are valid (Money = 15)
+    // Discriminants 0, 17-254, and 255 are invalid; 1-16 are valid (Composite = 16)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(16).is_err());
+        assert!(ColumnType::try_from(17).is_err());
         assert!(ColumnType::try_from(255).is_err());
+    }
+
+    #[test]
+    fn test_column_type_composite_roundtrip() {
+        let byte: u8 = ColumnType::Composite.into();
+        assert_eq!(byte, 16);
+        let back = ColumnType::try_from(16u8).unwrap();
+        assert_eq!(back, ColumnType::Composite);
     }
 
     #[test]

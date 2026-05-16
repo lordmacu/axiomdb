@@ -548,6 +548,11 @@ impl std::hash::Hash for HashableValue {
                 s.hash(state);
                 c.hash(state);
             }
+            Value::Composite(fields) => {
+                for f in fields {
+                    HashableValue(f.clone()).hash(state);
+                }
+            }
         }
     }
 }

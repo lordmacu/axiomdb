@@ -144,6 +144,11 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) -> Result<(), DbError> {
                 reason: "Money values cannot be used as index keys".to_string(),
             });
         }
+        Value::Composite(_) => {
+            return Err(DbError::InvalidValue {
+                reason: "Composite values cannot be used as index keys".to_string(),
+            });
+        }
     }
     Ok(())
 }

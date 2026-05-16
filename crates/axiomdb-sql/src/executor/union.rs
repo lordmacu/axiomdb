@@ -231,6 +231,15 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                 key.extend_from_slice(c);
                 key.push(0);
             }
+            Value::Composite(fields) => {
+                key.push(16);
+                for f in fields {
+                    // encode each field recursively as its display string
+                    let s = f.to_string();
+                    key.extend_from_slice(s.as_bytes());
+                    key.push(0);
+                }
+            }
         }
     }
     key

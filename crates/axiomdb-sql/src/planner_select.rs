@@ -930,6 +930,9 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
             return value;
         }
         ColumnType::Money => DataType::Money,
+        ColumnType::Composite => {
+            return value;
+        }
     };
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }

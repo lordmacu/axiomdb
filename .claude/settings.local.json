@@ -58,7 +58,11 @@
       "Bash(sed -n '1125,1160p' /Users/cristian/nexusdb/.claude/worktrees/beautiful-babbage-88f474/crates/axiomdb-sql/src/eval/ops.rs)",
       "Bash(chmod +x target/release/axiomdb-server)",
       "Bash(./tools/vm.sh fmt-check *)",
-      "Bash(cat >> *)"
+      "Bash(cat >> *)",
+      "Bash(awk '/fn parse_create_sequence/,/^pub/ {print NR\": \"$0}' /Users/cristian/nexusdb/crates/axiomdb-sql/src/parser/ddl.rs)",
+      "Bash(awk '/^pub\\\\\\(crate\\\\\\) fn parse_create_table/,/^pub/ {print NR\": \"$0}' /Users/cristian/nexusdb/crates/axiomdb-sql/src/parser/ddl.rs)",
+      "Bash(awk '/^## Fase 20/,/^## Fase [0-9]/' docs/progreso.md)",
+      "Bash(./tools/vm.sh cargo *)"
     ],
     "additionalDirectories": [
       "/Users/cristian/nexusdb/docs"

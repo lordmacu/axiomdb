@@ -201,6 +201,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
         ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
         ColumnType::Money => DataType::Money,
+        ColumnType::Composite => DataType::Composite(vec![]),
     }
 }
 
@@ -230,6 +231,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             }
             ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
             ColumnType::Money => DataType::Money,
+            ColumnType::Composite => DataType::Composite(vec![]),
         })
         .collect()
 }
@@ -750,6 +752,7 @@ pub(crate) fn coerce_values(
                 }
                 ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
                 ColumnType::Money => DataType::Money,
+                ColumnType::Composite => DataType::Composite(vec![]),
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -795,6 +798,7 @@ pub(crate) fn coerce_values_with_ctx(
             }
             ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
             ColumnType::Money => DataType::Money,
+            ColumnType::Composite => DataType::Composite(vec![]),
         };
 
         if ctx.strict_mode {

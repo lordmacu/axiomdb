@@ -967,6 +967,7 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Array => "ARRAY", // actual reconstruction done in column_sql_type_display
         ColumnType::Range => "RANGE",
         ColumnType::Money => "MONEY",
+        ColumnType::Composite => "COMPOSITE",
     }
 }
 
@@ -988,6 +989,7 @@ fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Array => "ARRAY",
         ColumnType::Range => "RANGE",
         ColumnType::Money => "MONEY",
+        ColumnType::Composite => "COMPOSITE",
     }
 }
 

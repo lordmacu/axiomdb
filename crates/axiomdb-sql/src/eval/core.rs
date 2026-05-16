@@ -540,6 +540,11 @@ impl Hash for HashableValue {
                 s.hash(state);
                 c.hash(state);
             }
+            Value::Composite(fields) => {
+                for f in fields {
+                    HashableValue(f.clone()).hash(state);
+                }
+            }
         }
     }
 }
@@ -1171,6 +1176,7 @@ enum ArrayElemType {
     Array,
     Range,
     Money,
+    Composite,
 }
 
 impl ArrayElemType {
@@ -1192,6 +1198,7 @@ impl ArrayElemType {
             Value::Array(_) => Self::Array,
             Value::Range(_) => Self::Range,
             Value::Money(..) => Self::Money,
+            Value::Composite(_) => Self::Composite,
         }
     }
 
@@ -1213,6 +1220,7 @@ impl ArrayElemType {
             Self::Array => None, // Nested arrays handled separately
             Self::Range => None, // Range types not supported as array elements
             Self::Money => Some(DataType::Money),
+            Self::Composite => None,
         }
     }
 }
