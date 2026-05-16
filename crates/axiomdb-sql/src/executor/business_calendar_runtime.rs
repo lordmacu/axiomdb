@@ -98,11 +98,14 @@ fn eval_text_arg_bc(
     }
 }
 
-/// `day + 4` mapped to `[0, 6]` where 0=Mon … 4=Fri, 5=Sat, 6=Sun.
-/// Unix epoch (day 0) is a Thursday → `(0 + 4) % 7 = 4` ✓.
+/// Returns true iff `day` is Mon–Fri (weekday).
+///
+/// Formula: `(day + 3) % 7` maps days to Mon=0 … Sun=6.
+/// Epoch 1970-01-01 (day 0) is Thursday → `(0 + 3) % 7 = 3` (Thu) ✓.
+/// Weekday iff the result is < 5.
 #[inline]
 fn is_weekday(day: i32) -> bool {
-    ((day + 4).rem_euclid(7) as u32) < 5
+    ((day + 3).rem_euclid(7) as u32) < 5
 }
 
 // ── IS_BUSINESS_DAY ───────────────────────────────────────────────────────────
@@ -190,8 +193,8 @@ fn business_days_between_fn(
     let full_weeks = span / 7;
     let remainder = span % 7;
 
-    // Day-of-week index for `start` (0=Mon … 6=Sun)
-    let start_dow = ((start + 4).rem_euclid(7)) as i64;
+    // Day-of-week index for `start` (0=Mon … 6=Sun, same as is_weekday formula)
+    let start_dow = ((start + 3).rem_euclid(7)) as i64;
 
     // Count weekdays in the remainder [start, start+remainder)
     let remainder_weekdays: i64 = (0..remainder)

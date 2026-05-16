@@ -47,7 +47,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             13.8b (SELECT FOR UPDATE / FOR SHARE SKIP LOCKED — skip rows locked by other txns),
             20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip),
             20.7 (BACKUP DATABASE TO / RESTORE DATABASE FROM: full + incremental + restore),
-            20.8 (COPY FROM streaming: CSV batch loop + JSONL schema-first, O(batch_size) memory)
+            20.8 (COPY FROM streaming: CSV batch loop + JSONL schema-first, O(batch_size) memory),
+            20.16 (holiday calendars: CREATE/DROP HOLIDAY CALENDAR + IS_BUSINESS_DAY / NEXT_BUSINESS_DAY / BUSINESS_DAYS_BETWEEN)
 """
 import os
 import signal
@@ -5413,6 +5414,41 @@ cur.execute("INSERT INTO _wire_range_slots VALUES (2, int4range(20, 30))")
 cur.execute("SELECT id FROM _wire_range_slots WHERE period @> 5")
 ids = [row[0] for row in cur.fetchall()]
 ok("[20.13k range_in_where] WHERE period @> 5 returns id=1", ids == [1], ids)
+
+# ── 20.16 Business calendar ───────────────────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_biz_tmp")
+cur.execute(
+    "CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01')"
+)
+# IS_BUSINESS_DAY: Monday that is a holiday → 0
+cur.execute("SELECT IS_BUSINESS_DAY('2024-01-01', 'CO')")
+ok("[20.16a is_business_day_holiday] IS_BUSINESS_DAY on holiday Monday = 0",
+   cur.fetchone()[0] == 0)
+
+# IS_BUSINESS_DAY: Saturday → 0 regardless of calendar
+cur.execute("SELECT IS_BUSINESS_DAY('2024-01-06', 'CO')")
+ok("[20.16b is_business_day_saturday] IS_BUSINESS_DAY on Saturday = 0",
+   cur.fetchone()[0] == 0)
+
+# NEXT_BUSINESS_DAY: Friday + holiday Monday → Tuesday 2024-01-09 (days 19731)
+cur.execute(
+    "CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01', '2024-01-08')"
+)
+cur.execute("SELECT NEXT_BUSINESS_DAY('2024-01-05', 'CO')")
+_next_biz = cur.fetchone()[0]
+ok("[20.16c next_business_day] NEXT_BUSINESS_DAY from Friday skipping holiday Monday = Tue 2024-01-09",
+   _next_biz == 19731, _next_biz)
+
+# BUSINESS_DAYS_BETWEEN: Mon 2024-01-01 (holiday) to Mon 2024-01-08 = 4
+cur.execute(
+    "CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01')"
+)
+cur.execute("SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO')")
+ok("[20.16d business_days_between] 5 weekdays minus 1 holiday = 4",
+   cur.fetchone()[0] == 4)
+
+cur.execute("DROP HOLIDAY CALENDAR IF EXISTS 'CO'")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

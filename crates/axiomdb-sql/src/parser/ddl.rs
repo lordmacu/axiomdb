@@ -2232,7 +2232,7 @@ pub(crate) fn parse_create_holiday_calendar(p: &mut Parser) -> Result<Stmt, DbEr
     let country_code = parse_country_code(p)?.to_ascii_uppercase();
 
     let mut holidays = Vec::new();
-    if matches!(p.peek(), Token::Ident(kw) if kw.eq_ignore_ascii_case("with")) {
+    if matches!(p.peek(), Token::With) {
         p.advance(); // consume WITH
         if matches!(p.peek(), Token::Ident(kw) if kw.eq_ignore_ascii_case("holidays")) {
             p.advance(); // consume HOLIDAYS
