@@ -1008,6 +1008,16 @@ fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
         return enum_name.clone();
     }
 
+    // DECIMAL(p,s): type_len encodes precision in upper byte, scale in lower byte.
+    if col.col_type == ColumnType::Decimal {
+        let (prec, scale) = if col.type_len != 0 {
+            ((col.type_len >> 8) as u8, (col.type_len & 0xFF) as u8)
+        } else {
+            (10u8, 0u8)
+        };
+        return format!("decimal({prec},{scale})");
+    }
+
     // Handle array types: reconstruct e.g. "INT[]", "TEXT[][]", "FLOAT[3][3]"
     if col.col_type == ColumnType::Array {
         let element_name = col
@@ -1015,8 +1025,6 @@ fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
             .map(scalar_type_to_sql_name)
             .unwrap_or("TEXT");
         let ndims = col.array_ndims.unwrap_or(1) as usize;
-        // For now, we reconstruct unbounded arrays (no size hints stored yet)
-        // Size hints would come from col.array_size_hints if we add that field
         format!("{}{}", element_name, "[]".repeat(ndims))
     } else {
         column_type_to_sql_name(col.col_type).into()

@@ -277,11 +277,19 @@ fn generate_is_columns_rows(
                     ColumnType::Text => Value::BigInt(65535),
                     _ => Value::Null,
                 };
+                let (decimal_prec, decimal_scale) = if col.col_type == ColumnType::Decimal {
+                    let p = if col.type_len != 0 { (col.type_len >> 8) as i64 } else { 10 };
+                    let s = if col.type_len != 0 { (col.type_len & 0xFF) as i64 } else { 0 };
+                    (p, s)
+                } else {
+                    (0, 0)
+                };
                 let num_prec = match col.col_type {
                     ColumnType::Int => Value::BigInt(10),
                     ColumnType::BigInt => Value::BigInt(19),
                     ColumnType::Float32 => Value::BigInt(7),
                     ColumnType::Float => Value::BigInt(15),
+                    ColumnType::Decimal => Value::BigInt(decimal_prec),
                     _ => Value::Null,
                 };
                 rows.push(vec![
@@ -296,7 +304,11 @@ fn generate_is_columns_rows(
                     char_max_len,                     // CHARACTER_MAXIMUM_LENGTH
                     Value::Null,                      // CHARACTER_OCTET_LENGTH
                     num_prec,                         // NUMERIC_PRECISION
-                    Value::Null,                      // NUMERIC_SCALE
+                    if col.col_type == ColumnType::Decimal {
+                        Value::BigInt(decimal_scale)
+                    } else {
+                        Value::Null
+                    },                                // NUMERIC_SCALE
                     Value::Null,                      // DATETIME_PRECISION
                     is_effective_column_collation(col, &t, db.default_collation.as_deref())
                         .map(|_| Value::Text("utf8mb4".into()))

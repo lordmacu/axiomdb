@@ -1212,8 +1212,9 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
         }
         Token::TyDecimal | Token::TyNumeric => {
             p.advance();
-            eat_optional_precision_scale(p)?;
-            (DataType::Decimal, 0, false)
+            let (prec, scale) = parse_decimal_params(p)?;
+            let type_len = ((prec as u16) << 8) | (scale as u16);
+            (DataType::Decimal, type_len, false)
         }
         Token::TyBool | Token::TyBoolean => {
             p.advance();
@@ -1482,28 +1483,60 @@ fn parse_state_type_name(p: &mut Parser) -> Result<String, DbError> {
     Ok(name)
 }
 
-fn eat_optional_precision_scale(p: &mut Parser) -> Result<(), DbError> {
-    if p.eat(&Token::LParen) {
-        if !matches!(p.peek(), Token::Integer(_)) {
+/// Parse optional `(precision [, scale])` for DECIMAL/NUMERIC.
+/// Returns `(precision, scale)` — defaults to `(10, 0)` when omitted.
+/// Validates: 1 ≤ precision ≤ 38, 0 ≤ scale ≤ precision.
+fn parse_decimal_params(p: &mut Parser) -> Result<(u8, u8), DbError> {
+    if !p.eat(&Token::LParen) {
+        return Ok((10, 0));
+    }
+    let prec = match p.peek() {
+        Token::Integer(n) => {
+            let v = *n;
+            p.advance();
+            v
+        }
+        _ => {
             return Err(DbError::ParseError {
-                message: "expected precision integer in type parameters".into(),
+                message: "expected precision integer in DECIMAL type parameters".into(),
                 position: Some(p.current_pos()),
             });
         }
-        p.advance();
-        if p.eat(&Token::Comma) {
-            if !matches!(p.peek(), Token::Integer(_)) {
+    };
+    if prec < 1 || prec > 38 {
+        return Err(DbError::ParseError {
+            message: format!("DECIMAL precision must be between 1 and 38, got {prec}"),
+            position: Some(p.current_pos()),
+        });
+    }
+    let scale = if p.eat(&Token::Comma) {
+        match p.peek() {
+            Token::Integer(n) => {
+                let v = *n;
+                p.advance();
+                v
+            }
+            _ => {
                 return Err(DbError::ParseError {
-                    message: "expected scale integer after comma in type parameters".into(),
+                    message: "expected scale integer after comma in DECIMAL type parameters"
+                        .into(),
                     position: Some(p.current_pos()),
                 });
             }
-            p.advance();
         }
-        p.expect(&Token::RParen)?;
+    } else {
+        0
+    };
+    if scale > prec {
+        return Err(DbError::ParseError {
+            message: format!("DECIMAL scale ({scale}) cannot exceed precision ({prec})"),
+            position: Some(p.current_pos()),
+        });
     }
-    Ok(())
+    p.expect(&Token::RParen)?;
+    Ok((prec as u8, scale as u8))
 }
+
 
 fn eat_optional_length(p: &mut Parser) -> Result<u16, DbError> {
     if p.eat(&Token::LParen) {
