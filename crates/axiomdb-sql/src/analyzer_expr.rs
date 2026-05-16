@@ -133,7 +133,55 @@ fn resolve_expr_full(
                     });
                 }
             }
-            // 3. Not found anywhere.
+            // 3. Try composite field access: `col_name.field_name`.
+            //    Only attempted when the name has exactly one dot AND there is
+            //    catalog access (state is Some), because we need to look up the
+            //    composite type definition to get the field index.
+            if let Some(state) = state {
+                if let Some(dot_pos) = name.find('.') {
+                    let col_part = &name[..dot_pos];
+                    let field_part = &name[dot_pos + 1..];
+                    // Check if col_part is itself qualified (table.col) — only
+                    // handle the simple `col.field` case here.
+                    if !col_part.contains('.') {
+                        // Try to find col_part as an unqualified column.
+                        let matches = ctx.find_column_all(col_part);
+                        if matches.len() == 1 {
+                            let (_, col_idx, _) = matches[0];
+                            // Find the ColumnDef to check col_type.
+                            'field_lookup: {
+                                for table in &ctx.tables {
+                                    for col in &table.columns {
+                                        if col.name.eq_ignore_ascii_case(col_part) {
+                                            if col.col_type == axiomdb_catalog::ColumnType::Composite {
+                                                // Resolve the composite type def to get field index.
+                                                if let Some(ref qname) = col.enum_type_name {
+                                                    let (schema, tname) = qname
+                                                        .split_once('.')
+                                                        .unwrap_or((state.default_schema, qname.as_str()));
+                                                    let snap = state.snapshot.clone();
+                                                    let mut reader = CatalogReader::new(state.storage, snap)?;
+                                                    if let Some(def) = reader.get_composite_type(schema, tname)? {
+                                                        if let Some(field_idx) = def.fields.iter().position(|f| f.name.eq_ignore_ascii_case(field_part)) {
+                                                            return Ok(Expr::FieldAccess { col_idx, field_idx });
+                                                        }
+                                                        return Err(DbError::ColumnNotFound {
+                                                            name: field_part.to_string(),
+                                                            table: format!("{col_part} (composite type {qname})"),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            break 'field_lookup;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 4. Not found anywhere.
             if ctx.tables.is_empty() && outer_scopes.is_empty() {
                 return Err(DbError::ColumnNotFound {
                     name: name.clone(),
