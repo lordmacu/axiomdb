@@ -497,6 +497,23 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
                 }),
             }
         }
+
+        // Phase 20.20 — XML constructor special forms.
+        Expr::XmlElement { tag, attrs, content } => {
+            super::functions::xml::eval_xmlelement(tag, attrs, content, row, &mut NoSubquery)
+        }
+        Expr::XmlForest { items } => {
+            super::functions::xml::eval_xmlforest(items, row, &mut NoSubquery)
+        }
+        Expr::XmlRoot { doc, version, standalone } => {
+            super::functions::xml::eval_xmlroot(doc, version, *standalone, row, &mut NoSubquery)
+        }
+        Expr::XmlConcat { args } => {
+            super::functions::xml::eval_xmlconcat(args, row, &mut NoSubquery)
+        }
+        Expr::XmlQuery { xpath, doc } => {
+            super::functions::xml::eval_xmlquery(xpath, doc, row, &mut NoSubquery)
+        }
     }
 }
 
@@ -1114,6 +1131,23 @@ pub fn eval_with<R: SubqueryRunner>(
                     got: format!("{composite:?}"),
                 }),
             }
+        }
+
+        // Phase 20.20 — XML constructor special forms.
+        Expr::XmlElement { tag, attrs, content } => {
+            super::functions::xml::eval_xmlelement(tag, attrs, content, row, sq)
+        }
+        Expr::XmlForest { items } => {
+            super::functions::xml::eval_xmlforest(items, row, sq)
+        }
+        Expr::XmlRoot { doc, version, standalone } => {
+            super::functions::xml::eval_xmlroot(doc, version, *standalone, row, sq)
+        }
+        Expr::XmlConcat { args } => {
+            super::functions::xml::eval_xmlconcat(args, row, sq)
+        }
+        Expr::XmlQuery { xpath, doc } => {
+            super::functions::xml::eval_xmlquery(xpath, doc, row, sq)
         }
     }
 }

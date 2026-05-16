@@ -143,3 +143,175 @@ fn xml_multi_row_insert_select() {
     let r = rows(result);
     assert_eq!(r[0][0], Value::BigInt(3));
 }
+
+// ── Step 2: XMLELEMENT ────────────────────────────────────────────────────────
+
+#[test]
+fn xmlelement_simple() {
+    assert_eq!(
+        run("SELECT XMLELEMENT(NAME a, 'hello')"),
+        Value::Xml("<a>hello</a>".into())
+    );
+}
+
+#[test]
+fn xmlelement_attrs() {
+    assert_eq!(
+        run("SELECT XMLELEMENT(NAME a, XMLATTRIBUTES('42' AS id), 'text')"),
+        Value::Xml("<a id=\"42\">text</a>".into())
+    );
+}
+
+#[test]
+fn xmlelement_escaping() {
+    assert_eq!(
+        run("SELECT XMLELEMENT(NAME a, '<>&')"),
+        Value::Xml("<a>&lt;&gt;&amp;</a>".into())
+    );
+}
+
+#[test]
+fn xmlelement_null_content_omitted() {
+    assert_eq!(
+        run("SELECT XMLELEMENT(NAME a, NULL)"),
+        Value::Xml("<a></a>".into())
+    );
+}
+
+#[test]
+fn xmlelement_null_attr_omitted() {
+    assert_eq!(
+        run("SELECT XMLELEMENT(NAME a, XMLATTRIBUTES(NULL AS id), 'x')"),
+        Value::Xml("<a>x</a>".into())
+    );
+}
+
+#[test]
+fn xmlelement_nested() {
+    assert_eq!(
+        run("SELECT XMLELEMENT(NAME elem1, XMLELEMENT(NAME elem2, 'val'))"),
+        Value::Xml("<elem1><elem2>val</elem2></elem1>".into())
+    );
+}
+
+// ── Step 2: XMLFOREST ─────────────────────────────────────────────────────────
+
+#[test]
+fn xmlforest_basic() {
+    assert_eq!(
+        run("SELECT XMLFOREST('bob' AS name, 42 AS age)"),
+        Value::Xml("<name>bob</name><age>42</age>".into())
+    );
+}
+
+#[test]
+fn xmlforest_null_omitted() {
+    assert_eq!(
+        run("SELECT XMLFOREST(NULL AS x, 'y' AS y)"),
+        Value::Xml("<y>y</y>".into())
+    );
+}
+
+#[test]
+fn xmlforest_all_null_empty() {
+    assert_eq!(
+        run("SELECT XMLFOREST(NULL AS x)"),
+        Value::Xml("".into())
+    );
+}
+
+// ── Step 2: XMLROOT ───────────────────────────────────────────────────────────
+
+#[test]
+fn xmlroot_basic() {
+    assert_eq!(
+        run("SELECT XMLROOT('<a/>'::XML, VERSION '1.0')"),
+        Value::Xml("<?xml version=\"1.0\"?><a/>".into())
+    );
+}
+
+#[test]
+fn xmlroot_standalone_yes() {
+    assert_eq!(
+        run("SELECT XMLROOT('<a/>'::XML, VERSION '1.0', STANDALONE YES)"),
+        Value::Xml("<?xml version=\"1.0\" standalone=\"yes\"?><a/>".into())
+    );
+}
+
+#[test]
+fn xmlroot_strips_existing_decl() {
+    assert_eq!(
+        run("SELECT XMLROOT('<?xml version=\"1.0\"?><a/>'::XML, VERSION '1.1')"),
+        Value::Xml("<?xml version=\"1.1\"?><a/>".into())
+    );
+}
+
+#[test]
+fn xmlroot_null_doc() {
+    assert_eq!(run("SELECT XMLROOT(NULL, VERSION '1.0')"), Value::Null);
+}
+
+// ── Step 2: XMLCONCAT ─────────────────────────────────────────────────────────
+
+#[test]
+fn xmlconcat_basic() {
+    assert_eq!(
+        run("SELECT XMLCONCAT('<a/>'::XML, '<b/>'::XML)"),
+        Value::Xml("<a/><b/>".into())
+    );
+}
+
+#[test]
+fn xmlconcat_null_skipped() {
+    assert_eq!(
+        run("SELECT XMLCONCAT('<a/>'::XML, NULL, '<b/>'::XML)"),
+        Value::Xml("<a/><b/>".into())
+    );
+}
+
+#[test]
+fn xmlconcat_all_null() {
+    assert_eq!(run("SELECT XMLCONCAT(NULL, NULL)"), Value::Null);
+}
+
+// ── Step 2: XMLQUERY ──────────────────────────────────────────────────────────
+
+#[test]
+fn xmlquery_basic() {
+    assert_eq!(
+        run("SELECT XMLQUERY('/root/a/text()' PASSING '<root><a>hi</a></root>'::XML)"),
+        Value::Text("hi".into())
+    );
+}
+
+#[test]
+fn xmlquery_no_match() {
+    assert_eq!(
+        run("SELECT XMLQUERY('/root/missing/text()' PASSING '<root><a>hi</a></root>'::XML)"),
+        Value::Null
+    );
+}
+
+#[test]
+fn xmlquery_null_doc() {
+    assert_eq!(
+        run("SELECT XMLQUERY('/root/text()' PASSING NULL)"),
+        Value::Null
+    );
+}
+
+#[test]
+fn xmlquery_attr() {
+    assert_eq!(
+        run("SELECT XMLQUERY('/root/a/@id' PASSING '<root><a id=\"42\">x</a></root>'::XML)"),
+        Value::Text("42".into())
+    );
+}
+
+#[test]
+fn xmlquery_invalid_xml_returns_null() {
+    assert_eq!(
+        run("SELECT XMLQUERY('/root' PASSING '<broken'::TEXT)"),
+        Value::Null
+    );
+}

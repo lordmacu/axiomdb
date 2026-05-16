@@ -403,6 +403,56 @@ pub enum Expr {
     /// `col_idx` is the column position in the FROM list; `field_idx` is the
     /// zero-based field index within the composite type.
     FieldAccess { col_idx: usize, field_idx: usize },
+
+    // ── Phase 20.20 — SQL/XML constructor special forms ───────────────────────
+
+    /// `XMLELEMENT(NAME tag [, XMLATTRIBUTES(v AS a, ...) ] [, content ...])`
+    ///
+    /// Builds an XML element from a tag name, optional attributes, and content
+    /// expressions. NULL content is silently skipped. Returns `Value::Xml`.
+    XmlElement {
+        tag: String,
+        /// `(value_expr, attr_name)` pairs from `XMLATTRIBUTES(...)`.
+        attrs: Vec<(Expr, String)>,
+        /// Content sub-expressions (text or nested XML).
+        content: Vec<Expr>,
+    },
+
+    /// `XMLFOREST(expr AS name [, ...])`
+    ///
+    /// Builds a forest (sequence of sibling elements) from a list of
+    /// `(value, element_name)` pairs. NULL values are skipped. Returns `Value::Xml`.
+    XmlForest {
+        items: Vec<(Expr, String)>,
+    },
+
+    /// `XMLROOT(xml_expr, VERSION string [, STANDALONE YES|NO|NO VALUE])`
+    ///
+    /// Wraps an XML value in an XML declaration. Strips any existing `<?xml ...?>`
+    /// declaration before prepending the new one. Returns `Value::Xml`.
+    XmlRoot {
+        doc: Box<Expr>,
+        version: String,
+        /// `Some(true)` = YES, `Some(false)` = NO, `None` = NO VALUE / omitted.
+        standalone: Option<bool>,
+    },
+
+    /// `XMLCONCAT(xml1 [, xml2, ...])`
+    ///
+    /// Concatenates XML values into a single XML fragment. NULL args are skipped.
+    /// Returns `Value::Null` only when every argument is NULL; otherwise `Value::Xml`.
+    XmlConcat {
+        args: Vec<Expr>,
+    },
+
+    /// `XMLQUERY(xpath PASSING xml_expr [RETURNING CONTENT])`
+    ///
+    /// Evaluates a minimal XPath 1.0 expression against an XML document and
+    /// returns the first match as `Value::Text`, or `Value::Null` if not found.
+    XmlQuery {
+        xpath: String,
+        doc: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

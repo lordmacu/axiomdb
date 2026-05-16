@@ -505,6 +505,41 @@ fn resolve_expr_full(
         }
         // FieldAccess is an analyzer output — should not appear as input.
         e @ Expr::FieldAccess { .. } => Ok(e),
+
+        // Phase 20.20 — XML constructor special forms: resolve all sub-expressions.
+        Expr::XmlElement { tag, attrs, content } => {
+            let resolved_attrs = attrs
+                .into_iter()
+                .map(|(e, name)| resolve_expr_full(e, ctx, outer_scopes, state).map(|re| (re, name)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let resolved_content = content
+                .into_iter()
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::XmlElement { tag, attrs: resolved_attrs, content: resolved_content })
+        }
+        Expr::XmlForest { items } => {
+            let resolved_items = items
+                .into_iter()
+                .map(|(e, name)| resolve_expr_full(e, ctx, outer_scopes, state).map(|re| (re, name)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::XmlForest { items: resolved_items })
+        }
+        Expr::XmlRoot { doc, version, standalone } => {
+            let resolved_doc = resolve_expr_full(*doc, ctx, outer_scopes, state)?;
+            Ok(Expr::XmlRoot { doc: Box::new(resolved_doc), version, standalone })
+        }
+        Expr::XmlConcat { args } => {
+            let resolved_args = args
+                .into_iter()
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::XmlConcat { args: resolved_args })
+        }
+        Expr::XmlQuery { xpath, doc } => {
+            let resolved_doc = resolve_expr_full(*doc, ctx, outer_scopes, state)?;
+            Ok(Expr::XmlQuery { xpath, doc: Box::new(resolved_doc) })
+        }
     }
 }
 

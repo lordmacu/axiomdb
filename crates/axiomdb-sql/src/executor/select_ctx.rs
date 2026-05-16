@@ -343,6 +343,19 @@ fn execute_select_ctx(
                         mask[*col_idx] = true;
                     }
                 }
+                // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+                crate::expr::Expr::XmlElement { attrs, content, .. } => {
+                    for (e, _) in attrs { collect_expr_columns(e, mask); }
+                    for e in content { collect_expr_columns(e, mask); }
+                }
+                crate::expr::Expr::XmlForest { items } => {
+                    for (e, _) in items { collect_expr_columns(e, mask); }
+                }
+                crate::expr::Expr::XmlRoot { doc, .. } => collect_expr_columns(doc, mask),
+                crate::expr::Expr::XmlConcat { args } => {
+                    for e in args { collect_expr_columns(e, mask); }
+                }
+                crate::expr::Expr::XmlQuery { doc, .. } => collect_expr_columns(doc, mask),
             }
         }
 

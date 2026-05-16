@@ -847,6 +847,14 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
         }
         Expr::FieldAccess { .. } => Ok(()),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Default => Ok(()),
+        // Phase 20.20 — XML constructor forms not allowed in index expressions.
+        Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => Err(DbError::NotImplemented {
+            feature: "XML constructor is not allowed in index expression".into(),
+        }),
     }
 }
 

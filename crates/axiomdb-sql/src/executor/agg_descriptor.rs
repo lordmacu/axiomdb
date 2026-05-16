@@ -80,6 +80,15 @@ fn contains_aggregate(expr: &Expr) -> bool {
         }
         Expr::Row(elems) => elems.iter().any(contains_aggregate),
         Expr::FieldAccess { .. } => false,
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            attrs.iter().any(|(e, _)| contains_aggregate(e))
+                || content.iter().any(contains_aggregate)
+        }
+        Expr::XmlForest { items } => items.iter().any(|(e, _)| contains_aggregate(e)),
+        Expr::XmlRoot { doc, .. } => contains_aggregate(doc),
+        Expr::XmlConcat { args } => args.iter().any(contains_aggregate),
+        Expr::XmlQuery { doc, .. } => contains_aggregate(doc),
     }
 }
 
@@ -479,6 +488,19 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             }
         }
         Expr::FieldAccess { .. } => {}
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { collect_agg_exprs_from(e, result); }
+            for e in content { collect_agg_exprs_from(e, result); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { collect_agg_exprs_from(e, result); }
+        }
+        Expr::XmlRoot { doc, .. } => collect_agg_exprs_from(doc, result),
+        Expr::XmlConcat { args } => {
+            for e in args { collect_agg_exprs_from(e, result); }
+        }
+        Expr::XmlQuery { doc, .. } => collect_agg_exprs_from(doc, result),
     }
 }
 

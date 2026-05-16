@@ -938,7 +938,12 @@ fn expr_contains_window(expr: &Expr) -> bool {
         | Expr::Subscript { .. }
         | Expr::AnyOf { .. }
         | Expr::AllOf { .. }
-        | Expr::FieldAccess { .. } => false,
+        | Expr::FieldAccess { .. }
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => false,
     }
 }
 
@@ -1032,7 +1037,13 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::Subscript { .. }
         | Expr::AnyOf { .. }
         | Expr::AllOf { .. }
-        | Expr::FieldAccess { .. } => false,
+        | Expr::FieldAccess { .. }
+        // Phase 20.20 — XML constructor forms (treat as non-aggregate leaves).
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => false,
     }
 }
 
@@ -1212,7 +1223,13 @@ fn rewrite_custom_aggregates_in_expr(
         | Expr::Exists { .. }
         | Expr::ArrayConstructor { .. }
         | Expr::Subscript { .. }
-        | Expr::FieldAccess { .. } => {}
+        | Expr::FieldAccess { .. }
+        // Phase 20.20 — XML constructor forms: no custom aggregates inside.
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => {}
     }
     Ok(())
 }
@@ -1356,6 +1373,19 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
             }
         }
         Expr::FieldAccess { .. } => {}
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { populate_grouping_indices(e, universe); }
+            for e in content { populate_grouping_indices(e, universe); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { populate_grouping_indices(e, universe); }
+        }
+        Expr::XmlRoot { doc, .. } => populate_grouping_indices(doc, universe),
+        Expr::XmlConcat { args } => {
+            for e in args { populate_grouping_indices(e, universe); }
+        }
+        Expr::XmlQuery { doc, .. } => populate_grouping_indices(doc, universe),
     }
 }
 

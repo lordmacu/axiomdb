@@ -588,6 +588,22 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 Ok(())
             }
             Expr::FieldAccess { .. } => Ok(()),
+            // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+            Expr::XmlElement { attrs, content, .. } => {
+                for (e, _) in attrs { self.visit_expr(e)?; }
+                for e in content { self.visit_expr(e)?; }
+                Ok(())
+            }
+            Expr::XmlForest { items } => {
+                for (e, _) in items { self.visit_expr(e)?; }
+                Ok(())
+            }
+            Expr::XmlRoot { doc, .. } => self.visit_expr(doc),
+            Expr::XmlConcat { args } => {
+                for e in args { self.visit_expr(e)?; }
+                Ok(())
+            }
+            Expr::XmlQuery { doc, .. } => self.visit_expr(doc),
         }
     }
 

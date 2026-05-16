@@ -380,6 +380,19 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 mask[*col_idx] = true;
             }
         }
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { collect_column_refs(e, mask); }
+            for e in content { collect_column_refs(e, mask); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { collect_column_refs(e, mask); }
+        }
+        Expr::XmlRoot { doc, .. } => collect_column_refs(doc, mask),
+        Expr::XmlConcat { args } => {
+            for e in args { collect_column_refs(e, mask); }
+        }
+        Expr::XmlQuery { doc, .. } => collect_column_refs(doc, mask),
     }
 }
 

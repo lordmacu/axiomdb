@@ -371,7 +371,13 @@ fn validate_generated_expr_refs(
         | Expr::Param { .. }
         | Expr::Default
         | Expr::Row(_)
-        | Expr::FieldAccess { .. } => Err(DbError::InvalidValue {
+        | Expr::FieldAccess { .. }
+        // Phase 20.20 — XML constructor forms not allowed in generated columns.
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => Err(DbError::InvalidValue {
             reason: format!(
                 "unsupported expression in generated column '{generated_name}'"
             ),

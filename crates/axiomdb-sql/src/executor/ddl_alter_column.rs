@@ -292,6 +292,15 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
         }
         Expr::Row(elems) => elems.iter().any(|e| expr_mentions_column_name(e, target_name)),
         Expr::FieldAccess { .. } => false,
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            attrs.iter().any(|(e, _)| expr_mentions_column_name(e, target_name))
+                || content.iter().any(|e| expr_mentions_column_name(e, target_name))
+        }
+        Expr::XmlForest { items } => items.iter().any(|(e, _)| expr_mentions_column_name(e, target_name)),
+        Expr::XmlRoot { doc, .. } => expr_mentions_column_name(doc, target_name),
+        Expr::XmlConcat { args } => args.iter().any(|e| expr_mentions_column_name(e, target_name)),
+        Expr::XmlQuery { doc, .. } => expr_mentions_column_name(doc, target_name),
     }
 }
 

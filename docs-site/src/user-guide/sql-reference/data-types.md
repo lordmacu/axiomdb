@@ -747,6 +747,44 @@ SELECT xml_is_well_formed('<broken');        -- 0
 SELECT xml_is_well_formed(NULL);             -- NULL
 ```
 
+### XML Constructor Functions
+
+AxiomDB implements the SQL/XML constructor functions defined in SQL:2006.
+
+| Form | Returns | Description |
+|---|---|---|
+| `XMLELEMENT(NAME tag [, XMLATTRIBUTES(v AS a, ...) ] [, content ...])` | `XML` | Build an element with optional attributes and content |
+| `XMLFOREST(expr AS name [, ...])` | `XML` | Build a sequence of sibling elements |
+| `XMLROOT(xml_expr, VERSION str [, STANDALONE YES\|NO])` | `XML` | Wrap XML with an XML declaration |
+| `XMLCONCAT(xml1, ...)` | `XML` | Concatenate XML fragments (NULLs skipped) |
+| `XMLQUERY(xpath PASSING xml_expr [RETURNING CONTENT])` | `TEXT` | Evaluate a minimal XPath expression |
+
+```sql
+-- Build an element
+SELECT XMLELEMENT(NAME person,
+    XMLATTRIBUTES(42 AS id),
+    XMLFOREST('Alice' AS name, 30 AS age));
+-- <person id="42"><name>Alice</name><age>30</age></person>
+
+-- Wrap with XML declaration
+SELECT XMLROOT('<root/>'::XML, VERSION '1.0', STANDALONE YES);
+-- <?xml version="1.0" standalone="yes"?><root/>
+
+-- Concatenate fragments
+SELECT XMLCONCAT('<a/>'::XML, '<b/>'::XML);
+-- <a/><b/>
+
+-- XPath extraction
+SELECT XMLQUERY('/root/item/text()' PASSING '<root><item>hello</item></root>'::XML);
+-- 'hello'
+
+-- Attribute extraction
+SELECT XMLQUERY('/doc/elem/@id' PASSING '<doc><elem id="99"/></doc>'::XML);
+-- '99'
+```
+
+**XPath support**: `XMLQUERY` supports absolute paths (`/elem/...`) with `text()` and `@attr` terminal steps. Element names without a terminal step return the element's text content.
+
 ---
 
 ## NULL in Every Type

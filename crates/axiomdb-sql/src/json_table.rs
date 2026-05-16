@@ -880,6 +880,15 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
         Expr::Row(elems) => elems.iter().any(expr_has_outer_column_refs),
         Expr::FieldAccess { .. } => false,
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            attrs.iter().any(|(e, _)| expr_has_outer_column_refs(e))
+                || content.iter().any(expr_has_outer_column_refs)
+        }
+        Expr::XmlForest { items } => items.iter().any(|(e, _)| expr_has_outer_column_refs(e)),
+        Expr::XmlRoot { doc, .. } => expr_has_outer_column_refs(doc),
+        Expr::XmlConcat { args } => args.iter().any(expr_has_outer_column_refs),
+        Expr::XmlQuery { doc, .. } => expr_has_outer_column_refs(doc),
     }
 }
 
@@ -1108,6 +1117,15 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
         // as "yes" to force the NotImplemented branch (users can wrap the
         // doc in a CTE / derived table if they need constant materialization).
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            attrs.iter().any(|(e, _)| doc_has_column_refs(e))
+                || content.iter().any(doc_has_column_refs)
+        }
+        Expr::XmlForest { items } => items.iter().any(|(e, _)| doc_has_column_refs(e)),
+        Expr::XmlRoot { doc, .. } => doc_has_column_refs(doc),
+        Expr::XmlConcat { args } => args.iter().any(doc_has_column_refs),
+        Expr::XmlQuery { doc, .. } => doc_has_column_refs(doc),
     }
 }
 
