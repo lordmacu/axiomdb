@@ -577,6 +577,7 @@ fn column_type_to_is_data_type(col: &axiomdb_catalog::ColumnDef) -> String {
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar",
         ColumnType::Array => "array",
+        ColumnType::Range => "range",
     }
     .to_string()
 }
@@ -672,6 +673,7 @@ fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar",
         ColumnType::Array => "array",
+        ColumnType::Range => "range",
     }
 }
 
@@ -690,6 +692,7 @@ fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::Timestamp => "datetime",
         ColumnType::Uuid => "varchar(36)",
         ColumnType::Array => "array",
+        ColumnType::Range => "range",
     }
 }
 

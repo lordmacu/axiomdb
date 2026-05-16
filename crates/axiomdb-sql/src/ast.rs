@@ -18,6 +18,23 @@ use crate::expr::Expr;
 
 // ── Base types ────────────────────────────────────────────────────────────────
 
+/// Sampling method for `TABLESAMPLE` (Phase 20.11).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableSampleMethod {
+    /// Page-level sampling: each heap page is included or skipped as a unit.
+    System,
+    /// Row-level sampling: each MVCC-visible row is independently included.
+    Bernoulli,
+}
+
+/// `TABLESAMPLE SYSTEM(p)` or `TABLESAMPLE BERNOULLI(p)` clause (Phase 20.11).
+/// `percent` is in `[0.0, 100.0]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableSample {
+    pub method: TableSampleMethod,
+    pub percent: f64,
+}
+
 /// A qualified table reference with an optional alias.
 ///
 /// Supports 1-part (`table`), 2-part (`schema.table`), and 3-part
@@ -27,12 +44,14 @@ use crate::expr::Expr;
 ///   executor substitutes the session's effective database.
 /// - `schema` is `None` when the query omits the schema prefix; the executor
 ///   substitutes the session's default schema (typically `"public"`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub database: Option<String>,
     pub schema: Option<String>,
     pub name: String,
     pub alias: Option<String>,
+    /// Phase 20.11 — optional `TABLESAMPLE` clause. `None` = full scan.
+    pub tablesample: Option<TableSample>,
 }
 
 impl TableRef {
@@ -43,6 +62,7 @@ impl TableRef {
             schema: None,
             name: name.into(),
             alias: None,
+            tablesample: None,
         }
     }
 }
@@ -1474,7 +1494,7 @@ pub struct CreateAggregateStmt {
 }
 
 /// `CREATE SEQUENCE [IF NOT EXISTS] name [options]`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateSequenceStmt {
     pub if_not_exists: bool,
     pub sequence: TableRef,
@@ -1487,14 +1507,14 @@ pub struct CreateSequenceStmt {
 }
 
 /// `CREATE TYPE name AS ENUM ('label'[, ...])`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateEnumTypeStmt {
     pub enum_type: TableRef,
     pub labels: Vec<String>,
 }
 
 /// `DROP TYPE [IF EXISTS] name`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DropEnumTypeStmt {
     pub if_exists: bool,
     pub enum_type: TableRef,
@@ -1515,7 +1535,7 @@ pub struct DropAggregateStmt {
 }
 
 /// `DROP SEQUENCE [IF EXISTS] name [, ...]`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DropSequenceStmt {
     pub if_exists: bool,
     pub sequences: Vec<TableRef>,
@@ -1772,6 +1792,7 @@ mod tests {
                 schema: Some("public".into()),
                 name: "users".into(),
                 alias: None,
+                tablesample: None,
             },
             columns: vec![
                 ColumnDef {
@@ -1949,6 +1970,7 @@ mod tests {
                 schema: None,
                 name: "orders".into(),
                 alias: Some("o".into()),
+                tablesample: None,
             }),
             condition: JoinCondition::On(Expr::binop(
                 BinaryOp::Eq,

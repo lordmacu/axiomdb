@@ -59,6 +59,8 @@ pub enum Value {
     /// SQL array value — ordered collection of values (Phase 20.4).
     /// All elements share the same array element type (enforced at schema level).
     Array(Vec<Value>),
+    /// SQL range value (Phase 20.13). Boxed to keep Value size stable.
+    Range(Box<crate::range_value::RangeValue>),
 }
 
 impl Value {
@@ -79,6 +81,7 @@ impl Value {
             Self::Json(_) => "Json",
             Self::Jsonb(_) => "Jsonb",
             Self::Array(_) => "Array",
+            Self::Range(_) => "Range",
         }
     }
 
@@ -144,6 +147,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
+            Self::Range(rv) => write!(f, "{}", rv.to_display_string()),
         }
     }
 }

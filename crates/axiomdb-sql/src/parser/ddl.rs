@@ -1196,6 +1196,26 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             p.advance();
             (DataType::Timestamp, 0, false)
         }
+        Token::Ident(s) if s.eq_ignore_ascii_case("INT4RANGE") => {
+            p.advance();
+            (DataType::Range(Box::new(DataType::Int)), 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("INT8RANGE") => {
+            p.advance();
+            (DataType::Range(Box::new(DataType::BigInt)), 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("NUMRANGE") => {
+            p.advance();
+            (DataType::Range(Box::new(DataType::Decimal)), 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("DATERANGE") => {
+            p.advance();
+            (DataType::Range(Box::new(DataType::Date)), 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("TSRANGE") => {
+            p.advance();
+            (DataType::Range(Box::new(DataType::Timestamp)), 0, false)
+        }
         other => {
             return Err(DbError::ParseError {
                 message: format!(
@@ -2081,6 +2101,7 @@ fn fdw_datatype_to_column_type(
         DataType::Decimal => Ok(ColumnType::Decimal),
         DataType::Date => Ok(ColumnType::Date),
         DataType::Array(_) => Ok(ColumnType::Array),
+        DataType::Range(_) => Ok(ColumnType::Range),
     }
 }
 

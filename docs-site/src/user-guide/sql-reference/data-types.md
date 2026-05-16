@@ -544,6 +544,83 @@ CREATE INDEX ON tags_example USING GIN (tags);
 
 ---
 
+## Range Types
+
+Range types represent a contiguous span of values with configurable lower and upper bounds.
+
+| Type | Element type | Discrete canonicalization |
+|------|-------------|--------------------------|
+| `INT4RANGE` | `INT` | yes — `(a,b]` → `[a+1,b+1)` |
+| `INT8RANGE` | `BIGINT` | yes |
+| `DATERANGE` | `DATE` | yes |
+| `NUMRANGE` | `DECIMAL` | no |
+| `TSRANGE` | `TIMESTAMP` | no |
+
+Bound notation follows PostgreSQL:
+- `[` / `]` = inclusive bound
+- `(` / `)` = exclusive bound
+- empty string for a bound = unbounded (−∞ or +∞)
+- `empty` = the empty range (contains no points)
+
+```sql
+-- Constructors: rangeType(lower, upper [, bounds])
+SELECT int4range(1, 10);          -- [1,10)  (default bounds)
+SELECT int4range(1, 5, '[]');     -- [1,6)   (inclusive → canonicalized)
+SELECT int4range(1, 5, '()');     -- [2,5)   (exclusive lower → canonicalized)
+SELECT int4range(5, 5);           -- empty
+
+-- Cast from text literal
+SELECT CAST('[1,5)' AS INT4RANGE);
+SELECT 'empty'::INT4RANGE;
+
+-- CREATE TABLE with range column
+CREATE TABLE reservations (
+    id   INT PRIMARY KEY,
+    slot INT4RANGE
+);
+INSERT INTO reservations VALUES (1, int4range(9, 17));
+SELECT slot FROM reservations;    -- [9,17)
+```
+
+### Range Operators
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `@>` | Contains element or range | `int4range(1,10) @> 5` → `TRUE` |
+| `<@` | Is contained by | `5 <@ int4range(1,10)` → `TRUE` |
+| `&&` | Overlaps | `int4range(1,5) && int4range(4,8)` → `TRUE` |
+| `+` | Union (adjacent or overlapping) | `int4range(1,5) + int4range(5,10)` → `[1,10)` |
+| `*` | Intersection | `int4range(1,8) * int4range(4,12)` → `[4,8)` |
+| `-` | Difference (non-interior) | `int4range(1,10) - int4range(1,5)` → `[5,10)` |
+| `=`, `<>` | Equality / inequality | |
+| `<`, `<=`, `>`, `>=` | Ordering by lower then upper bound | |
+
+### Range Scalar Functions
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `lower(r)` | element or NULL | Lower bound; NULL if unbounded or empty |
+| `upper(r)` | element or NULL | Upper bound; NULL if unbounded or empty |
+| `isempty(r)` | BOOL | TRUE if the range is empty |
+| `lowerinc(r)` | BOOL | TRUE if lower bound is inclusive |
+| `upperinc(r)` | BOOL | TRUE if upper bound is inclusive |
+
+```sql
+-- Containment query: find slots that include hour 7
+SELECT id FROM reservations WHERE slot @> 7;
+
+-- Overlap query: find conflicting reservations
+SELECT a.id, b.id
+FROM reservations a, reservations b
+WHERE a.id < b.id AND a.slot && b.slot;
+```
+
+<div class="callout-advantage">
+**Advantage over application-level checks:** range operators evaluate containment and overlap in a single expression, eliminating the four-way `lo1 < hi2 AND hi1 > lo2` check that is easy to get wrong when mixing inclusive/exclusive bounds.
+</div>
+
+---
+
 ## NULL in Every Type
 
 Every column of every type can hold NULL unless declared `NOT NULL`. The row codec

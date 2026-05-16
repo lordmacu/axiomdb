@@ -540,6 +540,9 @@ impl std::hash::Hash for HashableValue {
                     HashableValue(elem.clone()).hash(state);
                 }
             }
+            Value::Range(rv) => {
+                rv.to_display_string().hash(state);
+            }
         }
     }
 }

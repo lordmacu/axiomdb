@@ -65,6 +65,12 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
             // Array key encoding deferred to Step 5 (operators).
             buf.push(0x0D);
         }
+        Value::Range(rv) => {
+            buf.push(0x0E);
+            let s = rv.to_display_string();
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
     }
     buf
 }

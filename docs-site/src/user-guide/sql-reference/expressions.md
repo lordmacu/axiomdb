@@ -486,6 +486,40 @@ SELECT flags & 0xFF FROM events;   -- bitmask with hex constant
 | `MOD(x, y)`       | Modulo                                   | `MOD(10, 3)` → `1`    |
 | `POWER(x, y)`     | x raised to the power y                  | `POWER(2, 8)` → `256` |
 | `SQRT(x)`         | Square root                              | `SQRT(16)` → `4`      |
+| `RAND()`          | Random float in `[0.0, 1.0)`            | `RAND()` → `0.7341…`  |
+| `RANDOM()`        | Alias for `RAND()`                       | `RANDOM()` → `0.2187…`|
+
+#### RAND() / RANDOM() and ORDER BY RANDOM()
+
+`RAND()` (alias `RANDOM()`) returns a uniformly distributed `REAL` value in the
+half-open interval `[0.0, 1.0)` using a cryptographically seeded PRNG. It accepts
+zero arguments — passing any argument is an error.
+
+```sql
+-- Random scalar
+SELECT RAND();           -- e.g. 0.7341592653589793
+
+-- Random row from a table
+SELECT * FROM products ORDER BY RANDOM() LIMIT 1;
+
+-- Random 5-row sample (loot drop, quiz randomization, A/B assignment)
+SELECT id, name FROM items WHERE rarity = 'epic' ORDER BY RANDOM() LIMIT 5;
+
+-- Sort by a column first, break ties randomly
+SELECT * FROM candidates ORDER BY score DESC, RANDOM();
+```
+
+**Implementation details:**
+
+- `ORDER BY RANDOM()` (single sort key) uses an in-place **Fisher-Yates shuffle**
+  — O(n), correct and uniform.
+- `ORDER BY col, RANDOM()` pre-materializes one random key per row before sorting
+  so the comparator sees stable values (avoids the transitivity violation that
+  occurs when RANDOM() is called inside the comparator).
+- `ORDER BY RANDOM() LIMIT N` shuffles the full result set first, then slices —
+  no heap-sort optimisation (heap requires repeated comparisons which break
+  pre-materialized keys).
+- `RAND(1)` with any argument returns an error: `RAND takes no arguments`.
 
 ### String Functions
 
@@ -593,6 +627,41 @@ as path components such as `$.items.0`.
 Use <code>JSON_EXTRACT(data, '$.field')</code> when targeting MySQL-compatible clients and <code>data->>'field'</code> when porting PostgreSQL-style SQL; AxiomDB accepts both for simple field extraction.
 </div>
 </div>
+
+### Range Functions
+
+Range types (`INT4RANGE`, `INT8RANGE`, `NUMRANGE`, `DATERANGE`, `TSRANGE`) support
+constructor functions, scalar accessors, and operators. See [Range Types](data-types.md#range-types)
+for the full type reference.
+
+| Function / Operator | Returns | Description |
+|---------------------|---------|-------------|
+| `int4range(lo, hi [, bounds])` | `INT4RANGE` | Construct integer range; bounds default `'[)'` |
+| `int8range(lo, hi [, bounds])` | `INT8RANGE` | Construct bigint range |
+| `numrange(lo, hi [, bounds])` | `NUMRANGE` | Construct numeric range |
+| `daterange(lo, hi [, bounds])` | `DATERANGE` | Construct date range |
+| `tsrange(lo, hi [, bounds])` | `TSRANGE` | Construct timestamp range |
+| `lower(r)` | element or NULL | Lower bound; NULL if unbounded or empty |
+| `upper(r)` | element or NULL | Upper bound; NULL if unbounded or empty |
+| `isempty(r)` | BOOL | TRUE if range is empty |
+| `lowerinc(r)` | BOOL | TRUE if lower bound is inclusive |
+| `upperinc(r)` | BOOL | TRUE if upper bound is inclusive |
+| `r @> point` | BOOL | Range contains element |
+| `r @> r2` | BOOL | Range contains range |
+| `point <@ r` | BOOL | Element is contained by range |
+| `r && r2` | BOOL | Ranges overlap |
+| `r + r2` | range | Union (ranges must overlap or be adjacent) |
+| `r * r2` | range | Intersection |
+| `r - r2` | range | Difference (error if result is non-contiguous) |
+
+`lower()` and `upper()` also work on strings (case conversion). The engine
+dispatches to range accessors when the argument is a range type, and to string
+functions otherwise.
+
+```sql
+SELECT lower(int4range(2, 8));   -- 2   (range lower bound)
+SELECT lower('HELLO');           -- 'hello'  (string lower-case)
+```
 
 ### Conditional Functions
 

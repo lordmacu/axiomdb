@@ -404,6 +404,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Decimal => Ok(ColumnType::Decimal),
         DataType::Date => Ok(ColumnType::Date),
         DataType::Array(_elem) => Ok(ColumnType::Array),
+        DataType::Range(_) => Ok(ColumnType::Range),
     }
 }
 
@@ -423,6 +424,7 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Decimal => DataType::Decimal,
         ColumnType::Date => DataType::Date,
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
+        ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
     }
 }
 
@@ -457,6 +459,7 @@ fn datatype_of_value(v: &Value) -> DataType {
             let elem_dt = elems.iter().find(|e| !matches!(e, Value::Null)).map(datatype_of_value).unwrap_or(DataType::Int);
             DataType::Array(Box::new(elem_dt))
         }
+        Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
     }
 }
 
@@ -948,10 +951,87 @@ fn compare_rows_by_columns(
 /// Uses `sort_by` (stable) to preserve insertion order for equal keys.
 /// Errors from expression evaluation are captured via `sort_err` and
 /// returned after the sort completes — `sort_by` cannot return `Result`.
+/// Returns true if `expr` is a zero-argument call to RAND or RANDOM.
+fn is_rand_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Function { name, args }
+        if args.is_empty()
+            && matches!(name.to_ascii_lowercase().as_str(), "rand" | "random"))
+}
+
+/// Returns true if any ORDER BY item expression is a RAND/RANDOM() call.
+fn order_by_has_random(order_items: &[OrderByItem]) -> bool {
+    order_items.iter().any(|item| is_rand_call(&item.expr))
+}
+
 fn apply_order_by(mut rows: Vec<Row>, order_items: &[OrderByItem]) -> Result<Vec<Row>, DbError> {
     if order_items.is_empty() {
         return Ok(rows);
     }
+
+    // Pure RANDOM() — single ORDER BY item that is a zero-arg RAND()/RANDOM() call.
+    // Fisher-Yates shuffle via rand crate: O(n), one key per row (not per comparison).
+    if order_items.len() == 1 && is_rand_call(&order_items[0].expr) {
+        use rand::seq::SliceRandom;
+        rows.shuffle(&mut rand::thread_rng());
+        return Ok(rows);
+    }
+
+    // Mixed ORDER BY: RANDOM() combined with other sort expressions.
+    // Pre-materialize one f64 per RANDOM() position per row before sorting so the
+    // comparator sees stable keys (calling RANDOM() inside sort_by would violate
+    // comparison transitivity and produce corrupt output).
+    if order_by_has_random(order_items) {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let random_positions: Vec<usize> = order_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| is_rand_call(&item.expr))
+            .map(|(i, _)| i)
+            .collect();
+        let mut rows_with_keys: Vec<(Row, Vec<f64>)> = rows
+            .into_iter()
+            .map(|row| {
+                let keys: Vec<f64> =
+                    random_positions.iter().map(|_| rng.gen::<f64>()).collect();
+                (row, keys)
+            })
+            .collect();
+        let mut sort_err: Option<DbError> = None;
+        rows_with_keys.sort_by(|(row_a, keys_a), (row_b, keys_b)| {
+            if sort_err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            let mut rand_key_a = keys_a.iter();
+            let mut rand_key_b = keys_b.iter();
+            for item in order_items {
+                let (key_a, key_b) = if is_rand_call(&item.expr) {
+                    (
+                        Value::Real(*rand_key_a.next().unwrap()),
+                        Value::Real(*rand_key_b.next().unwrap()),
+                    )
+                } else {
+                    match (eval(&item.expr, row_a), eval(&item.expr, row_b)) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) | (_, Err(e)) => {
+                            sort_err = Some(e);
+                            return std::cmp::Ordering::Equal;
+                        }
+                    }
+                };
+                let ord = compare_sort_values(&key_a, &key_b, item.order, item.nulls);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+        return Ok(rows_with_keys.into_iter().map(|(row, _)| row).collect());
+    }
+
     // Fast path: when all ORDER BY expressions are simple column references,
     // skip the expression evaluator and compare values directly by index.
     if let Some(cols) = try_extract_sort_columns(order_items) {
@@ -997,6 +1077,14 @@ fn apply_order_by_top_n(
 
     if order_items.is_empty() || rows.is_empty() || top_n == 0 {
         return Ok(Vec::new());
+    }
+
+    // RANDOM() in ORDER BY requires pre-materialized keys — the heap comparator cannot
+    // call RANDOM() per comparison (non-transitive). Fall back to full shuffle + truncate.
+    if order_by_has_random(order_items) {
+        let mut sorted = apply_order_by(rows, order_items)?;
+        sorted.truncate(top_n);
+        return Ok(sorted);
     }
 
     let k = top_n.min(rows.len());

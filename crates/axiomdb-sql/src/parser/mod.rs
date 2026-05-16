@@ -312,6 +312,7 @@ impl<'src> Parser<'src> {
                     schema: Some(second),
                     name: third,
                     alias: None,
+                    tablesample: None,
                 })
             } else {
                 // schema.table
@@ -320,6 +321,7 @@ impl<'src> Parser<'src> {
                     schema: Some(first),
                     name: second,
                     alias: None,
+                    tablesample: None,
                 })
             }
         } else {
@@ -329,6 +331,7 @@ impl<'src> Parser<'src> {
                 schema: None,
                 name: first,
                 alias: None,
+                tablesample: None,
             })
         }
     }

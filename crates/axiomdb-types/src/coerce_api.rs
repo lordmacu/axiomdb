@@ -151,6 +151,16 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // ── JSONB identity ───────────────────────────────────────────────────
         (v @ Value::Jsonb(_), DataType::Jsonb) => Ok(v),
 
+        // ── Text → Range (Phase 20.13) ────────────────────────────────────────
+        // `CAST('[1,5)' AS INT4RANGE)` or `'[1,5)'::int4range`
+        (Value::Text(s), DataType::Range(inner_box)) => {
+            let rv = crate::range_value::parse_range_literal_text(&s, &inner_box)?;
+            Ok(Value::Range(Box::new(rv)))
+        }
+
+        // ── Range identity ────────────────────────────────────────────────────
+        (v @ Value::Range(_), DataType::Range(_)) => Ok(v),
+
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),

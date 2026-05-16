@@ -505,6 +505,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Timestamp => 0x07,                               // TIMESTAMP
         DataType::Uuid => 0xfd,                                    // VAR_STRING
         DataType::Array(_) => 0xfd,                                // VAR_STRING (PG text format)
+        DataType::Range(_) => 0xfd,                                // VAR_STRING (text format)
     }
 }
 
@@ -521,6 +522,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Timestamp => 19,
         DataType::Uuid => 36,
         DataType::Array(_) => 16_777_215, // PG text format, variable-length
+        DataType::Range(_) => 64,         // range literal text e.g. "[1,5)"
     }
 }
 
@@ -624,6 +626,7 @@ fn value_to_text(v: &Value) -> String {
             // For now, return empty PG-compatible representation.
             "{}".to_string()
         }
+        Value::Range(rv) => rv.to_display_string(),
     }
 }
 

@@ -5180,9 +5180,9 @@ ok("[20.6 read_parquet_count_star] COUNT(*) on READ_PARQUET returns 2",
 
 import tempfile as _tempfile, os as _os
 
-_bk_full = _os.path.join(_tempfile.gettempdir(), "axm_wire_full.axbk")
-_bk_inc  = _os.path.join(_tempfile.gettempdir(), "axm_wire_inc.axbk")
-_bk_rest = _os.path.join(_tempfile.gettempdir(), "axm_wire_rest.db")
+_bk_full = "/tmp/axm_wire_full.axbk"
+_bk_inc  = "/tmp/axm_wire_inc.axbk"
+_bk_rest = "/tmp/axm_wire_rest.db"
 for _p in [_bk_full, _bk_inc, _bk_rest]:
     if _os.path.exists(_p):
         _os.remove(_p)
@@ -5320,6 +5320,99 @@ cur.execute("SELECT NULL ~ 'x'")
 _null_tilde = cur.fetchone()[0]
 ok("[20.15g null_tilde_propagates] NULL ~ 'x' → NULL", _null_tilde is None, _null_tilde)
 
+
+# ── 20.11 — TABLESAMPLE ───────────────────────────────────────────────────────
+
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_tablesample (v INT)")
+cur.execute("DELETE FROM _wire_tablesample")
+for _i in range(20):
+    cur.execute(f"INSERT INTO _wire_tablesample VALUES ({_i})")
+conn.commit()
+
+cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE SYSTEM(100)")
+ok("[20.11a tablesample_system_100] TABLESAMPLE SYSTEM(100) returns all rows",
+   cur.fetchone()[0] == 20)
+
+cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE SYSTEM(0)")
+_sys0_row = cur.fetchone()
+ok("[20.11b tablesample_system_0] TABLESAMPLE SYSTEM(0) returns no rows",
+   _sys0_row is not None and _sys0_row[0] == 0,
+   f"row={_sys0_row!r}")
+
+cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE BERNOULLI(100)")
+ok("[20.11c tablesample_bernoulli_100] TABLESAMPLE BERNOULLI(100) returns all rows",
+   cur.fetchone()[0] == 20)
+
+conn.commit()
+
+
+# ── 20.12 — ORDER BY RANDOM() ─────────────────────────────────────────────────
+
+cur.execute("CREATE TABLE IF NOT EXISTS _wire_random (v INT)")
+cur.execute("DELETE FROM _wire_random")
+for _i in range(10):
+    cur.execute(f"INSERT INTO _wire_random VALUES ({_i})")
+conn.commit()
+
+# 20.12a: ORDER BY RANDOM() returns all rows (count-based permutation check)
+cur.execute("SELECT COUNT(*) FROM (SELECT v FROM _wire_random ORDER BY RANDOM()) sub")
+ok("[20.12a order_by_random_count] ORDER BY RANDOM() returns all rows", cur.fetchone()[0] == 10)
+
+# 20.12b: ORDER BY RANDOM() LIMIT 3 returns exactly 3 rows
+cur.execute("SELECT COUNT(*) FROM (SELECT v FROM _wire_random ORDER BY RANDOM() LIMIT 3) sub")
+ok("[20.12b order_by_random_limit] ORDER BY RANDOM() LIMIT 3 → 3 rows", cur.fetchone()[0] == 3)
+
+# 20.12c: RAND() returns a Real in [0, 1)
+cur.execute("SELECT RAND()")
+_rand_val = cur.fetchone()[0]
+ok("[20.12c rand_scalar_range] RAND() returns value in [0,1)", 0.0 <= _rand_val < 1.0, _rand_val)
+
+
+# ── 20.13 Range types smoke ───────────────────────────────────────────────────
+
+def _as_str(v):
+    return v.decode() if isinstance(v, bytes) else str(v)
+
+cur.execute("SELECT int4range(1, 10)")
+ok("[20.13a int4range_constructor] int4range(1,10) returns '[1,10)'",
+   _as_str(cur.fetchone()[0]) == "[1,10)")
+
+cur.execute("SELECT int4range(1, 5, '[]')")
+ok("[20.13b int4range_inclusive_bounds] int4range(1,5,'[]') canonicalizes to '[1,6)'",
+   _as_str(cur.fetchone()[0]) == "[1,6)")
+
+cur.execute("SELECT int4range(1, 10) @> 5")
+ok("[20.13c contains_element_true] [1,10) @> 5 = true", cur.fetchone()[0] == 1)
+
+cur.execute("SELECT int4range(1, 10) @> 10")
+ok("[20.13d contains_element_false] [1,10) @> 10 = false", cur.fetchone()[0] == 0)
+
+cur.execute("SELECT int4range(1, 5) && int4range(4, 8)")
+ok("[20.13e overlap_true] [1,5) && [4,8) = true", cur.fetchone()[0] == 1)
+
+cur.execute("SELECT lower(int4range(2, 8))")
+ok("[20.13f lower_fn] lower(int4range(2,8)) = 2", cur.fetchone()[0] == 2)
+
+cur.execute("SELECT upper(int4range(2, 8))")
+ok("[20.13g upper_fn] upper(int4range(2,8)) = 8", cur.fetchone()[0] == 8)
+
+cur.execute("SELECT isempty(int4range(5, 5))")
+ok("[20.13h isempty_true] isempty(int4range(5,5)) = true", cur.fetchone()[0] == 1)
+
+cur.execute("SELECT int4range(1, 5) + int4range(5, 10)")
+ok("[20.13i union] [1,5) + [5,10) = '[1,10)'", _as_str(cur.fetchone()[0]) == "[1,10)")
+
+cur.execute("SELECT CAST('[1,5)' AS INT4RANGE)")
+ok("[20.13j cast_text_to_range] CAST('[1,5)' AS INT4RANGE) = '[1,5)'",
+   _as_str(cur.fetchone()[0]) == "[1,5)")
+
+cur.execute("DROP TABLE IF EXISTS _wire_range_slots")
+cur.execute("CREATE TABLE _wire_range_slots (id INT PRIMARY KEY, period INT4RANGE)")
+cur.execute("INSERT INTO _wire_range_slots VALUES (1, int4range(1, 10))")
+cur.execute("INSERT INTO _wire_range_slots VALUES (2, int4range(20, 30))")
+cur.execute("SELECT id FROM _wire_range_slots WHERE period @> 5")
+ids = [row[0] for row in cur.fetchall()]
+ok("[20.13k range_in_where] WHERE period @> 5 returns id=1", ids == [1], ids)
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

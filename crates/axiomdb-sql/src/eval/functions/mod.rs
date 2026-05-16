@@ -10,6 +10,7 @@ pub(crate) mod datetime;
 mod json;
 mod nulls;
 mod numeric;
+pub(crate) mod range;
 mod sql_json_query;
 mod string;
 mod system;
@@ -36,6 +37,25 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "sign" | "pi" | "exp" | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "asin"
         | "acos" | "atan" | "atan2" | "cot" | "radians" | "degrees" | "truncate" | "trunc"
         | "rand" | "random" | "greatest" | "least" => numeric::eval(lower.as_str(), args, row),
+
+        // Range constructor functions (Phase 20.13)
+        "int4range" | "int8range" | "numrange" | "daterange" | "tsrange"
+        | "isempty" | "lowerinc" | "upperinc" | "lowerbnd" | "upperbnd" => {
+            range::eval(lower.as_str(), args, row)
+        }
+
+        // `lower` and `upper` are overloaded: string functions AND range bound accessors.
+        // Dispatch based on the runtime type of the first argument.
+        "lower" | "lcase" | "upper" | "ucase" if !args.is_empty() => {
+            // Evaluate first arg to check if it's a range
+            let first = crate::eval::eval(&args[0], row)?;
+            if matches!(first, Value::Range(_)) {
+                // Re-eval via range module (it will re-eval args internally)
+                range::eval(lower.as_str(), args, row)
+            } else {
+                string::eval(lower.as_str(), args, row)
+            }
+        }
 
         "length" | "char_length" | "character_length" | "len" | "octet_length" | "byte_length"
         | "upper" | "ucase" | "lower" | "lcase" | "trim" | "ltrim" | "rtrim" | "substr"

@@ -551,6 +551,7 @@ pub fn value_to_sql_literal(v: &Value) -> String {
             // Array SQL literal deferred to Step 10.
             "'{}'".to_string()
         }
+        Value::Range(rv) => format!("'{}'", rv.to_display_string().replace('\'', "''")),
     }
 }
 

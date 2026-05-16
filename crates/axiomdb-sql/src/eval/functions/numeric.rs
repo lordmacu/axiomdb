@@ -288,14 +288,12 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
         }
 
         "rand" | "random" => {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos();
-            let r = (seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) as f64)
-                / (u32::MAX as f64 + 1.0);
-            Ok(Value::Real(r))
+            if !args.is_empty() {
+                return Err(DbError::InvalidValue {
+                    reason: "RAND takes no arguments".into(),
+                });
+            }
+            Ok(Value::Real(rand::random::<f64>()))
         }
 
         "greatest" => {

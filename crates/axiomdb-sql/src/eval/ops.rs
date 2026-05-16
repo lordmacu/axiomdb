@@ -260,6 +260,13 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         return eval_binary_array(op, l, r);
     }
 
+    // ── Range operator dispatch (Phase 20.13) ─────────────────────────────────
+    if matches!(&l, Value::Range(_))
+        || (matches!(&r, Value::Range(_)) && matches!(op, BinaryOp::JsonContainedBy))
+    {
+        return eval_binary_range(op, l, r);
+    }
+
     // NULL propagation for all other binary ops.
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
@@ -1406,4 +1413,119 @@ fn eval_jsonb_delete_idx(doc: &[u8], idx: i64) -> Result<Value, DbError> {
         }
     };
     serde_json_to_jsonb_value(&out)
+}
+
+// ── Range binary operators (Phase 20.13) ─────────────────────────────────────
+
+/// Dispatch binary operators when LHS (or RHS for <@) is a range value.
+fn eval_binary_range(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
+    match op {
+        BinaryOp::Eq => {
+            let (a, b) = require_both_ranges(l, r, "=")?;
+            Ok(Value::Bool(a == b))
+        }
+        BinaryOp::NotEq => {
+            let (a, b) = require_both_ranges(l, r, "<>")?;
+            Ok(Value::Bool(a != b))
+        }
+        BinaryOp::Lt => {
+            let (a, b) = require_both_ranges(l, r, "<")?;
+            Ok(Value::Bool(a < b))
+        }
+        BinaryOp::LtEq => {
+            let (a, b) = require_both_ranges(l, r, "<=")?;
+            Ok(Value::Bool(a <= b))
+        }
+        BinaryOp::Gt => {
+            let (a, b) = require_both_ranges(l, r, ">")?;
+            Ok(Value::Bool(a > b))
+        }
+        BinaryOp::GtEq => {
+            let (a, b) = require_both_ranges(l, r, ">=")?;
+            Ok(Value::Bool(a >= b))
+        }
+
+        // @> containment: range @> range  OR  range @> element
+        BinaryOp::JsonContains => match l {
+            Value::Range(ref rv) => match &r {
+                Value::Range(rv2) => Ok(Value::Bool(rv.contains_range(rv2))),
+                _ => Ok(Value::Bool(rv.contains_value(&r))),
+            },
+            _ => Err(DbError::TypeMismatch {
+                expected: "RANGE @> RANGE or RANGE @> element".to_string(),
+                got: format!("{} @> {}", l.variant_name(), r.variant_name()),
+            }),
+        },
+
+        // <@ contained-by: range <@ range  OR  element <@ range
+        BinaryOp::JsonContainedBy => match r {
+            Value::Range(ref rv) => match &l {
+                Value::Range(rv_l) => Ok(Value::Bool(rv.contains_range(rv_l))),
+                _ => Ok(Value::Bool(rv.contains_value(&l))),
+            },
+            _ => Err(DbError::TypeMismatch {
+                expected: "RANGE <@ RANGE or element <@ RANGE".to_string(),
+                got: format!("{} <@ {}", l.variant_name(), r.variant_name()),
+            }),
+        },
+
+        // && overlap
+        BinaryOp::ArrayOverlap => {
+            let (a, b) = require_both_ranges(l, r, "&&")?;
+            Ok(Value::Bool(a.overlaps(&b)))
+        }
+
+        // + union
+        BinaryOp::Add => {
+            let (a, b) = require_both_ranges(l, r, "+")?;
+            a.union(&b)
+                .map(|rv| Value::Range(Box::new(rv)))
+                .ok_or_else(|| DbError::InvalidValue {
+                    reason: "ranges do not overlap or are not adjacent — cannot compute union"
+                        .to_string(),
+                })
+        }
+
+        // * intersection
+        BinaryOp::Mul => {
+            let (a, b) = require_both_ranges(l, r, "*")?;
+            Ok(Value::Range(Box::new(a.intersection(&b))))
+        }
+
+        // - difference
+        BinaryOp::Sub => {
+            let (a, b) = require_both_ranges(l, r, "-")?;
+            match a.difference(&b) {
+                Some(rv) => Ok(Value::Range(Box::new(rv))),
+                None => Err(DbError::InvalidValue {
+                    reason: "range difference would produce a non-contiguous result".to_string(),
+                }),
+            }
+        }
+
+        _ => Err(DbError::TypeMismatch {
+            expected: "range operator".to_string(),
+            got: format!("{} on Range", op_variant_name(&op)),
+        }),
+    }
+}
+
+fn require_both_ranges(
+    l: Value,
+    r: Value,
+    op: &str,
+) -> Result<
+    (
+        Box<axiomdb_types::range_value::RangeValue>,
+        Box<axiomdb_types::range_value::RangeValue>,
+    ),
+    DbError,
+> {
+    match (l, r) {
+        (Value::Range(a), Value::Range(b)) => Ok((a, b)),
+        (l, r) => Err(DbError::TypeMismatch {
+            expected: format!("RANGE {op} RANGE"),
+            got: format!("{} {op} {}", l.variant_name(), r.variant_name()),
+        }),
+    }
 }

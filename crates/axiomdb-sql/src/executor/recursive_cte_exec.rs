@@ -220,6 +220,7 @@ fn substitute_self_ref_with_values(
                 schema: None,
                 name: String::new(),
                 alias: None,
+                tablesample: None,
             }),
         );
         join.table = replace(taken);

@@ -160,6 +160,7 @@ fn value_to_csv_field(v: &Value) -> String {
                 u & 0xffff_ffff_ffff
             )
         }
+        Value::Range(rv) => rv.to_display_string(),
         Value::Array(elems) => {
             let json_arr: Vec<serde_json::Value> =
                 elems.iter().map(value_to_json_val).collect();
@@ -251,6 +252,7 @@ fn value_to_json_val(v: &Value) -> serde_json::Value {
         Value::Array(elems) => {
             serde_json::Value::Array(elems.iter().map(value_to_json_val).collect())
         }
+        Value::Range(rv) => serde_json::Value::String(rv.to_display_string()),
     }
 }
 

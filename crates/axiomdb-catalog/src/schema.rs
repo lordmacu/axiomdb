@@ -56,6 +56,8 @@ mod tests {
             ColumnType::Jsonb,
             ColumnType::Decimal,
             ColumnType::Date,
+            ColumnType::Array,
+            ColumnType::Range,
         ];
         for v in variants {
             let byte: u8 = v.into();
@@ -64,11 +66,11 @@ mod tests {
         }
     }
 
-    // Discriminants 0, 14-254, and 255 are invalid; 1-13 are valid (including Array = 13)
+    // Discriminants 0, 15-254, and 255 are invalid; 1-14 are valid (Range = 14)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(14).is_err());
+        assert!(ColumnType::try_from(15).is_err());
         assert!(ColumnType::try_from(255).is_err());
     }
 

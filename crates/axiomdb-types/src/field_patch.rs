@@ -31,7 +31,8 @@ pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
         | DataType::Bytes
         | DataType::Decimal
         | DataType::Uuid
-        | DataType::Array(_) => None,
+        | DataType::Array(_)
+        | DataType::Range(_) => None,
     }
 }
 
