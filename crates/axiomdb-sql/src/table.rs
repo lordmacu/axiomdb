@@ -58,6 +58,8 @@ use axiomdb_types::{
     DataType, Value,
 };
 use axiomdb_wal::TxnManager;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal as RustDecimal, RoundingStrategy};
 use std::mem::size_of;
 
 use crate::{clustered_secondary::ClusteredSecondaryLayout, key_encoding::encode_index_key};
@@ -733,6 +735,45 @@ fn apply_prepared_updates_preserve_rid(
 }
 
 /// Applies strict-mode coercion to each value against its target column type.
+/// Rounds `Value::Decimal(m, s_src)` to `scale` decimal places (ROUND_HALF_UP),
+/// then checks that the integer part fits within `precision - scale` digits.
+/// Returns `DbError::InvalidValue` on overflow. NULL values pass through unchanged.
+pub(crate) fn enforce_decimal_precision(
+    v: Value,
+    precision: u8,
+    scale: u8,
+) -> Result<Value, DbError> {
+    let (m, s_src) = match v {
+        Value::Null => return Ok(Value::Null),
+        Value::Decimal(m, s) => (m, s),
+        other => return Ok(other),
+    };
+
+    // Convert to rust_decimal for correct ROUND_HALF_UP.
+    let rd = RustDecimal::from_i128_with_scale(m, s_src as u32);
+    let rounded = rd.round_dp_with_strategy(scale as u32, RoundingStrategy::MidpointAwayFromZero);
+
+    // Convert back: new_mantissa = rounded × 10^scale
+    let factor = RustDecimal::from(10i64.pow(scale as u32));
+    let scaled = rounded * factor;
+    let new_mantissa = scaled.to_i128().ok_or(DbError::Overflow)?;
+
+    // Check integer part: |new_mantissa| / 10^scale must have < 10^(precision-scale) digits.
+    let max_int_digits = precision.saturating_sub(scale);
+    let max_int = 10u128.pow(max_int_digits as u32);
+    let int_part = new_mantissa.unsigned_abs() / 10u128.pow(scale as u32);
+    if int_part >= max_int {
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "value overflows DECIMAL({precision},{scale}): \
+                 integer part ({int_part}) exceeds {max_int_digits} digit(s)"
+            ),
+        });
+    }
+
+    Ok(Value::Decimal(new_mantissa, scale))
+}
+
 pub(crate) fn coerce_values(
     values: Vec<Value>,
     columns: &[ColumnDef],
@@ -755,7 +796,11 @@ pub(crate) fn coerce_values(
                 ColumnType::Timestamp => DataType::Timestamp,
                 ColumnType::Uuid => DataType::Uuid,
                 ColumnType::Jsonb => DataType::Jsonb,
-                ColumnType::Decimal => DataType::Decimal,
+                ColumnType::Decimal => {
+                    let coerced = coerce(v, DataType::Decimal, CoercionMode::Strict)?;
+                    let (prec, scale) = decimal_precision_scale(col);
+                    return enforce_decimal_precision(coerced, prec, scale);
+                }
                 ColumnType::Date => DataType::Date,
                 ColumnType::Array => {
                     // Use element type from ColumnDef metadata
@@ -772,6 +817,14 @@ pub(crate) fn coerce_values(
             coerce(v, target, CoercionMode::Strict)
         })
         .collect()
+}
+
+fn decimal_precision_scale(col: &ColumnDef) -> (u8, u8) {
+    if col.type_len != 0 {
+        ((col.type_len >> 8) as u8, (col.type_len & 0xFF) as u8)
+    } else {
+        (10, 0)
+    }
 }
 
 /// Session-aware coercion for a single row.
@@ -807,7 +860,22 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::Timestamp => DataType::Timestamp,
             ColumnType::Uuid => DataType::Uuid,
             ColumnType::Jsonb => DataType::Jsonb,
-            ColumnType::Decimal => DataType::Decimal,
+            ColumnType::Decimal => {
+                // Coerce to Decimal first, then enforce precision/scale from type_len.
+                let mode = if ctx.strict_mode {
+                    CoercionMode::Strict
+                } else {
+                    CoercionMode::Permissive
+                };
+                let coerced = match coerce(v.clone(), DataType::Decimal, CoercionMode::Strict) {
+                    Ok(c) => c,
+                    Err(_) if !ctx.strict_mode => coerce(v, DataType::Decimal, mode)?,
+                    Err(e) => return Err(e),
+                };
+                let (prec, scale) = decimal_precision_scale(col);
+                out.push(enforce_decimal_precision(coerced, prec, scale)?);
+                continue;
+            }
             ColumnType::Date => DataType::Date,
             ColumnType::Array => {
                 let elem_ct = col.array_element_type.unwrap_or(ColumnType::Text);
