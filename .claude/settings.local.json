@@ -62,7 +62,19 @@
       "Bash(awk '/fn parse_create_sequence/,/^pub/ {print NR\": \"$0}' /Users/cristian/nexusdb/crates/axiomdb-sql/src/parser/ddl.rs)",
       "Bash(awk '/^pub\\\\\\(crate\\\\\\) fn parse_create_table/,/^pub/ {print NR\": \"$0}' /Users/cristian/nexusdb/crates/axiomdb-sql/src/parser/ddl.rs)",
       "Bash(awk '/^## Fase 20/,/^## Fase [0-9]/' docs/progreso.md)",
-      "Bash(./tools/vm.sh cargo *)"
+      "Bash(./tools/vm.sh cargo *)",
+      "Bash(sed -n '255,280p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/shared.rs)",
+      "Bash(sed -n '14,30p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/agg_descriptor.rs)",
+      "Bash(sed -n '274,295p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/agg_descriptor.rs)",
+      "Bash(sed -n '405,420p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/agg_group_table.rs)",
+      "Bash(sed -n '499,520p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/agg_group_table.rs)",
+      "Bash(sed -n '217,235p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/select_ctx.rs)",
+      "Bash(sed -n '96,115p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/ddl_create_table.rs)",
+      "Bash(sed -n '186,210p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/executor/ddl_alter_column.rs)",
+      "Bash(sed -n '769,790p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/json_table.rs)",
+      "Bash(sed -n '1010,1030p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/json_table.rs)",
+      "Bash(sed -n '79,100p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/partial_index.rs)",
+      "Bash(sed -n '176,200p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/plan_deps.rs)"
     ],
     "additionalDirectories": [
       "/Users/cristian/nexusdb/docs"

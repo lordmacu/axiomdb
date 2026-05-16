@@ -875,6 +875,8 @@ pub fn expr_has_outer_column_refs(expr: &crate::expr::Expr) -> bool {
         Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
             expr_has_outer_column_refs(expr) || expr_has_outer_column_refs(array)
         }
+        Expr::Row(elems) => elems.iter().any(expr_has_outer_column_refs),
+        Expr::FieldAccess { .. } => false,
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
     }
 }
@@ -1098,6 +1100,8 @@ pub fn doc_has_column_refs(expr: &crate::expr::Expr) -> bool {
         Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
             doc_has_column_refs(expr) || doc_has_column_refs(array)
         }
+        Expr::Row(elems) => elems.iter().any(doc_has_column_refs),
+        Expr::FieldAccess { .. } => true,
         // Subqueries are not correlation we can detect at this layer — treat
         // as "yes" to force the NotImplemented branch (users can wrap the
         // doc in a CTE / derived table if they need constant materialization).

@@ -1228,6 +1228,19 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
             });
         }
 
+        // ROW(expr, ...) — composite value constructor (Phase 20.18).
+        if name.eq_ignore_ascii_case("row") {
+            let mut elems = Vec::new();
+            if !matches!(p.peek(), Token::RParen) {
+                elems.push(parse_expr(p)?);
+                while p.eat(&Token::Comma) {
+                    elems.push(parse_expr(p)?);
+                }
+            }
+            p.expect(&Token::RParen)?;
+            return Ok(Expr::Row(elems));
+        }
+
         // Regular args or no args
         let mut args = Vec::new();
         if !matches!(p.peek(), Token::RParen) {

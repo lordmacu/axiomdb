@@ -369,7 +369,9 @@ fn validate_generated_expr_refs(
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. }
         | Expr::Param { .. }
-        | Expr::Default => Err(DbError::InvalidValue {
+        | Expr::Default
+        | Expr::Row(_)
+        | Expr::FieldAccess { .. } => Err(DbError::InvalidValue {
             reason: format!(
                 "unsupported expression in generated column '{generated_name}'"
             ),

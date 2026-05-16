@@ -283,6 +283,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::CreateHolidayCalendar(_) | Stmt::DropHolidayCalendar(_) => Ok(()),
             // Phase 20.17: Exchange rate DDL — no table deps.
             Stmt::CreateExchangeRate(_) | Stmt::DropExchangeRate(_) => Ok(()),
+            // Phase 20.18: Composite type DDL — no table deps.
+            Stmt::CreateCompositeType(_) | Stmt::DropCompositeType(_) => Ok(()),
         }
     }
 
@@ -579,6 +581,13 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 self.visit_expr(expr)?;
                 self.visit_expr(array)
             }
+            Expr::Row(elems) => {
+                for e in elems {
+                    self.visit_expr(e)?;
+                }
+                Ok(())
+            }
+            Expr::FieldAccess { .. } => Ok(()),
         }
     }
 

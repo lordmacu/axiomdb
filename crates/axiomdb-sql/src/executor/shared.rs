@@ -370,6 +370,16 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
             collect_column_refs(expr, mask);
             collect_column_refs(array, mask);
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_column_refs(e, mask);
+            }
+        }
+        Expr::FieldAccess { col_idx, .. } => {
+            if *col_idx < mask.len() {
+                mask[*col_idx] = true;
+            }
+        }
     }
 }
 

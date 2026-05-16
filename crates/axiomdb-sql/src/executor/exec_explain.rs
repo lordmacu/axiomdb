@@ -253,6 +253,11 @@ fn dispatch(
                 feature: "exchange rate DDL — use session-aware path".into(),
             })
         }
+        Stmt::CreateCompositeType(_) | Stmt::DropCompositeType(_) => {
+            Err(DbError::NotImplemented {
+                feature: "composite type DDL — use session-aware path".into(),
+            })
+        }
     }
 }
 

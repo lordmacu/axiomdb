@@ -448,6 +448,15 @@ fn resolve_expr_full(
                 array: Box::new(resolved_array),
             })
         }
+        Expr::Row(elems) => {
+            let resolved: Result<Vec<_>, _> = elems
+                .into_iter()
+                .map(|e| resolve_expr_full(e, ctx, outer_scopes, state))
+                .collect();
+            Ok(Expr::Row(resolved?))
+        }
+        // FieldAccess is an analyzer output — should not appear as input.
+        e @ Expr::FieldAccess { .. } => Ok(e),
     }
 }
 

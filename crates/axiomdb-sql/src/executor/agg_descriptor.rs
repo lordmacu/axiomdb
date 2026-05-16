@@ -78,6 +78,8 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::AnyOf { expr, array, .. } | Expr::AllOf { expr, array, .. } => {
             contains_aggregate(expr) || contains_aggregate(array)
         }
+        Expr::Row(elems) => elems.iter().any(contains_aggregate),
+        Expr::FieldAccess { .. } => false,
     }
 }
 
@@ -471,6 +473,12 @@ fn collect_agg_exprs_from(expr: &Expr, result: &mut Vec<AggExpr>) {
             collect_agg_exprs_from(expr, result);
             collect_agg_exprs_from(array, result);
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_agg_exprs_from(e, result);
+            }
+        }
+        Expr::FieldAccess { .. } => {}
     }
 }
 

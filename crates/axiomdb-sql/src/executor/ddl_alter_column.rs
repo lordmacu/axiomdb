@@ -290,6 +290,8 @@ fn expr_mentions_column_name(expr: &crate::expr::Expr, target_name: &str) -> boo
             expr_mentions_column_name(expr, target_name)
                 || expr_mentions_column_name(array, target_name)
         }
+        Expr::Row(elems) => elems.iter().any(|e| expr_mentions_column_name(e, target_name)),
+        Expr::FieldAccess { .. } => false,
     }
 }
 

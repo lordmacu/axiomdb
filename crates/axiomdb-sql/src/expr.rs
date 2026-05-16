@@ -390,6 +390,22 @@ pub enum Expr {
         /// The array expression.
         array: Box<Expr>,
     },
+
+    /// `ROW(expr, ...)` constructor — builds a composite value at runtime.
+    ///
+    /// Each element corresponds to one field of the composite type in order.
+    /// The analyzer resolves the expected type and validates arity.
+    Row(Vec<Expr>),
+
+    /// `col.field` — field access on a composite column.
+    ///
+    /// Produced by the analyzer when it rewrites `col.field` dot notation.
+    /// `col_idx` is the column position in the FROM list; `field_idx` is the
+    /// zero-based field index within the composite type.
+    FieldAccess {
+        col_idx: usize,
+        field_idx: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
