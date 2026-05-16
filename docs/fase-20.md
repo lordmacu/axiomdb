@@ -631,3 +631,107 @@ SELECT home.city FROM orders;         -- returns NULL
   dot-notation SELECT/WHERE, NULL propagation, and catalog round-trip.
 - `tools/wire-test.py` — 4 wire assertions: `[20.18 composite]`
 - All 4187/4187 workspace tests pass; clippy + fmt clean.
+
+---
+
+## 20.19 — ltree hierarchical path type (2026-05-16)
+
+### What was built
+
+**`LTREE`** — a PostgreSQL-compatible hierarchical path type. A value is a dot-separated sequence
+of labels matching `[A-Za-z0-9_]+` (e.g., `'org.eng.backend'`). Supports ancestor/descendant
+operators, lquery wildcard matching, concatenation, and seven scalar functions.
+
+### Architecture
+
+#### Types layer (`axiomdb-types`)
+
+- `crates/axiomdb-types/src/ltree.rs` — pure Rust library for all ltree logic:
+  - `validate_ltree_path(&str) → Result<(), DbError>` — validates `[A-Za-z0-9_]+` dot-separated.
+  - `ltree_is_ancestor(ancestor, descendant) → bool` — prefix label comparison.
+  - `ltree_concat(left, right) → String` — join with `.`.
+  - `lquery_match(path, pattern) → bool` — `*` matches 0-or-more labels; anchored.
+  - `ltree_nlevel(path) → usize` — count of labels.
+  - `ltree_subpath(path, offset, len) → Option<String>` — suffix/slice; None if out of bounds.
+  - `ltree_index(path, subpath, offset) → Option<usize>` — first position of subpath.
+  - `ltree_lca(paths: &[&str]) → String` — longest common ancestor.
+  - 34 unit tests, all passing.
+- `Value::Ltree(String)` — new variant in the Value enum.
+- `DataType::Ltree` — new discriminant; `ColumnType::Ltree = 17`.
+- **On-disk codec**: u32 LE length prefix + UTF-8 bytes (same pattern as `Composite`, NOT the
+  u24 pattern used for `Text`). Handled in `encode_row`, `decode_row`, `decode_row_masked`.
+- Coercions: `Text → Ltree` (validates path), `Ltree → Text` (strips wrapper), identity.
+- `array_codec`: Ltree arrays are rejected (not supported as array element type).
+
+#### Catalog layer (`axiomdb-catalog`)
+
+- `ColumnType::Ltree = 17` added to `schema_database.rs` and `schema_aggregate.rs`.
+- `data_type_tag` / `data_type_from_tag` updated for `DataType::Ltree ↔ 17`.
+- `schema.rs` invalid-discriminant test updated to use `try_from(18)` (17 is now valid).
+
+#### Parser / DDL (`axiomdb-sql`)
+
+- `parse_column_type`: recognizes `LTREE` keyword → `DataType::Ltree`.
+- `data_type_to_column_type`: `DataType::Ltree → ColumnType::Ltree`.
+- `table.rs`: `ColumnType::Ltree → DataType::Ltree` in both `column_type_to_data_type` and
+  `column_data_types`.
+
+#### Operator dispatch (`eval/ops.rs`)
+
+Ltree operator dispatch inserted before NULL propagation (same pattern as Range/Money):
+
+```rust
+if matches!(&l, Value::Ltree(_)) {
+    return eval_binary_ltree(op, l, r);
+}
+```
+
+Operators reuse existing `BinaryOp` variants:
+
+| SQL operator | `BinaryOp` | Semantics |
+|---|---|---|
+| `@>` | `JsonContains` | ancestor: `lpath` is ancestor of RHS |
+| `<@` | `JsonContainedBy` | descendant: `lpath` is descendant of RHS |
+| `~` | `RegexpTilde` | lquery match; `*` = 0-or-more labels |
+| `\|\|` | `Concat` | concatenate two ltree paths |
+| `=`, `<>`, `<`, `<=`, `>`, `>=` | equality/comparison | lexicographic label comparison |
+
+#### Scalar functions (`eval/functions/ltree.rs`)
+
+New module `eval/functions/ltree.rs` registered in `mod.rs`:
+
+| Function | Signature | Notes |
+|---|---|---|
+| `nlevel(ltree)` | `→ Int` | number of labels |
+| `subpath(ltree, offset[, len])` | `→ Ltree\|NULL` | negative offset counts from end |
+| `subltree(ltree, start, end)` | `→ Ltree\|NULL` | labels `[start, end)` |
+| `index(ltree, ltree[, offset])` | `→ Int` | -1 if not found |
+| `lca(ltree, ...)` | `→ Ltree` | longest common ancestor |
+| `text2ltree(text)` | `→ Ltree` | validates and wraps |
+| `ltree2text(ltree)` | `→ Text` | strips type wrapper |
+
+All functions propagate NULL when any argument is NULL.
+
+#### Wire protocol (`axiomdb-network`)
+
+- `DataType::Ltree` → MySQL type `0xfd` (`VAR_STRING`), charset = `results_collation.id` (not
+  binary 63), `display_len = 65535`.
+- `value_to_text` produces the raw path string.
+
+#### Non-exhaustive match arms
+
+All match expressions across `axiomdb-sql` updated for the new `Value::Ltree` and `DataType::Ltree`
+variants: `eval/core.rs`, `eval/batch.rs`, `executor/shared.rs`, `executor/joins.rs`,
+`executor/agg_having.rs` (tag 0x11), `executor/information_schema_exec.rs`, `executor/fdw_http.rs`,
+`executor/copy_to.rs`, `executor/select_into_outfile.rs`, `executor/ddl_show.rs`,
+`executor/union.rs`, `index_maintenance.rs`, `json_table.rs`, `key_encoding.rs`, `planner_select.rs`.
+
+### Coverage
+
+- `crates/axiomdb-types/src/ltree.rs` — 34 unit tests for all pure functions.
+- `crates/axiomdb-sql/tests/integration_ltree.rs` — 24 integration tests covering DDL roundtrip,
+  literal coercions, all operators, all 7 scalar functions, table-level ancestor filter,
+  NULL propagation.
+- `tools/ltree_wire_smoke.py` — 8 wire assertions over the MySQL protocol: INSERT+SELECT
+  roundtrip, `@>`, `~`, `nlevel`, `subpath`, `lca`, `||`, `index`.
+- All 4253/4253 workspace tests pass; clippy + fmt clean.

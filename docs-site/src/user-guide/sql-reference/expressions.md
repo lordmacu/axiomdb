@@ -1487,4 +1487,29 @@ SELECT home.city FROM orders WHERE id = 3;  -- NULL if home column is NULL
 ```
 
 Dot notation is resolved at analysis time against the composite type's field list.
+
+---
+
+## LTREE Operators
+
+`LTREE` (hierarchical path type) operators use existing SQL operator symbols — dispatch
+is by value type at evaluation time.
+
+| Operator | Operands | Returns | Meaning |
+|---|---|---|---|
+| `@>` | `LTREE @> LTREE` | `BOOL` | Left is ancestor of (or equal to) right |
+| `<@` | `LTREE <@ LTREE` | `BOOL` | Left is descendant of (or equal to) right |
+| `~` | `LTREE ~ TEXT` | `BOOL` | Left matches lquery pattern (`*` = 0+ labels) |
+| `\|\|` | `LTREE \|\| LTREE` | `LTREE` | Concatenate two paths |
+| `=`, `<>` | `LTREE op LTREE` | `BOOL` | Exact label-by-label comparison |
+| `<`, `<=`, `>`, `>=` | `LTREE op LTREE` | `BOOL` | Lexicographic path order |
+
+```sql
+'a.b'::LTREE @> 'a.b.c'::LTREE   -- true (ancestor)
+'a.b.c'::LTREE <@ 'a.b'::LTREE   -- true (descendant)
+'a.b.c'::LTREE ~ 'a.*.c'         -- true (wildcard)
+'a.b'::LTREE || 'c.d'::LTREE     -- 'a.b.c.d'
+```
+
+All LTREE operators propagate NULL when either operand is NULL.
 Accessing a field that does not exist in the type definition raises an `InvalidValue` error.

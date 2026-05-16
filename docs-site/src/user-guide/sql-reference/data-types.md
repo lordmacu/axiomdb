@@ -621,6 +621,90 @@ WHERE a.id < b.id AND a.slot && b.slot;
 
 ---
 
+## LTREE — Hierarchical Path Type
+
+`LTREE` stores a dot-separated label path where every label matches `[A-Za-z0-9_]+`.
+It is designed for tree-structured data: org charts, file-system paths, category
+hierarchies, DNS zones.
+
+```sql
+CREATE TABLE categories (id INT, path LTREE);
+
+INSERT INTO categories VALUES
+  (1, 'electronics'),
+  (2, 'electronics.phones'),
+  (3, 'electronics.phones.smartphones'),
+  (4, 'electronics.laptops');
+
+-- All descendants of electronics.phones
+SELECT id FROM categories
+WHERE 'electronics.phones'::LTREE @> path;
+-- Returns ids 2 and 3
+```
+
+### LTREE Operators
+
+| Operator | Meaning | Example |
+|---|---|---|
+| `@>` | Left is ancestor of (or equal to) right | `'a.b'::LTREE @> 'a.b.c'::LTREE` → true |
+| `<@` | Left is descendant of (or equal to) right | `'a.b.c'::LTREE <@ 'a.b'::LTREE` → true |
+| `~` | Left matches lquery pattern | `'a.b.c'::LTREE ~ 'a.*.c'` → true |
+| `\|\|` | Concatenate two ltree paths | `'a.b'::LTREE \|\| 'c'::LTREE` → `'a.b.c'` |
+| `=`, `<>` | Exact path equality | |
+| `<`, `<=`, `>`, `>=` | Lexicographic path order | |
+
+**lquery patterns**: Use `*` to match one or more labels at that position.
+`'a.*.c'` matches any path that starts with `a`, ends with `c`, and has exactly
+one label in between.
+
+### LTREE Functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `nlevel(path)` | `INT` | Number of labels |
+| `subpath(path, offset[, len])` | `LTREE` | Suffix starting at offset (negative = from end) |
+| `subltree(path, start, end)` | `LTREE` | Labels `[start, end)` |
+| `index(path, subpath[, offset])` | `INT` | First position of subpath (-1 if not found) |
+| `lca(path, ...)` | `LTREE` | Longest common ancestor of all arguments |
+| `text2ltree(text)` | `LTREE` | Parse and validate text as an ltree path |
+| `ltree2text(path)` | `TEXT` | Extract the raw path string |
+
+```sql
+SELECT nlevel('a.b.c.d'::LTREE);          -- 4
+SELECT subpath('a.b.c.d'::LTREE, 1, 2);   -- 'b.c'
+SELECT subltree('a.b.c.d'::LTREE, 0, 2);  -- 'a.b'
+SELECT index('a.b.c.a.b'::LTREE, 'a.b'::LTREE); -- 0
+SELECT lca('a.b.c'::LTREE, 'a.b.d'::LTREE);     -- 'a.b'
+SELECT text2ltree('org.eng');                     -- 'org.eng'::LTREE
+SELECT ltree2text('org.eng'::LTREE);              -- 'org.eng'
+```
+
+### Cast to/from TEXT
+
+```sql
+SELECT 'org.eng.backend'::LTREE;           -- Ltree literal
+SELECT CAST('org.eng.backend'::LTREE AS TEXT); -- text string
+```
+
+Invalid paths (empty labels, double dots, illegal characters) raise an error:
+
+```sql
+SELECT 'a..b'::LTREE;  -- Error: empty label
+SELECT 'a b'::LTREE;   -- Error: space is not a valid label character
+```
+
+<div class="callout-advantage">
+<strong>AxiomDB vs. TEXT columns for hierarchies.</strong>
+Without <code>LTREE</code> the common workaround is to store a materialized path in a
+<code>TEXT</code> column and use <code>LIKE 'org.eng%'</code>. That requires a leading-
+wildcard safe index and breaks the moment a label contains a dot. <code>LTREE</code>
+validates the label grammar, provides semantically correct ancestor/descendant operators,
+and exposes the <code>lca</code> and <code>subpath</code> functions that are impossible
+to replicate with plain strings.
+</div>
+
+---
+
 ## NULL in Every Type
 
 Every column of every type can hold NULL unless declared `NOT NULL`. The row codec

@@ -14,7 +14,7 @@ functionality. The design is organized in three blocks:
 
 ## Current Status
 
-**Last completed subphase:** 21.5f `GENERATED ALWAYS AS (... ) STORED` columns — parser/AST now capture generated-column metadata, `axiom_columns` persists `generated_expr` + `generated_stored`, and all write paths recompute stored generated values before CHECK/FK/UNIQUE/index maintenance and `RETURNING`. Direct non-`DEFAULT` writes are rejected; `VIRTUAL` and `ALTER TABLE ... GENERATED` stay explicit `NotImplemented`. 19 integration tests + 2 wire-smoke assertions.
+**Last completed subphase:** 20.19 `LTREE` hierarchical path type — validated dot-separated labels `[A-Za-z0-9_]+`; `@>` ancestor, `<@` descendant, `~` lquery wildcard, `||` concat operators; `nlevel`, `subpath`, `subltree`, `index`, `lca`, `text2ltree`, `ltree2text` scalar functions; u32-LE codec; wire VAR_STRING; 24 integration tests + 8 wire smoke assertions.
 
 **Active development:** Phase 21 — Advanced SQL. Closed: 21.2, 21.3/21.3b, 21.4/21.4b, 21.5, 21.5b-e, 21.5f, 21.6, 21.9, 21.12, 21.17, 21.18, 21.19, 21.21, 21.22. Near-term remaining gaps: 21.6b exclusion constraints, 21.7 TEMP/UNLOGGED tables, 21.8 expression indexes, 21.10 cursors, 21.11 hints, 21.16 DEFERRABLE constraints.
 

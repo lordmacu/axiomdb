@@ -98,8 +98,9 @@ def _check_binary_freshness(binary):
 def start_server():
     global _server_proc, _data_dir
     # Kill any stale server from a previous run (e.g. if the test crashed).
-    subprocess.run(["pkill", "-f", "axiomdb-server"], capture_output=True)
-    time.sleep(0.3)
+    # Use SIGKILL (-9) so the process exits immediately and releases the port.
+    subprocess.run(["pkill", "-9", "-f", "axiomdb-server"], capture_output=True)
+    time.sleep(1.5)  # wait for the OS to release port 13306
     explicit = os.environ.get("AXIOMDB_SERVER_BIN")
     if explicit:
         binary = explicit
@@ -129,6 +130,11 @@ def start_server():
     # Wait up to 5s for the server to be ready
     import socket
     for _ in range(50):
+        # Abort early if the process exited (e.g. port already in use)
+        if _server_proc.poll() is not None:
+            stop_server()
+            print(f"Server process exited prematurely (code {_server_proc.returncode}) — port {PORT} may still be in use")
+            sys.exit(1)
         try:
             with socket.create_connection(("127.0.0.1", PORT), timeout=0.1):
                 return
@@ -271,6 +277,9 @@ def raw_execute(conn, stmt_id, param_types, inline_values=b"", null_indices=()):
 print(f"Starting AxiomDB on :{PORT}...")
 start_server()
 print("Server ready\n")
+
+import atexit
+atexit.register(stop_server)  # always stop server even if script crashes
 
 conn = connect()
 cur = conn.cursor()
@@ -5531,6 +5540,44 @@ except Exception:
 ok("[20.17d cross_currency_add_error] USD + EUR raises an error", _got_error)
 
 cur.execute("DROP TABLE IF EXISTS _wire_money_prices")
+
+# ── [20.19 ltree] ─────────────────────────────────────────────────────────────
+
+print("\n[20.19 ltree]")
+
+# DDL + roundtrip
+cur.execute("DROP TABLE IF EXISTS _wire_ltree_paths")
+cur.execute("CREATE TABLE _wire_ltree_paths (id INT, path LTREE)")
+cur.execute("INSERT INTO _wire_ltree_paths VALUES (1, 'org.eng.backend'), (2, 'org.hr')")
+cur.execute("SELECT path FROM _wire_ltree_paths WHERE id = 1")
+_ltree_val = cur.fetchone()[0]
+ok("[20.19 ltree] INSERT + SELECT LTREE column roundtrip", _ltree_val == "org.eng.backend", _ltree_val)
+
+# Ancestor operator @>
+cur.execute("SELECT 'org.eng'::LTREE @> 'org.eng.backend'::LTREE")
+ok("[20.19 ltree] @> ancestor returns true for parent/child", cur.fetchone()[0] == 1)
+
+# lquery ~ operator
+cur.execute("SELECT 'org.eng.backend'::LTREE ~ 'org.*.backend'")
+ok("[20.19 ltree] ~ lquery wildcard matches correctly", cur.fetchone()[0] == 1)
+
+# nlevel scalar function
+cur.execute("SELECT nlevel('a.b.c'::LTREE)")
+ok("[20.19 ltree] nlevel('a.b.c') = 3", cur.fetchone()[0] == 3)
+
+# subpath scalar function
+cur.execute("SELECT subpath('a.b.c.d'::LTREE, 1, 2)")
+ok("[20.19 ltree] subpath('a.b.c.d', 1, 2) = 'b.c'", cur.fetchone()[0] == "b.c")
+
+# lca scalar function
+cur.execute("SELECT lca('org.eng.backend'::LTREE, 'org.eng.frontend'::LTREE)")
+ok("[20.19 ltree] lca returns common ancestor 'org.eng'", cur.fetchone()[0] == "org.eng")
+
+# concat operator ||
+cur.execute("SELECT 'a.b'::LTREE || 'c.d'::LTREE")
+ok("[20.19 ltree] || concatenates two ltree paths", cur.fetchone()[0] == "a.b.c.d")
+
+cur.execute("DROP TABLE IF EXISTS _wire_ltree_paths")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

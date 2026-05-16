@@ -3,7 +3,7 @@
 Phase: 20 — Types + import/export
 Task: 20.19
 Spec: specs/fase-20/spec-20.19-ltree.md
-Status: in-progress
+Status: done
 
 ## Summary
 

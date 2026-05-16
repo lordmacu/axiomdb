@@ -8,6 +8,7 @@ pub(crate) mod array;
 mod binary;
 pub(crate) mod datetime;
 mod json;
+mod ltree;
 mod nulls;
 mod numeric;
 pub(crate) mod range;
@@ -164,6 +165,11 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         "money" => eval_money_constructor_pure(args, row),
         "currency_of" => eval_currency_of_pure(args, row),
         "amount_of" => eval_amount_of_pure(args, row),
+
+        // Phase 20.19: ltree scalar functions.
+        "nlevel" | "subpath" | "subltree" | "index" | "lca" | "text2ltree" | "ltree2text" => {
+            ltree::eval(lower.as_str(), args, row)
+        }
 
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),

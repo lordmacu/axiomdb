@@ -36,7 +36,10 @@ pub fn validate_ltree_path(s: &str) -> Result<(), DbError> {
                 reason: format!("ltree label '{label}' exceeds 255 bytes"),
             });
         }
-        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
             return Err(DbError::InvalidValue {
                 reason: format!(
                     "ltree label '{label}' contains invalid characters (only [A-Za-z0-9_] allowed)"

@@ -2,7 +2,7 @@
 
 Phase: 20 — Types + import/export
 Task: 20.19 within the sprint
-Status: approved
+Status: implemented
 
 ## Context
 

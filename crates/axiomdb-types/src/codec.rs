@@ -242,7 +242,10 @@ pub fn encoded_len(values: &[Value]) -> usize {
                         Value::Bytes(b) => 3 + b.len(),
                         Value::Money(..) => 20,
                         // Nested composite/array/ltree: overestimate
-                        Value::Array(_) | Value::Range(_) | Value::Composite(_) | Value::Ltree(_) => 16,
+                        Value::Array(_)
+                        | Value::Range(_)
+                        | Value::Composite(_)
+                        | Value::Ltree(_) => 16,
                     })
                     .sum::<usize>()
                     + bitmap_len(n);
