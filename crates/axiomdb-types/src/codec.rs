@@ -121,6 +121,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Int(_), DataType::SmallInt)
             | (Value::Int(_), DataType::Int)
             | (Value::BigInt(_), DataType::BigInt)
+            | (Value::Real(_), DataType::Float)
             | (Value::Real(_), DataType::Real)
             | (Value::Decimal(..), DataType::Decimal)
             | (Value::Text(_), DataType::Text)
@@ -298,6 +299,7 @@ fn col_type_to_data_type(ct: array_codec::ColumnType) -> DataType {
         array_codec::ColumnType::Int => DataType::Int,
         array_codec::ColumnType::BigInt => DataType::BigInt,
         array_codec::ColumnType::Float => DataType::Real,
+        array_codec::ColumnType::Float32 => DataType::Float,
         array_codec::ColumnType::Decimal => DataType::Decimal,
         array_codec::ColumnType::Text => DataType::Text,
         array_codec::ColumnType::Json => DataType::Json,
@@ -382,7 +384,7 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
     }
 
     // Phase 3: encode non-null values in column order.
-    for (i, v) in values.iter().enumerate() {
+    for (i, (v, dt)) in values.iter().zip(schema.iter()).enumerate() {
         if is_null_bit(&buf[0..blen], i) {
             continue;
         }
@@ -396,7 +398,11 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                         reason: "NaN is not a valid SQL real value".into(),
                     });
                 }
-                buf.extend_from_slice(&f.to_le_bytes());
+                if *dt == DataType::Float {
+                    buf.extend_from_slice(&(*f as f32).to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
             }
             Value::Decimal(m, s) => {
                 buf.extend_from_slice(&m.to_le_bytes());
@@ -568,6 +574,12 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
                 pos += 4;
                 Value::Int(v)
+            }
+            DataType::Float => {
+                ensure_bytes(bytes, pos, 4)?;
+                let v = f32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                Value::Real(v as f64)
             }
             DataType::BigInt => {
                 ensure_bytes(bytes, pos, 8)?;
@@ -847,6 +859,12 @@ pub fn decode_row_masked(
                     pos += 4;
                     Value::Int(v)
                 }
+                DataType::Float => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let v = f32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    Value::Real(v as f64)
+                }
                 DataType::BigInt => {
                     ensure_bytes(bytes, pos, 8)?;
                     let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
@@ -1036,7 +1054,11 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 1)?;
                     pos += 1;
                 }
-                DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::Date => {
+                DataType::TinyInt
+                | DataType::SmallInt
+                | DataType::Int
+                | DataType::Float
+                | DataType::Date => {
                     ensure_bytes(bytes, pos, 4)?;
                     pos += 4;
                 }

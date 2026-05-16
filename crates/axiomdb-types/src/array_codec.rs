@@ -55,6 +55,7 @@ pub enum ColumnType {
     Xml = 18,       // SQL XML / XMLTYPE (Phase 20.20)
     TinyInt = 19,   // SQL TINYINT — i8 range, wire 0x01 TINY (Phase 24.1)
     SmallInt = 20,  // SQL SMALLINT — i16 range, wire 0x02 SHORT (Phase 24.1)
+    Float32 = 21,   // SQL REAL/FLOAT4 — 4-byte f32 LE, wire 0x04 FLOAT (Phase 24.2)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -81,6 +82,7 @@ impl TryFrom<u8> for ColumnType {
             18 => Ok(Self::Xml),
             19 => Ok(Self::TinyInt),
             20 => Ok(Self::SmallInt),
+            21 => Ok(Self::Float32),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -117,6 +119,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::SmallInt => ColumnType::SmallInt,
         crate::types::DataType::Int => ColumnType::Int,
         crate::types::DataType::BigInt => ColumnType::BigInt,
+        crate::types::DataType::Float => ColumnType::Float32,
         crate::types::DataType::Real => ColumnType::Float,
         crate::types::DataType::Text => ColumnType::Text,
         crate::types::DataType::Bytes => ColumnType::Bytes,
@@ -184,6 +187,26 @@ fn encode_element(
             };
             buf.extend_from_slice(&n.to_le_bytes());
         }
+        ColumnType::Float32 => match elem {
+            Value::Real(f) => {
+                if f.is_nan() {
+                    return Err(DbError::InvalidValue {
+                        reason: "NaN is not a valid SQL real value".into(),
+                    });
+                }
+                buf.extend_from_slice(&(*f as f32).to_le_bytes());
+            }
+            Value::Null => {
+                buf.extend_from_slice(&0f32.to_le_bytes());
+                return Ok(4);
+            }
+            _ => {
+                return Err(DbError::TypeMismatch {
+                    expected: "REAL".to_string(),
+                    got: elem.variant_name().to_string(),
+                });
+            }
+        },
         ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp => match elem {
             Value::BigInt(n) => buf.extend_from_slice(&n.to_le_bytes()),
             Value::Real(f) => {
@@ -386,6 +409,17 @@ fn decode_element(
                 _ => Value::Int(n),
             };
             Ok((value, 4))
+        }
+        ColumnType::Float32 => {
+            if *pos + 4 > blob.len() {
+                return Err(DbError::ParseError {
+                    message: "truncated: expected 4 bytes for Float32 element".to_string(),
+                    position: None,
+                });
+            }
+            let f = f32::from_le_bytes(blob[*pos..*pos + 4].try_into().map_err(|_| slice_err())?);
+            *pos += 4;
+            Ok((Value::Real(f as f64), 4))
         }
         ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp => {
             if *pos + 8 > blob.len() {

@@ -1189,7 +1189,24 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             p.advance();
             (DataType::BigInt, 0, false)
         }
-        Token::TyReal | Token::TyDouble | Token::TyFloat => {
+        Token::TyReal | Token::TyFloat => {
+            p.advance();
+            eat_optional_length(p)?; // FLOAT(n) — precision hint, ignored
+            (DataType::Float, 0, false)
+        }
+        Token::TyDouble => {
+            p.advance();
+            // eat optional PRECISION keyword: DOUBLE PRECISION
+            if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("PRECISION")) {
+                p.advance();
+            }
+            (DataType::Real, 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("FLOAT4") => {
+            p.advance();
+            (DataType::Float, 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("FLOAT8") => {
             p.advance();
             (DataType::Real, 0, false)
         }
@@ -2173,6 +2190,7 @@ fn fdw_datatype_to_column_type(
         DataType::SmallInt => Ok(ColumnType::SmallInt),
         DataType::Int => Ok(ColumnType::Int),
         DataType::BigInt => Ok(ColumnType::BigInt),
+        DataType::Float => Ok(ColumnType::Float32),
         DataType::Real => Ok(ColumnType::Float),
         DataType::Text => Ok(ColumnType::Text),
         DataType::Bytes => Ok(ColumnType::Bytes),

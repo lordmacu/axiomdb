@@ -83,7 +83,7 @@ fn test_create_aggregate_parses() {
     match stmt {
         Stmt::CreateAggregate(agg) => {
             assert_eq!(agg.name, "median");
-            assert_eq!(agg.arg_types, vec![DataType::Real]);
+            assert_eq!(agg.arg_types, vec![DataType::Float]);
             assert_eq!(agg.sfunc, "median_state");
             assert_eq!(agg.stype, "FLOAT[]");
             assert_eq!(agg.finalfunc.as_deref(), Some("median_final"));
@@ -98,7 +98,7 @@ fn test_drop_aggregate_parses() {
     match stmt {
         Stmt::DropAggregate(agg) => {
             assert_eq!(agg.name, "median");
-            assert_eq!(agg.arg_types, vec![DataType::Real]);
+            assert_eq!(agg.arg_types, vec![DataType::Float]);
         }
         other => panic!("expected DropAggregate, got {other:?}"),
     }
@@ -283,9 +283,9 @@ fn test_data_types_bigint() {
 #[test]
 fn test_data_types_real() {
     let ct = create_table("CREATE TABLE t (a REAL, b DOUBLE, c FLOAT)");
-    assert_eq!(ct.columns[0].data_type, DataType::Real);
-    assert_eq!(ct.columns[1].data_type, DataType::Real);
-    assert_eq!(ct.columns[2].data_type, DataType::Real);
+    assert_eq!(ct.columns[0].data_type, DataType::Float); // REAL = f32
+    assert_eq!(ct.columns[1].data_type, DataType::Real); // DOUBLE = f64
+    assert_eq!(ct.columns[2].data_type, DataType::Float); // FLOAT = f32
 }
 
 #[test]

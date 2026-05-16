@@ -280,7 +280,8 @@ fn generate_is_columns_rows(
                 let num_prec = match col.col_type {
                     ColumnType::Int => Value::BigInt(10),
                     ColumnType::BigInt => Value::BigInt(19),
-                    ColumnType::Float => Value::BigInt(12),
+                    ColumnType::Float32 => Value::BigInt(7),
+                    ColumnType::Float => Value::BigInt(15),
                     _ => Value::Null,
                 };
                 rows.push(vec![
@@ -569,6 +570,7 @@ fn column_type_to_is_data_type(col: &axiomdb_catalog::ColumnDef) -> String {
         ColumnType::SmallInt => "smallint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
+        ColumnType::Float32 => "float",
         ColumnType::Float => "double",
         ColumnType::Decimal => "decimal",
         ColumnType::Text => "text",
@@ -671,6 +673,7 @@ fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
         ColumnType::SmallInt => "smallint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
+        ColumnType::Float32 => "float",
         ColumnType::Float => "double",
         ColumnType::Decimal => "decimal",
         ColumnType::Text => "text",
@@ -696,6 +699,7 @@ fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::SmallInt => "smallint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
+        ColumnType::Float32 => "float",
         ColumnType::Float => "double",
         ColumnType::Decimal => "decimal",
         ColumnType::Text => "text",

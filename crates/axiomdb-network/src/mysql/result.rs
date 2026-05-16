@@ -232,6 +232,7 @@ fn encode_binary_cell(
         (DataType::SmallInt, Value::Int(v)) => buf.extend_from_slice(&(*v as i16).to_le_bytes()), // 2-byte SHORT
         (DataType::Int, Value::Int(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::BigInt, Value::BigInt(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (DataType::Float, Value::Real(v)) => buf.extend_from_slice(&(*v as f32).to_le_bytes()),
         (DataType::Real, Value::Real(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::Decimal, Value::Decimal(m, s)) => {
             let s_text = format_decimal(*m, *s);
@@ -521,6 +522,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::SmallInt => 0x02,                                // SHORT (signed)
         DataType::Int => 0x03,                                     // LONG
         DataType::BigInt => 0x08,                                  // LONGLONG
+        DataType::Float => 0x04,                                   // FLOAT (4-byte)
         DataType::Real => 0x05,                                    // DOUBLE
         DataType::Decimal => 0xf6,                                 // NEWDECIMAL
         DataType::Text | DataType::Json | DataType::Jsonb => 0xfd, // VAR_STRING
@@ -544,6 +546,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::SmallInt => 6, // "-32768"
         DataType::Int => 11,
         DataType::BigInt => 20,
+        DataType::Float => 12,
         DataType::Real => 22,
         DataType::Decimal => 65,
         DataType::Text | DataType::Json | DataType::Jsonb => 16_777_215,
@@ -571,6 +574,7 @@ fn column_flags(dt: DataType) -> u16 {
 
 fn column_decimals(dt: DataType) -> u8 {
     match dt {
+        DataType::Float => 31,
         DataType::Real => 31,
         DataType::Decimal => 10,
         _ => 0,

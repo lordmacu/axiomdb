@@ -208,8 +208,9 @@ fn insert_and_select_all_value_types() {
     let row = &rows[0];
     assert_eq!(row[0], Value::Int(42));
     assert_eq!(row[1], Value::BigInt(9_000_000_000));
-    let expected_real = "3.14".parse::<f64>().unwrap();
-    assert!(matches!(row[2], Value::Real(f) if (f - expected_real).abs() < 1e-9));
+    // REAL is f32 precision; compare against f32-rounded value with f32 tolerance.
+    let expected_real = "3.14".parse::<f32>().unwrap() as f64;
+    assert!(matches!(row[2], Value::Real(f) if (f - expected_real).abs() < 1e-6));
     assert_eq!(row[3], Value::Text("hello".into()));
     assert_eq!(row[4], Value::Bool(true));
 }

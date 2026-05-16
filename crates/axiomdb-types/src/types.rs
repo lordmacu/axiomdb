@@ -27,7 +27,10 @@ pub enum DataType {
     Int,
     /// SQL BIGINT — stored as 8-byte little-endian i64.
     BigInt,
-    /// SQL REAL / DOUBLE PRECISION / FLOAT — stored as 8-byte LE f64 (IEEE 754).
+    /// SQL REAL / FLOAT4 / FLOAT — f32 precision, stored as 4-byte LE IEEE 754.
+    /// Runtime: Value::Real(f64) (widened on decode). Wire: 0x04 FLOAT (Phase 24.2).
+    Float,
+    /// SQL DOUBLE / DOUBLE PRECISION / FLOAT8 — stored as 8-byte LE f64 (IEEE 754).
     Real,
     /// SQL DECIMAL / NUMERIC — stored as 16-byte LE i128 mantissa + 1-byte scale.
     /// Represents `mantissa × 10^(-scale)`.
@@ -84,7 +87,8 @@ impl DataType {
             Self::SmallInt => "SMALLINT".into(),
             Self::Int => "INT".into(),
             Self::BigInt => "BIGINT".into(),
-            Self::Real => "REAL".into(),
+            Self::Float => "REAL".into(),
+            Self::Real => "DOUBLE".into(),
             Self::Decimal => "DECIMAL".into(),
             Self::Text => "TEXT".into(),
             Self::Bytes => "BYTES".into(),

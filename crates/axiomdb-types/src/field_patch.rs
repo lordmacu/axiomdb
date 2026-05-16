@@ -23,6 +23,7 @@ pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
     match dt {
         DataType::Bool => Some(1),
         DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::Date => Some(4),
+        DataType::Float => Some(4),
         DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
         // Variable-length or complex types: cannot patch in place.
         DataType::Text
@@ -134,6 +135,9 @@ pub fn read_field(row_data: &[u8], loc: &FieldLocation) -> Result<Value, DbError
                 Ok(Value::Int(v))
             }
         }
+        DataType::Float => Ok(Value::Real(
+            f32::from_le_bytes(bytes.try_into().unwrap()) as f64
+        )),
         DataType::BigInt => Ok(Value::BigInt(i64::from_le_bytes(bytes.try_into().unwrap()))),
         DataType::Real => Ok(Value::Real(f64::from_le_bytes(bytes.try_into().unwrap()))),
         DataType::Timestamp => Ok(Value::Timestamp(i64::from_le_bytes(
@@ -184,6 +188,9 @@ fn encode_field_value(value: &Value, dt: DataType) -> Result<[u8; 8], DbError> {
         }
         (Value::BigInt(n), DataType::BigInt) => {
             buf[..8].copy_from_slice(&n.to_le_bytes());
+        }
+        (Value::Real(f), DataType::Float) => {
+            buf[..4].copy_from_slice(&(*f as f32).to_le_bytes());
         }
         (Value::Real(f), DataType::Real) => {
             buf[..8].copy_from_slice(&f.to_le_bytes());

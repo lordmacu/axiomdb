@@ -369,6 +369,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::SmallInt => ColumnType::SmallInt,
         DataType::Int => ColumnType::Int,
         DataType::BigInt => ColumnType::BigInt,
+        DataType::Float => ColumnType::Float32,
         DataType::Real => ColumnType::Float,
         DataType::Text => ColumnType::Text,
         DataType::Json => ColumnType::Json,

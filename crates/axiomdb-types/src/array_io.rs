@@ -736,7 +736,7 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
             })?;
             Ok(crate::value::Value::BigInt(n))
         }
-        ColumnType::Float => {
+        ColumnType::Float32 | ColumnType::Float => {
             // Handle special values
             match unescaped.to_uppercase().as_str() {
                 "INFINITY" | "INF" => Ok(crate::value::Value::Real(f64::INFINITY)),

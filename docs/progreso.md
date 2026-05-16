@@ -269,7 +269,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [x] 24.1 ✅ Integer types completeness — TINYINT (i8, -128..=127, wire 0x01 TINY), SMALLINT (i16, -32768..=32767, wire 0x02 SHORT) added as real DataType/ColumnType variants with range-checked coercion; BIGSERIAL as syntactic sugar for BIGINT AUTO_INCREMENT; TINYINT parser bug fixed (was mapped to Bool); SMALLINT wire code fixed (was 0x03 LONG → now 0x02 SHORT); 11 integration tests + 13 wire assertions. Completed 2026-05-16.
 - [x] 24.1b ✅ SERIAL / SMALLSERIAL type shorthands — `SERIAL` (→ INT AUTO_INCREMENT) and `SMALLSERIAL` (→ SMALLINT AUTO_INCREMENT) added as pre-type-position shorthands in `parse_column_def`, alongside existing BIGSERIAL; `Token::Serial` already existed as trailing-constraint synonym (INT SERIAL), now also detected at type position; 4 integration tests + 4 wire assertions. Completed 2026-05-16.
 - [ ] 24.1c ⏳ GENERATED ALWAYS AS IDENTITY — modern SQL standard for auto-increment
-- [ ] 24.2 ⏳ REAL/FLOAT4 separate from DOUBLE — `f32` vs `f64`
+- [x] 24.2 ✅ REAL/FLOAT4 vs DOUBLE/FLOAT8 — `DataType::Float` (f32, 4-byte LE) + `ColumnType::Float32=21` distinct from `DataType::Real` (f64, 8-byte LE); REAL/FLOAT/FLOAT4 → f32; DOUBLE/DOUBLE PRECISION/FLOAT8 → f64; wire 0x04 FLOAT vs 0x05 DOUBLE; precision-truncating coerce; batch.rs SIMD path; 8 integration tests + 4 wire assertions. Completed 2026-05-16.
 - [ ] 24.3 ⏳ Exact DECIMAL — `rust_decimal` with fast path `i64+scale`
 - [ ] 24.4 ⏳ CITEXT — automatic case-insensitive comparisons
 - [ ] 24.5 ⏳ BYTEA/BLOB — binary with automatic TOAST

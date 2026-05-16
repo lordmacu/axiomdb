@@ -7,6 +7,7 @@ fn value_matches_type(value: &Value, target: DataType) -> bool {
         (Value::Bool(_), DataType::Bool)
             | (Value::Int(_), DataType::Int)
             | (Value::BigInt(_), DataType::BigInt)
+            | (Value::Real(_), DataType::Float)
             | (Value::Real(_), DataType::Real)
             | (Value::Decimal(..), DataType::Decimal)
             | (Value::Text(_), DataType::Text)

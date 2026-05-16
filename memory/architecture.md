@@ -1,5 +1,14 @@
 # Architecture Notes
 
+## 2026-05-16 — Float32 vs Real type split (24.2)
+
+- **`DataType::Float` (f32) is now distinct from `DataType::Real` (f64).** Both use `Value::Real(f64)` at runtime; distinction only matters for encode/decode (4 vs 8 bytes) and wire protocol (0x04 FLOAT vs 0x05 DOUBLE).
+- **`ColumnType::Float32 = 21`** added to `axiomdb-catalog/src/schema_database.rs` AND the local copy in `axiomdb-types/src/array_codec.rs` (local copy exists to break cyclic dependency between the two crates).
+- **Schema-aware encode_row**: the encode loop was changed from `values.iter().enumerate()` to `values.iter().zip(schema.iter()).enumerate()` so `Value::Real` on a Float column writes 4 bytes, not 8.
+- **Parser mapping**: REAL/FLOAT/FLOAT4 → `DataType::Float`; DOUBLE/FLOAT8/DOUBLE PRECISION → `DataType::Real`.
+- **Precision truncation is idempotent**: Float coerce arms cast `n as f32 as f64`; encode arm writes `(*f as f32).to_le_bytes()`; decode reads f32 and widens back to f64.
+- **`value_matches_type` short-circuit**: `(Value::Real(_), DataType::Float)` was added here for identity skip. `(Value::Int(_), DataType::TinyInt/SmallInt)` was intentionally NOT added to preserve range-check coercion arms.
+
 ## 2026-04-23 - Collation system (13.13)
 
 - **Collation metadata now lives in catalog rows, not only in session state.**

@@ -913,6 +913,7 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
         ColumnType::SmallInt => DataType::SmallInt,
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
+        ColumnType::Float32 => DataType::Float,
         ColumnType::Float => DataType::Real,
         ColumnType::Decimal => DataType::Decimal,
         ColumnType::Text => DataType::Text,

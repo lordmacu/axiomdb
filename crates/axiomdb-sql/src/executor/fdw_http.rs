@@ -352,6 +352,15 @@ fn json_value_to_axiom(
             };
             Ok(Value::BigInt(n))
         }
+        ColumnType::Float32 => {
+            let f = match v {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32 as f64,
+                serde_json::Value::String(s) => s.parse::<f32>().unwrap_or(0.0) as f64,
+                serde_json::Value::Bool(b) => f64::from(*b),
+                _ => 0.0,
+            };
+            Ok(Value::Real(f))
+        }
         ColumnType::Float => {
             let f = match v {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),

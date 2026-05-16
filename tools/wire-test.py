@@ -5762,6 +5762,29 @@ ok("[24.1b serial] SMALLSERIAL second row is 2", _ssr[1][0] == 2, _ssr[1][0])
 cur.execute("DROP TABLE IF EXISTS _wire_serial")
 cur.execute("DROP TABLE IF EXISTS _wire_smallserial")
 
+# ── 24.2 REAL / FLOAT4 / DOUBLE / FLOAT8 ─────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_float")
+cur.execute("CREATE TABLE _wire_float (id INT PRIMARY KEY, r REAL, d DOUBLE)")
+cur.execute("INSERT INTO _wire_float VALUES (1, 3.14, 3.141592653589793)")
+cur.execute("SELECT r, d FROM _wire_float WHERE id = 1")
+_fl = cur.fetchone()
+# REAL is f32: pymysql returns a float, check ~f32 precision
+ok("[24.2 float] REAL column round-trips", abs(_fl[0] - 3.14) < 1e-5, _fl[0])
+# DOUBLE is f64: full precision survives
+ok("[24.2 float] DOUBLE column round-trips with f64 precision", abs(_fl[1] - 3.141592653589793) < 1e-13, _fl[1])
+
+cur.execute("DROP TABLE IF EXISTS _wire_float4f8")
+cur.execute("CREATE TABLE _wire_float4f8 (id INT PRIMARY KEY, a FLOAT4, b FLOAT8)")
+cur.execute("INSERT INTO _wire_float4f8 VALUES (1, 1.5, 1.5)")
+cur.execute("SELECT a, b FROM _wire_float4f8 WHERE id = 1")
+_ff = cur.fetchone()
+ok("[24.2 float] FLOAT4 alias stores as f32", abs(_ff[0] - 1.5) < 1e-5, _ff[0])
+ok("[24.2 float] FLOAT8 alias stores as f64", abs(_ff[1] - 1.5) < 1e-13, _ff[1])
+
+cur.execute("DROP TABLE IF EXISTS _wire_float")
+cur.execute("DROP TABLE IF EXISTS _wire_float4f8")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

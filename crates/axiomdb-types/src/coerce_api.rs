@@ -86,9 +86,11 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
 
         // ── Numeric widening (lossless) ───────────────────────────────────────
         (Value::Int(n), DataType::BigInt) => Ok(Value::BigInt(n as i64)),
+        (Value::Int(n), DataType::Float) => Ok(Value::Real(n as f32 as f64)),
         (Value::Int(n), DataType::Real) => Ok(Value::Real(n as f64)),
         (Value::Int(n), DataType::Decimal) => Ok(Value::Decimal(n as i128, 0)),
 
+        (Value::BigInt(n), DataType::Float) => Ok(Value::Real(n as f32 as f64)),
         (Value::BigInt(n), DataType::Real) => Ok(Value::Real(n as f64)),
         (Value::BigInt(n), DataType::Decimal) => Ok(Value::Decimal(n as i128, 0)),
 
@@ -123,6 +125,10 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         (Value::Text(s), DataType::BigInt) => {
             let n = parse_text_to_bigint(&s, mode, "BIGINT")?;
             Ok(Value::BigInt(n))
+        }
+        (Value::Text(s), DataType::Float) => {
+            let f = parse_text_to_float(&s, mode, "REAL")?;
+            Ok(Value::Real(f as f32 as f64))
         }
         (Value::Text(s), DataType::Real) => {
             let f = parse_text_to_float(&s, mode, "REAL")?;
