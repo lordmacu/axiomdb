@@ -2252,7 +2252,9 @@ pub(crate) fn parse_create_holiday_calendar(p: &mut Parser) -> Result<Stmt, DbEr
                     }
                     other => {
                         return Err(DbError::ParseError {
-                            message: format!("expected date string literal in HOLIDAYS list, found {other:?}"),
+                            message: format!(
+                                "expected date string literal in HOLIDAYS list, found {other:?}"
+                            ),
                             position: Some(p.current_pos()),
                         });
                     }

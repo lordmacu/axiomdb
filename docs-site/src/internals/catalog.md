@@ -677,3 +677,84 @@ session-aware path (`select_ctx.rs`) and the legacy dispatch path (`select_core.
 skip the storage engine and call `fdw_scan_table()` instead, which issues an HTTP GET,
 parses the JSON response, and materializes rows before passing them through the normal
 WHERE/projection pipeline.
+
+---
+
+## Holiday Calendar Catalog (`axiom_holiday_calendars`)
+
+Stores country-level public holiday sets used by `IS_BUSINESS_DAY`,
+`NEXT_BUSINESS_DAY`, and `BUSINESS_DAYS_BETWEEN`.
+
+### Heap root — meta page offset 184
+
+The heap root page ID is stored at byte offset **184** in the meta page body
+(`CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET`). Like other catalog heaps, it is
+lazy-initialised: on a fresh database the field holds `0` and the heap is allocated
+on the first `CREATE HOLIDAY CALENDAR` write. `ensure_holiday_calendars_root()` in
+`bootstrap.rs` handles the lazy init.
+
+### `axiom_holiday_calendars` row format (`HolidayCalendarDef`)
+
+```text
+[code_len:  1 byte  u8 ]    — length of country_code in bytes (max 16)
+[code:      code_len bytes]  — UTF-8 country code, always uppercase
+[count:     2 bytes  u16 LE] — number of holiday dates
+[holidays:  count × 4 bytes] — i32 LE, days since Unix epoch (1970-01-01 = 0),
+                               sorted ascending, deduplicated
+```
+
+Example for `'CO'` with two holidays:
+
+```text
+02 43 4F                    — code_len=2, "CO"
+02 00                       — count=2
+2B 4D 00 00                 — 2024-01-01 = day 19755 (0x4D2B)
+93 52 00 00                 — 2024-07-04 = day 21155 (0x5293)
+```
+
+### `HolidayCalendarDef` (Rust)
+
+```rust
+pub struct HolidayCalendarDef {
+    pub country_code: String,  // always uppercase, max 16 bytes
+    pub holidays: Vec<i32>,    // days-since-epoch, sorted, deduplicated
+}
+```
+
+Serialisation/deserialisation is in `crates/axiomdb-catalog/src/schema_holiday_calendar.rs`.
+
+### Session-level holiday cache
+
+Each `SessionContext` holds a `holiday_cache: HashMap<String, Arc<HashSet<i32>>>` that
+maps country codes to a shared, read-only set of holiday day numbers. This avoids a
+catalog scan on every `IS_BUSINESS_DAY` call within a session.
+
+The cache is cleared by `SessionContext::invalidate_all()` — the same DDL fence that
+clears the schema cache and heap-tail cache. Any `CREATE HOLIDAY CALENDAR` or
+`DROP HOLIDAY CALENDAR` statement calls `invalidate_all()` before executing.
+
+### Catalog writer API
+
+```rust
+// Upsert (replace-or-insert) a calendar definition.
+pub fn upsert_holiday_calendar(&mut self, def: &HolidayCalendarDef) -> Result<(), DbError>
+
+// Delete by country code; if if_exists=false and not found, returns InvalidValue.
+pub fn delete_holiday_calendar(
+    &mut self,
+    country: &str,
+    if_exists: bool,
+) -> Result<(), DbError>
+```
+
+### Catalog reader API
+
+```rust
+// Returns None if no calendar is registered for the country code.
+pub fn get_holiday_calendar(&mut self, country: &str)
+    -> Result<Option<HolidayCalendarDef>, DbError>
+
+// Returns all calendars stored in the heap.
+pub fn list_holiday_calendars(&mut self)
+    -> Result<Vec<HolidayCalendarDef>, DbError>
+```

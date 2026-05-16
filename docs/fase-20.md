@@ -378,3 +378,81 @@ is preserved — identical to PostgreSQL COPY FROM behavior.
 - JSONL: strict unknown-column error mode (opt-in flag).
 - JSON array streaming via `serde_json::StreamDeserializer`.
 - Configurable `COPY_BATCH_SIZE` via WITH options.
+
+---
+
+## Subphase 20.16 — Business Calendar Functions
+
+**Closed:** 2026-05-15
+
+### What was built
+
+Holiday calendar management DDL and three scalar business-day functions.
+
+### SQL surface
+
+```sql
+-- DDL
+CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01', '2024-07-04');
+CREATE HOLIDAY CALENDAR 'US';            -- empty calendar
+DROP HOLIDAY CALENDAR 'CO';
+DROP HOLIDAY CALENDAR IF EXISTS 'CO';   -- idempotent
+
+-- Scalar functions
+SELECT IS_BUSINESS_DAY('2024-01-01', 'CO');          -- 0 (holiday)
+SELECT IS_BUSINESS_DAY('2024-01-02', 'CO');          -- 1 (Tuesday, no holiday)
+SELECT IS_BUSINESS_DAY('2024-01-06', 'CO');          -- 0 (Saturday)
+
+SELECT NEXT_BUSINESS_DAY('2024-01-05', 'CO');        -- 2024-01-08 (Monday) as days-since-epoch
+SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO');  -- 4 (if 01-01 is holiday)
+```
+
+### Architecture
+
+#### Catalog layer
+
+New constant in storage meta: `CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET = 184`.
+`HolidayCalendarDef` serialized as:
+
+```
+[code_len: u8][country_code: UTF-8][count: u16 LE][i32 LE × count]
+```
+
+Holidays stored sorted ascending, deduplicated. Country code always uppercase.
+
+`CatalogBootstrap::ensure_holiday_calendars_root` — lazy allocation on first `CREATE`.
+
+#### Session cache
+
+`SessionContext.holiday_cache: HashMap<String, Arc<HashSet<i32>>>` — loaded from catalog
+on first call per country code, cleared by `invalidate_all()` on any DDL statement.
+
+#### is_weekday formula
+
+```rust
+fn is_weekday(day: i32) -> bool { ((day + 3).rem_euclid(7) as u32) < 5 }
+```
+
+Mapping: `(day + 3) % 7` → 0=Mon … 4=Fri, 5=Sat, 6=Sun.
+Epoch 1970-01-01 is Thursday → `(0 + 3) % 7 = 3` ✓.
+
+#### BUSINESS_DAYS_BETWEEN O(1) formula
+
+```
+span = end - start (days)
+full_weeks = span / 7
+remainder = span % 7
+start_dow = (start + 3) % 7   -- 0=Mon…6=Sun
+remainder_weekdays = count of i in [0, remainder) where (start_dow + i) % 7 < 5
+total_weekdays = full_weeks * 5 + remainder_weekdays
+result = total_weekdays - holidays_in_range
+```
+
+O(1) for weekday count + O(|holidays|) for subtraction.
+
+### Coverage
+
+- `crates/axiomdb-catalog/src/schema_holiday_calendar.rs` — 4 unit tests
+- `crates/axiomdb-sql/tests/integration_business_calendar.rs` — 21 integration tests
+- `tools/wire-test.py` — 4 wire assertions: `[20.16a..d]`
+- All 2829 axiomdb-sql tests pass; clippy + fmt clean.

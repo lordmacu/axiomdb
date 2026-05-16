@@ -1281,3 +1281,78 @@ SELECT uuid_generate_v7();
 UUID v4 generates random 122-bit keys. When used as a B+ Tree primary key, each insert lands at a random leaf position, causing frequent page splits and poor cache locality. UUID v7 embeds a 48-bit millisecond timestamp as a prefix — inserts are nearly always at the rightmost leaf, eliminating most splits and matching the sequential-insert performance of <code>AUTO_INCREMENT</code>. For tables receiving hundreds of inserts per second, UUID v7 can be 2-5× faster than v4 for write throughput.
 </div>
 </div>
+
+---
+
+## Business Calendar Functions
+
+AxiomDB provides three scalar functions for working-day arithmetic. Holidays are
+configured per country code with `CREATE HOLIDAY CALENDAR`. If no calendar is
+registered for a country code, only weekends are excluded.
+
+### IS_BUSINESS_DAY
+
+Returns `1` if the date is a working day (not a weekend and not a registered
+holiday), `0` otherwise.
+
+```sql
+IS_BUSINESS_DAY(date, country_code)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `date` | Date / Text / Int | Date to test. Text must be `'YYYY-MM-DD'`. Int is days-since-epoch. |
+| `country_code` | Text | Uppercase country code identifying the holiday calendar. |
+
+```sql
+CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01');
+
+SELECT IS_BUSINESS_DAY('2024-01-01', 'CO');  -- 0 (holiday)
+SELECT IS_BUSINESS_DAY('2024-01-06', 'CO');  -- 0 (Saturday)
+SELECT IS_BUSINESS_DAY('2024-01-02', 'CO');  -- 1 (Tuesday)
+```
+
+### NEXT_BUSINESS_DAY
+
+Returns the next calendar date (strictly after `date`) that is a business day.
+
+```sql
+NEXT_BUSINESS_DAY(date, country_code)
+```
+
+Return type: `INT` (days since Unix epoch, 1970-01-01 = 0).
+
+```sql
+-- 2024-01-05 is Friday; Monday 2024-01-08 is the next business day
+SELECT NEXT_BUSINESS_DAY('2024-01-05', 'CO');
+
+-- Monday 2024-01-08 is a holiday; next business day is Tuesday 2024-01-09
+CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-08');
+SELECT NEXT_BUSINESS_DAY('2024-01-05', 'CO');
+```
+
+### BUSINESS_DAYS_BETWEEN
+
+Counts the number of business days in the half-open interval `[start, end)`.
+Returns `0` if `end <= start`.
+
+```sql
+BUSINESS_DAYS_BETWEEN(start, end, country_code)
+```
+
+```sql
+-- Mon 2024-01-01 to Mon 2024-01-08 = Mon+Tue+Wed+Thu+Fri = 5
+SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO');  -- 5
+
+-- Same range with 2024-01-01 as a holiday → 4
+CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01');
+SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO');  -- 4
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🏆</span>
+<div class="callout-body">
+<span class="callout-label">Performance — O(1) Working-Day Count</span>
+<code>BUSINESS_DAYS_BETWEEN</code> uses a full-weeks × 5 shortcut rather than iterating day-by-day. Only the partial weeks at the start and end require per-day checks, and holidays are looked up in an <code>O(log n)</code> sorted set. This makes even year-spanning ranges instantaneous, whereas application-side loops over date ranges scale linearly with the interval length.
+</div>
+</div>

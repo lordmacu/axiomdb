@@ -2023,7 +2023,10 @@ impl<'a> CatalogWriter<'a> {
 
         for (page_id, slot_id, data) in rows {
             let (existing, _) = HolidayCalendarDef::from_bytes(&data)?;
-            if existing.country_code.eq_ignore_ascii_case(&def.country_code) {
+            if existing
+                .country_code
+                .eq_ignore_ascii_case(&def.country_code)
+            {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
                 self.txn.record_delete(
                     self.conn,
@@ -2038,8 +2041,7 @@ impl<'a> CatalogWriter<'a> {
         }
 
         let data = def.to_bytes();
-        let (page_id, slot_id) =
-            HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
         self.txn.record_insert(
             self.conn,
             SYSTEM_TABLE_HOLIDAY_CALENDARS,

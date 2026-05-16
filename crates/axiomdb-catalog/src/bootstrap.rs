@@ -24,8 +24,7 @@ use axiomdb_storage::{
     CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMAS_ROOT_BODY_OFFSET,
     CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_SEQUENCES_ROOT_BODY_OFFSET,
     CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
-    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET,
-    NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
@@ -296,8 +295,7 @@ impl CatalogBootstrap {
         let cron_jobs = read_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET)?;
         let foreign_servers = read_meta_u64(storage, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET)?;
         let foreign_tables = read_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET)?;
-        let holiday_calendars =
-            read_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET)?;
+        let holiday_calendars = read_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -533,7 +531,11 @@ impl CatalogBootstrap {
         let new_root = storage.alloc_page(PageType::Data)?;
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
-        write_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET, new_root)?;
+        write_meta_u64(
+            storage,
+            CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET,
+            new_root,
+        )?;
         storage.flush()?;
         Ok(new_root)
     }

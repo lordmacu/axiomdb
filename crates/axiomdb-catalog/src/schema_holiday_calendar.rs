@@ -19,7 +19,10 @@ impl HolidayCalendarDef {
     pub fn to_bytes(&self) -> Vec<u8> {
         let code = self.country_code.as_bytes();
         debug_assert!(code.len() <= 16, "country code too long");
-        debug_assert!(self.holidays.len() <= u16::MAX as usize, "too many holidays");
+        debug_assert!(
+            self.holidays.len() <= u16::MAX as usize,
+            "too many holidays"
+        );
 
         let mut buf = Vec::with_capacity(1 + code.len() + 2 + 4 * self.holidays.len());
         buf.push(code.len() as u8);
@@ -38,7 +41,7 @@ impl HolidayCalendarDef {
         };
         let mut consumed = 0usize;
 
-        if bytes.len() < 1 {
+        if bytes.is_empty() {
             return Err(err());
         }
         let code_len = bytes[consumed] as usize;
@@ -73,7 +76,13 @@ impl HolidayCalendarDef {
             holidays.push(i32::from_le_bytes(raw));
         }
 
-        Ok((Self { country_code, holidays }, consumed))
+        Ok((
+            Self {
+                country_code,
+                holidays,
+            },
+            consumed,
+        ))
     }
 }
 

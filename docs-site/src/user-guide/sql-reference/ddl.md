@@ -1625,4 +1625,59 @@ RESTORE DATABASE FROM '/path/to/backup.axbk'
 - The restored file is a raw page store identical to the original; point
   `axiomdb-server` at it to bring the database online.
 
+---
+
+## CREATE HOLIDAY CALENDAR
+
+Registers a named set of public holidays for a given country code. The calendar is
+used by business-day scalar functions (`IS_BUSINESS_DAY`, `NEXT_BUSINESS_DAY`,
+`BUSINESS_DAYS_BETWEEN`) to exclude non-working days from calculations.
+
+```sql
+CREATE HOLIDAY CALENDAR country_code
+    [WITH HOLIDAYS (date_literal [, date_literal ...])]
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `country_code` | A string identifier for the calendar (e.g. `'CO'`, `'US'`). Stored uppercase. Max 16 bytes. |
+| `WITH HOLIDAYS` | Optional list of ISO-8601 date literals (`'YYYY-MM-DD'`) to mark as public holidays. |
+
+**Notes:**
+- If `WITH HOLIDAYS` is omitted the calendar is created with an empty holiday set.
+- Date strings that do not parse as valid ISO-8601 dates return `InvalidValue`.
+- If a calendar with the same country code already exists it is **replaced**, not appended.
+- Holidays are deduplicated and sorted internally.
+
+```sql
+-- Create a Colombian holiday calendar
+CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01', '2024-07-20', '2024-08-07');
+
+-- Empty calendar (weekends only)
+CREATE HOLIDAY CALENDAR 'CO';
+
+-- Replace an existing calendar
+CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01', '2024-12-25');
+```
+
+---
+
+## DROP HOLIDAY CALENDAR
+
+Removes a holiday calendar from the catalog.
+
+```sql
+DROP HOLIDAY CALENDAR [IF EXISTS] country_code
+```
+
+- Without `IF EXISTS`: returns `InvalidValue` if the calendar does not exist.
+- With `IF EXISTS`: succeeds silently if the calendar does not exist.
+
+```sql
+DROP HOLIDAY CALENDAR 'CO';
+DROP HOLIDAY CALENDAR IF EXISTS 'CO';
+```
+
 **Result column:** `status TEXT` — page count and path information.
