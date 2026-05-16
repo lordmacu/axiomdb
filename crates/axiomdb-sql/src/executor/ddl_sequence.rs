@@ -166,3 +166,80 @@ fn validate_sequence_options(stmt: &crate::ast::CreateSequenceStmt) -> Result<()
     }
     Ok(())
 }
+
+pub(crate) fn execute_create_composite_type(
+    stmt: crate::ast::CreateCompositeTypeStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    default_schema: &str,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.type_ref.schema.as_deref().unwrap_or(default_schema);
+    let name = &stmt.type_ref.name;
+    if stmt.type_ref.database.is_some() {
+        return Err(DbError::InvalidValue {
+            reason: format!("composite type '{name}' cannot be qualified with a database"),
+        });
+    }
+    if stmt.fields.is_empty() {
+        return Err(DbError::InvalidValue {
+            reason: format!("composite type '{schema}.{name}' must have at least one field"),
+        });
+    }
+
+    let snap = txn.active_snapshot(conn_txn);
+    let mut reader = CatalogReader::new(storage, snap)?;
+    if reader.get_composite_type(schema, name)?.is_some() {
+        return Err(DbError::InvalidValue {
+            reason: format!("composite type '{schema}.{name}' already exists"),
+        });
+    }
+    if reader.get_enum_type(schema, name)?.is_some() {
+        return Err(DbError::InvalidValue {
+            reason: format!("type '{schema}.{name}' already exists as an enum type"),
+        });
+    }
+
+    let def = axiomdb_catalog::CompositeTypeDef {
+        schema_name: schema.to_string(),
+        name: name.clone(),
+        fields: stmt
+            .fields
+            .into_iter()
+            .map(|f| axiomdb_catalog::CompositeField {
+                name: f.name,
+                type_name: f.type_name,
+            })
+            .collect(),
+    };
+    let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+    writer.create_composite_type(def)?;
+    Ok(QueryResult::Empty)
+}
+
+pub(crate) fn execute_drop_composite_type(
+    stmt: crate::ast::DropCompositeTypeStmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut axiomdb_wal::ConnectionTxn,
+    default_schema: &str,
+) -> Result<QueryResult, DbError> {
+    let schema = stmt.type_ref.schema.as_deref().unwrap_or(default_schema);
+    let name = &stmt.type_ref.name;
+    let mut writer = CatalogWriter::new(storage, txn, conn_txn)?;
+    // Try composite first, then enum — DROP TYPE is unified for both.
+    let found_composite = writer.delete_composite_type(schema, name)?;
+    if found_composite {
+        return Ok(QueryResult::Empty);
+    }
+    let found_enum = writer.delete_enum_type(schema, name)?;
+    if found_enum {
+        return Ok(QueryResult::Empty);
+    }
+    if !stmt.if_exists {
+        return Err(DbError::InvalidValue {
+            reason: format!("type '{schema}.{name}' does not exist"),
+        });
+    }
+    Ok(QueryResult::Empty)
+}
