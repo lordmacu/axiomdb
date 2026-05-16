@@ -26,6 +26,64 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         (Value::Int(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
         (Value::BigInt(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
 
+        // ── TinyInt / SmallInt coercion with range check ──────────────────────
+        (Value::Int(n), DataType::TinyInt) => {
+            if n < i8::MIN as i32 || n > i8::MAX as i32 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for TINYINT ({}..={})", n, i8::MIN, i8::MAX),
+                })
+            } else {
+                Ok(Value::Int(n))
+            }
+        }
+        (Value::Int(n), DataType::SmallInt) => {
+            if n < i16::MIN as i32 || n > i16::MAX as i32 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for SMALLINT ({}..={})", n, i16::MIN, i16::MAX),
+                })
+            } else {
+                Ok(Value::Int(n))
+            }
+        }
+        (Value::BigInt(n), DataType::TinyInt) => {
+            if n < i8::MIN as i64 || n > i8::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for TINYINT ({}..={})", n, i8::MIN, i8::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+        (Value::BigInt(n), DataType::SmallInt) => {
+            if n < i16::MIN as i64 || n > i16::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for SMALLINT ({}..={})", n, i16::MIN, i16::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+        (Value::Text(s), DataType::TinyInt) => {
+            let n = parse_text_to_bigint(&s, mode, "TINYINT")?;
+            if n < i8::MIN as i64 || n > i8::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for TINYINT ({}..={})", n, i8::MIN, i8::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+        (Value::Text(s), DataType::SmallInt) => {
+            let n = parse_text_to_bigint(&s, mode, "SMALLINT")?;
+            if n < i16::MIN as i64 || n > i16::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for SMALLINT ({}..={})", n, i16::MIN, i16::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+
         // ── Numeric widening (lossless) ───────────────────────────────────────
         (Value::Int(n), DataType::BigInt) => Ok(Value::BigInt(n as i64)),
         (Value::Int(n), DataType::Real) => Ok(Value::Real(n as f64)),

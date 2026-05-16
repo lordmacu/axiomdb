@@ -82,7 +82,7 @@ impl TableEngine {
         let zm_col_idx = columns.iter().position(|c| {
             matches!(
                 c.col_type,
-                ColumnType::Int | ColumnType::BigInt | ColumnType::Bool
+                ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::BigInt | ColumnType::Bool
             )
         });
 

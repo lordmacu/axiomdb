@@ -17,6 +17,12 @@
 pub enum DataType {
     /// SQL BOOLEAN — stored as 1 byte (0x00 / 0x01).
     Bool,
+    /// SQL TINYINT — i8 range (-128..=127). Stored as Value::Int(i64) at runtime.
+    /// Distinct from Bool: TINYINT is a numeric type, not boolean. Wire: 0x01 TINY.
+    TinyInt,
+    /// SQL SMALLINT — i16 range (-32768..=32767). Stored as Value::Int(i64) at runtime.
+    /// Wire: 0x02 SHORT.
+    SmallInt,
     /// SQL INT / INTEGER — stored as 4-byte little-endian i32.
     Int,
     /// SQL BIGINT — stored as 8-byte little-endian i64.
@@ -74,6 +80,8 @@ impl DataType {
     pub fn name(&self) -> String {
         match self {
             Self::Bool => "BOOL".into(),
+            Self::TinyInt => "TINYINT".into(),
+            Self::SmallInt => "SMALLINT".into(),
             Self::Int => "INT".into(),
             Self::BigInt => "BIGINT".into(),
             Self::Real => "REAL".into(),

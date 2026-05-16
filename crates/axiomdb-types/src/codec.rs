@@ -117,6 +117,8 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
     let ok = matches!(
         (value, dt.clone()),
         (Value::Bool(_), DataType::Bool)
+            | (Value::Int(_), DataType::TinyInt)
+            | (Value::Int(_), DataType::SmallInt)
             | (Value::Int(_), DataType::Int)
             | (Value::BigInt(_), DataType::BigInt)
             | (Value::Real(_), DataType::Real)
@@ -291,6 +293,8 @@ fn value_to_col_type(v: &Value) -> array_codec::ColumnType {
 fn col_type_to_data_type(ct: array_codec::ColumnType) -> DataType {
     match ct {
         array_codec::ColumnType::Bool => DataType::Bool,
+        array_codec::ColumnType::TinyInt => DataType::TinyInt,
+        array_codec::ColumnType::SmallInt => DataType::SmallInt,
         array_codec::ColumnType::Int => DataType::Int,
         array_codec::ColumnType::BigInt => DataType::BigInt,
         array_codec::ColumnType::Float => DataType::Real,
@@ -559,7 +563,7 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += 1;
                 Value::Bool(v)
             }
-            DataType::Int => {
+            DataType::TinyInt | DataType::SmallInt | DataType::Int => {
                 ensure_bytes(bytes, pos, 4)?;
                 let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
                 pos += 4;
@@ -837,7 +841,7 @@ pub fn decode_row_masked(
                     pos += 1;
                     Value::Bool(v)
                 }
-                DataType::Int => {
+                DataType::TinyInt | DataType::SmallInt | DataType::Int => {
                     ensure_bytes(bytes, pos, 4)?;
                     let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
                     pos += 4;
@@ -1032,7 +1036,7 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 1)?;
                     pos += 1;
                 }
-                DataType::Int | DataType::Date => {
+                DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::Date => {
                     ensure_bytes(bytes, pos, 4)?;
                     pos += 4;
                 }

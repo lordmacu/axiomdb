@@ -507,7 +507,7 @@ fn is_null_bit(bitmap: &[u8], col: usize) -> bool {
 fn fixed_size(dt: DataType) -> Option<usize> {
     match dt {
         DataType::Bool => Some(1),
-        DataType::Int | DataType::Date => Some(4),
+        DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::Date => Some(4),
         DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
         DataType::Text
         | DataType::Json

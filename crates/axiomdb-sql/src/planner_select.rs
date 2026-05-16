@@ -909,6 +909,8 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
     };
     let target = match col.col_type {
         ColumnType::Bool => DataType::Bool,
+        ColumnType::TinyInt => DataType::TinyInt,
+        ColumnType::SmallInt => DataType::SmallInt,
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
         ColumnType::Float => DataType::Real,

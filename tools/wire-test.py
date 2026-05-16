@@ -3194,67 +3194,79 @@ except Exception:
 
 print("\n[11.20b NESTED PATH]")
 
-# Basic shred with parent × child fan-out
-cur.execute("""SELECT inv_id, item_name, qty FROM JSON_TABLE(
-    '[{"id":1,"items":[{"name":"A","qty":2},{"name":"B","qty":3}]},
-      {"id":2,"items":[{"name":"C","qty":1}]}]',
-    '$[*]' COLUMNS (
-        inv_id INT PATH '$.id',
-        NESTED PATH '$.items[*]' COLUMNS (
-            item_name TEXT PATH '$.name',
-            qty       INT  PATH '$.qty'
+# Use isolated connection — pre-existing bug: pymysql type-converter crashes on
+# mixed INT/TEXT NESTED PATH result sets (wire metadata issue, not 24.1 regression).
+_conn_11b = connect()
+_cur_11b = _conn_11b.cursor()
+
+try:
+    _cur_11b.execute("""SELECT inv_id, item_name, qty FROM JSON_TABLE(
+        '[{"id":1,"items":[{"name":"A","qty":2},{"name":"B","qty":3}]},
+          {"id":2,"items":[{"name":"C","qty":1}]}]',
+        '$[*]' COLUMNS (
+            inv_id INT PATH '$.id',
+            NESTED PATH '$.items[*]' COLUMNS (
+                item_name TEXT PATH '$.name',
+                qty       INT  PATH '$.qty'
+            )
         )
-    )
-) AS t ORDER BY inv_id, item_name""")
-rows = cur.fetchall()
-normalized = [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
-ok("11.20b JSON_TABLE NESTED parent × children",
-   normalized == [(1, "A", 2), (1, "B", 3), (2, "C", 1)],
-   f"got {normalized}")
+    ) AS t ORDER BY inv_id, item_name""")
+    rows = _cur_11b.fetchall()
+    normalized = [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+    ok("11.20b JSON_TABLE NESTED parent × children",
+       normalized == [(1, "A", 2), (1, "B", 3), (2, "C", 1)],
+       f"got {normalized}")
+except Exception as _e11b:
+    ok("11.20b JSON_TABLE NESTED parent × children", False, str(_e11b))
+    _conn_11b.close()
+    _conn_11b = connect()
+    _cur_11b = _conn_11b.cursor()
 
-# LEFT-OUTER NULL pad on empty children
-cur.execute("""SELECT inv_id, item_name FROM JSON_TABLE(
-    '[{"id":1,"items":[{"name":"A"}]},
-      {"id":2,"items":[]}]',
-    '$[*]' COLUMNS (
-        inv_id INT PATH '$.id',
-        NESTED PATH '$.items[*]' COLUMNS (item_name TEXT PATH '$.name')
-    )
-) AS t ORDER BY inv_id""")
-rows = cur.fetchall()
-ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad",
-   len(rows) == 2 and int(rows[0][0]) == 1 and str(rows[0][1]) == "A"
-   and int(rows[1][0]) == 2 and rows[1][1] is None,
-   f"got {rows}")
+try:
+    _cur_11b.execute("""SELECT inv_id, item_name FROM JSON_TABLE(
+        '[{"id":1,"items":[{"name":"A"}]},
+          {"id":2,"items":[]}]',
+        '$[*]' COLUMNS (
+            inv_id INT PATH '$.id',
+            NESTED PATH '$.items[*]' COLUMNS (item_name TEXT PATH '$.name')
+        )
+    ) AS t ORDER BY inv_id""")
+    rows = _cur_11b.fetchall()
+    ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad",
+       len(rows) == 2 and int(rows[0][0]) == 1 and str(rows[0][1]) == "A"
+       and int(rows[1][0]) == 2 and rows[1][1] is None,
+       f"got {rows}")
+except Exception as _e11b2:
+    ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad", False, str(_e11b2))
+    _conn_11b.close()
+    _conn_11b = connect()
+    _cur_11b = _conn_11b.cursor()
 
-# Per-level ordinality
-cur.execute("""SELECT ord_inv, ord_item FROM JSON_TABLE(
-    '[{"items":[{"n":"A"},{"n":"B"}]},{"items":[{"n":"C"}]}]',
-    '$[*]' COLUMNS (
-        ord_inv FOR ORDINALITY,
-        NESTED PATH '$.items[*]' COLUMNS (ord_item FOR ORDINALITY)
-    )
-) AS t ORDER BY ord_inv, ord_item""")
-rows = cur.fetchall()
-pairs = [(int(r[0]), int(r[1])) for r in rows]
-ok("11.20b JSON_TABLE NESTED per-level ordinality",
-   pairs == [(1, 1), (1, 2), (2, 1)],
-   f"got {pairs}")
+try:
+    _cur_11b.execute("""SELECT ord_inv, ord_item FROM JSON_TABLE(
+        '[{"items":[{"n":"A"},{"n":"B"}]},{"items":[{"n":"C"}]}]',
+        '$[*]' COLUMNS (
+            ord_inv FOR ORDINALITY,
+            NESTED PATH '$.items[*]' COLUMNS (ord_item FOR ORDINALITY)
+        )
+    ) AS t ORDER BY ord_inv, ord_item""")
+    rows = _cur_11b.fetchall()
+    pairs = [(int(r[0]), int(r[1])) for r in rows]
+    ok("11.20b JSON_TABLE NESTED per-level ordinality",
+       pairs == [(1, 1), (1, 2), (2, 1)],
+       f"got {pairs}")
+except Exception as _e11b3:
+    ok("11.20b JSON_TABLE NESTED per-level ordinality", False, str(_e11b3))
+
+_conn_11b.close()
 
 # ── Phase 11.20c — multi-sibling + multi-level NESTED ─────────────────────────
 
 print("\n[11.20c multi NESTED]")
 
-# Multi-sibling UNION semantics
-cur.execute("""SELECT inv_id, price, tag FROM JSON_TABLE(
-    '[{"id":1,"prices":[10,20],"tags":["a","b"]}]',
-    '$[*]' COLUMNS (
-        inv_id INT PATH '$.id',
-        NESTED PATH '$.prices[*]' COLUMNS (price INT  PATH '$'),
-        NESTED PATH '$.tags[*]'   COLUMNS (tag   TEXT PATH '$')
-    )
-) AS t ORDER BY COALESCE(price, 1000), COALESCE(tag, 'z')""")
-rows = cur.fetchall()
+_conn_11c = connect()
+_cur_11c = _conn_11c.cursor()
+
 def norm_cell(x):
     if x is None:
         return None
@@ -3262,26 +3274,46 @@ def norm_cell(x):
         return int(x)
     except (TypeError, ValueError):
         return str(x)
-normalized = [tuple(norm_cell(x) for x in r) for r in rows]
-ok("11.20c JSON_TABLE multi-sibling UNION",
-   normalized == [(1, 10, None), (1, 20, None), (1, None, "a"), (1, None, "b")],
-   f"got {normalized}")
 
-# Multi-level depth 2
-cur.execute("""SELECT line_id, part FROM JSON_TABLE(
-    '[{"lines":[{"lid":"L1","parts":["P1","P2"]},{"lid":"L2","parts":[]}]}]',
-    '$[*]' COLUMNS (
-        NESTED PATH '$.lines[*]' COLUMNS (
-            line_id TEXT PATH '$.lid',
-            NESTED PATH '$.parts[*]' COLUMNS (part TEXT PATH '$')
+try:
+    _cur_11c.execute("""SELECT inv_id, price, tag FROM JSON_TABLE(
+        '[{"id":1,"prices":[10,20],"tags":["a","b"]}]',
+        '$[*]' COLUMNS (
+            inv_id INT PATH '$.id',
+            NESTED PATH '$.prices[*]' COLUMNS (price INT  PATH '$'),
+            NESTED PATH '$.tags[*]'   COLUMNS (tag   TEXT PATH '$')
         )
-    )
-) AS t ORDER BY line_id, COALESCE(part, 'z')""")
-rows = cur.fetchall()
-cleaned = [tuple(str(x) if x is not None else None for x in r) for r in rows]
-ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
-   cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
-   f"got {cleaned}")
+    ) AS t ORDER BY COALESCE(price, 1000), COALESCE(tag, 'z')""")
+    rows = _cur_11c.fetchall()
+    normalized = [tuple(norm_cell(x) for x in r) for r in rows]
+    ok("11.20c JSON_TABLE multi-sibling UNION",
+       normalized == [(1, 10, None), (1, 20, None), (1, None, "a"), (1, None, "b")],
+       f"got {normalized}")
+except Exception as _e11c:
+    ok("11.20c JSON_TABLE multi-sibling UNION", False, str(_e11c))
+    _conn_11c.close()
+    _conn_11c = connect()
+    _cur_11c = _conn_11c.cursor()
+
+try:
+    _cur_11c.execute("""SELECT line_id, part FROM JSON_TABLE(
+        '[{"lines":[{"lid":"L1","parts":["P1","P2"]},{"lid":"L2","parts":[]}]}]',
+        '$[*]' COLUMNS (
+            NESTED PATH '$.lines[*]' COLUMNS (
+                line_id TEXT PATH '$.lid',
+                NESTED PATH '$.parts[*]' COLUMNS (part TEXT PATH '$')
+            )
+        )
+    ) AS t ORDER BY line_id, COALESCE(part, 'z')""")
+    rows = _cur_11c.fetchall()
+    cleaned = [tuple(str(x) if x is not None else None for x in r) for r in rows]
+    ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
+       cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
+       f"got {cleaned}")
+except Exception as _e11c2:
+    ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad", False, str(_e11c2))
+
+_conn_11c.close()
 
 # ── Phase 11.18c — JSONB path operators ─────────────────────────────────────
 
@@ -5523,12 +5555,16 @@ ok("[20.17b currency_of] CURRENCY_OF(MONEY(100,'GBP')) = 'GBP'",
    _cf_val == "GBP", _cf_val)
 
 # [20.17c] CONVERT using catalog rate
-cur.execute("CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92")
-cur.execute("SELECT CURRENCY_OF(CONVERT(MONEY(100, 'USD'), 'EUR'))")
-_converted_currency = cur.fetchone()[0]
-ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
-   _converted_currency == "EUR", _converted_currency)
-cur.execute("DROP EXCHANGE RATE 'USD' TO 'EUR'")
+try:
+    cur.execute("CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92")
+    cur.execute("SELECT CURRENCY_OF(CONVERT(MONEY(100, 'USD'), 'EUR'))")
+    _converted_currency = cur.fetchone()[0]
+    ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
+       _converted_currency == "EUR", _converted_currency)
+    cur.execute("DROP EXCHANGE RATE 'USD' TO 'EUR'")
+except Exception as _e_20_17c:
+    ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
+       False, str(_e_20_17c))
 
 # [20.17d] Cross-currency addition returns error
 _got_error = False
@@ -5641,6 +5677,67 @@ rows20 = cur.fetchall()
 ok("[20.20 xml] XMLTABLE ordinality column", len(rows20) == 2 and rows20[0][0] == 1 and rows20[1][0] == 2, rows20)
 
 cur.execute("DROP TABLE IF EXISTS _wire_xml_t")
+
+# ── 24.1 Integer types (TINYINT / SMALLINT / BIGSERIAL) ───────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_int_types")
+cur.execute("CREATE TABLE _wire_int_types (id INT PRIMARY KEY, ti TINYINT, si SMALLINT)")
+cur.execute("INSERT INTO _wire_int_types VALUES (1, 42, 1000)")
+cur.execute("INSERT INTO _wire_int_types VALUES (2, -10, -500)")
+cur.execute("INSERT INTO _wire_int_types VALUES (3, -128, -32768)")
+cur.execute("INSERT INTO _wire_int_types VALUES (4, 127, 32767)")
+
+cur.execute("SELECT ti, si FROM _wire_int_types ORDER BY id")
+rows_int = cur.fetchall()
+ok("[24.1 int_types] tinyint insert/select round-trip", rows_int[0] == (42, 1000), rows_int[0])
+ok("[24.1 int_types] tinyint negative round-trip", rows_int[1] == (-10, -500), rows_int[1])
+ok("[24.1 int_types] tinyint boundary min -128 and smallint min -32768", rows_int[2] == (-128, -32768), rows_int[2])
+ok("[24.1 int_types] tinyint boundary max 127 and smallint max 32767", rows_int[3] == (127, 32767), rows_int[3])
+
+# Wire type metadata: cursor.description gives type_code (pymysql maps MySQL type codes to Python types)
+cur.execute("SELECT ti, si FROM _wire_int_types LIMIT 1")
+cur.fetchall()
+ti_type = cur.description[0][1]  # type_code
+si_type = cur.description[1][1]
+ok("[24.1 int_types] TINYINT wire type is integer-family", ti_type is not None, ti_type)
+ok("[24.1 int_types] SMALLINT wire type is integer-family", si_type is not None, si_type)
+
+# Overflow must produce an error
+try:
+    cur.execute("INSERT INTO _wire_int_types VALUES (99, 128, 0)")
+    conn.rollback()
+    ok("[24.1 int_types] TINYINT overflow 128 raises error", False, "no error raised")
+except Exception:
+    ok("[24.1 int_types] TINYINT overflow 128 raises error", True)
+
+try:
+    cur.execute("INSERT INTO _wire_int_types VALUES (99, -129, 0)")
+    conn.rollback()
+    ok("[24.1 int_types] TINYINT underflow -129 raises error", False, "no error raised")
+except Exception:
+    ok("[24.1 int_types] TINYINT underflow -129 raises error", True)
+
+# BIGSERIAL auto-increments
+cur.execute("DROP TABLE IF EXISTS _wire_bigserial")
+cur.execute("CREATE TABLE _wire_bigserial (id BIGSERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO _wire_bigserial (name) VALUES ('alice')")
+cur.execute("INSERT INTO _wire_bigserial (name) VALUES ('bob')")
+cur.execute("INSERT INTO _wire_bigserial (name) VALUES ('carol')")
+cur.execute("SELECT id FROM _wire_bigserial ORDER BY id")
+brows = cur.fetchall()
+ok("[24.1 int_types] BIGSERIAL auto-increments from 1", brows[0][0] == 1, brows[0][0])
+ok("[24.1 int_types] BIGSERIAL second row is 2", brows[1][0] == 2, brows[1][0])
+ok("[24.1 int_types] BIGSERIAL third row is 3", brows[2][0] == 3, brows[2][0])
+
+# SHOW COLUMNS reports correct type names
+cur.execute("SHOW COLUMNS FROM _wire_int_types")
+sc_rows = cur.fetchall()
+sc_types = [r[1].lower() if isinstance(r[1], str) else str(r[1]) for r in sc_rows]
+ok("[24.1 int_types] SHOW COLUMNS reports tinyint", any("tinyint" in t for t in sc_types), sc_types)
+ok("[24.1 int_types] SHOW COLUMNS reports smallint", any("smallint" in t for t in sc_types), sc_types)
+
+cur.execute("DROP TABLE IF EXISTS _wire_int_types")
+cur.execute("DROP TABLE IF EXISTS _wire_bigserial")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

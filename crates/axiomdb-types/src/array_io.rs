@@ -720,7 +720,7 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
                 reason: format!("invalid input syntax for type boolean: \"{}\"", text),
             }),
         },
-        ColumnType::Int | ColumnType::Date => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::Date => {
             // For Date, we store as i32 days. Parse as integer.
             let n: i64 = unescaped.parse().map_err(|_| DbError::InvalidValue {
                 reason: format!("invalid input syntax for type integer: \"{}\"", text),

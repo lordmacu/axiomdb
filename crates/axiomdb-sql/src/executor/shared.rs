@@ -415,6 +415,8 @@ fn make_resolver_with_database<'a>(
 fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
     match dt {
         DataType::Bool => Ok(ColumnType::Bool),
+        DataType::TinyInt => Ok(ColumnType::TinyInt),
+        DataType::SmallInt => Ok(ColumnType::SmallInt),
         DataType::Int => Ok(ColumnType::Int),
         DataType::BigInt => Ok(ColumnType::BigInt),
         DataType::Real => Ok(ColumnType::Float),
@@ -439,6 +441,8 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
 fn column_type_to_datatype(ct: ColumnType) -> DataType {
     match ct {
         ColumnType::Bool => DataType::Bool,
+        ColumnType::TinyInt => DataType::TinyInt,
+        ColumnType::SmallInt => DataType::SmallInt,
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
         ColumnType::Float => DataType::Real,

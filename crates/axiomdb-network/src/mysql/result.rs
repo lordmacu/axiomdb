@@ -228,6 +228,8 @@ fn encode_binary_cell(
 ) -> Result<(), DbError> {
     match (data_type, value) {
         (DataType::Bool, Value::Bool(v)) => buf.push(u8::from(*v)),
+        (DataType::TinyInt, Value::Int(v)) => buf.push(*v as i8 as u8), // 1-byte TINY
+        (DataType::SmallInt, Value::Int(v)) => buf.extend_from_slice(&(*v as i16).to_le_bytes()), // 2-byte SHORT
         (DataType::Int, Value::Int(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::BigInt, Value::BigInt(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::Real, Value::Real(v)) => buf.extend_from_slice(&v.to_le_bytes()),
@@ -515,6 +517,8 @@ fn build_row_packet(
 fn datatype_to_mysql_type(dt: DataType) -> u8 {
     match dt {
         DataType::Bool => 0x01,                                    // TINY
+        DataType::TinyInt => 0x01,                                 // TINY (signed)
+        DataType::SmallInt => 0x02,                                // SHORT (signed)
         DataType::Int => 0x03,                                     // LONG
         DataType::BigInt => 0x08,                                  // LONGLONG
         DataType::Real => 0x05,                                    // DOUBLE
@@ -536,6 +540,8 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
 fn column_display_len(dt: DataType) -> u32 {
     match dt {
         DataType::Bool => 1,
+        DataType::TinyInt => 4,  // "-128"
+        DataType::SmallInt => 6, // "-32768"
         DataType::Int => 11,
         DataType::BigInt => 20,
         DataType::Real => 22,

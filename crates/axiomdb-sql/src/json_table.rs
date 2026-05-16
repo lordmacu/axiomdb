@@ -365,6 +365,8 @@ pub fn datatype_to_column_type_pub(dt: &DataType) -> Result<ColumnType, DbError>
 fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
     Ok(match dt {
         DataType::Bool => ColumnType::Bool,
+        DataType::TinyInt => ColumnType::TinyInt,
+        DataType::SmallInt => ColumnType::SmallInt,
         DataType::Int => ColumnType::Int,
         DataType::BigInt => ColumnType::BigInt,
         DataType::Real => ColumnType::Float,

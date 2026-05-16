@@ -53,6 +53,8 @@ pub enum ColumnType {
     Composite = 16, // SQL composite type (Phase 20.18)
     Ltree = 17,     // SQL ltree hierarchical path (Phase 20.19)
     Xml = 18,       // SQL XML / XMLTYPE (Phase 20.20)
+    TinyInt = 19,   // SQL TINYINT — i8 range, wire 0x01 TINY (Phase 24.1)
+    SmallInt = 20,  // SQL SMALLINT — i16 range, wire 0x02 SHORT (Phase 24.1)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -77,6 +79,8 @@ impl TryFrom<u8> for ColumnType {
             16 => Ok(Self::Composite),
             17 => Ok(Self::Ltree),
             18 => Ok(Self::Xml),
+            19 => Ok(Self::TinyInt),
+            20 => Ok(Self::SmallInt),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -109,6 +113,8 @@ const MAX_ARRAY_INLINE: usize = 0xFF_FFFF; // 16,777,215
 pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
     match dt {
         crate::types::DataType::Bool => ColumnType::Bool,
+        crate::types::DataType::TinyInt => ColumnType::TinyInt,
+        crate::types::DataType::SmallInt => ColumnType::SmallInt,
         crate::types::DataType::Int => ColumnType::Int,
         crate::types::DataType::BigInt => ColumnType::BigInt,
         crate::types::DataType::Real => ColumnType::Float,
@@ -157,7 +163,7 @@ fn encode_element(
             };
             buf.push(if b { 1 } else { 0 });
         }
-        ColumnType::Int | ColumnType::Date => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::Date => {
             let n = match elem {
                 Value::Int(n) => *n,
                 Value::Date(d) => *d,
@@ -366,7 +372,7 @@ fn decode_element(
             *pos += 1;
             Ok((Value::Bool(b), 1))
         }
-        ColumnType::Int | ColumnType::Date => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::Date => {
             if *pos + 4 > blob.len() {
                 return Err(DbError::ParseError {
                     message: "truncated: expected 4 bytes for Int/Date element".to_string(),

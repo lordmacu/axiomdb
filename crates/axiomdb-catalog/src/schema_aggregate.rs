@@ -190,6 +190,8 @@ impl AggregateDef {
 fn data_type_tag(ty: DataType) -> u8 {
     match ty {
         DataType::Bool => 1,
+        DataType::TinyInt => 19,
+        DataType::SmallInt => 20,
         DataType::Int => 2,
         DataType::BigInt => 3,
         DataType::Real => 4,
@@ -230,6 +232,8 @@ fn data_type_from_tag(tag: u8) -> Result<DataType, DbError> {
         16 => Ok(DataType::Composite(vec![])),
         17 => Ok(DataType::Ltree),
         18 => Ok(DataType::Xml),
+        19 => Ok(DataType::TinyInt),
+        20 => Ok(DataType::SmallInt),
         other => Err(DbError::ParseError {
             message: format!("invalid aggregate arg type byte {other}"),
             position: None,

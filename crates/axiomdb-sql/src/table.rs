@@ -187,6 +187,8 @@ fn parse_toast_placeholder(placeholder: &str) -> Option<(u64, bool, usize)> {
 pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
     match ct {
         ColumnType::Bool => DataType::Bool,
+        ColumnType::TinyInt => DataType::TinyInt,
+        ColumnType::SmallInt => DataType::SmallInt,
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
         ColumnType::Float => DataType::Real,
@@ -214,6 +216,8 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
         .iter()
         .map(|c| match c.col_type {
             ColumnType::Bool => DataType::Bool,
+            ColumnType::TinyInt => DataType::TinyInt,
+            ColumnType::SmallInt => DataType::SmallInt,
             ColumnType::Int => DataType::Int,
             ColumnType::BigInt => DataType::BigInt,
             ColumnType::Float => DataType::Real,
@@ -737,6 +741,8 @@ pub(crate) fn coerce_values(
         .map(|(v, col)| {
             let target = match col.col_type {
                 ColumnType::Bool => DataType::Bool,
+                ColumnType::TinyInt => DataType::TinyInt,
+                ColumnType::SmallInt => DataType::SmallInt,
                 ColumnType::Int => DataType::Int,
                 ColumnType::BigInt => DataType::BigInt,
                 ColumnType::Float => DataType::Real,
@@ -786,6 +792,8 @@ pub(crate) fn coerce_values_with_ctx(
     for (v, col) in values.into_iter().zip(columns.iter()) {
         let target = match col.col_type {
             ColumnType::Bool => DataType::Bool,
+            ColumnType::TinyInt => DataType::TinyInt,
+            ColumnType::SmallInt => DataType::SmallInt,
             ColumnType::Int => DataType::Int,
             ColumnType::BigInt => DataType::BigInt,
             ColumnType::Float => DataType::Real,

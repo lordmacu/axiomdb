@@ -565,6 +565,8 @@ fn column_type_to_is_data_type(col: &axiomdb_catalog::ColumnDef) -> String {
     }
     match col.col_type {
         ColumnType::Bool => "tinyint",
+        ColumnType::TinyInt => "tinyint",
+        ColumnType::SmallInt => "smallint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
         ColumnType::Float => "double",
@@ -665,6 +667,8 @@ fn column_type_to_column_type_str(col: &axiomdb_catalog::ColumnDef) -> String {
 fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "tinyint",
+        ColumnType::TinyInt => "tinyint",
+        ColumnType::SmallInt => "smallint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
         ColumnType::Float => "double",
@@ -688,6 +692,8 @@ fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
 fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "tinyint(1)",
+        ColumnType::TinyInt => "tinyint",
+        ColumnType::SmallInt => "smallint",
         ColumnType::Int => "int",
         ColumnType::BigInt => "bigint",
         ColumnType::Float => "double",

@@ -558,9 +558,30 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
+
+    // BIGSERIAL — shorthand for BIGINT NOT NULL AUTO_INCREMENT.
+    let bigserial = matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("BIGSERIAL"));
+    if bigserial {
+        p.advance();
+    }
+
     let (data_type, type_len, is_char, declared_type_name, array_ndims, array_size_hints) =
-        parse_column_data_type(p)?;
+        if bigserial {
+            (
+                DataType::BigInt,
+                0u16,
+                false,
+                None::<crate::ast::TableRef>,
+                0u8,
+                vec![],
+            )
+        } else {
+            parse_column_data_type(p)?
+        };
     let mut constraints = Vec::new();
+    if bigserial {
+        constraints.push(ColumnConstraint::AutoIncrement);
+    }
     let mut collation = None;
 
     loop {
@@ -1220,12 +1241,12 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
         Token::Ident(s) if s.eq_ignore_ascii_case("TINYINT") => {
             p.advance();
             eat_optional_length(p)?; // TINYINT(N) — display width, ignored
-            (DataType::Bool, 0, false)
+            (DataType::TinyInt, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("SMALLINT") => {
             p.advance();
             eat_optional_length(p)?;
-            (DataType::Int, 0, false)
+            (DataType::SmallInt, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("MEDIUMINT") => {
             p.advance();
@@ -2146,6 +2167,8 @@ fn fdw_datatype_to_column_type(
     use axiomdb_types::DataType;
     match dt {
         DataType::Bool => Ok(ColumnType::Bool),
+        DataType::TinyInt => Ok(ColumnType::TinyInt),
+        DataType::SmallInt => Ok(ColumnType::SmallInt),
         DataType::Int => Ok(ColumnType::Int),
         DataType::BigInt => Ok(ColumnType::BigInt),
         DataType::Real => Ok(ColumnType::Float),

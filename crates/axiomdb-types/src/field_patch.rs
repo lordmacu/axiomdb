@@ -22,7 +22,7 @@ use axiomdb_core::error::DbError;
 pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
     match dt {
         DataType::Bool => Some(1),
-        DataType::Int | DataType::Date => Some(4),
+        DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::Date => Some(4),
         DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
         // Variable-length or complex types: cannot patch in place.
         DataType::Text

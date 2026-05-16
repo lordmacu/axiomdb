@@ -21,10 +21,18 @@ types for temporal and numeric overlaps).
 | `UBIGINT`  | `UINT8`        | 8 bytes | `u64`     | 0 to 18.4 × 10¹⁸ (used for LSN, page_id)|
 | `HUGEINT`  | `INT16`        | 16 bytes| `i128`    | ±1.7 × 10³⁸ (cryptography, checksums)   |
 
+**Auto-increment shorthand:** `BIGSERIAL` is sugar for `BIGINT AUTO_INCREMENT`.
+
 ```sql
--- Typical primary key
+-- Typical primary key (explicit form)
 CREATE TABLE users (
     id   BIGINT PRIMARY KEY AUTO_INCREMENT,
+    age  SMALLINT NOT NULL
+);
+
+-- Same table using BIGSERIAL shorthand
+CREATE TABLE users (
+    id   BIGSERIAL PRIMARY KEY,
     age  SMALLINT NOT NULL
 );
 
@@ -34,6 +42,10 @@ CREATE TABLE page_views (
     views    UINT NOT NULL DEFAULT 0
 );
 ```
+
+> **Range enforcement:** `TINYINT` and `SMALLINT` enforce their ranges at insert
+> time. Inserting a value out of range (e.g. `128` into a TINYINT column) returns
+> `DbError::InvalidValue` — the row is rejected and no partial write occurs.
 
 ---
 

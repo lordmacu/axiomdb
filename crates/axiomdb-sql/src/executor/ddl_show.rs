@@ -953,6 +953,8 @@ pub(crate) fn execute_show_collation() -> QueryResult {
 fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "BOOL",
+        ColumnType::TinyInt => "TINYINT",
+        ColumnType::SmallInt => "SMALLINT",
         ColumnType::Int => "INT",
         ColumnType::BigInt => "BIGINT",
         ColumnType::Float => "REAL",
@@ -977,6 +979,8 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
 fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "BOOL",
+        ColumnType::TinyInt => "TINYINT",
+        ColumnType::SmallInt => "SMALLINT",
         ColumnType::Int => "INT",
         ColumnType::BigInt => "BIGINT",
         ColumnType::Float => "REAL",

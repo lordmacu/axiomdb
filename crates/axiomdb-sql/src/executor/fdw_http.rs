@@ -334,7 +334,7 @@ fn json_value_to_axiom(
             serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0).unwrap_or(false),
             _ => false,
         })),
-        ColumnType::Int => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int => {
             let n = match v {
                 serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
                 serde_json::Value::String(s) => s.parse().unwrap_or(0),
