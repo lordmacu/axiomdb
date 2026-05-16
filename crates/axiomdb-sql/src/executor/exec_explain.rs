@@ -243,6 +243,11 @@ fn dispatch(
             execute_create_foreign_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
         }
         Stmt::DropForeignTable(s) => execute_drop_foreign_table(s, storage, txn, conn_txn),
+        Stmt::CreateHolidayCalendar(_) | Stmt::DropHolidayCalendar(_) => {
+            Err(DbError::NotImplemented {
+                feature: "holiday calendar DDL — use session-aware path".into(),
+            })
+        }
     }
 }
 

@@ -1051,9 +1051,22 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_server(self)
             }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("holiday") => {
+                self.advance(); // consume HOLIDAY
+                match self.peek().clone() {
+                    Token::Ident(kw2) if kw2.eq_ignore_ascii_case("calendar") => {
+                        self.advance(); // consume CALENDAR
+                        ddl::parse_create_holiday_calendar(self)
+                    }
+                    other => Err(DbError::ParseError {
+                        message: format!("expected CALENDAR after HOLIDAY, found {other:?}"),
+                        position: Some(self.current_pos()),
+                    }),
+                }
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, INDEX, FOREIGN TABLE, or SERVER after CREATE, found {:?}",
+                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, INDEX, FOREIGN TABLE, SERVER, or HOLIDAY CALENDAR after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1113,9 +1126,22 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_drop_server(self)
             }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("holiday") => {
+                self.advance(); // consume HOLIDAY
+                match self.peek().clone() {
+                    Token::Ident(kw2) if kw2.eq_ignore_ascii_case("calendar") => {
+                        self.advance(); // consume CALENDAR
+                        ddl::parse_drop_holiday_calendar(self)
+                    }
+                    other => Err(DbError::ParseError {
+                        message: format!("expected CALENDAR after HOLIDAY, found {other:?}"),
+                        position: Some(self.current_pos()),
+                    }),
+                }
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA, INDEX, FOREIGN TABLE, or SERVER after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA, INDEX, FOREIGN TABLE, SERVER, or HOLIDAY CALENDAR after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

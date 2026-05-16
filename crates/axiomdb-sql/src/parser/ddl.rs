@@ -2219,3 +2219,91 @@ pub(crate) fn parse_drop_foreign_table(p: &mut Parser) -> Result<Stmt, DbError> 
         if_exists,
     }))
 }
+
+// ── Holiday calendar DDL (Phase 20.16) ────────────────────────────────────────
+
+/// Parses everything after `CREATE HOLIDAY CALENDAR` has been consumed.
+///
+/// Syntax: `country_code [WITH HOLIDAYS (date_str[, ...])]`
+///
+/// `country_code` may be a string literal (`'CO'`) or a bare identifier (`CO`).
+/// Dates are ISO-8601 string literals, e.g. `'2024-01-01'`.
+pub(crate) fn parse_create_holiday_calendar(p: &mut Parser) -> Result<Stmt, DbError> {
+    let country_code = parse_country_code(p)?.to_ascii_uppercase();
+
+    let mut holidays = Vec::new();
+    if matches!(p.peek(), Token::Ident(kw) if kw.eq_ignore_ascii_case("with")) {
+        p.advance(); // consume WITH
+        if matches!(p.peek(), Token::Ident(kw) if kw.eq_ignore_ascii_case("holidays")) {
+            p.advance(); // consume HOLIDAYS
+        } else {
+            return Err(DbError::ParseError {
+                message: "expected HOLIDAYS after WITH in CREATE HOLIDAY CALENDAR".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        p.expect(&Token::LParen)?;
+        if !p.eat(&Token::RParen) {
+            loop {
+                let date_str = match p.peek().clone() {
+                    Token::StringLit(s) => {
+                        p.advance();
+                        s
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!("expected date string literal in HOLIDAYS list, found {other:?}"),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                };
+                holidays.push(date_str);
+                if !p.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            p.expect(&Token::RParen)?;
+        }
+    }
+
+    Ok(Stmt::CreateHolidayCalendar(
+        crate::ast::CreateHolidayCalendarStmt {
+            country_code,
+            holidays,
+        },
+    ))
+}
+
+/// Parses everything after `DROP HOLIDAY CALENDAR` has been consumed.
+///
+/// Syntax: `[IF EXISTS] country_code`
+pub(crate) fn parse_drop_holiday_calendar(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let country_code = parse_country_code(p)?.to_ascii_uppercase();
+    Ok(Stmt::DropHolidayCalendar(
+        crate::ast::DropHolidayCalendarStmt {
+            if_exists,
+            country_code,
+        },
+    ))
+}
+
+/// Parses a country code, accepting either a string literal (`'CO'`) or a
+/// bare identifier (`CO`).
+fn parse_country_code(p: &mut Parser) -> Result<String, DbError> {
+    match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            Ok(s)
+        }
+        Token::Ident(s) => {
+            let owned = s.to_string();
+            p.advance();
+            Ok(owned)
+        }
+        other => Err(DbError::ParseError {
+            message: format!("expected country code string or identifier, found {other:?}"),
+            position: Some(p.current_pos()),
+        }),
+    }
+}

@@ -1548,6 +1548,26 @@ pub struct ShowCreateTriggerStmt {
     pub table: TableRef,
 }
 
+/// `CREATE HOLIDAY CALENDAR country_code [WITH HOLIDAYS (date_str[, ...])]`
+///
+/// Registers or replaces a country holiday calendar in the catalog.
+/// `country_code` is normalized to upper-case. `holidays` are ISO-8601 date
+/// strings (YYYY-MM-DD) parsed at execution time into days-since-Unix-epoch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateHolidayCalendarStmt {
+    /// Upper-cased country code, e.g. `"CO"`, `"US"`.
+    pub country_code: String,
+    /// Holiday dates as ISO-8601 strings, e.g. `["2024-01-01", "2024-07-04"]`.
+    pub holidays: Vec<String>,
+}
+
+/// `DROP HOLIDAY CALENDAR [IF EXISTS] country_code`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropHolidayCalendarStmt {
+    pub if_exists: bool,
+    pub country_code: String,
+}
+
 /// `CLOSE name` or `CLOSE ALL`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseCursorStmt {
@@ -1633,6 +1653,10 @@ pub enum Stmt {
     DropServer(DropServerStmt),
     CreateForeignTable(CreateForeignTableStmt),
     DropForeignTable(DropForeignTableStmt),
+    /// `CREATE HOLIDAY CALENDAR country_code [WITH HOLIDAYS (...)]` — Phase 20.16.
+    CreateHolidayCalendar(CreateHolidayCalendarStmt),
+    /// `DROP HOLIDAY CALENDAR [IF EXISTS] country_code` — Phase 20.16.
+    DropHolidayCalendar(DropHolidayCalendarStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),
