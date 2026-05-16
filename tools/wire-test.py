@@ -5579,6 +5579,69 @@ ok("[20.19 ltree] || concatenates two ltree paths", cur.fetchone()[0] == "a.b.c.
 
 cur.execute("DROP TABLE IF EXISTS _wire_ltree_paths")
 
+# ── Phase 20.20 — XMLType ─────────────────────────────────────────────────────
+
+# Core type: XML column + cast
+cur.execute("DROP TABLE IF EXISTS _wire_xml_t")
+cur.execute("CREATE TABLE _wire_xml_t (id INT, doc XML)")
+cur.execute("INSERT INTO _wire_xml_t VALUES (1, '<root><a>hello</a></root>')")
+cur.execute("SELECT doc FROM _wire_xml_t WHERE id = 1")
+ok("[20.20 xml] XML column round-trips correctly", cur.fetchone()[0] == "<root><a>hello</a></root>")
+
+cur.execute("SELECT CAST('<root/>' AS XML)")
+ok("[20.20 xml] CAST text to XML", cur.fetchone()[0] == "<root/>")
+
+cur.execute("SELECT xml_is_well_formed('<a/>')")
+ok("[20.20 xml] xml_is_well_formed('<a/>') = 1", cur.fetchone()[0] == 1)
+
+cur.execute("SELECT xml_is_well_formed('<broken')")
+ok("[20.20 xml] xml_is_well_formed('<broken') = 0", cur.fetchone()[0] == 0)
+
+# XMLELEMENT
+cur.execute("SELECT XMLELEMENT(NAME a, 'hello')")
+ok("[20.20 xml] XMLELEMENT produces element", cur.fetchone()[0] == "<a>hello</a>")
+
+cur.execute("SELECT XMLELEMENT(NAME a, XMLATTRIBUTES('42' AS id), 'text')")
+ok("[20.20 xml] XMLELEMENT with attributes", cur.fetchone()[0] == '<a id="42">text</a>')
+
+# XMLFOREST
+cur.execute("SELECT XMLFOREST('bob' AS name, 42 AS age)")
+ok("[20.20 xml] XMLFOREST produces multiple elements", cur.fetchone()[0] == "<name>bob</name><age>42</age>")
+
+# XMLROOT
+cur.execute("SELECT XMLROOT('<a/>'::XML, VERSION '1.0')")
+ok("[20.20 xml] XMLROOT adds declaration", cur.fetchone()[0] == '<?xml version="1.0"?><a/>')
+
+# XMLCONCAT
+cur.execute("SELECT XMLCONCAT('<a/>'::XML, '<b/>'::XML)")
+ok("[20.20 xml] XMLCONCAT joins fragments", cur.fetchone()[0] == "<a/><b/>")
+
+# XMLQUERY
+cur.execute("SELECT XMLQUERY('/root/a/text()' PASSING '<root><a>hi</a></root>'::XML)")
+ok("[20.20 xml] XMLQUERY extracts text", cur.fetchone()[0] == "hi")
+
+cur.execute("SELECT XMLQUERY('/root/a/@id' PASSING '<root><a id=\"7\">x</a></root>'::XML)")
+ok("[20.20 xml] XMLQUERY extracts attribute", cur.fetchone()[0] == "7")
+
+# XMLTABLE
+cur.execute("""
+SELECT name, age FROM XMLTABLE('/rows/row'
+  PASSING '<rows><row><name>Alice</name><age>30</age></row></rows>'
+  COLUMNS name TEXT, age INT) AS t
+""")
+row = cur.fetchone()
+ok("[20.20 xml] XMLTABLE extracts row columns", row[0] == "Alice" and row[1] == 30, row)
+
+cur.execute("""
+SELECT ord, name FROM XMLTABLE('/rows/row'
+  PASSING '<rows><row><name>A</name></row><row><name>B</name></row></rows>'
+  COLUMNS ord FOR ORDINALITY, name TEXT) AS t
+""")
+rows20 = cur.fetchall()
+ok("[20.20 xml] XMLTABLE ordinality column", len(rows20) == 2 and rows20[0][0] == 1 and rows20[1][0] == 2, rows20)
+
+cur.execute("DROP TABLE IF EXISTS _wire_xml_t")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

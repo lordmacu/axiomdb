@@ -586,6 +586,10 @@ fn analyze_merge_source(
         FromClause::ReadParquet(_) => Err(DbError::NotImplemented {
             feature: "READ_PARQUET in subquery/DDL context".into(),
         }),
+        // Phase 20.20 — XMLTABLE not allowed in DDL context.
+        FromClause::XmlTable(_) => Err(DbError::NotImplemented {
+            feature: "XMLTABLE in subquery/DDL context".into(),
+        }),
     }
 }
 

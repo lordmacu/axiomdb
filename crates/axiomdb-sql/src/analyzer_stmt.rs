@@ -519,6 +519,14 @@ fn analyze_select_with_outer(
             FromClause::ReadParquet(rp) => {
                 join.table = FromClause::ReadParquet(rp);
             }
+            // Phase 20.20 — XMLTABLE: resolve the PASSING expressions.
+            FromClause::XmlTable(mut xt) => {
+                for (expr, _) in &mut xt.passing {
+                    let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                    *expr = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                }
+                join.table = FromClause::XmlTable(xt);
+            }
         }
         // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
         // the accumulated left-side scope and this join's right-side BoundTable,

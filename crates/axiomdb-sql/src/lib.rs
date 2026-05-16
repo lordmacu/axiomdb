@@ -45,6 +45,7 @@ pub mod trigram;
 pub mod unnest;
 pub mod vacuum;
 pub mod values_clause;
+pub mod xml_table;
 
 pub use ast::{
     AlterTableOp, AlterTableStmt, Assignment, CloseCursorStmt, ColumnConstraint, ColumnDef,

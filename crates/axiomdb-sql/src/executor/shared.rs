@@ -841,7 +841,18 @@ fn build_derived_output_columns(
                 let name = alias
                     .clone()
                     .unwrap_or_else(|| expr_column_name(expr, None));
-                out.push(ColumnMeta::computed(name, axiomdb_types::DataType::Text));
+                // For bare column references into a derived table (TVF or subquery),
+                // look up the typed ColumnMeta from derived_cols so the wire protocol
+                // sends the correct MySQL type code.
+                let data_type = match expr {
+                    crate::expr::Expr::Column { col_idx, .. } => derived_cols
+                        .get(*col_idx)
+                        .map(|m| m.data_type.clone())
+                        .unwrap_or(axiomdb_types::DataType::Text),
+                    _ => axiomdb_types::DataType::Text,
+                };
+                let nullable = true;
+                out.push(ColumnMeta::new(name, data_type, nullable, None));
             }
         }
     }

@@ -511,6 +511,47 @@ fn bound_from_clause(
             *col_offset += n;
             Ok(vec![bound])
         }
+        // Phase 20.20 — XMLTABLE virtual table.
+        FromClause::XmlTable(xt) => {
+            let spec = crate::xml_table::compile_xml_table(xt)?;
+            let metas = crate::xml_table::column_metas_for_spec(&spec);
+            let virtual_cols: Vec<axiomdb_catalog::schema::ColumnDef> = metas
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let col_type = crate::json_table::datatype_to_column_type_pub(&m.data_type)
+                        .unwrap_or(axiomdb_catalog::schema::ColumnType::Text);
+                    axiomdb_catalog::schema::ColumnDef {
+                        table_id: 0,
+                        col_idx: i as u16,
+                        name: m.name.clone(),
+                        col_type,
+                        nullable: true,
+                        auto_increment: false,
+                        type_len: 0,
+                        is_fixed_len: false,
+                        default_expr: None,
+                        on_update_expr: None,
+                        generated_expr: None,
+                        collation: None,
+                        generated_stored: false,
+                        enum_type_name: None,
+                        array_element_type: None,
+                        array_ndims: None,
+                    }
+                })
+                .collect();
+            let n = virtual_cols.len();
+            let alias = xt.alias.clone().unwrap_or_else(|| "xmltable".into());
+            let bound = BoundTable {
+                alias: Some(alias.clone()),
+                name: alias,
+                columns: virtual_cols,
+                col_offset: *col_offset,
+            };
+            *col_offset += n;
+            Ok(vec![bound])
+        }
     }
 }
 

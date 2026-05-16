@@ -785,6 +785,64 @@ SELECT XMLQUERY('/doc/elem/@id' PASSING '<doc><elem id="99"/></doc>'::XML);
 
 **XPath support**: `XMLQUERY` supports absolute paths (`/elem/...`) with `text()` and `@attr` terminal steps. Element names without a terminal step return the element's text content.
 
+### XMLTABLE — Shred XML into Rows
+
+`XMLTABLE` is a table-valued function (TVF) that turns an XML document into a set of rows. It appears in the `FROM` clause.
+
+```sql
+SELECT col1, col2
+FROM XMLTABLE(
+    'row_xpath'           -- XPath that selects one node per output row
+    PASSING xml_expr      -- expression that produces the XML document
+    COLUMNS
+        col1  TYPE [PATH 'xpath'] [DEFAULT expr],
+        col2  TYPE [PATH 'xpath'],
+        ord   FOR ORDINALITY     -- 1-based row counter
+) AS t;
+```
+
+**Column PATH**: XPath relative to the row node. Defaults to the column name as a child element path. Use `@attr` for attribute values.
+
+**FOR ORDINALITY**: Integer column auto-assigned 1, 2, 3, … for each row in document order.
+
+**DEFAULT**: Value used when the PATH matches no node (instead of NULL).
+
+**NULL propagation**: If the PASSING expression evaluates to NULL or unparseable text, XMLTABLE returns zero rows.
+
+```sql
+-- Basic shredding
+SELECT name, age
+FROM XMLTABLE(
+    '/rows/row'
+    PASSING '<rows><row><name>Alice</name><age>30</age></row></rows>'
+    COLUMNS name TEXT, age INT
+) AS t;
+-- name='Alice', age=30
+
+-- Attribute extraction
+SELECT id, val
+FROM XMLTABLE(
+    '/items/item'
+    PASSING '<items><item id="1">hello</item></items>'
+    COLUMNS id INT PATH '@id', val TEXT
+) AS t;
+-- id=1, val='hello'
+
+-- Ordinality + custom path + default
+SELECT ord, label
+FROM XMLTABLE(
+    '/data/entry'
+    PASSING '<data><entry/><entry><lbl>x</lbl></entry></data>'
+    COLUMNS ord FOR ORDINALITY, label TEXT PATH 'lbl' DEFAULT 'n/a'
+) AS t;
+-- row 1: ord=1, label='n/a'
+-- row 2: ord=2, label='x'
+```
+
+<div class="callout-advantage">
+<strong>AxiomDB advantage vs MySQL</strong>: MySQL has no XMLTABLE — XML shredding requires application-side parsing. AxiomDB's XMLTABLE follows the SQL:2006 / PostgreSQL 10+ standard and supports full <code>WHERE</code>, <code>ORDER BY</code>, <code>JOIN</code>, and aggregation against the derived table.
+</div>
+
 ---
 
 ## NULL in Every Type

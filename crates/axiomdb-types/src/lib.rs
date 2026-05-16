@@ -13,9 +13,9 @@ pub mod field_patch;
 pub mod jsonb;
 pub mod ltree;
 pub mod range_value;
-pub mod xml;
 pub mod types;
 pub mod value;
+pub mod xml;
 
 pub use array_codec::{decode_array, encode_array, encode_array_nd};
 pub use array_io::{array_to_text, text_to_array};
@@ -30,6 +30,6 @@ pub use ltree::{
     ltree_subpath, validate_ltree_path,
 };
 pub use range_value::RangeValue;
-pub use xml::validate_xml_text;
 pub use types::DataType;
 pub use value::Value;
+pub use xml::validate_xml_text;

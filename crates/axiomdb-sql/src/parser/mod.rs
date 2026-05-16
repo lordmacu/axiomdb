@@ -13,6 +13,7 @@ pub(crate) mod dml;
 pub(crate) mod expr;
 pub(crate) mod json_table;
 pub(crate) mod sql_json_common;
+pub(crate) mod xml_table;
 
 use axiomdb_core::error::DbError;
 

@@ -520,6 +520,12 @@ fn collect_dml_join_candidates_ctx(
                     message: "unlowered PIVOT reached DML join executor".into(),
                 });
             }
+            // Phase 20.20 — XMLTABLE as DML JOIN right-side source.
+            FromClause::XmlTable(_) => {
+                return Err(DbError::NotImplemented {
+                    feature: "XMLTABLE on the right side of a DML JOIN".into(),
+                });
+            }
         }
     }
 

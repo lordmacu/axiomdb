@@ -405,7 +405,6 @@ pub enum Expr {
     FieldAccess { col_idx: usize, field_idx: usize },
 
     // ── Phase 20.20 — SQL/XML constructor special forms ───────────────────────
-
     /// `XMLELEMENT(NAME tag [, XMLATTRIBUTES(v AS a, ...) ] [, content ...])`
     ///
     /// Builds an XML element from a tag name, optional attributes, and content
@@ -422,9 +421,7 @@ pub enum Expr {
     ///
     /// Builds a forest (sequence of sibling elements) from a list of
     /// `(value, element_name)` pairs. NULL values are skipped. Returns `Value::Xml`.
-    XmlForest {
-        items: Vec<(Expr, String)>,
-    },
+    XmlForest { items: Vec<(Expr, String)> },
 
     /// `XMLROOT(xml_expr, VERSION string [, STANDALONE YES|NO|NO VALUE])`
     ///
@@ -441,18 +438,13 @@ pub enum Expr {
     ///
     /// Concatenates XML values into a single XML fragment. NULL args are skipped.
     /// Returns `Value::Null` only when every argument is NULL; otherwise `Value::Xml`.
-    XmlConcat {
-        args: Vec<Expr>,
-    },
+    XmlConcat { args: Vec<Expr> },
 
     /// `XMLQUERY(xpath PASSING xml_expr [RETURNING CONTENT])`
     ///
     /// Evaluates a minimal XPath 1.0 expression against an XML document and
     /// returns the first match as `Value::Text`, or `Value::Null` if not found.
-    XmlQuery {
-        xpath: String,
-        doc: Box<Expr>,
-    },
+    XmlQuery { xpath: String, doc: Box<Expr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

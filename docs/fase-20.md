@@ -735,3 +735,101 @@ variants: `eval/core.rs`, `eval/batch.rs`, `executor/shared.rs`, `executor/joins
 - `tools/ltree_wire_smoke.py` — 8 wire assertions over the MySQL protocol: INSERT+SELECT
   roundtrip, `@>`, `~`, `nlevel`, `subpath`, `lca`, `||`, `index`.
 - All 4253/4253 workspace tests pass; clippy + fmt clean.
+
+---
+
+## 20.20 — XMLType (2026-05-16)
+
+### What was built
+
+Full XMLType support aligned with SQL:2003 and PostgreSQL behavior:
+
+- **`XML` / `XMLTYPE` data type** — storage, serialization, coercion, wire protocol.
+- **`xml_is_well_formed(text)`** — validates XML text, returns 1/0.
+- **XML constructor functions**: `XMLELEMENT`, `XMLFOREST`, `XMLROOT`, `XMLCONCAT`, `XMLQUERY`.
+- **`XMLTABLE(row_xpath PASSING doc COLUMNS ...)`** — table-valued function that shreds an XML
+  document into relational rows using XPath row paths and column paths.
+
+### Architecture
+
+#### Type layer (`axiomdb-types`)
+
+- `Value::Xml(String)` — stores raw XML text as a validated string.
+- `DataType::Xml` — new variant in the data-type enum.
+- `validate_xml_text(s)` — parses with `roxmltree`; returns `Ok(())` or error.
+- Coercion: `Text → Xml` (strict: must be valid XML), `Xml → Text` (identity).
+- `ColumnType::Xml = 18` — wire protocol tag.
+
+#### Catalog / wire (`axiomdb-catalog`, `axiomdb-network`)
+
+- `ColumnType::Xml` serializes as MySQL `BLOB` (type `0xFC`), charset = 63 (binary), display
+  length 65535 — same convention as PostgreSQL pg_type.
+- DDL keywords: `XML`, `XMLTYPE` (alias) parsed and mapped to `DataType::Xml`.
+
+#### SQL expression layer (`axiomdb-sql`)
+
+Five new `Expr` variants with dedicated parse functions and eval functions:
+
+| Variant | Syntax |
+|---------|--------|
+| `XmlElement` | `XMLELEMENT(NAME tag [, XMLATTRIBUTES(...)] [, content...])` |
+| `XmlForest` | `XMLFOREST(expr AS name [, ...])` |
+| `XmlRoot` | `XMLROOT(doc, VERSION ver [, STANDALONE YES/NO])` |
+| `XmlConcat` | `XMLCONCAT(xml1, xml2, ...)` |
+| `XmlQuery` | `XMLQUERY(xpath PASSING doc)` |
+
+Parsers in `parser/expr.rs` dispatch from `parse_ident_or_call()`. All eval functions in
+`eval/functions/xml.rs` are generic over `SubqueryRunner` so subqueries in content expressions work.
+
+The `xml_is_well_formed()` function dispatches from `eval/functions/mod.rs` by name.
+
+Minimal XPath 1.0 evaluator (`eval_xpath` in `xml.rs`) supports:
+- Absolute element navigation: `/root/elem/.../text()`, `/root/elem/.../@attr`
+- Returns NULL on parse failure, missing path, or NULL input.
+
+#### XMLTABLE TVF (`crates/axiomdb-sql/src/xml_table.rs`)
+
+Mirrors `json_table.rs` architecture:
+
+- `XmlTableSpec` / `XmlTableColumnSpec` — compiled form of the AST.
+- `parse_xpath(xpath)` — tokenizes XPath strings into `XPathStep` variants:
+  `Child(name)`, `Wildcard`, `Descendant(name)`, `Attr(name)`, `Text`, `Position(n)`.
+- `eval_xpath_nodes(doc, steps)` — applies an absolute XPath to a document, returning all
+  context nodes (one per result row). First step matches root element by name.
+- `eval_relative_xpath(node, steps)` — applies a column path relative to a context node.
+- `compile_xml_table(ast)` — AST → XmlTableSpec; default column path = column name.
+- `materialize_xml_table(spec, xml_val)` — shreds document into `Vec<Vec<Value>>`.
+- `xmltable_is_correlated(ast)` — checks if PASSING expressions reference outer columns.
+
+Parser: `parser/xml_table.rs` — `parse_xmltable_call(p)` handles full XMLTABLE syntax including
+`PASSING`, `COLUMNS`, `FOR ORDINALITY`, `PATH`, `DEFAULT`, `NOT NULL`.
+
+Dispatcher added in `parser/dml.rs` → `parse_from_item` after JSON_TABLE check.
+
+Analyzer: `analyzer_bind.rs` publishes typed `BoundTable` from XMLTABLE column declarations.
+`analyzer_stmt.rs` resolves PASSING expressions against the accumulated scope.
+
+Executor:
+- `select_core.rs` → `execute_select_xmltable_source` for XMLTABLE as first-FROM.
+- `select_ctx.rs` delegates to `execute_select` for the session-bound path.
+- `select_joins_ctx.rs` materializes XMLTABLE as a JOIN right-side (correlated deferred).
+- `executor/shared.rs` — `build_derived_output_columns` now infers column data types from
+  `derived_cols` for bare column references, so typed XMLTABLE columns produce correct MySQL
+  type codes over the wire protocol.
+
+#### Non-exhaustive match propagation
+
+`FromClause::XmlTable` added to all consumer sites:
+`parser/dml.rs`, `analyzer_bind.rs`, `analyzer_ddl.rs`, `analyzer_pivot.rs`,
+`analyzer_stmt.rs`, `executor/dml_join.rs`, `executor/exec_explain.rs`,
+`executor/select_helpers.rs`, `executor/select_joins_ctx.rs`, `plan_deps.rs`.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_xml.rs` — **45 integration tests**:
+  - 14 core type tests (DDL, cast, coerce, null propagation)
+  - 21 constructor function tests (XMLELEMENT, XMLFOREST, XMLROOT, XMLCONCAT, XMLQUERY)
+  - 10 XMLTABLE tests (basic, column path, ordinality, null doc, invalid XML, missing path,
+    default value, @attr path, multiple columns, WHERE filter)
+- Wire smoke (`tools/wire-test.py`): 13 XML assertions over MySQL protocol — all pass.
+- All 4298/4298 workspace tests pass; clippy + fmt clean.

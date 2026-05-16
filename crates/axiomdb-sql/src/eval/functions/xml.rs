@@ -260,7 +260,11 @@ fn eval_xpath(doc: &roxmltree::Document<'_>, xpath: &str) -> Option<String> {
                 .filter(|n| n.is_text())
                 .filter_map(|n| n.text())
                 .collect();
-            if text.is_empty() { None } else { Some(text) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         }
         XPathFinalStep::Attr(name) => node.attribute(name).map(|s| s.to_string()),
         XPathFinalStep::Element => {
@@ -269,7 +273,11 @@ fn eval_xpath(doc: &roxmltree::Document<'_>, xpath: &str) -> Option<String> {
                 .filter(|n| n.is_text())
                 .filter_map(|n| n.text())
                 .collect();
-            if text.is_empty() { None } else { Some(text) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         }
     }
 }

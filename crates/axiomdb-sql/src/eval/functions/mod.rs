@@ -10,13 +10,13 @@ pub(crate) mod datetime;
 mod json;
 mod ltree;
 mod nulls;
-pub(crate) mod xml;
 mod numeric;
 pub(crate) mod range;
 mod sql_json_query;
 mod string;
 mod system;
 mod uuid;
+pub(crate) mod xml;
 
 pub(crate) use json::{
     execute_jsonpath_owned as execute_jsonpath_owned_public, execute_jsonpath_owned_env,

@@ -977,10 +977,10 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
         if matches!(p.peek(), Token::LParen) {
             match lower.as_str() {
                 "xmlelement" => return parse_xmlelement(p),
-                "xmlforest"  => return parse_xmlforest(p),
-                "xmlroot"    => return parse_xmlroot(p),
-                "xmlconcat"  => return parse_xmlconcat(p),
-                "xmlquery"   => return parse_xmlquery(p),
+                "xmlforest" => return parse_xmlforest(p),
+                "xmlroot" => return parse_xmlroot(p),
+                "xmlconcat" => return parse_xmlconcat(p),
+                "xmlquery" => return parse_xmlquery(p),
                 _ => {}
             }
         }
@@ -1809,7 +1809,11 @@ fn parse_xmlelement(p: &mut Parser) -> Result<Expr, DbError> {
     }
 
     p.expect(&Token::RParen)?;
-    Ok(Expr::XmlElement { tag, attrs, content })
+    Ok(Expr::XmlElement {
+        tag,
+        attrs,
+        content,
+    })
 }
 
 /// `XMLFOREST(expr AS name [, ...])`
@@ -1850,11 +1854,16 @@ fn parse_xmlroot(p: &mut Parser) -> Result<Expr, DbError> {
     }
 
     let version = match p.peek().clone() {
-        Token::StringLit(s) => { p.advance(); s }
-        other => return Err(DbError::ParseError {
-            message: format!("expected version string in XMLROOT, got {other:?}"),
-            position: Some(p.current_pos()),
-        }),
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected version string in XMLROOT, got {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
     };
 
     let mut standalone: Option<bool> = None;
@@ -1885,15 +1894,23 @@ fn parse_xmlroot(p: &mut Parser) -> Result<Expr, DbError> {
                     standalone = Some(false);
                 }
             }
-            other => return Err(DbError::ParseError {
-                message: format!("expected YES, NO, or NO VALUE after STANDALONE, got {other:?}"),
-                position: Some(p.current_pos()),
-            }),
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "expected YES, NO, or NO VALUE after STANDALONE, got {other:?}"
+                    ),
+                    position: Some(p.current_pos()),
+                })
+            }
         }
     }
 
     p.expect(&Token::RParen)?;
-    Ok(Expr::XmlRoot { doc, version, standalone })
+    Ok(Expr::XmlRoot {
+        doc,
+        version,
+        standalone,
+    })
 }
 
 /// `XMLCONCAT(xml1 [, xml2, ...])`
@@ -1917,11 +1934,16 @@ fn parse_xmlquery(p: &mut Parser) -> Result<Expr, DbError> {
     p.expect(&Token::LParen)?;
 
     let xpath = match p.peek().clone() {
-        Token::StringLit(s) => { p.advance(); s }
-        other => return Err(DbError::ParseError {
-            message: format!("expected XPath string in XMLQUERY, got {other:?}"),
-            position: Some(p.current_pos()),
-        }),
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected XPath string in XMLQUERY, got {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
     };
 
     // PASSING keyword
@@ -1942,7 +1964,9 @@ fn parse_xmlquery(p: &mut Parser) -> Result<Expr, DbError> {
             let content_kw = p.parse_identifier()?;
             if !content_kw.eq_ignore_ascii_case("CONTENT") {
                 return Err(DbError::ParseError {
-                    message: format!("expected CONTENT after RETURNING in XMLQUERY, got '{content_kw}'"),
+                    message: format!(
+                        "expected CONTENT after RETURNING in XMLQUERY, got '{content_kw}'"
+                    ),
                     position: Some(p.current_pos()),
                 });
             }

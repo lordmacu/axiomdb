@@ -50,7 +50,11 @@ fn create_table_with_xml_column() {
 #[test]
 fn xml_xmltype_keyword_alias() {
     let (mut storage, mut txn) = common::setup();
-    common::run("CREATE TABLE t (id INT, doc XMLTYPE)", &mut storage, &mut txn);
+    common::run(
+        "CREATE TABLE t (id INT, doc XMLTYPE)",
+        &mut storage,
+        &mut txn,
+    );
     common::run("INSERT INTO t VALUES (1, '<a/>')", &mut storage, &mut txn);
     let result = common::run("SELECT doc FROM t", &mut storage, &mut txn);
     let r = rows(result);
@@ -59,7 +63,10 @@ fn xml_xmltype_keyword_alias() {
 
 #[test]
 fn xml_cast_valid() {
-    assert_eq!(run("SELECT CAST('<root/>' AS XML)"), Value::Xml("<root/>".into()));
+    assert_eq!(
+        run("SELECT CAST('<root/>' AS XML)"),
+        Value::Xml("<root/>".into())
+    );
 }
 
 #[test]
@@ -87,7 +94,10 @@ fn xml_cast_empty_returns_error() {
 
 #[test]
 fn xml_to_text_cast() {
-    assert_eq!(run("SELECT CAST('<a/>'::XML AS TEXT)"), Value::Text("<a/>".into()));
+    assert_eq!(
+        run("SELECT CAST('<a/>'::XML AS TEXT)"),
+        Value::Text("<a/>".into())
+    );
 }
 
 #[test]
@@ -214,10 +224,7 @@ fn xmlforest_null_omitted() {
 
 #[test]
 fn xmlforest_all_null_empty() {
-    assert_eq!(
-        run("SELECT XMLFOREST(NULL AS x)"),
-        Value::Xml("".into())
-    );
+    assert_eq!(run("SELECT XMLFOREST(NULL AS x)"), Value::Xml("".into()));
 }
 
 // ── Step 2: XMLROOT ───────────────────────────────────────────────────────────
@@ -314,4 +321,126 @@ fn xmlquery_invalid_xml_returns_null() {
         run("SELECT XMLQUERY('/root' PASSING '<broken'::TEXT)"),
         Value::Null
     );
+}
+
+// ── Step 3: XMLTABLE ──────────────────────────────────────────────────────────
+
+fn run_rows(sql: &str) -> Vec<Vec<Value>> {
+    let (mut storage, mut txn) = common::setup();
+    rows(common::run(sql, &mut storage, &mut txn))
+}
+
+#[test]
+fn xmltable_basic() {
+    let r = run_rows(
+        "SELECT name, age FROM XMLTABLE('/rows/row' \
+         PASSING '<rows><row><name>Alice</name><age>30</age></row><row><name>Bob</name><age>25</age></row></rows>' \
+         COLUMNS name TEXT, age INT) AS t"
+    );
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Text("Alice".into()));
+    assert_eq!(r[0][1], Value::Int(30));
+    assert_eq!(r[1][0], Value::Text("Bob".into()));
+    assert_eq!(r[1][1], Value::Int(25));
+}
+
+#[test]
+fn xmltable_column_path() {
+    let r = run_rows(
+        "SELECT val FROM XMLTABLE('/items/item' \
+         PASSING '<items><item><v>hello</v></item></items>' \
+         COLUMNS val TEXT PATH 'v') AS t",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("hello".into()));
+}
+
+#[test]
+fn xmltable_ordinality() {
+    let r = run_rows(
+        "SELECT ord, name FROM XMLTABLE('/rows/row' \
+         PASSING '<rows><row><name>A</name></row><row><name>B</name></row></rows>' \
+         COLUMNS ord FOR ORDINALITY, name TEXT) AS t",
+    );
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::BigInt(1));
+    assert_eq!(r[1][0], Value::BigInt(2));
+}
+
+#[test]
+fn xmltable_null_document() {
+    let r = run_rows(
+        "SELECT name FROM XMLTABLE('/rows/row' \
+         PASSING NULL \
+         COLUMNS name TEXT) AS t",
+    );
+    assert_eq!(r.len(), 0);
+}
+
+#[test]
+fn xmltable_invalid_xml_returns_no_rows() {
+    let r = run_rows(
+        "SELECT name FROM XMLTABLE('/rows/row' \
+         PASSING '<broken' \
+         COLUMNS name TEXT) AS t",
+    );
+    assert_eq!(r.len(), 0);
+}
+
+#[test]
+fn xmltable_missing_path_is_null() {
+    let r = run_rows(
+        "SELECT missing FROM XMLTABLE('/row' \
+         PASSING '<row><other>x</other></row>' \
+         COLUMNS missing TEXT PATH 'nonexistent') AS t",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Null);
+}
+
+#[test]
+fn xmltable_with_default_value() {
+    let r = run_rows(
+        "SELECT val FROM XMLTABLE('/row' \
+         PASSING '<row></row>' \
+         COLUMNS val TEXT PATH 'nonexistent' DEFAULT 'fallback') AS t",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("fallback".into()));
+}
+
+#[test]
+fn xmltable_attr_path() {
+    let r = run_rows(
+        "SELECT id FROM XMLTABLE('/rows/row' \
+         PASSING '<rows><row id=\"42\">x</row></rows>' \
+         COLUMNS id INT PATH '@id') AS t",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int(42));
+}
+
+#[test]
+fn xmltable_multiple_columns() {
+    let r = run_rows(
+        "SELECT a, b, c FROM XMLTABLE('/r' \
+         PASSING '<r><a>1</a><b>two</b><c>3</c></r>' \
+         COLUMNS a INT, b TEXT, c BIGINT) AS t",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int(1));
+    assert_eq!(r[0][1], Value::Text("two".into()));
+    assert_eq!(r[0][2], Value::BigInt(3));
+}
+
+#[test]
+fn xmltable_where_filter() {
+    let r = run_rows(
+        "SELECT name FROM XMLTABLE('/rows/row' \
+         PASSING '<rows><row><name>Alice</name><age>30</age></row><row><name>Bob</name><age>25</age></row></rows>' \
+         COLUMNS name TEXT, age INT) AS t \
+         WHERE age > 28"
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("Alice".into()));
 }

@@ -2743,3 +2743,89 @@ SELECT * FROM t TABLESAMPLE SYSTEM(100); -- always all rows
 skipping the entire page if the coin comes up tails. This means sampling 1% of a 10 GB
 table reads only ~100 MB of data on average.
 </div>
+
+## XMLTABLE — Shred XML into Rows (Phase 20.20)
+
+`XMLTABLE` is a SQL:2006 table-valued function that appears in the `FROM` clause
+and turns an XML document into a relational result set.
+
+### Syntax
+
+```
+XMLTABLE (
+    'row_xpath'               -- XPath selecting one node per output row
+    PASSING <xml_expr>        -- expression producing the XML document
+    COLUMNS
+        <col_name> <type> [PATH 'xpath'] [DEFAULT <expr>]
+      | <col_name> FOR ORDINALITY
+      [, ...]
+) [AS alias]
+```
+
+### Column definitions
+
+| Clause | Description |
+|--------|-------------|
+| `col TYPE` | Extract the element named `col` (or its text content) and cast to `TYPE` |
+| `col TYPE PATH 'xpath'` | Extract using a custom XPath relative to the row node |
+| `col TYPE PATH '@attr'` | Extract an attribute value |
+| `col TYPE DEFAULT expr` | Use `expr` when the PATH matches nothing (instead of NULL) |
+| `col FOR ORDINALITY` | 1-based row counter — `BIGINT` type |
+
+### XPath semantics
+
+- Paths are **absolute** (start with `/`). The first step name must match the root
+  element; subsequent steps navigate children.
+- Supported steps: element name, `@attribute`, `text()`, wildcard `*`.
+- `//descendant` step supported.
+- If the document is NULL or not well-formed XML, XMLTABLE returns **zero rows**
+  (no error is raised).
+
+### Examples
+
+```sql
+-- Basic — shred rows out of an XML document
+SELECT name, age
+FROM XMLTABLE(
+    '/rows/row'
+    PASSING '<rows><row><name>Alice</name><age>30</age></row>
+                   <row><name>Bob</name><age>25</age></row></rows>'
+    COLUMNS name TEXT, age INT
+) AS t;
+-- Alice / 30
+-- Bob   / 25
+
+-- Attribute extraction
+SELECT id
+FROM XMLTABLE(
+    '/rows/row'
+    PASSING '<rows><row id="42">x</row></rows>'
+    COLUMNS id INT PATH '@id'
+) AS t;
+-- 42
+
+-- Ordinality + default
+SELECT ord, label
+FROM XMLTABLE(
+    '/data/entry'
+    PASSING '<data><entry/><entry><lbl>x</lbl></entry></data>'
+    COLUMNS ord FOR ORDINALITY, label TEXT PATH 'lbl' DEFAULT 'n/a'
+) AS t;
+-- 1 / n/a
+-- 2 / x
+
+-- Combined with WHERE
+SELECT name FROM XMLTABLE(
+    '/rows/row'
+    PASSING '<rows>...</rows>'
+    COLUMNS name TEXT, age INT
+) AS t
+WHERE age > 28;
+```
+
+<div class="callout-advantage">
+<strong>AxiomDB advantage vs MySQL</strong>: MySQL has no XMLTABLE and no native XML
+type — XML processing requires application-side libraries. AxiomDB's XMLTABLE follows
+the SQL:2006 / PostgreSQL 10+ standard; the derived table supports full
+<code>WHERE</code>, <code>ORDER BY</code>, <code>JOIN</code>, and aggregation.
+</div>
