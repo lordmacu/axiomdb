@@ -5334,8 +5334,10 @@ ok("[20.11a tablesample_system_100] TABLESAMPLE SYSTEM(100) returns all rows",
    cur.fetchone()[0] == 20)
 
 cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE SYSTEM(0)")
+_sys0_row = cur.fetchone()
 ok("[20.11b tablesample_system_0] TABLESAMPLE SYSTEM(0) returns no rows",
-   cur.fetchone()[0] == 0)
+   _sys0_row is not None and _sys0_row[0] == 0,
+   f"row={_sys0_row!r}")
 
 cur.execute("SELECT COUNT(*) FROM _wire_tablesample TABLESAMPLE BERNOULLI(100)")
 ok("[20.11c tablesample_bernoulli_100] TABLESAMPLE BERNOULLI(100) returns all rows",
