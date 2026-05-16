@@ -23,6 +23,7 @@ use crate::{
     },
     schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
+    schema_holiday_calendar::HolidayCalendarDef,
 };
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
@@ -863,6 +864,43 @@ impl<'a> CatalogReader<'a> {
             }
         }
         Ok(None)
+    }
+
+    // ── Holiday calendars (Phase 20.16) ───────────────────────────────────────
+
+    /// Returns the holiday calendar for the given country code, or `None` if not found.
+    pub fn get_holiday_calendar(
+        &mut self,
+        country: &str,
+    ) -> Result<Option<HolidayCalendarDef>, DbError> {
+        let root = self.page_ids.holiday_calendars;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = HolidayCalendarDef::from_bytes(&data)?;
+            if def.country_code.eq_ignore_ascii_case(country) {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns all visible holiday calendar definitions, sorted by country code.
+    pub fn list_holiday_calendars(&mut self) -> Result<Vec<HolidayCalendarDef>, DbError> {
+        let root = self.page_ids.holiday_calendars;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = HolidayCalendarDef::from_bytes(&data)?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| a.country_code.cmp(&b.country_code));
+        Ok(out)
     }
 
     /// Returns the next available foreign table ID (max existing + 1, or BASE + 1).

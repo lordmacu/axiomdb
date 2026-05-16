@@ -20,11 +20,12 @@ use axiomdb_storage::{
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET,
     CATALOG_DATABASES_ROOT_BODY_OFFSET, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET,
-    CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
-    CATALOG_SEQUENCES_ROOT_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
-    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
-    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET,
+    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMAS_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_SEQUENCES_ROOT_BODY_OFFSET,
+    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
+    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET,
+    NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
@@ -83,6 +84,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_foreign_tables` heap (Phase 22b.2).
     /// Zero on legacy databases; lazily initialized on first `CREATE FOREIGN TABLE`.
     pub foreign_tables: u64,
+    /// Root page of the `axiom_holiday_calendars` heap (Phase 20.16).
+    /// Zero on legacy databases; lazily initialized on first `CREATE HOLIDAY CALENDAR`.
+    pub holiday_calendars: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -260,6 +264,7 @@ impl CatalogBootstrap {
             cron_jobs: cron_jobs_root,
             foreign_servers: foreign_servers_root,
             foreign_tables: foreign_tables_root,
+            holiday_calendars: 0,
         })
     }
 
@@ -291,6 +296,8 @@ impl CatalogBootstrap {
         let cron_jobs = read_meta_u64(storage, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET)?;
         let foreign_servers = read_meta_u64(storage, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET)?;
         let foreign_tables = read_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET)?;
+        let holiday_calendars =
+            read_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -307,6 +314,7 @@ impl CatalogBootstrap {
             cron_jobs,
             foreign_servers,
             foreign_tables,
+            holiday_calendars,
         })
     }
 
@@ -510,6 +518,22 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_holiday_calendars` root page exists (Phase 20.16).
+    ///
+    /// Lazily initialized on first `CREATE HOLIDAY CALENDAR` statement.
+    pub fn ensure_holiday_calendars_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }

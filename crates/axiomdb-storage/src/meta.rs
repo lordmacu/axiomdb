@@ -173,6 +173,11 @@ pub const CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET: usize = 168;
 /// initialized on first `CREATE FOREIGN TABLE` statement.
 pub const CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET: usize = 176;
 
+/// body offset of `catalog_holiday_calendars_root: u64` — root heap page for
+/// `axiom_holiday_calendars` (Phase 20.16). Value 0 = not yet allocated (lazily
+/// initialized on first `CREATE HOLIDAY CALENDAR` statement).
+pub const CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET: usize = 184;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"

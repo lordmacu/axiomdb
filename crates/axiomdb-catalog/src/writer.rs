@@ -53,6 +53,7 @@ use crate::{
     },
     schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
+    schema_holiday_calendar::HolidayCalendarDef,
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -87,6 +88,8 @@ pub const SYSTEM_TABLE_CRON_JOBS: u32 = u32::MAX - 12;
 pub const SYSTEM_TABLE_FOREIGN_SERVERS: u32 = u32::MAX - 13;
 /// WAL `table_id` used for inserts/deletes into `axiom_foreign_tables` (Phase 22b.2).
 pub const SYSTEM_TABLE_FOREIGN_TABLES: u32 = u32::MAX - 14;
+/// WAL `table_id` used for inserts/deletes into `axiom_holiday_calendars` (Phase 20.16).
+pub const SYSTEM_TABLE_HOLIDAY_CALENDARS: u32 = u32::MAX - 15;
 
 fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
     if def.labels.is_empty() {
@@ -1994,6 +1997,80 @@ impl<'a> CatalogWriter<'a> {
                     self.conn,
                     SYSTEM_TABLE_FOREIGN_TABLES,
                     key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // ── Holiday calendar operations (Phase 20.16) ─────────────────────────────
+
+    /// Inserts or replaces a holiday calendar in `axiom_holiday_calendars`.
+    ///
+    /// If a calendar for the same country code already exists (case-insensitive),
+    /// the old row is deleted before inserting the new one (upsert semantics).
+    pub fn upsert_holiday_calendar(&mut self, def: HolidayCalendarDef) -> Result<(), DbError> {
+        let root = CatalogBootstrap::ensure_holiday_calendars_root(self.storage)?;
+        self.page_ids.holiday_calendars = root;
+
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (existing, _) = HolidayCalendarDef::from_bytes(&data)?;
+            if existing.country_code.eq_ignore_ascii_case(&def.country_code) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_HOLIDAY_CALENDARS,
+                    existing.country_code.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                break;
+            }
+        }
+
+        let data = def.to_bytes();
+        let (page_id, slot_id) =
+            HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_HOLIDAY_CALENDARS,
+            def.country_code.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a holiday calendar by country code (case-insensitive).
+    ///
+    /// Returns `true` if the calendar was found and deleted, `false` if not found.
+    pub fn delete_holiday_calendar(&mut self, country: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.holiday_calendars;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = HolidayCalendarDef::from_bytes(&data)?;
+            if def.country_code.eq_ignore_ascii_case(country) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_HOLIDAY_CALENDARS,
+                    def.country_code.as_bytes(),
                     &data,
                     page_id,
                     slot_id,

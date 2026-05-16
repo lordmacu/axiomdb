@@ -11,6 +11,7 @@ pub mod resolver;
 pub mod schema;
 pub mod schema_foreign_server;
 pub mod schema_foreign_table;
+pub mod schema_holiday_calendar;
 pub mod writer;
 
 pub use bootstrap::{CatalogBootstrap, CatalogPageIds};
@@ -28,10 +29,11 @@ pub use schema::{
 };
 pub use schema_foreign_server::ForeignServerDef;
 pub use schema_foreign_table::{ForeignColumnDef, ForeignTableDef, FOREIGN_TABLE_ID_BASE};
+pub use schema_holiday_calendar::HolidayCalendarDef;
 pub use writer::{
     CatalogWriter, SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_CRON_JOBS,
     SYSTEM_TABLE_DATABASES, SYSTEM_TABLE_ENUM_TYPES, SYSTEM_TABLE_FOREIGN_KEYS,
-    SYSTEM_TABLE_FOREIGN_SERVERS, SYSTEM_TABLE_FOREIGN_TABLES, SYSTEM_TABLE_INDEXES,
-    SYSTEM_TABLE_SCHEMAS, SYSTEM_TABLE_SEQUENCES, SYSTEM_TABLE_STATS, SYSTEM_TABLE_TABLES,
-    SYSTEM_TABLE_TABLE_DATABASES,
+    SYSTEM_TABLE_FOREIGN_SERVERS, SYSTEM_TABLE_FOREIGN_TABLES, SYSTEM_TABLE_HOLIDAY_CALENDARS,
+    SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_SCHEMAS, SYSTEM_TABLE_SEQUENCES, SYSTEM_TABLE_STATS,
+    SYSTEM_TABLE_TABLES, SYSTEM_TABLE_TABLE_DATABASES,
 };
