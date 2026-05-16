@@ -5739,6 +5739,29 @@ ok("[24.1 int_types] SHOW COLUMNS reports smallint", any("smallint" in t for t i
 cur.execute("DROP TABLE IF EXISTS _wire_int_types")
 cur.execute("DROP TABLE IF EXISTS _wire_bigserial")
 
+# ── 24.1b SERIAL / SMALLSERIAL ────────────────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_serial")
+cur.execute("CREATE TABLE _wire_serial (id SERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO _wire_serial (name) VALUES ('a')")
+cur.execute("INSERT INTO _wire_serial (name) VALUES ('b')")
+cur.execute("SELECT id FROM _wire_serial ORDER BY id")
+_sr = cur.fetchall()
+ok("[24.1b serial] SERIAL auto-increments from 1", _sr[0][0] == 1, _sr[0][0])
+ok("[24.1b serial] SERIAL second row is 2", _sr[1][0] == 2, _sr[1][0])
+
+cur.execute("DROP TABLE IF EXISTS _wire_smallserial")
+cur.execute("CREATE TABLE _wire_smallserial (id SMALLSERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO _wire_smallserial (name) VALUES ('x')")
+cur.execute("INSERT INTO _wire_smallserial (name) VALUES ('y')")
+cur.execute("SELECT id FROM _wire_smallserial ORDER BY id")
+_ssr = cur.fetchall()
+ok("[24.1b serial] SMALLSERIAL auto-increments from 1", _ssr[0][0] == 1, _ssr[0][0])
+ok("[24.1b serial] SMALLSERIAL second row is 2", _ssr[1][0] == 2, _ssr[1][0])
+
+cur.execute("DROP TABLE IF EXISTS _wire_serial")
+cur.execute("DROP TABLE IF EXISTS _wire_smallserial")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

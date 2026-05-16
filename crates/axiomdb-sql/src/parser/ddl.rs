@@ -559,27 +559,29 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
 
-    // BIGSERIAL — shorthand for BIGINT NOT NULL AUTO_INCREMENT.
-    let bigserial = matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("BIGSERIAL"));
-    if bigserial {
+    // Serial shorthands: BIGSERIAL → BigInt, SERIAL → Int, SMALLSERIAL → SmallInt.
+    let serial_type: Option<DataType> = if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("BIGSERIAL"))
+    {
         p.advance();
-    }
+        Some(DataType::BigInt)
+    } else if matches!(p.peek(), Token::Serial) {
+        p.advance();
+        Some(DataType::Int)
+    } else if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("SMALLSERIAL")) {
+        p.advance();
+        Some(DataType::SmallInt)
+    } else {
+        None
+    };
 
     let (data_type, type_len, is_char, declared_type_name, array_ndims, array_size_hints) =
-        if bigserial {
-            (
-                DataType::BigInt,
-                0u16,
-                false,
-                None::<crate::ast::TableRef>,
-                0u8,
-                vec![],
-            )
+        if let Some(dt) = serial_type.clone() {
+            (dt, 0u16, false, None::<crate::ast::TableRef>, 0u8, vec![])
         } else {
             parse_column_data_type(p)?
         };
     let mut constraints = Vec::new();
-    if bigserial {
+    if serial_type.is_some() {
         constraints.push(ColumnConstraint::AutoIncrement);
     }
     let mut collation = None;

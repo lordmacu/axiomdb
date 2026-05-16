@@ -3,7 +3,7 @@
 Phase: 24 — Complete type system
 Task: 24.1b — SERIAL and SMALLSERIAL column type sugar
 Spec: specs/fase-24/spec-24.1b-serial-smallserial.md
-Status: in-progress
+Status: done
 
 ## Summary
 

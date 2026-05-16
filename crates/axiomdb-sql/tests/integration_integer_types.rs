@@ -221,3 +221,84 @@ fn show_columns_reports_tinyint_and_smallint() {
         "expected smallint in types, got {types:?}"
     );
 }
+
+// ── SERIAL / SMALLSERIAL ──────────────────────────────────────────────────────
+
+#[test]
+fn serial_auto_increments() {
+    let (mut s, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)",
+        &mut s,
+        &mut txn,
+    );
+    common::run("INSERT INTO t (name) VALUES ('a')", &mut s, &mut txn);
+    common::run("INSERT INTO t (name) VALUES ('b')", &mut s, &mut txn);
+    let out = common::rows(common::run(
+        "SELECT id FROM t ORDER BY id",
+        &mut s,
+        &mut txn,
+    ));
+    assert_eq!(out, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn smallserial_auto_increments() {
+    let (mut s, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (id SMALLSERIAL PRIMARY KEY, name TEXT)",
+        &mut s,
+        &mut txn,
+    );
+    common::run("INSERT INTO t (name) VALUES ('x')", &mut s, &mut txn);
+    common::run("INSERT INTO t (name) VALUES ('y')", &mut s, &mut txn);
+    let out = common::rows(common::run(
+        "SELECT id FROM t ORDER BY id",
+        &mut s,
+        &mut txn,
+    ));
+    assert_eq!(out, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn show_columns_reports_serial_types() {
+    let (mut s, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (a SERIAL PRIMARY KEY, b SMALLSERIAL, c BIGSERIAL)",
+        &mut s,
+        &mut txn,
+    );
+    let rows = common::rows(common::run("SHOW COLUMNS FROM t", &mut s, &mut txn));
+    let types: Vec<String> = rows
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Text(s) => s.to_lowercase(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        types.iter().any(|t| t == "int"),
+        "expected int, got {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "smallint"),
+        "expected smallint, got {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "bigint"),
+        "expected bigint, got {types:?}"
+    );
+}
+
+#[test]
+fn serial_trailing_form_regression() {
+    let (mut s, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (id INT SERIAL PRIMARY KEY, val TEXT)",
+        &mut s,
+        &mut txn,
+    );
+    common::run("INSERT INTO t (val) VALUES ('r')", &mut s, &mut txn);
+    let out = common::rows(common::run("SELECT id FROM t", &mut s, &mut txn));
+    assert_eq!(out, vec![vec![Value::Int(1)]]);
+}

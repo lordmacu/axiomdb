@@ -21,19 +21,26 @@ types for temporal and numeric overlaps).
 | `UBIGINT`  | `UINT8`        | 8 bytes | `u64`     | 0 to 18.4 × 10¹⁸ (used for LSN, page_id)|
 | `HUGEINT`  | `INT16`        | 16 bytes| `i128`    | ±1.7 × 10³⁸ (cryptography, checksums)   |
 
-**Auto-increment shorthand:** `BIGSERIAL` is sugar for `BIGINT AUTO_INCREMENT`.
+**Auto-increment shorthands:** `SERIAL`, `SMALLSERIAL`, and `BIGSERIAL` expand to
+the corresponding integer type with `AUTO_INCREMENT` added automatically.
+
+| Shorthand | Expands to |
+|-----------|-----------|
+| `SERIAL` | `INT AUTO_INCREMENT` |
+| `SMALLSERIAL` | `SMALLINT AUTO_INCREMENT` |
+| `BIGSERIAL` | `BIGINT AUTO_INCREMENT` |
 
 ```sql
--- Typical primary key (explicit form)
-CREATE TABLE users (
-    id   BIGINT PRIMARY KEY AUTO_INCREMENT,
-    age  SMALLINT NOT NULL
-);
-
--- Same table using BIGSERIAL shorthand
+-- Using BIGSERIAL shorthand (most common for primary keys)
 CREATE TABLE users (
     id   BIGSERIAL PRIMARY KEY,
     age  SMALLINT NOT NULL
+);
+
+-- Using SERIAL (32-bit auto-increment)
+CREATE TABLE events (
+    id   SERIAL PRIMARY KEY,
+    name TEXT
 );
 
 -- Unsigned counter that never goes negative

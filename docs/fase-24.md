@@ -104,7 +104,7 @@ Wire smoke: 13 assertions in `tools/wire-test.py` under `[24.1 int_types]`.
 | ID | Status | Description |
 |----|--------|-------------|
 | 24.1 | ✅ Done | TINYINT, SMALLINT, BIGSERIAL |
-| 24.1b | ⏳ | SERIAL / SMALLSERIAL aliases |
+| 24.1b | ✅ Done | SERIAL / SMALLSERIAL aliases |
 | 24.1c | ⏳ | GENERATED ALWAYS AS IDENTITY |
 | 24.2 | ⏳ | REAL/FLOAT4 distinct from DOUBLE |
 | 24.3 | ⏳ | Exact DECIMAL (rust_decimal) |
