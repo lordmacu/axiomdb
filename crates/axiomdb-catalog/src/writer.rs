@@ -51,6 +51,7 @@ use crate::{
         IndexDef, RelationKind, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
         TablePersistence, TableStorageLayout,
     },
+    schema_exchange_rate::ExchangeRateDef,
     schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
     schema_holiday_calendar::HolidayCalendarDef,
@@ -90,6 +91,8 @@ pub const SYSTEM_TABLE_FOREIGN_SERVERS: u32 = u32::MAX - 13;
 pub const SYSTEM_TABLE_FOREIGN_TABLES: u32 = u32::MAX - 14;
 /// WAL `table_id` used for inserts/deletes into `axiom_holiday_calendars` (Phase 20.16).
 pub const SYSTEM_TABLE_HOLIDAY_CALENDARS: u32 = u32::MAX - 15;
+/// WAL `table_id` used for inserts/deletes into `axiom_exchange_rates` (Phase 20.17).
+pub const SYSTEM_TABLE_EXCHANGE_RATES: u32 = u32::MAX - 16;
 
 fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
     if def.labels.is_empty() {
@@ -2073,6 +2076,86 @@ impl<'a> CatalogWriter<'a> {
                     self.conn,
                     SYSTEM_TABLE_HOLIDAY_CALENDARS,
                     def.country_code.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // ── Exchange rate operations (Phase 20.17) ────────────────────────────────
+
+    /// Inserts or replaces an exchange rate in `axiom_exchange_rates`.
+    ///
+    /// If a rate for the same (from, to) pair already exists (case-insensitive),
+    /// the old row is deleted before inserting the new one (upsert semantics).
+    pub fn upsert_exchange_rate(&mut self, def: ExchangeRateDef) -> Result<(), DbError> {
+        let root = CatalogBootstrap::ensure_exchange_rates_root(self.storage)?;
+        self.page_ids.exchange_rates = root;
+
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (existing, _) = ExchangeRateDef::from_bytes(&data)?;
+            if existing.from_currency.eq_ignore_ascii_case(&def.from_currency)
+                && existing.to_currency.eq_ignore_ascii_case(&def.to_currency)
+            {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}->{}", existing.from_currency, existing.to_currency);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_EXCHANGE_RATES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                break;
+            }
+        }
+
+        let data = def.to_bytes();
+        let key = format!("{}->{}", def.from_currency, def.to_currency);
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_EXCHANGE_RATES,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes an exchange rate by (from, to) pair (case-insensitive).
+    ///
+    /// Returns `true` if found and deleted, `false` if not found.
+    pub fn delete_exchange_rate(&mut self, from: &str, to: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.exchange_rates;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = ExchangeRateDef::from_bytes(&data)?;
+            if def.from_currency.eq_ignore_ascii_case(from)
+                && def.to_currency.eq_ignore_ascii_case(to)
+            {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}->{}", def.from_currency, def.to_currency);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_EXCHANGE_RATES,
+                    key.as_bytes(),
                     &data,
                     page_id,
                     slot_id,

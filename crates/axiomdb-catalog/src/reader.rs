@@ -22,6 +22,7 @@ use crate::{
         DEFAULT_DATABASE_NAME,
     },
     schema_foreign_server::ForeignServerDef,
+    schema_exchange_rate::ExchangeRateDef,
     schema_foreign_table::ForeignTableDef,
     schema_holiday_calendar::HolidayCalendarDef,
 };
@@ -900,6 +901,50 @@ impl<'a> CatalogReader<'a> {
             out.push(def);
         }
         out.sort_by(|a, b| a.country_code.cmp(&b.country_code));
+        Ok(out)
+    }
+
+    // ── Exchange rates (Phase 20.17) ──────────────────────────────────────────
+
+    /// Returns the exchange rate for the given (from, to) pair, or `None` if not found.
+    pub fn get_exchange_rate(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<ExchangeRateDef>, DbError> {
+        let root = self.page_ids.exchange_rates;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = ExchangeRateDef::from_bytes(&data)?;
+            if def.from_currency.eq_ignore_ascii_case(from)
+                && def.to_currency.eq_ignore_ascii_case(to)
+            {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns all visible exchange rate definitions, sorted by (from, to).
+    pub fn list_exchange_rates(&mut self) -> Result<Vec<ExchangeRateDef>, DbError> {
+        let root = self.page_ids.exchange_rates;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = ExchangeRateDef::from_bytes(&data)?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| {
+            a.from_currency
+                .cmp(&b.from_currency)
+                .then(a.to_currency.cmp(&b.to_currency))
+        });
         Ok(out)
     }
 

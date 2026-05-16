@@ -178,6 +178,11 @@ pub const CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET: usize = 176;
 /// initialized on first `CREATE HOLIDAY CALENDAR` statement).
 pub const CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET: usize = 184;
 
+/// body offset of `catalog_exchange_rates_root: u64` — root heap page for
+/// `axiom_exchange_rates` (Phase 20.17). Value 0 = not yet allocated (lazily
+/// initialized on first `CREATE EXCHANGE RATE` statement).
+pub const CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET: usize = 192;
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"
