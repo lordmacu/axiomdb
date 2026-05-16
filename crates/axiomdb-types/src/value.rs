@@ -69,6 +69,9 @@ pub enum Value {
     /// Fields are in declaration order; a NULL field slot is `Value::Null`.
     /// Displays as `(v1,v2,…)` — parenthesized, comma-separated.
     Composite(Vec<Value>),
+    /// SQL ltree — hierarchical label path (Phase 20.19).
+    /// Stored as a validated `[A-Za-z0-9_]+` dot-separated path string.
+    Ltree(String),
 }
 
 impl Value {
@@ -92,6 +95,7 @@ impl Value {
             Self::Range(_) => "Range",
             Self::Money(..) => "Money",
             Self::Composite(_) => "Composite",
+            Self::Ltree(_) => "Ltree",
         }
     }
 
@@ -168,6 +172,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Self::Ltree(s) => write!(f, "{s}"),
             Self::Money(m, s, c) => {
                 let currency = std::str::from_utf8(c)
                     .unwrap_or("???")

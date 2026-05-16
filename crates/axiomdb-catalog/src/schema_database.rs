@@ -274,6 +274,7 @@ pub enum ColumnType {
     Range = 14,      // SQL range type (Phase 20.13)
     Money = 15,      // SQL MONEY type (Phase 20.17)
     Composite = 16,  // SQL composite user-defined type (Phase 20.18)
+    Ltree = 17,      // SQL ltree hierarchical path (Phase 20.19)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -297,6 +298,7 @@ impl TryFrom<u8> for ColumnType {
             14 => Ok(Self::Range),
             15 => Ok(Self::Money),
             16 => Ok(Self::Composite),
+            17 => Ok(Self::Ltree),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,

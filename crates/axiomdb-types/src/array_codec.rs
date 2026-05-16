@@ -41,16 +41,17 @@ pub enum ColumnType {
     Float = 4, // f64
     Text = 5,
     Bytes = 6,
-    Timestamp = 7, // i64 microseconds
-    Uuid = 8,      // [u8; 16]
-    Json = 9,      // validated UTF-8 JSON text
-    Jsonb = 10,    // binary JSONB blob
-    Decimal = 11,  // i128 mantissa + u8 scale
-    Date = 12,     // i32 days since 1970-01-01
-    Array = 13,    // PostgreSQL array
-    Range = 14,      // SQL range type
-    Money = 15,      // SQL MONEY type (Phase 20.17)
-    Composite = 16,  // SQL composite type (Phase 20.18)
+    Timestamp = 7,  // i64 microseconds
+    Uuid = 8,       // [u8; 16]
+    Json = 9,       // validated UTF-8 JSON text
+    Jsonb = 10,     // binary JSONB blob
+    Decimal = 11,   // i128 mantissa + u8 scale
+    Date = 12,      // i32 days since 1970-01-01
+    Array = 13,     // PostgreSQL array
+    Range = 14,     // SQL range type
+    Money = 15,     // SQL MONEY type (Phase 20.17)
+    Composite = 16, // SQL composite type (Phase 20.18)
+    Ltree = 17,     // SQL ltree hierarchical path (Phase 20.19)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -73,6 +74,7 @@ impl TryFrom<u8> for ColumnType {
             14 => Ok(Self::Range),
             15 => Ok(Self::Money),
             16 => Ok(Self::Composite),
+            17 => Ok(Self::Ltree),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -120,6 +122,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Range(_) => ColumnType::Range,
         crate::types::DataType::Money => ColumnType::Money,
         crate::types::DataType::Composite(_) => ColumnType::Composite,
+        crate::types::DataType::Ltree => ColumnType::Ltree,
     }
 }
 
@@ -320,6 +323,11 @@ fn encode_element(
                 reason: "Composite type cannot be used as an array element type".to_string(),
             });
         }
+        ColumnType::Ltree => {
+            return Err(DbError::InvalidValue {
+                reason: "Ltree type cannot be used as an array element type".to_string(),
+            });
+        }
     }
     Ok(buf.len() - start_len)
 }
@@ -505,6 +513,10 @@ fn decode_element(
         }),
         ColumnType::Composite => Err(DbError::ParseError {
             message: "Composite element type not supported as array element".to_string(),
+            position: None,
+        }),
+        ColumnType::Ltree => Err(DbError::ParseError {
+            message: "Ltree element type not supported as array element".to_string(),
             position: None,
         }),
     }

@@ -161,8 +161,27 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // ── Range identity ────────────────────────────────────────────────────
         (v @ Value::Range(_), DataType::Range(_)) => Ok(v),
 
+        // ── Composite identity (Phase 20.18) ─────────────────────────────────
+        (v @ Value::Composite(_), DataType::Composite(_)) => Ok(v),
+
         // ── Money identity ────────────────────────────────────────────────────
         (v @ Value::Money(..), DataType::Money) => Ok(v),
+
+        // ── Ltree coercions (Phase 20.19) ─────────────────────────────────────
+        // Text → Ltree: validate the path then wrap in Value::Ltree.
+        (Value::Text(s), DataType::Ltree) => {
+            crate::ltree::validate_ltree_path(&s).map_err(|e| DbError::InvalidCoercion {
+                from: "Text".into(),
+                to: "LTREE".into(),
+                value: format!("'{s}'"),
+                reason: e.to_string(),
+            })?;
+            Ok(Value::Ltree(s))
+        }
+        // Ltree → Text: strip the type wrapper.
+        (Value::Ltree(s), DataType::Text) => Ok(Value::Text(s)),
+        // Ltree identity.
+        (v @ Value::Ltree(_), DataType::Ltree) => Ok(v),
 
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {

@@ -74,7 +74,9 @@
       "Bash(sed -n '769,790p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/json_table.rs)",
       "Bash(sed -n '1010,1030p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/json_table.rs)",
       "Bash(sed -n '79,100p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/partial_index.rs)",
-      "Bash(sed -n '176,200p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/plan_deps.rs)"
+      "Bash(sed -n '176,200p' /Users/cristian/nexusdb/.claude/worktrees/priceless-montalcini-945319/crates/axiomdb-sql/src/plan_deps.rs)",
+      "Bash(./tools/vm.sh wire *)",
+      "Bash(tee /tmp/wire-out.txt)"
     ],
     "additionalDirectories": [
       "/Users/cristian/nexusdb/docs"

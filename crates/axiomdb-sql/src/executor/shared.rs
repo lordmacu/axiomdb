@@ -1483,6 +1483,11 @@ fn validate_enum_column_value(
     txn: &TxnManager,
     conn_txn: &ConnectionTxn,
 ) -> Result<(), DbError> {
+    // Composite columns reuse enum_type_name to store the qualified type name
+    // but are not enum columns — skip enum label validation for them.
+    if column.col_type == axiomdb_catalog::ColumnType::Composite {
+        return Ok(());
+    }
     let Some(type_name) = column.enum_type_name.as_deref() else {
         return Ok(());
     };

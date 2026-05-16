@@ -11,6 +11,7 @@ pub mod codec;
 pub mod coerce;
 pub mod field_patch;
 pub mod jsonb;
+pub mod ltree;
 pub mod range_value;
 pub mod types;
 pub mod value;
@@ -22,6 +23,10 @@ pub use coerce::{coerce, coerce_for_op, CoercionMode};
 pub use jsonb::{
     jsonb_contains, jsonb_merge_patch, jsonb_overlaps, JsonbDecoder, JsonbEncoder, JsonbRef,
     JsonbValue,
+};
+pub use ltree::{
+    lquery_match, ltree_concat, ltree_index, ltree_is_ancestor, ltree_lca, ltree_nlevel,
+    ltree_subpath, validate_ltree_path,
 };
 pub use range_value::RangeValue;
 pub use types::DataType;

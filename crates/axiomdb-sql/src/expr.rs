@@ -402,10 +402,7 @@ pub enum Expr {
     /// Produced by the analyzer when it rewrites `col.field` dot notation.
     /// `col_idx` is the column position in the FROM list; `field_idx` is the
     /// zero-based field index within the composite type.
-    FieldAccess {
-        col_idx: usize,
-        field_idx: usize,
-    },
+    FieldAccess { col_idx: usize, field_idx: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -34,7 +34,8 @@ pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
         | DataType::Array(_)
         | DataType::Range(_)
         | DataType::Money
-        | DataType::Composite(_) => None,
+        | DataType::Composite(_)
+        | DataType::Ltree => None,
     }
 }
 

@@ -57,6 +57,9 @@ pub enum DataType {
     /// Inner vec holds `(field_name, field_type)` in declaration order.
     /// On disk: `[u32 LE data_len][encode_row(field_values, field_types)]`.
     Composite(Vec<(String, DataType)>),
+    /// SQL ltree — hierarchical label path (Phase 20.19).
+    /// On disk: `[u32 LE data_len][UTF-8 path bytes]`.
+    Ltree,
 }
 
 impl DataType {
@@ -90,6 +93,7 @@ impl DataType {
             },
             Self::Money => "MONEY".into(),
             Self::Composite(_) => "COMPOSITE".into(),
+            Self::Ltree => "LTREE".into(),
         }
     }
 }

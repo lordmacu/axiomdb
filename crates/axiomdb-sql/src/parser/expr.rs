@@ -908,6 +908,22 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             })
         }
 
+        // ROW(expr, ...) — composite value constructor (Phase 20.18).
+        // Token::Row is a keyword token; handle it here before the `other` fallback.
+        Token::Row => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            let mut elems = Vec::new();
+            if !matches!(p.peek(), Token::RParen) {
+                elems.push(parse_expr(p)?);
+                while p.eat(&Token::Comma) {
+                    elems.push(parse_expr(p)?);
+                }
+            }
+            p.expect(&Token::RParen)?;
+            Ok(Expr::Row(elems))
+        }
+
         other => Err(DbError::ParseError {
             message: format!("unexpected token {:?} in expression", other,),
             position: Some(pos),

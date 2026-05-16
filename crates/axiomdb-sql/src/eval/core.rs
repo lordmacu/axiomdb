@@ -473,18 +473,23 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             Ok(Value::Composite(vals?))
         }
         Expr::FieldAccess { col_idx, field_idx } => {
-            let composite = row.get(*col_idx).cloned().ok_or(DbError::ColumnIndexOutOfBounds {
-                idx: *col_idx,
-                len: row.len(),
-            })?;
+            let composite = row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: row.len(),
+                })?;
             match composite {
-                Value::Composite(fields) => fields
-                    .into_iter()
-                    .nth(*field_idx)
-                    .ok_or(DbError::ColumnIndexOutOfBounds {
-                        idx: *field_idx,
-                        len: 0,
-                    }),
+                Value::Composite(fields) => {
+                    fields
+                        .into_iter()
+                        .nth(*field_idx)
+                        .ok_or(DbError::ColumnIndexOutOfBounds {
+                            idx: *field_idx,
+                            len: 0,
+                        })
+                }
                 Value::Null => Ok(Value::Null),
                 _ => Err(DbError::TypeMismatch {
                     expected: "composite".into(),
@@ -1085,18 +1090,23 @@ pub fn eval_with<R: SubqueryRunner>(
             Ok(Value::Composite(vals?))
         }
         Expr::FieldAccess { col_idx, field_idx } => {
-            let composite = row.get(*col_idx).cloned().ok_or(DbError::ColumnIndexOutOfBounds {
-                idx: *col_idx,
-                len: row.len(),
-            })?;
+            let composite = row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: row.len(),
+                })?;
             match composite {
-                Value::Composite(fields) => fields
-                    .into_iter()
-                    .nth(*field_idx)
-                    .ok_or(DbError::ColumnIndexOutOfBounds {
-                        idx: *field_idx,
-                        len: 0,
-                    }),
+                Value::Composite(fields) => {
+                    fields
+                        .into_iter()
+                        .nth(*field_idx)
+                        .ok_or(DbError::ColumnIndexOutOfBounds {
+                            idx: *field_idx,
+                            len: 0,
+                        })
+                }
                 Value::Null => Ok(Value::Null),
                 _ => Err(DbError::TypeMismatch {
                     expected: "composite".into(),
