@@ -194,6 +194,9 @@ fn flatten_array_elements(arr: &[Value], out: &mut Vec<Vec<u8>>) {
             Value::Range(_) => {
                 // Range values are not GIN-indexable as array elements; skip.
             }
+            Value::Money(..) => {
+                // Money values are not GIN-indexable as array elements; skip.
+            }
         }
     }
 }

@@ -506,6 +506,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Uuid => 0xfd,                                    // VAR_STRING
         DataType::Array(_) => 0xfd,                                // VAR_STRING (PG text format)
         DataType::Range(_) => 0xfd,                                // VAR_STRING (text format)
+        DataType::Money => 0xfd,                                   // VAR_STRING ("100.50 USD")
     }
 }
 
@@ -523,6 +524,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Uuid => 36,
         DataType::Array(_) => 16_777_215, // PG text format, variable-length
         DataType::Range(_) => 64,         // range literal text e.g. "[1,5)"
+        DataType::Money => 32,            // "100.50 USD" — mantissa + currency code
     }
 }
 
@@ -627,6 +629,19 @@ fn value_to_text(v: &Value) -> String {
             "{}".to_string()
         }
         Value::Range(rv) => rv.to_display_string(),
+        Value::Money(m, s, c) => {
+            let currency = std::str::from_utf8(c).unwrap_or("???").trim_end_matches('\0');
+            if *s == 0 {
+                format!("{m} {currency}")
+            } else {
+                let abs_m = m.unsigned_abs();
+                let divisor = 10u128.pow(*s as u32);
+                let int_part = abs_m / divisor;
+                let frac_part = abs_m % divisor;
+                let sign = if *m < 0 { "-" } else { "" };
+                format!("{sign}{int_part}.{frac_part:0>width$} {currency}", width = *s as usize)
+            }
+        }
     }
 }
 

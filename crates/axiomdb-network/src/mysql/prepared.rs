@@ -552,6 +552,10 @@ pub fn value_to_sql_literal(v: &Value) -> String {
             "'{}'".to_string()
         }
         Value::Range(rv) => format!("'{}'", rv.to_display_string().replace('\'', "''")),
+        Value::Money(m, s, c) => {
+            let v = Value::Money(*m, *s, *c);
+            format!("'{}'", v.to_string().replace('\'', "''"))
+        }
     }
 }
 

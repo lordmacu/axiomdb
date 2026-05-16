@@ -161,6 +161,9 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // ── Range identity ────────────────────────────────────────────────────
         (v @ Value::Range(_), DataType::Range(_)) => Ok(v),
 
+        // ── Money identity ────────────────────────────────────────────────────
+        (v @ Value::Money(..), DataType::Money) => Ok(v),
+
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),

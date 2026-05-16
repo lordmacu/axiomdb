@@ -929,6 +929,7 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
             // Range columns are not used as index scan keys; return value as-is.
             return value;
         }
+        ColumnType::Money => DataType::Money,
     };
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }

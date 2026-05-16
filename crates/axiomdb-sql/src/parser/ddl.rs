@@ -2102,6 +2102,7 @@ fn fdw_datatype_to_column_type(
         DataType::Date => Ok(ColumnType::Date),
         DataType::Array(_) => Ok(ColumnType::Array),
         DataType::Range(_) => Ok(ColumnType::Range),
+        DataType::Money => Ok(ColumnType::Money),
     }
 }
 

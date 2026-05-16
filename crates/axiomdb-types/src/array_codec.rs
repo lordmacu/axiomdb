@@ -49,6 +49,7 @@ pub enum ColumnType {
     Date = 12,     // i32 days since 1970-01-01
     Array = 13,    // PostgreSQL array
     Range = 14,    // SQL range type
+    Money = 15,    // SQL MONEY type (Phase 20.17)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -69,6 +70,7 @@ impl TryFrom<u8> for ColumnType {
             12 => Ok(Self::Date),
             13 => Ok(Self::Array),
             14 => Ok(Self::Range),
+            15 => Ok(Self::Money),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -114,6 +116,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Date => ColumnType::Date,
         crate::types::DataType::Array(_) => ColumnType::Array,
         crate::types::DataType::Range(_) => ColumnType::Range,
+        crate::types::DataType::Money => ColumnType::Money,
     }
 }
 
@@ -304,6 +307,11 @@ fn encode_element(
                 reason: "Range type cannot be used as an array element type".to_string(),
             });
         }
+        ColumnType::Money => {
+            return Err(DbError::InvalidValue {
+                reason: "Money type cannot be used as an array element type".to_string(),
+            });
+        }
     }
     Ok(buf.len() - start_len)
 }
@@ -481,6 +489,10 @@ fn decode_element(
         }),
         ColumnType::Range => Err(DbError::ParseError {
             message: "Range element type not supported as array element".to_string(),
+            position: None,
+        }),
+        ColumnType::Money => Err(DbError::ParseError {
+            message: "Money element type not supported as array element".to_string(),
             position: None,
         }),
     }

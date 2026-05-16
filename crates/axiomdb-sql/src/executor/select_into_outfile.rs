@@ -116,6 +116,7 @@ fn outfile_field_str(v: &Value) -> String {
             serde_json::to_string(&arr).unwrap_or_default()
         }
         Value::Range(rv) => rv.to_display_string(),
+        Value::Money(m, s, c) => Value::Money(*m, *s, *c).to_string(),
     }
 }
 

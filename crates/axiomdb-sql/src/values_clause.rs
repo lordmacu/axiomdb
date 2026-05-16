@@ -108,6 +108,7 @@ fn value_type(v: &Value) -> DataType {
         Value::Jsonb(_) => DataType::Jsonb,
         Value::Array(_) => DataType::Array(Box::new(DataType::Text)),
         Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
+        Value::Money(..) => DataType::Money,
         _ => DataType::Text,
     }
 }

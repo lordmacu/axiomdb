@@ -405,6 +405,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Date => Ok(ColumnType::Date),
         DataType::Array(_elem) => Ok(ColumnType::Array),
         DataType::Range(_) => Ok(ColumnType::Range),
+        DataType::Money => Ok(ColumnType::Money),
     }
 }
 
@@ -425,6 +426,7 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Date => DataType::Date,
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
         ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
+        ColumnType::Money => DataType::Money,
     }
 }
 
@@ -460,6 +462,7 @@ fn datatype_of_value(v: &Value) -> DataType {
             DataType::Array(Box::new(elem_dt))
         }
         Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
+        Value::Money(..) => DataType::Money,
     }
 }
 

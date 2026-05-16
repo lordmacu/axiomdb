@@ -130,6 +130,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Uuid(_), DataType::Uuid)
             | (Value::Array(_), DataType::Array(_))
             | (Value::Range(_), DataType::Range(_))
+            | (Value::Money(..), DataType::Money)
     );
     if ok {
         Ok(())
@@ -167,6 +168,7 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
             Value::Range(_) => {
                 return crate::types::DataType::Range(Box::new(crate::types::DataType::Int))
             }
+            Value::Money(..) => return crate::types::DataType::Money,
         }
     }
     crate::types::DataType::Int // default
@@ -215,6 +217,8 @@ pub fn encoded_len(values: &[Value]) -> usize {
                 let payload = range_payload_len(rv);
                 3 + payload
             }
+            // Money: 16 bytes mantissa + 1 byte scale + 3 bytes currency = 20 bytes (fixed)
+            Value::Money(..) => 20,
         })
         .sum();
     blen + data
@@ -360,6 +364,11 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                         got: schema[i].name(),
                     });
                 }
+            }
+            Value::Money(m, s, c) => {
+                buf.extend_from_slice(&m.to_le_bytes());
+                buf.push(*s);
+                buf.extend_from_slice(c);
             }
             Value::Null => unreachable!("null already skipped by bitmap check"),
         }
@@ -571,6 +580,15 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += len;
                 Value::Range(Box::new(decode_range_payload(blob, elem_dt)?))
             }
+            DataType::Money => {
+                ensure_bytes(bytes, pos, 20)?;
+                let m = i128::from_le_bytes(bytes[pos..pos + 16].try_into().unwrap());
+                let s = bytes[pos + 16];
+                let mut c = [0u8; 3];
+                c.copy_from_slice(&bytes[pos + 17..pos + 20]);
+                pos += 20;
+                Value::Money(m, s, c)
+            }
         };
         values.push(v);
     }
@@ -772,6 +790,15 @@ pub fn decode_row_masked(
                     pos += len;
                     Value::Range(Box::new(decode_range_payload(blob, elem_dt)?))
                 }
+                DataType::Money => {
+                    ensure_bytes(bytes, pos, 20)?;
+                    let m = i128::from_le_bytes(bytes[pos..pos + 16].try_into().unwrap());
+                    let s = bytes[pos + 16];
+                    let mut c = [0u8; 3];
+                    c.copy_from_slice(&bytes[pos + 17..pos + 20]);
+                    pos += 20;
+                    Value::Money(m, s, c)
+                }
             };
             values.push(v);
         } else {
@@ -796,6 +823,10 @@ pub fn decode_row_masked(
                 DataType::Uuid => {
                     ensure_bytes(bytes, pos, 16)?;
                     pos += 16;
+                }
+                DataType::Money => {
+                    ensure_bytes(bytes, pos, 20)?;
+                    pos += 20;
                 }
                 DataType::Text
                 | DataType::Json

@@ -50,6 +50,9 @@ pub enum DataType {
     /// Maps to: Int→INT4RANGE, BigInt→INT8RANGE, Decimal→NUMRANGE,
     /// Date→DATERANGE, Timestamp→TSRANGE.
     Range(Box<DataType>),
+    /// SQL MONEY — exact decimal amount + ISO 4217 3-byte currency code (Phase 20.17).
+    /// Stored as 16-byte LE i128 mantissa + 1-byte scale + 3-byte ASCII currency.
+    Money,
 }
 
 impl DataType {
@@ -81,6 +84,7 @@ impl DataType {
                 DataType::Timestamp => "TSRANGE".into(),
                 other => format!("RANGE({})", other.name()),
             },
+            Self::Money => "MONEY".into(),
         }
     }
 }

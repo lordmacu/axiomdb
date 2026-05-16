@@ -1681,3 +1681,30 @@ DROP HOLIDAY CALENDAR IF EXISTS 'CO';
 ```
 
 **Result column:** `status TEXT` — page count and path information.
+
+---
+
+## MONEY column type (Phase 20.17)
+
+`MONEY` is a fixed-precision monetary column type that stores an exact decimal
+amount together with a 3-character ISO 4217 currency code.
+
+```sql
+CREATE TABLE invoices (
+    id     BIGINT PRIMARY KEY AUTO_INCREMENT,
+    total  MONEY  NOT NULL
+);
+```
+
+**Display format:** values are shown as `"100.50 USD"` — mantissa formatted to
+the stored decimal precision, a space, then the 3-character currency code.
+
+**Arithmetic:** same-currency `+` and `-` are always valid. Cross-currency
+operations require a registered exchange rate (see `CREATE EXCHANGE RATE` — Phase 20.17 step 3).
+
+**Restrictions:**
+- `MONEY` columns cannot be used as index keys or array element types.
+- `MONEY` is not supported as a `JSON_TABLE` return type or FDW column mapping target in the current release.
+
+`CREATE EXCHANGE RATE`, `DROP EXCHANGE RATE`, and the scalar functions
+`MONEY()`, `CONVERT()`, `CURRENCY_OF()`, `AMOUNT_OF()` are added in Phase 20.17 (parser + executor steps).

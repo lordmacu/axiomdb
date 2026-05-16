@@ -61,6 +61,10 @@ pub enum Value {
     Array(Vec<Value>),
     /// SQL range value (Phase 20.13). Boxed to keep Value size stable.
     Range(Box<crate::range_value::RangeValue>),
+    /// SQL MONEY — exact decimal amount + ISO 4217 currency code (Phase 20.17).
+    /// Stored as `mantissa × 10^(-scale)` plus a 3-byte ASCII currency code.
+    /// Example: `Money(10050, 2, *b"USD")` = 100.50 USD.
+    Money(i128, u8, [u8; 3]),
 }
 
 impl Value {
@@ -82,6 +86,7 @@ impl Value {
             Self::Jsonb(_) => "Jsonb",
             Self::Array(_) => "Array",
             Self::Range(_) => "Range",
+            Self::Money(..) => "Money",
         }
     }
 
@@ -148,6 +153,25 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
             Self::Range(rv) => write!(f, "{}", rv.to_display_string()),
+            Self::Money(m, s, c) => {
+                let currency = std::str::from_utf8(c)
+                    .unwrap_or("???")
+                    .trim_end_matches('\0');
+                if *s == 0 {
+                    write!(f, "{m} {currency}")
+                } else {
+                    let abs_m = m.unsigned_abs();
+                    let divisor = 10u128.pow(*s as u32);
+                    let int_part = abs_m / divisor;
+                    let frac_part = abs_m % divisor;
+                    let sign = if *m < 0 { "-" } else { "" };
+                    write!(
+                        f,
+                        "{sign}{int_part}.{frac_part:0>width$} {currency}",
+                        width = *s as usize
+                    )
+                }
+            }
         }
     }
 }

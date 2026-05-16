@@ -58,6 +58,7 @@ mod tests {
             ColumnType::Date,
             ColumnType::Array,
             ColumnType::Range,
+            ColumnType::Money,
         ];
         for v in variants {
             let byte: u8 = v.into();
@@ -66,12 +67,20 @@ mod tests {
         }
     }
 
-    // Discriminants 0, 15-254, and 255 are invalid; 1-14 are valid (Range = 14)
+    // Discriminants 0, 16-254, and 255 are invalid; 1-15 are valid (Money = 15)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(15).is_err());
+        assert!(ColumnType::try_from(16).is_err());
         assert!(ColumnType::try_from(255).is_err());
+    }
+
+    #[test]
+    fn test_column_type_money_roundtrip() {
+        let byte: u8 = ColumnType::Money.into();
+        assert_eq!(byte, 15);
+        let back = ColumnType::try_from(15u8).unwrap();
+        assert_eq!(back, ColumnType::Money);
     }
 
     // ── DatabaseDef ───────────────────────────────────────────────────────────

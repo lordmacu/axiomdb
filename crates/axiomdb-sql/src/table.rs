@@ -200,6 +200,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Uuid => DataType::Uuid,
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
         ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
+        ColumnType::Money => DataType::Money,
     }
 }
 
@@ -228,6 +229,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
                 DataType::Array(Box::new(elem_dt))
             }
             ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
+            ColumnType::Money => DataType::Money,
         })
         .collect()
 }
@@ -747,6 +749,7 @@ pub(crate) fn coerce_values(
                     DataType::Array(Box::new(elem_dt))
                 }
                 ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
+                ColumnType::Money => DataType::Money,
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -791,6 +794,7 @@ pub(crate) fn coerce_values_with_ctx(
                 DataType::Array(Box::new(elem_dt))
             }
             ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
+            ColumnType::Money => DataType::Money,
         };
 
         if ctx.strict_mode {

@@ -139,6 +139,11 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) -> Result<(), DbError> {
                 reason: "Range values cannot be used as index keys".to_string(),
             });
         }
+        Value::Money(..) => {
+            return Err(DbError::InvalidValue {
+                reason: "Money values cannot be used as index keys".to_string(),
+            });
+        }
     }
     Ok(())
 }

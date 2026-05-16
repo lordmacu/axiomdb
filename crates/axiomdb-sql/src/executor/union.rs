@@ -224,6 +224,13 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                 key.extend_from_slice(s.as_bytes());
                 key.push(0);
             }
+            Value::Money(m, s, c) => {
+                key.push(15);
+                key.extend_from_slice(&m.to_le_bytes());
+                key.push(*s);
+                key.extend_from_slice(c);
+                key.push(0);
+            }
         }
     }
     key

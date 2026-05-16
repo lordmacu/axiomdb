@@ -543,6 +543,11 @@ impl std::hash::Hash for HashableValue {
             Value::Range(rv) => {
                 rv.to_display_string().hash(state);
             }
+            Value::Money(m, s, c) => {
+                m.hash(state);
+                s.hash(state);
+                c.hash(state);
+            }
         }
     }
 }

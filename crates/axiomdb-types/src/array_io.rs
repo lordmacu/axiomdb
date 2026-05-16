@@ -223,6 +223,7 @@ fn format_element_text(elem: &crate::value::Value) -> String {
             "{}".to_string()
         }
         crate::value::Value::Range(rv) => rv.to_display_string(),
+        crate::value::Value::Money(m, s, c) => crate::value::Value::Money(*m, *s, *c).to_string(),
     }
 }
 
@@ -806,6 +807,9 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
         }),
         ColumnType::Range => Err(DbError::InvalidValue {
             reason: "array element type cannot be range".to_string(),
+        }),
+        ColumnType::Money => Err(DbError::InvalidValue {
+            reason: "array element type cannot be money".to_string(),
         }),
     }
 }

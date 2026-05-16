@@ -758,3 +758,40 @@ pub fn get_holiday_calendar(&mut self, country: &str)
 pub fn list_holiday_calendars(&mut self)
     -> Result<Vec<HolidayCalendarDef>, DbError>
 ```
+
+---
+
+## MONEY Column Type (Phase 20.17)
+
+### `ColumnType::Money = 15`
+
+`MONEY` is a fixed-point monetary type with an attached ISO 4217 currency code.
+It is stored as a new `ColumnType` discriminant (value `15`, after `Range = 14`).
+
+**In-memory representation (`Value::Money`):**
+
+```rust
+Value::Money(mantissa: i128, scale: u8, currency: [u8; 3])
+// amount = mantissa × 10^(-scale)
+// currency = 3-byte ASCII ISO 4217 code (e.g. b"USD", b"EUR")
+```
+
+Display format: `"100.50 USD"` (mantissa formatted with `scale` decimal places, space, 3-char code).
+
+**Heap codec — 20 fixed bytes per value:**
+
+```text
+[mantissa: 16 bytes LE i128]   — exact decimal integer
+[scale:     1 byte  u8  ]      — decimal point position
+[currency:  3 bytes       ]    — ASCII ISO 4217 code, no null terminator
+```
+
+**Exchange rate catalog (meta offset 192)** — heap root stored at
+`CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET`. Populated in Phase 20.17 step 2;
+see `schema_exchange_rate.rs` for the `ExchangeRateDef` binary layout.
+
+**Restrictions:**
+
+- `MONEY` values cannot be used as B-Tree index keys (`key_encoding.rs` returns `InvalidValue`).
+- `MONEY` cannot be used as array element type (`array_codec.rs` returns `InvalidValue`).
+- Cross-currency arithmetic (`+`, `-`) requires an exchange rate in the catalog; same-currency operations are always allowed.
