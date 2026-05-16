@@ -630,7 +630,9 @@ fn value_to_text(v: &Value) -> String {
         }
         Value::Range(rv) => rv.to_display_string(),
         Value::Money(m, s, c) => {
-            let currency = std::str::from_utf8(c).unwrap_or("???").trim_end_matches('\0');
+            let currency = std::str::from_utf8(c)
+                .unwrap_or("???")
+                .trim_end_matches('\0');
             if *s == 0 {
                 format!("{m} {currency}")
             } else {
@@ -639,7 +641,10 @@ fn value_to_text(v: &Value) -> String {
                 let int_part = abs_m / divisor;
                 let frac_part = abs_m % divisor;
                 let sign = if *m < 0 { "-" } else { "" };
-                format!("{sign}{int_part}.{frac_part:0>width$} {currency}", width = *s as usize)
+                format!(
+                    "{sign}{int_part}.{frac_part:0>width$} {currency}",
+                    width = *s as usize
+                )
             }
         }
     }

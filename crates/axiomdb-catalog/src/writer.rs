@@ -2102,7 +2102,9 @@ impl<'a> CatalogWriter<'a> {
 
         for (page_id, slot_id, data) in rows {
             let (existing, _) = ExchangeRateDef::from_bytes(&data)?;
-            if existing.from_currency.eq_ignore_ascii_case(&def.from_currency)
+            if existing
+                .from_currency
+                .eq_ignore_ascii_case(&def.from_currency)
                 && existing.to_currency.eq_ignore_ascii_case(&def.to_currency)
             {
                 HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;

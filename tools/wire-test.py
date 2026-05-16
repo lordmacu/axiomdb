@@ -5450,6 +5450,44 @@ ok("[20.16d business_days_between] 5 weekdays minus 1 holiday = 4",
 
 cur.execute("DROP HOLIDAY CALENDAR IF EXISTS 'CO'")
 
+# ── 20.17 MONEY type ─────────────────────────────────────────────────────────
+
+# [20.17a] CREATE TABLE with MONEY column and INSERT/SELECT roundtrip
+cur.execute("DROP TABLE IF EXISTS _wire_money_prices")
+cur.execute("CREATE TABLE _wire_money_prices (id INT, price MONEY NOT NULL)")
+cur.execute("INSERT INTO _wire_money_prices VALUES (1, MONEY(9.99, 'USD'))")
+cur.execute("INSERT INTO _wire_money_prices VALUES (2, MONEY(19.99, 'EUR'))")
+cur.execute("SELECT id, CURRENCY_OF(price) FROM _wire_money_prices ORDER BY id")
+_money_rows = cur.fetchall()
+ok("[20.17a money_table_roundtrip] INSERT + SELECT MONEY column returns correct rows",
+   len(_money_rows) == 2 and _money_rows[0][1] == "USD" and _money_rows[1][1] == "EUR",
+   _money_rows)
+
+# [20.17b] CURRENCY_OF and AMOUNT_OF scalar functions
+cur.execute("SELECT CURRENCY_OF(MONEY(100, 'GBP'))")
+_cf_val = cur.fetchone()[0]
+ok("[20.17b currency_of] CURRENCY_OF(MONEY(100,'GBP')) = 'GBP'",
+   _cf_val == "GBP", _cf_val)
+
+# [20.17c] CONVERT using catalog rate
+cur.execute("CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92")
+cur.execute("SELECT CURRENCY_OF(CONVERT(MONEY(100, 'USD'), 'EUR'))")
+_converted_currency = cur.fetchone()[0]
+ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
+   _converted_currency == "EUR", _converted_currency)
+cur.execute("DROP EXCHANGE RATE 'USD' TO 'EUR'")
+
+# [20.17d] Cross-currency addition returns error
+_got_error = False
+try:
+    cur.execute("SELECT MONEY(10, 'USD') + MONEY(10, 'EUR')")
+    cur.fetchone()
+except Exception:
+    _got_error = True
+ok("[20.17d cross_currency_add_error] USD + EUR raises an error", _got_error)
+
+cur.execute("DROP TABLE IF EXISTS _wire_money_prices")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

@@ -159,8 +159,121 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
             })
         }
 
+        // Phase 20.17: MONEY pure functions (no storage needed).
+        // convert_currency is handled by money_runtime.rs (needs catalog access).
+        "money" => eval_money_constructor_pure(args, row),
+        "currency_of" => eval_currency_of_pure(args, row),
+        "amount_of" => eval_amount_of_pure(args, row),
+
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),
+        }),
+    }
+}
+
+// ── Pure MONEY helpers (Phase 20.17) ─────────────────────────────────────────
+// These mirror money_runtime.rs but work without storage context.
+
+fn eval_money_constructor_pure(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    use axiomdb_types::{coerce, CoercionMode, DataType};
+    if args.len() != 2 {
+        return Err(DbError::TypeMismatch {
+            expected: "MONEY(amount, currency_code)".into(),
+            got: format!("{} argument(s)", args.len()),
+        });
+    }
+    let amount = crate::eval::eval(&args[0], row)?;
+    let currency_raw = crate::eval::eval(&args[1], row)?;
+
+    let (mantissa, scale) = match amount {
+        Value::Decimal(m, s) => (m, s),
+        Value::Int(n) => (n as i128, 0u8),
+        Value::BigInt(n) => (n as i128, 0u8),
+        Value::Real(f) => {
+            let s = 6u8;
+            let m = (f * 1_000_000.0).round() as i128;
+            (m, s)
+        }
+        Value::Text(ref s) => match coerce(
+            Value::Text(s.clone()),
+            DataType::Decimal,
+            CoercionMode::Strict,
+        ) {
+            Ok(Value::Decimal(m, sc)) => (m, sc),
+            _ => {
+                return Err(DbError::TypeMismatch {
+                    expected: "numeric amount for MONEY()".into(),
+                    got: s.clone(),
+                })
+            }
+        },
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "numeric amount for MONEY()".into(),
+                got: other.variant_name().to_string(),
+            })
+        }
+    };
+
+    let currency_code = match currency_raw {
+        Value::Text(s) => s.to_ascii_uppercase(),
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "currency code string for MONEY()".into(),
+                got: other.variant_name().to_string(),
+            })
+        }
+    };
+
+    if currency_code.len() != 3 || !currency_code.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(DbError::InvalidValue {
+            reason: format!("currency code '{currency_code}' must be 3 ASCII letters (ISO 4217)"),
+        });
+    }
+
+    let mut code_bytes = [0u8; 3];
+    code_bytes.copy_from_slice(currency_code.as_bytes());
+    Ok(Value::Money(mantissa, scale, code_bytes))
+}
+
+fn eval_currency_of_pure(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    if args.len() != 1 {
+        return Err(DbError::TypeMismatch {
+            expected: "CURRENCY_OF(money_expr)".into(),
+            got: format!("{} argument(s)", args.len()),
+        });
+    }
+    match crate::eval::eval(&args[0], row)? {
+        Value::Money(_, _, c) => {
+            let s = std::str::from_utf8(&c)
+                .map_err(|_| DbError::InvalidValue {
+                    reason: "invalid currency code".into(),
+                })?
+                .to_string();
+            Ok(Value::Text(s))
+        }
+        Value::Null => Ok(Value::Null),
+        other => Err(DbError::TypeMismatch {
+            expected: "MONEY value for CURRENCY_OF()".into(),
+            got: other.variant_name().to_string(),
+        }),
+    }
+}
+
+fn eval_amount_of_pure(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
+    if args.len() != 1 {
+        return Err(DbError::TypeMismatch {
+            expected: "AMOUNT_OF(money_expr)".into(),
+            got: format!("{} argument(s)", args.len()),
+        });
+    }
+    match crate::eval::eval(&args[0], row)? {
+        Value::Money(m, s, _) => Ok(Value::Decimal(m, s)),
+        Value::Null => Ok(Value::Null),
+        other => Err(DbError::TypeMismatch {
+            expected: "MONEY value for AMOUNT_OF()".into(),
+            got: other.variant_name().to_string(),
         }),
     }
 }

@@ -3,7 +3,7 @@
 Phase: 20 — Types + import/export
 Task: 20.17 — MONEY scalar type, exchange rate catalog, arithmetic and conversion
 Spec: specs/fase-20/spec-20.17-money.md
-Status: in-progress
+Status: done
 
 ## Summary
 

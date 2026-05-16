@@ -2326,6 +2326,9 @@ pub(crate) fn parse_create_exchange_rate(p: &mut Parser) -> Result<Stmt, DbError
     let from_currency = parse_currency_code(p)?.to_ascii_uppercase();
 
     match p.peek().clone() {
+        Token::To => {
+            p.advance();
+        }
         Token::Ident(kw) if kw.eq_ignore_ascii_case("TO") => {
             p.advance();
         }
@@ -2341,6 +2344,13 @@ pub(crate) fn parse_create_exchange_rate(p: &mut Parser) -> Result<Stmt, DbError
 
     let to_currency = parse_currency_code(p)?.to_ascii_uppercase();
 
+    // Consume optional RATE keyword before the numeric literal
+    if let Token::Ident(kw) = p.peek().clone() {
+        if kw.eq_ignore_ascii_case("RATE") {
+            p.advance();
+        }
+    }
+
     let rate_str = match p.peek().clone() {
         Token::Integer(n) => {
             p.advance();
@@ -2352,19 +2362,19 @@ pub(crate) fn parse_create_exchange_rate(p: &mut Parser) -> Result<Stmt, DbError
         }
         other => {
             return Err(DbError::ParseError {
-                message: format!(
-                    "expected numeric rate in CREATE EXCHANGE RATE, found {other:?}"
-                ),
+                message: format!("expected numeric rate in CREATE EXCHANGE RATE, found {other:?}"),
                 position: Some(p.current_pos()),
             });
         }
     };
 
-    Ok(Stmt::CreateExchangeRate(crate::ast::CreateExchangeRateStmt {
-        from_currency,
-        to_currency,
-        rate_str,
-    }))
+    Ok(Stmt::CreateExchangeRate(
+        crate::ast::CreateExchangeRateStmt {
+            from_currency,
+            to_currency,
+            rate_str,
+        },
+    ))
 }
 
 /// Parses everything after `DROP EXCHANGE RATE` has been consumed.
@@ -2375,6 +2385,9 @@ pub(crate) fn parse_drop_exchange_rate(p: &mut Parser) -> Result<Stmt, DbError> 
     let from_currency = parse_currency_code(p)?.to_ascii_uppercase();
 
     match p.peek().clone() {
+        Token::To => {
+            p.advance();
+        }
         Token::Ident(kw) if kw.eq_ignore_ascii_case("TO") => {
             p.advance();
         }
@@ -2409,9 +2422,7 @@ fn parse_currency_code(p: &mut Parser) -> Result<String, DbError> {
             Ok(owned)
         }
         other => Err(DbError::ParseError {
-            message: format!(
-                "expected ISO 4217 currency code (e.g. 'USD'), found {other:?}"
-            ),
+            message: format!("expected ISO 4217 currency code (e.g. 'USD'), found {other:?}"),
             position: Some(p.current_pos()),
         }),
     }

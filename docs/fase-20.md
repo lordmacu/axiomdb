@@ -456,3 +456,74 @@ O(1) for weekday count + O(|holidays|) for subtraction.
 - `crates/axiomdb-sql/tests/integration_business_calendar.rs` — 21 integration tests
 - `tools/wire-test.py` — 4 wire assertions: `[20.16a..d]`
 - All 2829 axiomdb-sql tests pass; clippy + fmt clean.
+
+---
+
+## Subphase 20.17 — MONEY type with multi-currency arithmetic
+
+**Closed:** 2026-05-15
+
+### Summary
+
+Adds a native `MONEY` type for exact fixed-point multi-currency values. Amounts are
+stored as `(mantissa: i128, scale: u8, currency: [u8; 3])`, where
+`amount = mantissa × 10^(-scale)` and `currency` is an ISO 4217 3-letter code.
+
+Exchange rates are registered via DDL and cached per-session, avoiding repeated
+catalog reads for repeated conversions in the same query.
+
+### Value representation
+
+```
+Value::Money(i128 mantissa, u8 scale, [u8; 3] currency_code)
+ColumnType::Money = 15
+Heap codec: 20 bytes — 16 LE i128 | 1 u8 scale | 3 bytes currency
+```
+
+### Exchange rate catalog
+
+A new `axiom_exchange_rates` heap is bootstrapped from meta page offset 192
+(following `axiom_holiday_calendars` at 184). Each entry uses a variable-length
+binary layout: `[from_len u8][from UTF-8][to_len u8][to UTF-8][mantissa 16 LE][scale u8]`.
+
+`CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92` — persists or replaces.
+`DROP EXCHANGE RATE [IF EXISTS] 'USD' TO 'EUR'` — removes.
+
+Both DDL statements clear the session `exchange_rate_cache` via `invalidate_all()`.
+
+### Scalar functions
+
+| Function | Result |
+|---|---|
+| `MONEY(amount, 'USD')` | Constructs a MONEY value |
+| `CONVERT(money, 'EUR')` | Converts using catalog rate (session-cached) |
+| `CURRENCY_OF(money)` | Returns the 3-letter currency code as TEXT |
+| `AMOUNT_OF(money)` | Returns the mantissa/scale as DECIMAL |
+
+`CONVERT(money, 'USD')` is parsed as a special case: when the second argument is a
+string literal, the parser emits `Expr::Function { name: "convert_currency", ... }`
+instead of a type cast, bypassing the existing MySQL `CONVERT(expr, type)` path.
+
+### Arithmetic
+
+Same-currency operations are supported directly:
+- `MONEY + MONEY` / `MONEY - MONEY`: scale normalization (align to `max(scale_l, scale_r)`) then checked add/sub
+- `MONEY * INT` / `MONEY * BIGINT` / `INT * MONEY`: scalar multiply, same scale
+- `MONEY / INT` / `MONEY / BIGINT`: integer division, same scale
+- `=`, `!=`, `<`, `<=`, `>`, `>=`: same-currency comparison via normalized mantissa
+
+Cross-currency arithmetic raises `DbError::InvalidValue` — call `CONVERT()` first.
+
+### Pure eval path
+
+INSERT VALUES and WHERE expressions are evaluated without a storage runner.
+`MONEY()`, `CURRENCY_OF()`, and `AMOUNT_OF()` are also registered in
+`eval/functions/mod.rs` for this pure-eval path. `CONVERT()` (desugared to
+`convert_currency`) requires storage access and remains executor-only.
+
+### Coverage
+
+- `crates/axiomdb-catalog/src/schema_exchange_rate.rs` — 3 unit tests
+- `crates/axiomdb-sql/tests/integration_money.rs` — 32 integration tests
+- `tools/wire-test.py` — 4 wire assertions: `[20.17a..d]`
+- All 4166/4166 workspace tests pass; clippy + fmt clean.

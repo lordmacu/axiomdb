@@ -2,7 +2,7 @@
 
 Phase: 20 — Types + import/export
 Task: 20.17 — MONEY scalar type, exchange rate catalog, arithmetic and conversion
-Status: approved
+Status: implemented
 
 ## Context
 

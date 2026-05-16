@@ -267,6 +267,11 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         return eval_binary_range(op, l, r);
     }
 
+    // ── Money operator dispatch (Phase 20.17) ─────────────────────────────────
+    if matches!(&l, Value::Money(..)) || matches!(&r, Value::Money(..)) {
+        return eval_binary_money(op, l, r);
+    }
+
     // NULL propagation for all other binary ops.
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
@@ -1527,5 +1532,177 @@ fn require_both_ranges(
             expected: format!("RANGE {op} RANGE"),
             got: format!("{} {op} {}", l.variant_name(), r.variant_name()),
         }),
+    }
+}
+
+// ── Money arithmetic (Phase 20.17) ────────────────────────────────────────────
+
+/// Handles binary operations involving at least one `Value::Money` operand.
+///
+/// Same-currency `+` and `-` are always valid. Cross-currency operations and
+/// any other op on Money return `TypeMismatch`.
+fn eval_binary_money(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
+    match (op, l, r) {
+        (BinaryOp::Add, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) => {
+            if lc != rc {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "cannot add {} and {} — use CONVERT() to unify currencies first",
+                        std::str::from_utf8(&lc).unwrap_or("?"),
+                        std::str::from_utf8(&rc).unwrap_or("?"),
+                    ),
+                });
+            }
+            let (mantissa, scale) = align_and_add(lm, ls, rm, rs, false)?;
+            Ok(Value::Money(mantissa, scale, lc))
+        }
+        (BinaryOp::Sub, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) => {
+            if lc != rc {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "cannot subtract {} and {} — use CONVERT() to unify currencies first",
+                        std::str::from_utf8(&lc).unwrap_or("?"),
+                        std::str::from_utf8(&rc).unwrap_or("?"),
+                    ),
+                });
+            }
+            let (mantissa, scale) = align_and_add(lm, ls, rm, rs, true)?;
+            Ok(Value::Money(mantissa, scale, lc))
+        }
+        (BinaryOp::Eq, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) => {
+            if lc != rc {
+                return Ok(Value::Bool(false));
+            }
+            let ord = compare_money(lm, ls, rm, rs);
+            Ok(Value::Bool(ord == std::cmp::Ordering::Equal))
+        }
+        (BinaryOp::NotEq, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) => {
+            if lc != rc {
+                return Ok(Value::Bool(true));
+            }
+            let ord = compare_money(lm, ls, rm, rs);
+            Ok(Value::Bool(ord != std::cmp::Ordering::Equal))
+        }
+        (BinaryOp::Lt, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) if lc == rc => Ok(
+            Value::Bool(compare_money(lm, ls, rm, rs) == std::cmp::Ordering::Less),
+        ),
+        (BinaryOp::LtEq, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) if lc == rc => Ok(
+            Value::Bool(compare_money(lm, ls, rm, rs) != std::cmp::Ordering::Greater),
+        ),
+        (BinaryOp::Gt, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) if lc == rc => Ok(
+            Value::Bool(compare_money(lm, ls, rm, rs) == std::cmp::Ordering::Greater),
+        ),
+        (BinaryOp::GtEq, Value::Money(lm, ls, lc), Value::Money(rm, rs, rc)) if lc == rc => Ok(
+            Value::Bool(compare_money(lm, ls, rm, rs) != std::cmp::Ordering::Less),
+        ),
+        // Scalar multiplication: MONEY * Int, MONEY * BigInt, Int * MONEY, BigInt * MONEY
+        (BinaryOp::Mul, Value::Money(m, s, c), Value::Int(f)) => {
+            let result = m
+                .checked_mul(f as i128)
+                .ok_or_else(|| DbError::InvalidValue {
+                    reason: "money multiplication overflow".into(),
+                })?;
+            Ok(Value::Money(result, s, c))
+        }
+        (BinaryOp::Mul, Value::Money(m, s, c), Value::BigInt(f)) => {
+            let result = m
+                .checked_mul(f as i128)
+                .ok_or_else(|| DbError::InvalidValue {
+                    reason: "money multiplication overflow".into(),
+                })?;
+            Ok(Value::Money(result, s, c))
+        }
+        (BinaryOp::Mul, Value::Int(f), Value::Money(m, s, c)) => {
+            let result = m
+                .checked_mul(f as i128)
+                .ok_or_else(|| DbError::InvalidValue {
+                    reason: "money multiplication overflow".into(),
+                })?;
+            Ok(Value::Money(result, s, c))
+        }
+        (BinaryOp::Mul, Value::BigInt(f), Value::Money(m, s, c)) => {
+            let result = m
+                .checked_mul(f as i128)
+                .ok_or_else(|| DbError::InvalidValue {
+                    reason: "money multiplication overflow".into(),
+                })?;
+            Ok(Value::Money(result, s, c))
+        }
+        // Scalar division: MONEY / Int, MONEY / BigInt
+        (BinaryOp::Div, Value::Money(m, s, c), Value::Int(f)) => {
+            if f == 0 {
+                return Err(DbError::InvalidValue {
+                    reason: "division by zero".into(),
+                });
+            }
+            Ok(Value::Money(m / (f as i128), s, c))
+        }
+        (BinaryOp::Div, Value::Money(m, s, c), Value::BigInt(f)) => {
+            if f == 0 {
+                return Err(DbError::InvalidValue {
+                    reason: "division by zero".into(),
+                });
+            }
+            Ok(Value::Money(m / (f as i128), s, c))
+        }
+        (op, l, r) => Err(DbError::TypeMismatch {
+            expected: "MONEY +/- MONEY (same currency)".into(),
+            got: format!(
+                "{} {} {}",
+                l.variant_name(),
+                op_variant_name(&op),
+                r.variant_name()
+            ),
+        }),
+    }
+}
+
+/// Aligns two fixed-point values to the same scale then adds (or subtracts).
+fn align_and_add(
+    lm: i128,
+    ls: u8,
+    rm: i128,
+    rs: u8,
+    subtract: bool,
+) -> Result<(i128, u8), DbError> {
+    let scale = ls.max(rs);
+    let lm_aligned = if ls < scale {
+        lm.checked_mul(10i128.pow((scale - ls) as u32))
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: "money arithmetic overflow".into(),
+            })?
+    } else {
+        lm
+    };
+    let rm_aligned = if rs < scale {
+        rm.checked_mul(10i128.pow((scale - rs) as u32))
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: "money arithmetic overflow".into(),
+            })?
+    } else {
+        rm
+    };
+    let result = if subtract {
+        lm_aligned.checked_sub(rm_aligned)
+    } else {
+        lm_aligned.checked_add(rm_aligned)
+    }
+    .ok_or_else(|| DbError::InvalidValue {
+        reason: "money arithmetic overflow".into(),
+    })?;
+    Ok((result, scale))
+}
+
+/// Compares two same-currency money amounts by aligning their scales.
+fn compare_money(lm: i128, ls: u8, rm: i128, rs: u8) -> std::cmp::Ordering {
+    if ls == rs {
+        return lm.cmp(&rm);
+    }
+    if ls > rs {
+        let factor = 10i128.pow((ls - rs) as u32);
+        lm.cmp(&rm.saturating_mul(factor))
+    } else {
+        let factor = 10i128.pow((rs - ls) as u32);
+        lm.saturating_mul(factor).cmp(&rm)
     }
 }

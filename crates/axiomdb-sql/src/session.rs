@@ -800,6 +800,12 @@ pub struct SessionContext {
     /// `BUSINESS_DAYS_BETWEEN` for a given country code. Cleared whenever the
     /// schema cache is invalidated (i.e., after any DDL statement).
     pub holiday_cache: HashMap<String, Arc<HashSet<i32>>>,
+    /// Per-session exchange rate cache keyed by (from_currency, to_currency).
+    ///
+    /// Loaded lazily on first call to `CONVERT(money, 'CUR')` for a given pair.
+    /// Cleared whenever the schema cache is invalidated (after any DDL statement).
+    /// Value: `(mantissa, scale)` — same fixed-point encoding as `ExchangeRateDef`.
+    pub exchange_rate_cache: HashMap<(String, String), (i128, u8)>,
 }
 
 impl Default for SessionContext {
@@ -846,6 +852,7 @@ impl SessionContext {
             cursors: HashMap::new(),
             sequence_currvals: HashMap::new(),
             holiday_cache: HashMap::new(),
+            exchange_rate_cache: HashMap::new(),
         }
     }
 
@@ -1077,6 +1084,7 @@ impl SessionContext {
         self.cache.clear();
         self.heap_tail.clear();
         self.holiday_cache.clear();
+        self.exchange_rate_cache.clear();
     }
 
     // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────

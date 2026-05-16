@@ -1356,3 +1356,86 @@ SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO');  -- 4
 <code>BUSINESS_DAYS_BETWEEN</code> uses a full-weeks × 5 shortcut rather than iterating day-by-day. Only the partial weeks at the start and end require per-day checks, and holidays are looked up in an <code>O(log n)</code> sorted set. This makes even year-spanning ranges instantaneous, whereas application-side loops over date ranges scale linearly with the interval length.
 </div>
 </div>
+
+---
+
+## MONEY scalar functions (Phase 20.17)
+
+These functions operate on `MONEY` values — exact fixed-point amounts with an ISO 4217 currency code.
+
+### MONEY
+
+Constructs a `MONEY` value from an amount and a currency code.
+
+```sql
+MONEY(amount, currency_code)
+```
+
+- `amount`: any numeric expression (`INT`, `BIGINT`, `DECIMAL`, `REAL`, or numeric text)
+- `currency_code`: a 3-letter ISO 4217 code (`'USD'`, `'EUR'`, `'GBP'`, etc.) — case-insensitive, stored as uppercase
+- Returns `NULL` if `amount` is `NULL`
+
+```sql
+SELECT MONEY(9.99, 'USD');   -- 9.99 USD
+SELECT MONEY(100, 'EUR');    -- 100 EUR
+SELECT MONEY(-5.00, 'GBP'); -- -5.00 GBP
+```
+
+### CONVERT (currency)
+
+Converts a `MONEY` value to a different currency using an exchange rate registered with `CREATE EXCHANGE RATE`.
+
+```sql
+CONVERT(money_expr, 'target_currency')
+```
+
+- Exchange rates are cached in the session and invalidated when `CREATE/DROP EXCHANGE RATE` is executed.
+- Returns `NULL` if either argument is `NULL`.
+- Raises `InvalidValue` if no rate is registered for the pair.
+
+```sql
+CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92;
+SELECT CONVERT(MONEY(100, 'USD'), 'EUR');  -- 92.00 EUR
+```
+
+### CURRENCY_OF
+
+Extracts the currency code from a `MONEY` value as `TEXT`.
+
+```sql
+CURRENCY_OF(money_expr)
+```
+
+```sql
+SELECT CURRENCY_OF(MONEY(50, 'GBP'));  -- 'GBP'
+SELECT CURRENCY_OF(NULL);              -- NULL
+```
+
+### AMOUNT_OF
+
+Extracts the numeric amount from a `MONEY` value as `DECIMAL`.
+
+```sql
+AMOUNT_OF(money_expr)
+```
+
+```sql
+SELECT AMOUNT_OF(MONEY(9.99, 'USD'));  -- 9.99 (as DECIMAL)
+SELECT AMOUNT_OF(NULL);               -- NULL
+```
+
+---
+
+## MONEY arithmetic
+
+Same-currency arithmetic is supported directly. Cross-currency operations require an explicit `CONVERT()` call.
+
+| Expression | Result |
+|---|---|
+| `MONEY(10,'USD') + MONEY(5,'USD')` | `15.00 USD` |
+| `MONEY(10,'USD') - MONEY(3,'USD')` | `7.00 USD` |
+| `MONEY(10,'USD') * 3` | `30.00 USD` |
+| `MONEY(10,'USD') / 2` | `5.00 USD` |
+| `MONEY(10,'USD') = MONEY(10,'USD')` | `TRUE` |
+| `MONEY(5,'USD') < MONEY(10,'USD')` | `TRUE` |
+| `MONEY(10,'USD') + MONEY(10,'EUR')` | **Error** — use `CONVERT()` first |

@@ -21,8 +21,8 @@ use crate::{
         IndexDef, SchemaDef, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
         DEFAULT_DATABASE_NAME,
     },
-    schema_foreign_server::ForeignServerDef,
     schema_exchange_rate::ExchangeRateDef,
+    schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
     schema_holiday_calendar::HolidayCalendarDef,
 };
