@@ -97,6 +97,9 @@ def _check_binary_freshness(binary):
 
 def start_server():
     global _server_proc, _data_dir
+    # Kill any stale server from a previous run (e.g. if the test crashed).
+    subprocess.run(["pkill", "-f", "axiomdb-server"], capture_output=True)
+    time.sleep(0.3)
     explicit = os.environ.get("AXIOMDB_SERVER_BIN")
     if explicit:
         binary = explicit
@@ -4514,6 +4517,47 @@ ok("[20.3 enum types] SHOW CREATE TABLE shows enum type in column definition",
 
 cur.execute("DROP TABLE moods")
 cur.execute("DROP TYPE mood")
+conn.commit()
+
+# ── Phase 20.18 — Composite / user-defined types ──────────────────────────────
+
+print("\n[20.18 composite types]")
+
+cur.execute("CREATE TYPE address AS (city TEXT, zip INT)")
+conn.commit()
+
+cur.execute("CREATE TABLE orders20 (id INT PRIMARY KEY, home address)")
+conn.commit()
+
+cur.execute("INSERT INTO orders20 VALUES (1, ROW('NYC', 10001)), (2, ROW('LA', 90001))")
+conn.commit()
+
+cur.execute("SELECT id, home FROM orders20 ORDER BY id")
+rows = cur.fetchall()
+ok("[20.18 composite] INSERT and SELECT composite column",
+   len(rows) == 2 and rows[0][1] == '(NYC,10001)' and rows[1][1] == '(LA,90001)',
+   rows)
+
+cur.execute("SELECT id, home.city FROM orders20 ORDER BY id")
+rows = cur.fetchall()
+ok("[20.18 composite] dot-notation field access in SELECT",
+   len(rows) == 2 and rows[0][1] == 'NYC' and rows[1][1] == 'LA',
+   rows)
+
+cur.execute("SELECT id FROM orders20 WHERE home.city = 'NYC'")
+rows = cur.fetchall()
+ok("[20.18 composite] dot-notation field access in WHERE clause",
+   len(rows) == 1 and rows[0][0] == 1,
+   rows)
+
+cur.execute("SELECT COUNT(*) FROM orders20")
+row = cur.fetchone()
+ok("[20.18 composite] COUNT(*) on table with composite column",
+   row[0] == 2,
+   row)
+
+cur.execute("DROP TABLE orders20")
+cur.execute("DROP TYPE address")
 conn.commit()
 
 # ── Phase 20.4 — SQL Arrays ───────────────────────────────────────────────────

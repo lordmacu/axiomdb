@@ -1439,3 +1439,52 @@ Same-currency arithmetic is supported directly. Cross-currency operations requir
 | `MONEY(10,'USD') = MONEY(10,'USD')` | `TRUE` |
 | `MONEY(5,'USD') < MONEY(10,'USD')` | `TRUE` |
 | `MONEY(10,'USD') + MONEY(10,'EUR')` | **Error** — use `CONVERT()` first |
+
+---
+
+## ROW Constructor
+
+The `ROW(expr, ...)` constructor creates a composite value from a list of scalar expressions.
+It is used to insert values into columns declared with a composite type.
+
+```sql
+ROW(expr [, expr ...])
+```
+
+```sql
+-- Insert a composite value into an `address` column
+INSERT INTO orders VALUES (1, ROW('NYC', 10001));
+INSERT INTO orders VALUES (1, ROW('NYC', 10001)), (2, ROW('LA', 90001));
+```
+
+- The number of expressions must match the number of fields in the target composite type.
+- Field values are evaluated left-to-right and coerced to the declared field types.
+- A `NULL` composite column can be inserted with `NULL` (without the `ROW` constructor).
+
+---
+
+## Composite Field Access (Dot Notation)
+
+Individual fields of a composite-typed column are accessed with dot notation: `column.field`.
+
+```sql
+column_name.field_name
+```
+
+```sql
+-- Select a single field
+SELECT home.city FROM orders;
+SELECT home.zip FROM orders;
+
+-- Use in WHERE
+SELECT id FROM orders WHERE home.city = 'NYC';
+
+-- Use in ORDER BY
+SELECT id, home.city FROM orders ORDER BY home.city;
+
+-- NULL propagation
+SELECT home.city FROM orders WHERE id = 3;  -- NULL if home column is NULL
+```
+
+Dot notation is resolved at analysis time against the composite type's field list.
+Accessing a field that does not exist in the type definition raises an `InvalidValue` error.

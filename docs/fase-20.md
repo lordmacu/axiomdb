@@ -527,3 +527,107 @@ INSERT VALUES and WHERE expressions are evaluated without a storage runner.
 - `crates/axiomdb-sql/tests/integration_money.rs` — 32 integration tests
 - `tools/wire-test.py` — 4 wire assertions: `[20.17a..d]`
 - All 4166/4166 workspace tests pass; clippy + fmt clean.
+
+---
+
+## Subphase 20.18 — Composite / User-Defined Types
+
+**Closed:** 2026-05-16
+
+### What was built
+
+User-defined composite types: `CREATE TYPE name AS (field type, ...)`, `DROP TYPE [IF EXISTS]`,
+composite column DDL, `ROW(...)` constructor for INSERT, dot-notation field access in SELECT/WHERE,
+and full wire-protocol serialization.
+
+### SQL surface
+
+```sql
+-- Type DDL
+CREATE TYPE address AS (city TEXT, zip INT);
+DROP TYPE address;
+DROP TYPE IF EXISTS address;          -- idempotent
+
+-- Table with composite column
+CREATE TABLE orders (id INT, home address);
+
+-- Insert using ROW constructor
+INSERT INTO orders VALUES (1, ROW('NYC', 10001));
+INSERT INTO orders VALUES (1, ROW('NYC', 10001)), (2, ROW('LA', 90001));
+
+-- Select the whole composite value (returns "(NYC,10001)" text)
+SELECT id, home FROM orders;
+
+-- Dot-notation field access
+SELECT id, home.city FROM orders ORDER BY id;
+SELECT home.zip FROM orders;
+
+-- WHERE predicate on a composite field
+SELECT id FROM orders WHERE home.city = 'NYC';
+
+-- NULL composite value
+INSERT INTO orders VALUES (1, NULL);
+SELECT home.city FROM orders;         -- returns NULL
+```
+
+### Architecture
+
+#### Type system (`axiomdb-types`)
+
+- `Value::Composite(Vec<Value>)` — runtime representation; `Display` produces `(f1,f2,...)`.
+- `DataType::Composite(Vec<(String, DataType)>)` — logical type with optional field names.
+- **Self-describing codec**: the binary encoding stores `[N u8][N × ColumnType tags][field bytes]`
+  inside a 4-byte length prefix so `decode_row` can reconstruct field types without catalog access.
+  This avoids a cyclic dependency between `axiomdb-types` and `axiomdb-catalog`.
+- Helper functions in `codec.rs`: `value_to_col_type`, `col_type_to_data_type`,
+  `decode_composite_inner`.
+- `coerce()` identity case for `(Value::Composite, DataType::Composite)` in `coerce_api.rs`.
+- `value_matches_type()` updated in `coerce_helpers.rs`.
+
+#### Catalog layer (`axiomdb-catalog`)
+
+- `CompositeTypeDef { id, schema_name, name, fields: Vec<CompositeField> }` — on-disk entry.
+- `CompositeField { name: String, type_name: String }` — field descriptor.
+- `axiom_composite_types` catalog heap (meta offset 200).
+- `CatalogWriter::create_composite_type`, `delete_composite_type`.
+- `CatalogReader::get_composite_type`, `list_composite_types`.
+- `ColumnDef.col_type = ColumnType::Composite` + `enum_type_name = Some("public.name")`.
+
+#### Parser (`axiomdb-sql`)
+
+- `Stmt::CreateCompositeType { schema, name, fields: Vec<(String, String)> }` AST node.
+- `Stmt::DropType { schema, name, if_exists }` AST node.
+- `Expr::Row(Vec<Expr>)` for `ROW(expr, ...)` composite value constructors.
+- `Token::Row` is a reserved keyword; handled directly in `parse_atom` before the fallback arm
+  (it is never seen as `Token::Ident("row")`).
+- `Expr::FieldAccess { expr, field }` for dot-notation field access.
+- `FieldAccess` detection in `parse_postfix`: after parsing a qualified column name, if the next
+  token is `.ident` the parser wraps it in `Expr::FieldAccess`.
+
+#### Analyzer / Executor
+
+- `bind_expr` routes `Expr::Row(fields)` → new `BoundExpr::Row(fields)`.
+- `bind_expr` routes `Expr::FieldAccess { expr, field }` → `BoundExpr::FieldAccess { expr, field }`.
+- `eval_bound_expr` evaluates `Row(fields)` → `Value::Composite(evaluated_fields)`.
+- `eval_bound_expr` evaluates `FieldAccess` → indexes into `Value::Composite`; propagates NULL
+  when the composite value itself is `Value::Null`.
+- Analyzer resolves composite type at `CREATE TABLE` time; stores `ColumnType::Composite`.
+- `validate_enum_column_value` guards with `if column.col_type == ColumnType::Composite { return Ok(()) }`
+  because composite columns reuse `enum_type_name` for their qualified type name.
+- DDL executor handles `CREATE TYPE … AS (…)` and `DROP TYPE` via `execute_composite_ddl`.
+
+#### Wire protocol (`axiomdb-network`)
+
+- `DataType::Composite(_)` → MySQL type `0xfd` (`VAR_STRING`).
+- **Charset fix**: composite (and Array, Range, Money, Json, Jsonb) now use `results_collation.id`
+  in `build_column_def`, not `BINARY_COLLATION_DEF.id` (63). Without this fix, pymysql returned
+  the composite value as `bytes` instead of `str`.
+- `value_to_text` converts `Value::Composite` to its `Display` form `(f1,f2,...)`.
+
+### Coverage
+
+- `crates/axiomdb-sql/tests/integration_composite_types.rs` — 16 integration tests covering
+  DDL persistence, duplicate detection, DROP, CREATE TABLE, INSERT + SELECT, ROW constructor,
+  dot-notation SELECT/WHERE, NULL propagation, and catalog round-trip.
+- `tools/wire-test.py` — 4 wire assertions: `[20.18 composite]`
+- All 4187/4187 workspace tests pass; clippy + fmt clean.
