@@ -118,7 +118,7 @@ fn outfile_field_str(v: &Value) -> String {
         Value::Range(rv) => rv.to_display_string(),
         Value::Money(m, s, c) => Value::Money(*m, *s, *c).to_string(),
         Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
-        Value::Ltree(s) => s.clone(),
+        Value::Ltree(s) | Value::Xml(s) => s.clone(),
     }
 }
 

@@ -13,6 +13,7 @@ pub mod field_patch;
 pub mod jsonb;
 pub mod ltree;
 pub mod range_value;
+pub mod xml;
 pub mod types;
 pub mod value;
 
@@ -29,5 +30,6 @@ pub use ltree::{
     ltree_subpath, validate_ltree_path,
 };
 pub use range_value::RangeValue;
+pub use xml::validate_xml_text;
 pub use types::DataType;
 pub use value::Value;

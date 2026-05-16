@@ -374,7 +374,8 @@ fn json_value_to_axiom(
         | ColumnType::Range
         | ColumnType::Money
         | ColumnType::Composite
-        | ColumnType::Ltree => {
+        | ColumnType::Ltree
+        | ColumnType::Xml => {
             let s = match v {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -519,7 +520,7 @@ fn value_to_url_string(v: &Value) -> String {
         Value::Range(rv) => rv.to_display_string(),
         Value::Money(m, s, c) => Value::Money(*m, *s, *c).to_string(),
         Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
-        Value::Ltree(s) => s.clone(),
+        Value::Ltree(s) | Value::Xml(s) => s.clone(),
         Value::Null => String::new(),
     }
 }

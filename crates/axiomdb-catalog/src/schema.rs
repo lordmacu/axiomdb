@@ -69,11 +69,11 @@ mod tests {
         }
     }
 
-    // Discriminants 0, 18-254, and 255 are invalid; 1-17 are valid (Ltree = 17)
+    // Discriminants 0, 19-254, and 255 are invalid; 1-18 are valid (Xml = 18)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(18).is_err());
+        assert!(ColumnType::try_from(19).is_err());
         assert!(ColumnType::try_from(255).is_err());
     }
 

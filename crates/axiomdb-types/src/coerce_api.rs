@@ -183,6 +183,22 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // Ltree identity.
         (v @ Value::Ltree(_), DataType::Ltree) => Ok(v),
 
+        // ── Xml coercions (Phase 20.20) ───────────────────────────────────────
+        // Text → Xml: parse with roxmltree to validate well-formedness.
+        (Value::Text(s), DataType::Xml) => {
+            crate::xml::validate_xml_text(&s).map_err(|reason| DbError::InvalidCoercion {
+                from: "Text".into(),
+                to: "XML".into(),
+                value: format!("'{s}'"),
+                reason,
+            })?;
+            Ok(Value::Xml(s))
+        }
+        // Xml → Text: strip the type wrapper.
+        (Value::Xml(s), DataType::Text) => Ok(Value::Text(s)),
+        // Xml identity.
+        (v @ Value::Xml(_), DataType::Xml) => Ok(v),
+
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {
             from: value.variant_name().into(),

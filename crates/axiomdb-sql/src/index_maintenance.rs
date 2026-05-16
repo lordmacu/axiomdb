@@ -208,6 +208,14 @@ fn flatten_array_elements(arr: &[Value], out: &mut Vec<Vec<u8>>) {
                 t.extend_from_slice(s.as_bytes());
                 out.push(t);
             }
+            Value::Xml(s) => {
+                // Xml values indexed as text (ColumnType::Xml = 18)
+                let mut t = Vec::with_capacity(1 + 4 + s.len());
+                t.push(18u8); // ColumnType::Xml
+                t.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                t.extend_from_slice(s.as_bytes());
+                out.push(t);
+            }
         }
     }
 }

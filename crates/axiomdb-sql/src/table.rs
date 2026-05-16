@@ -203,6 +203,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Money => DataType::Money,
         ColumnType::Composite => DataType::Composite(vec![]),
         ColumnType::Ltree => DataType::Ltree,
+        ColumnType::Xml => DataType::Xml,
     }
 }
 
@@ -234,6 +235,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             ColumnType::Money => DataType::Money,
             ColumnType::Composite => DataType::Composite(vec![]),
             ColumnType::Ltree => DataType::Ltree,
+            ColumnType::Xml => DataType::Xml,
         })
         .collect()
 }
@@ -756,6 +758,7 @@ pub(crate) fn coerce_values(
                 ColumnType::Money => DataType::Money,
                 ColumnType::Composite => DataType::Composite(vec![]),
                 ColumnType::Ltree => DataType::Ltree,
+                ColumnType::Xml => DataType::Xml,
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -803,6 +806,7 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::Money => DataType::Money,
             ColumnType::Composite => DataType::Composite(vec![]),
             ColumnType::Ltree => DataType::Ltree,
+            ColumnType::Xml => DataType::Xml,
         };
 
         if ctx.strict_mode {

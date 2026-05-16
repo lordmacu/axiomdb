@@ -245,6 +245,11 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                 key.extend_from_slice(s.as_bytes());
                 key.push(0);
             }
+            Value::Xml(s) => {
+                key.push(18);
+                key.extend_from_slice(s.as_bytes());
+                key.push(0);
+            }
         }
     }
     key

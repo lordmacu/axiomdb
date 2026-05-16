@@ -393,6 +393,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
             });
         }
         DataType::Ltree => ColumnType::Ltree,
+        DataType::Xml => ColumnType::Xml,
     })
 }
 

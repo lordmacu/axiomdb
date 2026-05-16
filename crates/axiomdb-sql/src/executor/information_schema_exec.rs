@@ -581,6 +581,7 @@ fn column_type_to_is_data_type(col: &axiomdb_catalog::ColumnDef) -> String {
         ColumnType::Money => "money",
         ColumnType::Composite => "composite",
         ColumnType::Ltree => "ltree",
+        ColumnType::Xml => "xml",
     }
     .to_string()
 }
@@ -680,6 +681,7 @@ fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
         ColumnType::Money => "money",
         ColumnType::Composite => "composite",
         ColumnType::Ltree => "ltree",
+        ColumnType::Xml => "xml",
     }
 }
 
@@ -702,6 +704,7 @@ fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::Money => "money",
         ColumnType::Composite => "composite",
         ColumnType::Ltree => "ltree",
+        ColumnType::Xml => "xml",
     }
 }
 

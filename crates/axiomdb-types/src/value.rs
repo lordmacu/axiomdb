@@ -72,6 +72,9 @@ pub enum Value {
     /// SQL ltree — hierarchical label path (Phase 20.19).
     /// Stored as a validated `[A-Za-z0-9_]+` dot-separated path string.
     Ltree(String),
+    /// SQL XML / XMLTYPE — UTF-8 XML text (Phase 20.20).
+    /// Guaranteed well-formed at construction time (validated via roxmltree).
+    Xml(String),
 }
 
 impl Value {
@@ -96,6 +99,7 @@ impl Value {
             Self::Money(..) => "Money",
             Self::Composite(_) => "Composite",
             Self::Ltree(_) => "Ltree",
+            Self::Xml(_) => "Xml",
         }
     }
 
@@ -172,7 +176,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Self::Ltree(s) => write!(f, "{s}"),
+            Self::Ltree(s) | Self::Xml(s) => write!(f, "{s}"),
             Self::Money(m, s, c) => {
                 let currency = std::str::from_utf8(c)
                     .unwrap_or("???")

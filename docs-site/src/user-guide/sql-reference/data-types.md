@@ -705,6 +705,50 @@ to replicate with plain strings.
 
 ---
 
+## XML / XMLTYPE — Document Type (Phase 20.20)
+
+`XML` (alias `XMLTYPE`) stores a UTF-8 XML text value. The stored string must be
+well-formed XML (either a complete document or a valid XML fragment). Validation
+is performed on write.
+
+```sql
+CREATE TABLE docs (id INT, content XML);
+
+INSERT INTO docs VALUES (1, '<root><item id="1">hello</item></root>');
+
+SELECT content FROM docs WHERE id = 1;
+-- Returns: <root><item id="1">hello</item></root>
+```
+
+### XML Coercions
+
+```sql
+-- Cast a text literal to XML (validates well-formedness)
+SELECT CAST('<root/>' AS XML);
+SELECT '<root/>'::XML;
+
+-- Cast XML back to TEXT
+SELECT CAST('<root/>'::XML AS TEXT);
+
+-- Invalid XML raises an error
+SELECT CAST('<broken' AS XML);  -- Error: InvalidCoercion
+```
+
+### XML Functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `xml_is_well_formed(text)` | `INT` | 1 if the string is valid XML, 0 if not, NULL if input is NULL |
+
+```sql
+SELECT xml_is_well_formed('<a/>');           -- 1
+SELECT xml_is_well_formed('<?xml version="1.0"?><root/>'); -- 1
+SELECT xml_is_well_formed('<broken');        -- 0
+SELECT xml_is_well_formed(NULL);             -- NULL
+```
+
+---
+
 ## NULL in Every Type
 
 Every column of every type can hold NULL unless declared `NOT NULL`. The row codec

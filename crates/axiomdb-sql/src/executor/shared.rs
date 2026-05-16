@@ -418,6 +418,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Money => Ok(ColumnType::Money),
         DataType::Composite(_) => Ok(ColumnType::Composite),
         DataType::Ltree => Ok(ColumnType::Ltree),
+        DataType::Xml => Ok(ColumnType::Xml),
     }
 }
 
@@ -441,6 +442,7 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Money => DataType::Money,
         ColumnType::Composite => DataType::Composite(vec![]),
         ColumnType::Ltree => DataType::Ltree,
+        ColumnType::Xml => DataType::Xml,
     }
 }
 
@@ -479,6 +481,7 @@ fn datatype_of_value(v: &Value) -> DataType {
         Value::Money(..) => DataType::Money,
         Value::Composite(_) => DataType::Composite(vec![]),
         Value::Ltree(_) => DataType::Ltree,
+        Value::Xml(_) => DataType::Xml,
     }
 }
 

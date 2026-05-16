@@ -10,6 +10,7 @@ pub(crate) mod datetime;
 mod json;
 mod ltree;
 mod nulls;
+pub(crate) mod xml;
 mod numeric;
 pub(crate) mod range;
 mod sql_json_query;
@@ -170,6 +171,9 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         "nlevel" | "subpath" | "subltree" | "index" | "lca" | "text2ltree" | "ltree2text" => {
             ltree::eval(lower.as_str(), args, row)
         }
+
+        // Phase 20.20: XML scalar functions.
+        "xml_is_well_formed" => xml::eval_is_well_formed(args, row),
 
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),

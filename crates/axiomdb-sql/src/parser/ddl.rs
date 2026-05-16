@@ -1269,6 +1269,10 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             p.advance();
             (DataType::Ltree, 0, false)
         }
+        Token::Ident(s) if s.eq_ignore_ascii_case("XML") || s.eq_ignore_ascii_case("XMLTYPE") => {
+            p.advance();
+            (DataType::Xml, 0, false)
+        }
         other => {
             return Err(DbError::ParseError {
                 message: format!(
@@ -2158,6 +2162,7 @@ fn fdw_datatype_to_column_type(
         DataType::Money => Ok(ColumnType::Money),
         DataType::Composite(_) => Ok(ColumnType::Composite),
         DataType::Ltree => Ok(ColumnType::Ltree),
+        DataType::Xml => Ok(ColumnType::Xml),
     }
 }
 

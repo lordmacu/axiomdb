@@ -261,6 +261,11 @@ fn encode_binary_cell(
             let encoded = charset::encode_text(results_collation.charset, s)?;
             write_lenenc_str(buf, &encoded);
         }
+        (DataType::Xml, Value::Xml(s)) => {
+            // Xml in binary protocol: send XML text as length-prefixed text
+            let encoded = charset::encode_text(results_collation.charset, s)?;
+            write_lenenc_str(buf, &encoded);
+        }
         // Any mismatch is a QueryResult invariant violation — not a user-visible error.
         (_, other) => unreachable!("binary cell type/value mismatch: {other:?}"),
     }
@@ -383,7 +388,8 @@ fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) 
         | DataType::Range(_)
         | DataType::Money
         | DataType::Composite(_)
-        | DataType::Ltree => results_collation.id,
+        | DataType::Ltree
+        | DataType::Xml => results_collation.id,
         _ => BINARY_COLLATION_DEF.id, // 63
     };
     buf.extend_from_slice(&charset_id.to_le_bytes());
@@ -523,6 +529,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Money => 0xfd,                                   // VAR_STRING ("100.50 USD")
         DataType::Composite(_) => 0xfd,                            // VAR_STRING (row literal)
         DataType::Ltree => 0xfd,                                   // VAR_STRING (path string)
+        DataType::Xml => 0xfd,                                     // VAR_STRING (XML text)
     }
 }
 
@@ -543,6 +550,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Money => 32,            // "100.50 USD" — mantissa + currency code
         DataType::Composite(_) => 16_777_215, // variable-length row literal
         DataType::Ltree => 65_535,        // ltree path string — up to 65535 chars
+        DataType::Xml => 16_777_215,      // XML document — MEDIUMBLOB-size limit
     }
 }
 
@@ -666,7 +674,7 @@ fn value_to_text(v: &Value) -> String {
             }
         }
         Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
-        Value::Ltree(s) => s.clone(),
+        Value::Ltree(s) | Value::Xml(s) => s.clone(),
     }
 }
 

@@ -19,6 +19,7 @@ fn value_matches_type(value: &Value, target: DataType) -> bool {
             | (Value::Range(_), DataType::Range(_))
             | (Value::Composite(_), DataType::Composite(_))
             | (Value::Ltree(_), DataType::Ltree)
+            | (Value::Xml(_), DataType::Xml)
     )
 }
 

@@ -52,6 +52,7 @@ pub enum ColumnType {
     Money = 15,     // SQL MONEY type (Phase 20.17)
     Composite = 16, // SQL composite type (Phase 20.18)
     Ltree = 17,     // SQL ltree hierarchical path (Phase 20.19)
+    Xml = 18,       // SQL XML / XMLTYPE (Phase 20.20)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -75,6 +76,7 @@ impl TryFrom<u8> for ColumnType {
             15 => Ok(Self::Money),
             16 => Ok(Self::Composite),
             17 => Ok(Self::Ltree),
+            18 => Ok(Self::Xml),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -123,6 +125,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Money => ColumnType::Money,
         crate::types::DataType::Composite(_) => ColumnType::Composite,
         crate::types::DataType::Ltree => ColumnType::Ltree,
+        crate::types::DataType::Xml => ColumnType::Xml,
     }
 }
 
@@ -328,6 +331,11 @@ fn encode_element(
                 reason: "Ltree type cannot be used as an array element type".to_string(),
             });
         }
+        ColumnType::Xml => {
+            return Err(DbError::InvalidValue {
+                reason: "Xml type cannot be used as an array element type".to_string(),
+            });
+        }
     }
     Ok(buf.len() - start_len)
 }
@@ -517,6 +525,10 @@ fn decode_element(
         }),
         ColumnType::Ltree => Err(DbError::ParseError {
             message: "Ltree element type not supported as array element".to_string(),
+            position: None,
+        }),
+        ColumnType::Xml => Err(DbError::ParseError {
+            message: "Xml element type not supported as array element".to_string(),
             position: None,
         }),
     }

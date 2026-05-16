@@ -133,6 +133,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Money(..), DataType::Money)
             | (Value::Composite(_), DataType::Composite(_))
             | (Value::Ltree(_), DataType::Ltree)
+            | (Value::Xml(_), DataType::Xml)
     );
     if ok {
         Ok(())
@@ -173,6 +174,7 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
             Value::Money(..) => return crate::types::DataType::Money,
             Value::Composite(_) => return crate::types::DataType::Composite(vec![]),
             Value::Ltree(_) => return crate::types::DataType::Ltree,
+            Value::Xml(_) => return crate::types::DataType::Xml,
         }
     }
     crate::types::DataType::Int // default
@@ -223,8 +225,8 @@ pub fn encoded_len(values: &[Value]) -> usize {
             }
             // Money: 16 bytes mantissa + 1 byte scale + 3 bytes currency = 20 bytes (fixed)
             Value::Money(..) => 20,
-            // Ltree: 4-byte LE u32 length + UTF-8 bytes
-            Value::Ltree(s) => 4 + s.len(),
+            // Ltree/Xml: 4-byte LE u32 length + UTF-8 bytes
+            Value::Ltree(s) | Value::Xml(s) => 4 + s.len(),
             // Composite: 4-byte length + 1-byte field_count + N type_tags + field data
             Value::Composite(fields) => {
                 let n = fields.len();
@@ -241,11 +243,12 @@ pub fn encoded_len(values: &[Value]) -> usize {
                         Value::Jsonb(b) => 3 + b.len(),
                         Value::Bytes(b) => 3 + b.len(),
                         Value::Money(..) => 20,
-                        // Nested composite/array/ltree: overestimate
+                        // Nested composite/array/ltree/xml: overestimate
                         Value::Array(_)
                         | Value::Range(_)
                         | Value::Composite(_)
-                        | Value::Ltree(_) => 16,
+                        | Value::Ltree(_)
+                        | Value::Xml(_) => 16,
                     })
                     .sum::<usize>()
                     + bitmap_len(n);
@@ -279,6 +282,7 @@ fn value_to_col_type(v: &Value) -> array_codec::ColumnType {
         Value::Range(_) => array_codec::ColumnType::Range,
         Value::Money(..) => array_codec::ColumnType::Money,
         Value::Ltree(_) => array_codec::ColumnType::Ltree,
+        Value::Xml(_) => array_codec::ColumnType::Xml,
         Value::Composite(_) | Value::Null => array_codec::ColumnType::Int,
     }
 }
@@ -303,6 +307,7 @@ fn col_type_to_data_type(ct: array_codec::ColumnType) -> DataType {
         array_codec::ColumnType::Money => DataType::Money,
         array_codec::ColumnType::Composite => DataType::Composite(vec![]),
         array_codec::ColumnType::Ltree => DataType::Ltree,
+        array_codec::ColumnType::Xml => DataType::Xml,
     }
 }
 
@@ -506,7 +511,7 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 buf.extend_from_slice(&data_len.to_le_bytes());
                 buf.extend_from_slice(&inner);
             }
-            Value::Ltree(s) => {
+            Value::Ltree(s) | Value::Xml(s) => {
                 let bytes = s.as_bytes();
                 let data_len = bytes.len() as u32;
                 buf.extend_from_slice(&data_len.to_le_bytes());
@@ -754,6 +759,20 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += data_len;
                 Value::Ltree(s)
             }
+            DataType::Xml => {
+                ensure_bytes(bytes, pos, 4)?;
+                let data_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                ensure_bytes(bytes, pos, data_len)?;
+                let s = std::str::from_utf8(&bytes[pos..pos + data_len])
+                    .map_err(|_| DbError::ParseError {
+                        message: format!("invalid UTF-8 in Xml column at offset {pos}"),
+                        position: None,
+                    })?
+                    .to_string();
+                pos += data_len;
+                Value::Xml(s)
+            }
         };
         values.push(v);
     }
@@ -989,6 +1008,21 @@ pub fn decode_row_masked(
                     pos += data_len;
                     Value::Ltree(s)
                 }
+                DataType::Xml => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let data_len =
+                        u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    ensure_bytes(bytes, pos, data_len)?;
+                    let s = std::str::from_utf8(&bytes[pos..pos + data_len])
+                        .map_err(|_| DbError::ParseError {
+                            message: format!("invalid UTF-8 in Xml column at offset {pos}"),
+                            position: None,
+                        })?
+                        .to_string();
+                    pos += data_len;
+                    Value::Xml(s)
+                }
             };
             values.push(v);
         } else {
@@ -1018,7 +1052,7 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 20)?;
                     pos += 20;
                 }
-                DataType::Composite(_) | DataType::Ltree => {
+                DataType::Composite(_) | DataType::Ltree | DataType::Xml => {
                     // Skip: read u32 data_len then skip that many bytes.
                     ensure_bytes(bytes, pos, 4)?;
                     let data_len =

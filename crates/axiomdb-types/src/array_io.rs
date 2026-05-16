@@ -227,7 +227,7 @@ fn format_element_text(elem: &crate::value::Value) -> String {
         crate::value::Value::Composite(fields) => {
             crate::value::Value::Composite(fields.clone()).to_string()
         }
-        crate::value::Value::Ltree(s) => quote_text_element(s),
+        crate::value::Value::Ltree(s) | crate::value::Value::Xml(s) => quote_text_element(s),
     }
 }
 
@@ -820,6 +820,9 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
         }),
         ColumnType::Ltree => Err(DbError::InvalidValue {
             reason: "array element type cannot be ltree".to_string(),
+        }),
+        ColumnType::Xml => Err(DbError::InvalidValue {
+            reason: "array element type cannot be xml".to_string(),
         }),
     }
 }

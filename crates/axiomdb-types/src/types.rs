@@ -60,6 +60,9 @@ pub enum DataType {
     /// SQL ltree — hierarchical label path (Phase 20.19).
     /// On disk: `[u32 LE data_len][UTF-8 path bytes]`.
     Ltree,
+    /// SQL XML / XMLTYPE — validated well-formed UTF-8 XML text (Phase 20.20).
+    /// On disk: `[u32 LE data_len][UTF-8 XML bytes]`.
+    Xml,
 }
 
 impl DataType {
@@ -94,6 +97,7 @@ impl DataType {
             Self::Money => "MONEY".into(),
             Self::Composite(_) => "COMPOSITE".into(),
             Self::Ltree => "LTREE".into(),
+            Self::Xml => "XML".into(),
         }
     }
 }

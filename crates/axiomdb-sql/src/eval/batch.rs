@@ -519,7 +519,8 @@ fn fixed_size(dt: DataType) -> Option<usize> {
         | DataType::Range(_)
         | DataType::Money
         | DataType::Composite(_)
-        | DataType::Ltree => None,
+        | DataType::Ltree
+        | DataType::Xml => None,
     }
 }
 

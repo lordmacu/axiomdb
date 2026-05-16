@@ -969,6 +969,7 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Money => "MONEY",
         ColumnType::Composite => "COMPOSITE",
         ColumnType::Ltree => "LTREE",
+        ColumnType::Xml => "XML",
     }
 }
 
@@ -992,6 +993,7 @@ fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Money => "MONEY",
         ColumnType::Composite => "COMPOSITE",
         ColumnType::Ltree => "LTREE",
+        ColumnType::Xml => "XML",
     }
 }
 
