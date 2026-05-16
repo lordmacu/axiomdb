@@ -1064,9 +1064,22 @@ impl<'src> Parser<'src> {
                     }),
                 }
             }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("exchange") => {
+                self.advance(); // consume EXCHANGE
+                match self.peek().clone() {
+                    Token::Ident(kw2) if kw2.eq_ignore_ascii_case("rate") => {
+                        self.advance(); // consume RATE
+                        ddl::parse_create_exchange_rate(self)
+                    }
+                    other => Err(DbError::ParseError {
+                        message: format!("expected RATE after EXCHANGE, found {other:?}"),
+                        position: Some(self.current_pos()),
+                    }),
+                }
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, INDEX, FOREIGN TABLE, SERVER, or HOLIDAY CALENDAR after CREATE, found {:?}",
+                    "expected DATABASE, TYPE, TEMP[ORARY] TABLE, UNLOGGED TABLE, TABLE, [OR REPLACE] VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, INDEX, FOREIGN TABLE, SERVER, HOLIDAY CALENDAR, or EXCHANGE RATE after CREATE, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),
@@ -1139,9 +1152,22 @@ impl<'src> Parser<'src> {
                     }),
                 }
             }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("exchange") => {
+                self.advance(); // consume EXCHANGE
+                match self.peek().clone() {
+                    Token::Ident(kw2) if kw2.eq_ignore_ascii_case("rate") => {
+                        self.advance(); // consume RATE
+                        ddl::parse_drop_exchange_rate(self)
+                    }
+                    other => Err(DbError::ParseError {
+                        message: format!("expected RATE after EXCHANGE, found {other:?}"),
+                        position: Some(self.current_pos()),
+                    }),
+                }
+            }
             other => Err(DbError::ParseError {
                 message: format!(
-                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA, INDEX, FOREIGN TABLE, SERVER, or HOLIDAY CALENDAR after DROP, found {:?}",
+                    "expected DATABASE, TABLE, VIEW, MATERIALIZED VIEW, TRIGGER, AGGREGATE, SEQUENCE, TYPE, SCHEMA, INDEX, FOREIGN TABLE, SERVER, HOLIDAY CALENDAR, or EXCHANGE RATE after DROP, found {:?}",
                     other,
                 ),
                 position: Some(self.current_pos()),

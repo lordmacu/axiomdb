@@ -1568,6 +1568,25 @@ pub struct DropHolidayCalendarStmt {
     pub country_code: String,
 }
 
+/// `CREATE EXCHANGE RATE 'FROM' TO 'TO' rate_literal` — Phase 20.17.
+///
+/// Stores a conversion rate from `from_currency` to `to_currency`.
+/// `rate_str` is the raw literal text (e.g. `"0.92"`) parsed at execution time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateExchangeRateStmt {
+    pub from_currency: String,
+    pub to_currency: String,
+    pub rate_str: String,
+}
+
+/// `DROP EXCHANGE RATE [IF EXISTS] 'FROM' TO 'TO'` — Phase 20.17.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropExchangeRateStmt {
+    pub if_exists: bool,
+    pub from_currency: String,
+    pub to_currency: String,
+}
+
 /// `CLOSE name` or `CLOSE ALL`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseCursorStmt {
@@ -1657,6 +1676,10 @@ pub enum Stmt {
     CreateHolidayCalendar(CreateHolidayCalendarStmt),
     /// `DROP HOLIDAY CALENDAR [IF EXISTS] country_code` — Phase 20.16.
     DropHolidayCalendar(DropHolidayCalendarStmt),
+    /// `CREATE EXCHANGE RATE 'FROM' TO 'TO' rate` — Phase 20.17.
+    CreateExchangeRate(CreateExchangeRateStmt),
+    /// `DROP EXCHANGE RATE [IF EXISTS] 'FROM' TO 'TO'` — Phase 20.17.
+    DropExchangeRate(DropExchangeRateStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),

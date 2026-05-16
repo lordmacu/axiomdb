@@ -281,6 +281,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             Stmt::Backup(_) | Stmt::Restore(_) => Ok(()),
             // Phase 20.16: Holiday calendar DDL — no table deps.
             Stmt::CreateHolidayCalendar(_) | Stmt::DropHolidayCalendar(_) => Ok(()),
+            // Phase 20.17: Exchange rate DDL — no table deps.
+            Stmt::CreateExchangeRate(_) | Stmt::DropExchangeRate(_) => Ok(()),
         }
     }
 

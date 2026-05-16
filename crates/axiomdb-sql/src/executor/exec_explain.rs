@@ -248,6 +248,11 @@ fn dispatch(
                 feature: "holiday calendar DDL — use session-aware path".into(),
             })
         }
+        Stmt::CreateExchangeRate(_) | Stmt::DropExchangeRate(_) => {
+            Err(DbError::NotImplemented {
+                feature: "exchange rate DDL — use session-aware path".into(),
+            })
+        }
     }
 }
 

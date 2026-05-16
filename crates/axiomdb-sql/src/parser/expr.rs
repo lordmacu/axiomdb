@@ -1153,17 +1153,30 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
 
         // CONVERT(expr, type) or CONVERT(expr USING charset) — MySQL syntax (4.19g).
         // Both forms are desugared to Expr::Cast; USING form maps to Text.
+        // Exception: CONVERT(money_expr, 'CURRENCY_CODE') — Phase 20.17 money conversion.
         if name.eq_ignore_ascii_case("convert") {
             let expr = parse_expr(p)?;
-            let target = if p.eat(&Token::Using) {
+            if p.eat(&Token::Using) {
                 // CONVERT(expr USING charset_name) — consume charset name, cast to Text.
                 // charset name may be an identifier or a keyword (utf8, binary, etc.)
                 p.advance(); // consume whatever the charset token is
-                DataType::Text
-            } else {
-                p.expect(&Token::Comma)?;
-                parse_convert_type(p)?
-            };
+                p.expect(&Token::RParen)?;
+                return Ok(Expr::Cast {
+                    expr: Box::new(expr),
+                    target: DataType::Text,
+                });
+            }
+            p.expect(&Token::Comma)?;
+            // Phase 20.17: CONVERT(money_expr, 'USD') → money currency conversion.
+            if let Token::StringLit(currency) = p.peek().clone() {
+                p.advance();
+                p.expect(&Token::RParen)?;
+                return Ok(Expr::Function {
+                    name: "convert_currency".into(),
+                    args: vec![expr, Expr::Literal(Value::Text(currency))],
+                });
+            }
+            let target = parse_convert_type(p)?;
             p.expect(&Token::RParen)?;
             return Ok(Expr::Cast {
                 expr: Box::new(expr),

@@ -1216,6 +1216,10 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             p.advance();
             (DataType::Range(Box::new(DataType::Timestamp)), 0, false)
         }
+        Token::Ident(s) if s.eq_ignore_ascii_case("MONEY") => {
+            p.advance();
+            (DataType::Money, 0, false)
+        }
         other => {
             return Err(DbError::ParseError {
                 message: format!(
@@ -2306,6 +2310,108 @@ fn parse_country_code(p: &mut Parser) -> Result<String, DbError> {
         }
         other => Err(DbError::ParseError {
             message: format!("expected country code string or identifier, found {other:?}"),
+            position: Some(p.current_pos()),
+        }),
+    }
+}
+
+// ── Exchange rate DDL (Phase 20.17) ───────────────────────────────────────────
+
+/// Parses everything after `CREATE EXCHANGE RATE` has been consumed.
+///
+/// Syntax: `'FROM_CURRENCY' TO 'TO_CURRENCY' rate_literal`
+///
+/// Example: `CREATE EXCHANGE RATE 'USD' TO 'EUR' 0.92`
+pub(crate) fn parse_create_exchange_rate(p: &mut Parser) -> Result<Stmt, DbError> {
+    let from_currency = parse_currency_code(p)?.to_ascii_uppercase();
+
+    match p.peek().clone() {
+        Token::Ident(kw) if kw.eq_ignore_ascii_case("TO") => {
+            p.advance();
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "expected TO after from_currency in CREATE EXCHANGE RATE, found {other:?}"
+                ),
+                position: Some(p.current_pos()),
+            });
+        }
+    }
+
+    let to_currency = parse_currency_code(p)?.to_ascii_uppercase();
+
+    let rate_str = match p.peek().clone() {
+        Token::Integer(n) => {
+            p.advance();
+            n.to_string()
+        }
+        Token::Float(f) => {
+            p.advance();
+            f.to_string()
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "expected numeric rate in CREATE EXCHANGE RATE, found {other:?}"
+                ),
+                position: Some(p.current_pos()),
+            });
+        }
+    };
+
+    Ok(Stmt::CreateExchangeRate(crate::ast::CreateExchangeRateStmt {
+        from_currency,
+        to_currency,
+        rate_str,
+    }))
+}
+
+/// Parses everything after `DROP EXCHANGE RATE` has been consumed.
+///
+/// Syntax: `[IF EXISTS] 'FROM_CURRENCY' TO 'TO_CURRENCY'`
+pub(crate) fn parse_drop_exchange_rate(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let from_currency = parse_currency_code(p)?.to_ascii_uppercase();
+
+    match p.peek().clone() {
+        Token::Ident(kw) if kw.eq_ignore_ascii_case("TO") => {
+            p.advance();
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!(
+                    "expected TO after from_currency in DROP EXCHANGE RATE, found {other:?}"
+                ),
+                position: Some(p.current_pos()),
+            });
+        }
+    }
+
+    let to_currency = parse_currency_code(p)?.to_ascii_uppercase();
+    Ok(Stmt::DropExchangeRate(crate::ast::DropExchangeRateStmt {
+        if_exists,
+        from_currency,
+        to_currency,
+    }))
+}
+
+/// Parses a 3-character ISO 4217 currency code: string literal or bare identifier.
+fn parse_currency_code(p: &mut Parser) -> Result<String, DbError> {
+    match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            Ok(s)
+        }
+        Token::Ident(s) => {
+            let owned = s.to_string();
+            p.advance();
+            Ok(owned)
+        }
+        other => Err(DbError::ParseError {
+            message: format!(
+                "expected ISO 4217 currency code (e.g. 'USD'), found {other:?}"
+            ),
             position: Some(p.current_pos()),
         }),
     }

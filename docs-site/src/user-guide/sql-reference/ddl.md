@@ -1706,5 +1706,52 @@ operations require a registered exchange rate (see `CREATE EXCHANGE RATE` — Ph
 - `MONEY` columns cannot be used as index keys or array element types.
 - `MONEY` is not supported as a `JSON_TABLE` return type or FDW column mapping target in the current release.
 
-`CREATE EXCHANGE RATE`, `DROP EXCHANGE RATE`, and the scalar functions
-`MONEY()`, `CONVERT()`, `CURRENCY_OF()`, `AMOUNT_OF()` are added in Phase 20.17 (parser + executor steps).
+The scalar functions `MONEY()`, `CONVERT()`, `CURRENCY_OF()`, `AMOUNT_OF()` and the
+exchange rate DDL below are implemented in Phase 20.17.
+
+---
+
+## CREATE EXCHANGE RATE
+
+Registers a currency conversion rate from one ISO 4217 currency to another.
+The rate is stored with full precision as a fixed-point decimal.
+
+```sql
+CREATE EXCHANGE RATE 'from_currency' TO 'to_currency' rate
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `from_currency` | 3-character ISO 4217 source currency code (e.g. `'USD'`). Stored upper-case. |
+| `to_currency` | 3-character ISO 4217 target currency code (e.g. `'EUR'`). Stored upper-case. |
+| `rate` | Numeric literal — the conversion factor (e.g. `0.92` means 1 USD = 0.92 EUR). |
+
+**Notes:**
+- If an exchange rate for the same (from, to) pair already exists, it is replaced.
+- Rates are directional: `'USD'→'EUR'` and `'EUR'→'USD'` are independent entries.
+- The rate is stored exactly as a fixed-point value — no floating-point rounding.
+
+```sql
+CREATE EXCHANGE RATE 'USD' TO 'EUR' 0.92;
+CREATE EXCHANGE RATE 'EUR' TO 'USD' 1.09;
+```
+
+---
+
+## DROP EXCHANGE RATE
+
+Removes an exchange rate definition from the catalog.
+
+```sql
+DROP EXCHANGE RATE [IF EXISTS] 'from_currency' TO 'to_currency'
+```
+
+```sql
+DROP EXCHANGE RATE 'USD' TO 'EUR';
+DROP EXCHANGE RATE IF EXISTS 'GBP' TO 'EUR';
+```
+
+- With `IF EXISTS`: succeeds silently if the rate does not exist.
+- Without `IF EXISTS`: returns `InvalidValue` if the rate is not found.
