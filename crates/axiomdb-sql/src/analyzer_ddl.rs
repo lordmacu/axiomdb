@@ -839,6 +839,13 @@ fn reject_disallowed_in_index_expr(expr: &crate::expr::Expr) -> Result<(), DbErr
             reject_disallowed_in_index_expr(expr)?;
             reject_disallowed_in_index_expr(array)
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                reject_disallowed_in_index_expr(e)?;
+            }
+            Ok(())
+        }
+        Expr::FieldAccess { .. } => Ok(()),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Default => Ok(()),
     }
 }

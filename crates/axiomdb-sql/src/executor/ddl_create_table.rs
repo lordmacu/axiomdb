@@ -369,7 +369,9 @@ fn validate_generated_expr_refs(
         | Expr::InsertValue { .. }
         | Expr::ExcludedValue { .. }
         | Expr::Param { .. }
-        | Expr::Default => Err(DbError::InvalidValue {
+        | Expr::Default
+        | Expr::Row(_)
+        | Expr::FieldAccess { .. } => Err(DbError::InvalidValue {
             reason: format!(
                 "unsupported expression in generated column '{generated_name}'"
             ),
@@ -426,7 +428,7 @@ fn execute_create_table(
         }
     }
 
-    let enum_type_names = resolve_create_table_enum_types(&stmt, storage, txn, conn_txn, schema)?;
+    let resolved_user_types = resolve_create_table_user_types(&stmt, storage, txn, conn_txn, schema)?;
 
     // Check existence before constructing CatalogWriter (avoids double mutable borrow).
     {
@@ -509,7 +511,7 @@ fn execute_create_table(
             .unwrap_or(false);
 
         // Handle array columns: extract leaf element type and ndims
-        let (col_type, array_element_type, array_ndims) = if let Some(ndims) = col_def.array_ndims {
+        let (mut col_type, array_element_type, array_ndims) = if let Some(ndims) = col_def.array_ndims {
             // This is an array column
             let leaf_type = extract_leaf_data_type(&col_def.data_type);
             let element_ct = datatype_to_column_type(&leaf_type)?;
@@ -518,6 +520,11 @@ fn execute_create_table(
             let ct = datatype_to_column_type(&col_def.data_type)?;
             (ct, None, None)
         };
+
+        let (user_type_name, is_composite) = resolved_user_types[i].clone();
+        if is_composite {
+            col_type = ColumnType::Composite;
+        }
 
         writer.create_column(CatalogColumnDef {
             table_id,
@@ -533,7 +540,7 @@ fn execute_create_table(
             generated_expr,
             collation: col_def.collation.clone(),
             generated_stored,
-            enum_type_name: enum_type_names[i].clone(),
+            enum_type_name: user_type_name,
             array_element_type,
             array_ndims,
         })?;
@@ -792,36 +799,45 @@ fn execute_create_table(
     Ok(QueryResult::Empty)
 }
 
-fn resolve_create_table_enum_types(
+/// Resolves user-defined type column references for CREATE TABLE.
+///
+/// Returns a vector of `(Option<qualified_name>, is_composite)` per column.
+/// `is_composite = true` means the column uses a composite type and its
+/// `col_type` must be overridden to `ColumnType::Composite`.
+fn resolve_create_table_user_types(
     stmt: &CreateTableStmt,
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &axiomdb_wal::ConnectionTxn,
     default_schema: &str,
-) -> Result<Vec<Option<String>>, DbError> {
+) -> Result<Vec<(Option<String>, bool)>, DbError> {
     let snap = txn.active_snapshot(conn_txn);
     let mut reader = CatalogReader::new(storage, snap)?;
     stmt.columns
         .iter()
         .map(|col| {
             let Some(type_ref) = &col.declared_type_name else {
-                return Ok(None);
+                return Ok((None, false));
             };
             if type_ref.database.is_some() {
                 return Err(DbError::InvalidValue {
                     reason: format!(
-                        "enum type '{}' cannot be qualified with a database",
+                        "type '{}' cannot be qualified with a database",
                         type_ref.name
                     ),
                 });
             }
             let type_schema = type_ref.schema.as_deref().unwrap_or(default_schema);
-            if reader.get_enum_type(type_schema, &type_ref.name)?.is_none() {
-                return Err(DbError::InvalidValue {
-                    reason: format!("enum type '{}.{}' does not exist", type_schema, type_ref.name),
-                });
+            let qualified = format!("{}.{}", type_schema, type_ref.name);
+            if reader.get_enum_type(type_schema, &type_ref.name)?.is_some() {
+                return Ok((Some(qualified), false));
             }
-            Ok(Some(format!("{}.{}", type_schema, type_ref.name)))
+            if reader.get_composite_type(type_schema, &type_ref.name)?.is_some() {
+                return Ok((Some(qualified), true));
+            }
+            Err(DbError::InvalidValue {
+                reason: format!("type '{qualified}' does not exist"),
+            })
         })
         .collect()
 }

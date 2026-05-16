@@ -194,7 +194,9 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::Subscript { .. }
         // Phase 20.4 — ANY/ALL not supported in partial index predicates.
         | Expr::AnyOf { .. }
-        | Expr::AllOf { .. } => Err(DbError::NotImplemented {
+        | Expr::AllOf { .. }
+        | Expr::Row(_)
+        | Expr::FieldAccess { .. } => Err(DbError::NotImplemented {
             feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate/array/subscript/any/all)"
                 .into(),
         }),

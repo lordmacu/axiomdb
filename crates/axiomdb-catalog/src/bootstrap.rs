@@ -19,7 +19,8 @@ use axiomdb_storage::{
     PageType, StorageEngine, CATALOG_AGGREGATES_ROOT_BODY_OFFSET, CATALOG_COLUMNS_ROOT_BODY_OFFSET,
     CATALOG_CONSTRAINTS_ROOT_BODY_OFFSET, CATALOG_CRON_JOBS_ROOT_BODY_OFFSET,
     CATALOG_DATABASES_ROOT_BODY_OFFSET, CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET,
-    CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET, CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
+    CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET, CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET,
+    CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET,
     CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET, CATALOG_INDEXES_ROOT_BODY_OFFSET,
     CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
@@ -90,6 +91,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_exchange_rates` heap (Phase 20.17).
     /// Zero on legacy databases; lazily initialized on first `CREATE EXCHANGE RATE`.
     pub exchange_rates: u64,
+    /// Root page of the `axiom_composite_types` heap (Phase 20.18).
+    /// Zero on legacy databases; lazily initialized on first `CREATE TYPE … AS (…)`.
+    pub composite_types: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -208,6 +212,16 @@ impl CatalogBootstrap {
             enum_types_root,
         )?;
 
+        // Allocate the composite types root (Phase 20.18).
+        let composite_types_root = storage.alloc_page(PageType::Data)?;
+        let composite_types_page = Page::new(PageType::Data, composite_types_root);
+        storage.write_page(composite_types_root, &composite_types_page)?;
+        write_meta_u64(
+            storage,
+            CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET,
+            composite_types_root,
+        )?;
+
         // Allocate the cron jobs root (Phase 22b.1).
         let cron_jobs_root = storage.alloc_page(PageType::Data)?;
         let cron_jobs_page = Page::new(PageType::Data, cron_jobs_root);
@@ -269,6 +283,7 @@ impl CatalogBootstrap {
             foreign_tables: foreign_tables_root,
             holiday_calendars: 0,
             exchange_rates: 0,
+            composite_types: composite_types_root,
         })
     }
 
@@ -302,6 +317,7 @@ impl CatalogBootstrap {
         let foreign_tables = read_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET)?;
         let holiday_calendars = read_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET)?;
         let exchange_rates = read_meta_u64(storage, CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET)?;
+        let composite_types = read_meta_u64(storage, CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -320,6 +336,7 @@ impl CatalogBootstrap {
             foreign_tables,
             holiday_calendars,
             exchange_rates,
+            composite_types,
         })
     }
 
@@ -419,6 +436,14 @@ impl CatalogBootstrap {
             storage.write_page(root, &page)?;
             write_meta_u64(storage, CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, root)?;
             ids.foreign_tables = root;
+        }
+
+        if ids.composite_types == 0 {
+            let root = storage.alloc_page(PageType::Data)?;
+            let page = Page::new(PageType::Data, root);
+            storage.write_page(root, &page)?;
+            write_meta_u64(storage, CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET, root)?;
+            ids.composite_types = root;
         }
 
         storage.flush()?;
@@ -559,6 +584,22 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_composite_types` root page exists (Phase 20.18).
+    ///
+    /// Lazily initialized on first `CREATE TYPE … AS (…)` statement.
+    pub fn ensure_composite_types_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }

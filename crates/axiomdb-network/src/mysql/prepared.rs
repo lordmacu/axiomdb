@@ -556,6 +556,10 @@ pub fn value_to_sql_literal(v: &Value) -> String {
             let v = Value::Money(*m, *s, *c);
             format!("'{}'", v.to_string().replace('\'', "''"))
         }
+        Value::Composite(fields) => {
+            let s = Value::Composite(fields.clone()).to_string();
+            format!("'{}'", s.replace('\'', "''"))
+        }
     }
 }
 

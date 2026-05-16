@@ -369,7 +369,15 @@ fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) 
     // character_set — text-like columns use the result collation id;
     //                 numeric / date / bytes use binary collation id (63).
     let charset_id = match col.data_type {
-        DataType::Text | DataType::Decimal | DataType::Uuid => results_collation.id,
+        DataType::Text
+        | DataType::Json
+        | DataType::Jsonb
+        | DataType::Decimal
+        | DataType::Uuid
+        | DataType::Array(_)
+        | DataType::Range(_)
+        | DataType::Money
+        | DataType::Composite(_) => results_collation.id,
         _ => BINARY_COLLATION_DEF.id, // 63
     };
     buf.extend_from_slice(&charset_id.to_le_bytes());
@@ -507,6 +515,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Array(_) => 0xfd,                                // VAR_STRING (PG text format)
         DataType::Range(_) => 0xfd,                                // VAR_STRING (text format)
         DataType::Money => 0xfd,                                   // VAR_STRING ("100.50 USD")
+        DataType::Composite(_) => 0xfd,                            // VAR_STRING (row literal)
     }
 }
 
@@ -525,6 +534,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Array(_) => 16_777_215, // PG text format, variable-length
         DataType::Range(_) => 64,         // range literal text e.g. "[1,5)"
         DataType::Money => 32,            // "100.50 USD" — mantissa + currency code
+        DataType::Composite(_) => 16_777_215, // variable-length row literal
     }
 }
 
@@ -647,6 +657,7 @@ fn value_to_text(v: &Value) -> String {
                 )
             }
         }
+        Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
     }
 }
 

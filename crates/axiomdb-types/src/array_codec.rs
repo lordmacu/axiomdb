@@ -48,8 +48,9 @@ pub enum ColumnType {
     Decimal = 11,  // i128 mantissa + u8 scale
     Date = 12,     // i32 days since 1970-01-01
     Array = 13,    // PostgreSQL array
-    Range = 14,    // SQL range type
-    Money = 15,    // SQL MONEY type (Phase 20.17)
+    Range = 14,      // SQL range type
+    Money = 15,      // SQL MONEY type (Phase 20.17)
+    Composite = 16,  // SQL composite type (Phase 20.18)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -71,6 +72,7 @@ impl TryFrom<u8> for ColumnType {
             13 => Ok(Self::Array),
             14 => Ok(Self::Range),
             15 => Ok(Self::Money),
+            16 => Ok(Self::Composite),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -117,6 +119,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Array(_) => ColumnType::Array,
         crate::types::DataType::Range(_) => ColumnType::Range,
         crate::types::DataType::Money => ColumnType::Money,
+        crate::types::DataType::Composite(_) => ColumnType::Composite,
     }
 }
 
@@ -312,6 +315,11 @@ fn encode_element(
                 reason: "Money type cannot be used as an array element type".to_string(),
             });
         }
+        ColumnType::Composite => {
+            return Err(DbError::InvalidValue {
+                reason: "Composite type cannot be used as an array element type".to_string(),
+            });
+        }
     }
     Ok(buf.len() - start_len)
 }
@@ -493,6 +501,10 @@ fn decode_element(
         }),
         ColumnType::Money => Err(DbError::ParseError {
             message: "Money element type not supported as array element".to_string(),
+            position: None,
+        }),
+        ColumnType::Composite => Err(DbError::ParseError {
+            message: "Composite element type not supported as array element".to_string(),
             position: None,
         }),
     }

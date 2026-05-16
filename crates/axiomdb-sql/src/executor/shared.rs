@@ -370,6 +370,16 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
             collect_column_refs(expr, mask);
             collect_column_refs(array, mask);
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_column_refs(e, mask);
+            }
+        }
+        Expr::FieldAccess { col_idx, .. } => {
+            if *col_idx < mask.len() {
+                mask[*col_idx] = true;
+            }
+        }
     }
 }
 
@@ -406,6 +416,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Array(_elem) => Ok(ColumnType::Array),
         DataType::Range(_) => Ok(ColumnType::Range),
         DataType::Money => Ok(ColumnType::Money),
+        DataType::Composite(_) => Ok(ColumnType::Composite),
     }
 }
 
@@ -427,6 +438,7 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Array => DataType::Array(Box::new(DataType::Text)),
         ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
         ColumnType::Money => DataType::Money,
+        ColumnType::Composite => DataType::Composite(vec![]),
     }
 }
 
@@ -463,6 +475,7 @@ fn datatype_of_value(v: &Value) -> DataType {
         }
         Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
         Value::Money(..) => DataType::Money,
+        Value::Composite(_) => DataType::Composite(vec![]),
     }
 }
 

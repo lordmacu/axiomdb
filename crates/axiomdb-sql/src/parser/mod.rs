@@ -977,7 +977,7 @@ impl<'src> Parser<'src> {
             }
             Token::Type => {
                 self.advance();
-                ddl::parse_create_enum_type(self)
+                ddl::parse_create_type(self)
             }
             Token::Schema => {
                 self.advance();
@@ -1124,7 +1124,7 @@ impl<'src> Parser<'src> {
             }
             Token::Type => {
                 self.advance();
-                ddl::parse_drop_enum_type(self)
+                ddl::parse_drop_type(self)
             }
             Token::Schema => {
                 self.advance();

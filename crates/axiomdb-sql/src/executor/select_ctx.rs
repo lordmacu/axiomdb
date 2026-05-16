@@ -333,6 +333,16 @@ fn execute_select_ctx(
                     collect_expr_columns(expr, mask);
                     collect_expr_columns(array, mask);
                 }
+                crate::expr::Expr::Row(elems) => {
+                    for e in elems {
+                        collect_expr_columns(e, mask);
+                    }
+                }
+                crate::expr::Expr::FieldAccess { col_idx, .. } => {
+                    if *col_idx < mask.len() {
+                        mask[*col_idx] = true;
+                    }
+                }
             }
         }
 

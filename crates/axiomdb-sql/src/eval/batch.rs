@@ -517,7 +517,8 @@ fn fixed_size(dt: DataType) -> Option<usize> {
         | DataType::Uuid
         | DataType::Array(_)
         | DataType::Range(_)
-        | DataType::Money => None,
+        | DataType::Money
+        | DataType::Composite(_) => None,
     }
 }
 

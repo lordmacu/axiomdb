@@ -1587,6 +1587,30 @@ pub struct DropExchangeRateStmt {
     pub to_currency: String,
 }
 
+/// One field in `CREATE TYPE … AS (…)` — name + SQL type string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeFieldDef {
+    pub name: String,
+    pub type_name: String,
+}
+
+/// `CREATE TYPE [schema.]name AS (field type[, ...])` — Phase 20.18.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateCompositeTypeStmt {
+    pub type_ref: TableRef,
+    pub fields: Vec<CompositeFieldDef>,
+}
+
+/// `DROP TYPE [IF EXISTS] [schema.]name` — Phase 20.18.
+///
+/// Matches composite types only (not ENUM). If the type is an ENUM,
+/// the executor falls back to the existing `DropEnumType` path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCompositeTypeStmt {
+    pub if_exists: bool,
+    pub type_ref: TableRef,
+}
+
 /// `CLOSE name` or `CLOSE ALL`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseCursorStmt {
@@ -1680,6 +1704,10 @@ pub enum Stmt {
     CreateExchangeRate(CreateExchangeRateStmt),
     /// `DROP EXCHANGE RATE [IF EXISTS] 'FROM' TO 'TO'` — Phase 20.17.
     DropExchangeRate(DropExchangeRateStmt),
+    /// `CREATE TYPE name AS (field type[, ...])` — Phase 20.18.
+    CreateCompositeType(CreateCompositeTypeStmt),
+    /// `DROP TYPE [IF EXISTS] name` — Phase 20.18.
+    DropCompositeType(DropCompositeTypeStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     TruncateTable(TruncateTableStmt),
     AlterTable(AlterTableStmt),

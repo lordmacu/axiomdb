@@ -468,6 +468,30 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             let arr_val = eval(array, row)?;
             eval_all_of(&elem_val, &arr_val, BinaryOp::Eq)
         }
+        Expr::Row(elems) => {
+            let vals: Result<Vec<_>, _> = elems.iter().map(|e| eval(e, row)).collect();
+            Ok(Value::Composite(vals?))
+        }
+        Expr::FieldAccess { col_idx, field_idx } => {
+            let composite = row.get(*col_idx).cloned().ok_or(DbError::ColumnIndexOutOfBounds {
+                idx: *col_idx,
+                len: row.len(),
+            })?;
+            match composite {
+                Value::Composite(fields) => fields
+                    .into_iter()
+                    .nth(*field_idx)
+                    .ok_or(DbError::ColumnIndexOutOfBounds {
+                        idx: *field_idx,
+                        len: 0,
+                    }),
+                Value::Null => Ok(Value::Null),
+                _ => Err(DbError::TypeMismatch {
+                    expected: "composite".into(),
+                    got: format!("{composite:?}"),
+                }),
+            }
+        }
     }
 }
 
@@ -539,6 +563,11 @@ impl Hash for HashableValue {
                 m.hash(state);
                 s.hash(state);
                 c.hash(state);
+            }
+            Value::Composite(fields) => {
+                for f in fields {
+                    HashableValue(f.clone()).hash(state);
+                }
             }
         }
     }
@@ -1051,6 +1080,30 @@ pub fn eval_with<R: SubqueryRunner>(
                 super::array_ops::array_subscript(&arr_val, &idx_val)
             }
         }
+        Expr::Row(elems) => {
+            let vals: Result<Vec<_>, _> = elems.iter().map(|e| eval_with(e, row, sq)).collect();
+            Ok(Value::Composite(vals?))
+        }
+        Expr::FieldAccess { col_idx, field_idx } => {
+            let composite = row.get(*col_idx).cloned().ok_or(DbError::ColumnIndexOutOfBounds {
+                idx: *col_idx,
+                len: row.len(),
+            })?;
+            match composite {
+                Value::Composite(fields) => fields
+                    .into_iter()
+                    .nth(*field_idx)
+                    .ok_or(DbError::ColumnIndexOutOfBounds {
+                        idx: *field_idx,
+                        len: 0,
+                    }),
+                Value::Null => Ok(Value::Null),
+                _ => Err(DbError::TypeMismatch {
+                    expected: "composite".into(),
+                    got: format!("{composite:?}"),
+                }),
+            }
+        }
     }
 }
 
@@ -1171,6 +1224,7 @@ enum ArrayElemType {
     Array,
     Range,
     Money,
+    Composite,
 }
 
 impl ArrayElemType {
@@ -1192,6 +1246,7 @@ impl ArrayElemType {
             Value::Array(_) => Self::Array,
             Value::Range(_) => Self::Range,
             Value::Money(..) => Self::Money,
+            Value::Composite(_) => Self::Composite,
         }
     }
 
@@ -1213,6 +1268,7 @@ impl ArrayElemType {
             Self::Array => None, // Nested arrays handled separately
             Self::Range => None, // Range types not supported as array elements
             Self::Money => Some(DataType::Money),
+            Self::Composite => None,
         }
     }
 }

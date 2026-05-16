@@ -53,6 +53,10 @@ pub enum DataType {
     /// SQL MONEY — exact decimal amount + ISO 4217 3-byte currency code (Phase 20.17).
     /// Stored as 16-byte LE i128 mantissa + 1-byte scale + 3-byte ASCII currency.
     Money,
+    /// SQL composite (user-defined) type (Phase 20.18).
+    /// Inner vec holds `(field_name, field_type)` in declaration order.
+    /// On disk: `[u32 LE data_len][encode_row(field_values, field_types)]`.
+    Composite(Vec<(String, DataType)>),
 }
 
 impl DataType {
@@ -85,6 +89,7 @@ impl DataType {
                 other => format!("RANGE({})", other.name()),
             },
             Self::Money => "MONEY".into(),
+            Self::Composite(_) => "COMPOSITE".into(),
         }
     }
 }

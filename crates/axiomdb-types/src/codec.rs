@@ -131,6 +131,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Array(_), DataType::Array(_))
             | (Value::Range(_), DataType::Range(_))
             | (Value::Money(..), DataType::Money)
+            | (Value::Composite(_), DataType::Composite(_))
     );
     if ok {
         Ok(())
@@ -169,6 +170,9 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
                 return crate::types::DataType::Range(Box::new(crate::types::DataType::Int))
             }
             Value::Money(..) => return crate::types::DataType::Money,
+            Value::Composite(_) => {
+                return crate::types::DataType::Composite(vec![])
+            }
         }
     }
     crate::types::DataType::Int // default
@@ -219,6 +223,28 @@ pub fn encoded_len(values: &[Value]) -> usize {
             }
             // Money: 16 bytes mantissa + 1 byte scale + 3 bytes currency = 20 bytes (fixed)
             Value::Money(..) => 20,
+            // Composite: 4-byte length prefix + recursively-encoded inner fields
+            Value::Composite(fields) => {
+                let inner_len: usize = fields
+                    .iter()
+                    .map(|f| match f {
+                        Value::Null => 0,
+                        Value::Bool(_) => 1,
+                        Value::Int(_) | Value::Date(_) => 4,
+                        Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) => 8,
+                        Value::Decimal(..) => 17,
+                        Value::Uuid(_) => 16,
+                        Value::Text(s) | Value::Json(s) => 3 + s.len(),
+                        Value::Jsonb(b) => 3 + b.len(),
+                        Value::Bytes(b) => 3 + b.len(),
+                        Value::Money(..) => 20,
+                        // Nested composite/array: overestimate; encode never nests deeply
+                        Value::Array(_) | Value::Range(_) | Value::Composite(_) => 16,
+                    })
+                    .sum::<usize>()
+                    + bitmap_len(fields.len());
+                4 + inner_len
+            }
         })
         .sum();
     blen + data
@@ -369,6 +395,21 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 buf.extend_from_slice(&m.to_le_bytes());
                 buf.push(*s);
                 buf.extend_from_slice(c);
+            }
+            Value::Composite(fields) => {
+                if let DataType::Composite(field_defs) = &schema[i] {
+                    let inner_schema: Vec<DataType> =
+                        field_defs.iter().map(|(_, dt)| dt.clone()).collect();
+                    let inner_bytes = encode_row(fields, &inner_schema)?;
+                    let len = inner_bytes.len() as u32;
+                    buf.extend_from_slice(&len.to_le_bytes());
+                    buf.extend_from_slice(&inner_bytes);
+                } else {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Composite".to_string(),
+                        got: schema[i].name(),
+                    });
+                }
             }
             Value::Null => unreachable!("null already skipped by bitmap check"),
         }
@@ -589,6 +630,19 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += 20;
                 Value::Money(m, s, c)
             }
+            DataType::Composite(field_defs) => {
+                ensure_bytes(bytes, pos, 4)?;
+                let data_len =
+                    u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                ensure_bytes(bytes, pos, data_len)?;
+                let inner_bytes = &bytes[pos..pos + data_len];
+                pos += data_len;
+                let inner_schema: Vec<DataType> =
+                    field_defs.iter().map(|(_, dt)| dt.clone()).collect();
+                let inner_values = decode_row(inner_bytes, &inner_schema)?;
+                Value::Composite(inner_values)
+            }
         };
         values.push(v);
     }
@@ -799,6 +853,19 @@ pub fn decode_row_masked(
                     pos += 20;
                     Value::Money(m, s, c)
                 }
+                DataType::Composite(field_defs) => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let data_len =
+                        u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    ensure_bytes(bytes, pos, data_len)?;
+                    let inner_bytes = &bytes[pos..pos + data_len];
+                    pos += data_len;
+                    let inner_schema: Vec<DataType> =
+                        field_defs.iter().map(|(_, dt)| dt.clone()).collect();
+                    let inner_values = decode_row(inner_bytes, &inner_schema)?;
+                    Value::Composite(inner_values)
+                }
             };
             values.push(v);
         } else {
@@ -827,6 +894,15 @@ pub fn decode_row_masked(
                 DataType::Money => {
                     ensure_bytes(bytes, pos, 20)?;
                     pos += 20;
+                }
+                DataType::Composite(_) => {
+                    // Skip: read u32 data_len then skip that many bytes.
+                    ensure_bytes(bytes, pos, 4)?;
+                    let data_len =
+                        u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    ensure_bytes(bytes, pos, data_len)?;
+                    pos += data_len;
                 }
                 DataType::Text
                 | DataType::Json

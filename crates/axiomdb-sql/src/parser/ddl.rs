@@ -6,14 +6,15 @@ use axiomdb_types::DataType;
 
 use crate::{
     ast::{
-        AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, ConstraintDeferrability,
-        ConstraintTiming, CreateAggregateStmt, CreateEnumTypeStmt, CreateIndexStmt,
-        CreateMaterializedViewStmt, CreateSequenceStmt, CreateTableAsSelectStmt,
-        CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt, CreateViewStmt, DropAggregateStmt,
-        DropIndexStmt, DropMaterializedViewStmt, DropSequenceStmt, DropTableStmt, DropTriggerStmt,
-        DropViewStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
-        ForeignKeyAction, GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt,
-        ShowCreateViewStmt, SortOrder, Stmt, TableConstraint, TriggerEvent,
+        AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CompositeFieldDef,
+        ConstraintDeferrability, ConstraintTiming, CreateAggregateStmt, CreateCompositeTypeStmt,
+        CreateEnumTypeStmt, CreateIndexStmt, CreateMaterializedViewStmt, CreateSequenceStmt,
+        CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt,
+        CreateViewStmt, DropAggregateStmt, DropCompositeTypeStmt, DropIndexStmt,
+        DropMaterializedViewStmt, DropSequenceStmt, DropTableStmt, DropTriggerStmt, DropViewStmt,
+        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction,
+        GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, ShowCreateViewStmt,
+        SortOrder, Stmt, TableConstraint, TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -212,37 +213,81 @@ pub(crate) fn parse_create_sequence(p: &mut Parser) -> Result<Stmt, DbError> {
     }))
 }
 
-pub(crate) fn parse_drop_enum_type(p: &mut Parser) -> Result<Stmt, DbError> {
-    let if_exists = eat_if_exists(p)?;
-    let enum_type = p.parse_table_ref()?;
-    Ok(Stmt::DropEnumType(crate::ast::DropEnumTypeStmt {
-        if_exists,
-        enum_type,
-    }))
-}
-
-pub(crate) fn parse_create_enum_type(p: &mut Parser) -> Result<Stmt, DbError> {
-    let enum_type = p.parse_table_ref()?;
+/// `CREATE TYPE name AS ENUM (...)` → CreateEnumType
+/// `CREATE TYPE name AS (field type[, ...])` → CreateCompositeType
+pub(crate) fn parse_create_type(p: &mut Parser) -> Result<Stmt, DbError> {
+    let type_ref = p.parse_table_ref()?;
     p.expect(&Token::As)?;
-    p.expect(&Token::Enum)?;
-    p.expect(&Token::LParen)?;
-    if p.eat(&Token::RParen) {
-        return Err(DbError::ParseError {
-            message: "CREATE TYPE AS ENUM requires at least one label".into(),
-            position: Some(p.current_pos()),
-        });
+    if p.peek() == &Token::Enum {
+        // ENUM path — re-enter the existing function with type_ref already parsed.
+        p.advance(); // consume ENUM
+        p.expect(&Token::LParen)?;
+        if p.eat(&Token::RParen) {
+            return Err(DbError::ParseError {
+                message: "CREATE TYPE AS ENUM requires at least one label".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+        let mut labels = Vec::new();
+        loop {
+            labels.push(p.parse_string_literal()?);
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+        p.expect(&Token::RParen)?;
+        return Ok(Stmt::CreateEnumType(CreateEnumTypeStmt {
+            enum_type: type_ref,
+            labels,
+        }));
     }
-    let mut labels = Vec::new();
+
+    // Composite path: AS (field_name type_name [, ...])
+    p.expect(&Token::LParen)?;
+    let mut fields = Vec::new();
     loop {
-        labels.push(p.parse_string_literal()?);
+        let name = match p.peek().clone() {
+            Token::Ident(n) => {
+                let s = n.to_string();
+                p.advance();
+                s
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!("expected field name in composite type, found {other:?}"),
+                    position: Some(p.current_pos()),
+                });
+            }
+        };
+        let type_name = parse_state_type_name(p)?;
+        fields.push(CompositeFieldDef { name, type_name });
         if !p.eat(&Token::Comma) {
             break;
         }
     }
     p.expect(&Token::RParen)?;
-    Ok(Stmt::CreateEnumType(CreateEnumTypeStmt {
-        enum_type,
-        labels,
+    if fields.is_empty() {
+        return Err(DbError::ParseError {
+            message: "CREATE TYPE AS (...) requires at least one field".into(),
+            position: Some(p.current_pos()),
+        });
+    }
+    Ok(Stmt::CreateCompositeType(CreateCompositeTypeStmt {
+        type_ref,
+        fields,
+    }))
+}
+
+/// `DROP TYPE [IF EXISTS] name` — dispatches to ENUM or composite at execution time.
+///
+/// The parser doesn't know at parse time whether the name refers to an enum or
+/// a composite, so we produce `DropCompositeType` and let the executor try both.
+pub(crate) fn parse_drop_type(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let type_ref = p.parse_table_ref()?;
+    Ok(Stmt::DropCompositeType(DropCompositeTypeStmt {
+        if_exists,
+        type_ref,
     }))
 }
 
@@ -2107,6 +2152,7 @@ fn fdw_datatype_to_column_type(
         DataType::Array(_) => Ok(ColumnType::Array),
         DataType::Range(_) => Ok(ColumnType::Range),
         DataType::Money => Ok(ColumnType::Money),
+        DataType::Composite(_) => Ok(ColumnType::Composite),
     }
 }
 

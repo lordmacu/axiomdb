@@ -648,6 +648,10 @@ mod ffi {
                 let s = rv.to_display_string();
                 CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("empty").unwrap()))
             }
+            Value::Composite(fields) => {
+                let disp = Value::Composite(fields).to_string();
+                CellValue::Text(CString::new(disp).unwrap_or_else(|_| CString::new("").unwrap()))
+            }
             Value::Money(m, s, c) => {
                 let disp = Value::Money(m, s, c).to_string();
                 CellValue::Text(CString::new(disp).unwrap_or_else(|_| CString::new("").unwrap()))

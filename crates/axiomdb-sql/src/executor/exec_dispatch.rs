@@ -251,6 +251,32 @@ fn dispatch_ctx(
                     .expect("conn_txn must be set before dispatch_ctx"),
             )
         }
+        Stmt::CreateCompositeType(s) => {
+            ctx.invalidate_all();
+            let default_schema = ctx.default_create_schema().to_string();
+            execute_create_composite_type(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &default_schema,
+            )
+        }
+        Stmt::DropCompositeType(s) => {
+            ctx.invalidate_all();
+            let default_schema = ctx.default_create_schema().to_string();
+            execute_drop_composite_type(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &default_schema,
+            )
+        }
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
             let search_path = ctx.search_path.clone();

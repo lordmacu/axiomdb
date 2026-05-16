@@ -67,8 +67,10 @@ fn analyze_stmt(
         | Stmt::CreateAggregate(_)
         | Stmt::CreateSequence(_)
         | Stmt::CreateEnumType(_)
+        | Stmt::CreateCompositeType(_)
         | Stmt::DropSequence(_)
-        | Stmt::DropAggregate(_) => Ok(stmt),
+        | Stmt::DropAggregate(_)
+        | Stmt::DropCompositeType(_) => Ok(stmt),
         Stmt::DropTable(s) => {
             analyze_drop_table(s, storage, snapshot, default_database, default_schema)
                 .map(Stmt::DropTable)
@@ -170,12 +172,14 @@ fn analyze_stmt_cached(
         | Stmt::CreateAggregate(_)
         | Stmt::CreateSequence(_)
         | Stmt::CreateEnumType(_)
+        | Stmt::CreateCompositeType(_)
         | Stmt::DropTable(_)
         | Stmt::DropMaterializedView(_)
         | Stmt::DropView(_)
         | Stmt::DropTrigger(_)
         | Stmt::DropAggregate(_)
         | Stmt::DropSequence(_)
+        | Stmt::DropCompositeType(_)
         | Stmt::AlterTable(_) => {
             cache.invalidate();
             analyze_stmt(stmt, storage, snapshot, default_database, default_schema)
@@ -920,6 +924,7 @@ fn expr_contains_window(expr: &Expr) -> bool {
                 || on_behavior_contains_window(on_error)
         }
         Expr::InSubquery { expr, .. } => expr_contains_window(expr),
+        Expr::Row(elems) => elems.iter().any(expr_contains_window),
         Expr::Literal(_)
         | Expr::Column { .. }
         | Expr::OuterColumn { .. }
@@ -932,7 +937,8 @@ fn expr_contains_window(expr: &Expr) -> bool {
         | Expr::ArrayConstructor { .. }
         | Expr::Subscript { .. }
         | Expr::AnyOf { .. }
-        | Expr::AllOf { .. } => false,
+        | Expr::AllOf { .. }
+        | Expr::FieldAccess { .. } => false,
     }
 }
 
@@ -1012,6 +1018,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
                 || on_behavior_contains_aggregate(on_error)
         }
         Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Row(elems) => elems.iter().any(expr_contains_aggregate),
         Expr::Literal(_)
         | Expr::Column { .. }
         | Expr::OuterColumn { .. }
@@ -1024,7 +1031,8 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::ArrayConstructor { .. }
         | Expr::Subscript { .. }
         | Expr::AnyOf { .. }
-        | Expr::AllOf { .. } => false,
+        | Expr::AllOf { .. }
+        | Expr::FieldAccess { .. } => false,
     }
 }
 
@@ -1188,6 +1196,11 @@ fn rewrite_custom_aggregates_in_expr(
             rewrite_custom_aggregates_in_expr(expr, reader, default_schema)?;
             rewrite_custom_aggregates_in_expr(array, reader, default_schema)?;
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                rewrite_custom_aggregates_in_expr(e, reader, default_schema)?;
+            }
+        }
         Expr::Literal(_)
         | Expr::Default
         | Expr::Column { .. }
@@ -1198,7 +1211,8 @@ fn rewrite_custom_aggregates_in_expr(
         | Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::ArrayConstructor { .. }
-        | Expr::Subscript { .. } => {}
+        | Expr::Subscript { .. }
+        | Expr::FieldAccess { .. } => {}
     }
     Ok(())
 }
@@ -1336,6 +1350,12 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
             populate_grouping_indices(expr, universe);
             populate_grouping_indices(array, universe);
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                populate_grouping_indices(e, universe);
+            }
+        }
+        Expr::FieldAccess { .. } => {}
     }
 }
 

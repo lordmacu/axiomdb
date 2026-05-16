@@ -496,6 +496,12 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
             collect_col_idxs_non_agg(expr, out);
             collect_col_idxs_non_agg(array, out);
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_col_idxs_non_agg(e, out);
+            }
+        }
+        Expr::FieldAccess { col_idx, .. } => out.push(*col_idx),
     }
 }
 
@@ -592,5 +598,12 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
             collect_non_agg_col_idxs_in_expr(expr, inside_agg, out);
             collect_non_agg_col_idxs_in_expr(array, inside_agg, out);
         }
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_non_agg_col_idxs_in_expr(e, inside_agg, out);
+            }
+        }
+        Expr::FieldAccess { col_idx, .. } if !inside_agg => out.push(*col_idx),
+        Expr::FieldAccess { .. } => {}
     }
 }

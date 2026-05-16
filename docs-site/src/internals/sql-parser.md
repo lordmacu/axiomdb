@@ -1472,3 +1472,93 @@ patched into output column metadata by name after `build_derived_output_columns`
 schema with `OPTIONAL` repetition for every column, writes one row group using
 `SerializedFileWriter`, and handles NULLs via definition levels (def=1 present,
 def=0 null).
+
+---
+
+## Composite Types (Phase 20.18)
+
+### AST nodes
+
+```rust
+Stmt::CreateCompositeType {
+    schema: Option<String>,
+    name: String,
+    fields: Vec<(String, String)>,   // (field_name, type_name)
+}
+
+Stmt::DropType {
+    schema: Option<String>,
+    name: String,
+    if_exists: bool,
+}
+
+Expr::Row(Vec<Expr>)          // ROW(expr, ...) constructor
+Expr::FieldAccess {           // column.field dot notation
+    expr: Box<Expr>,
+    field: String,
+}
+```
+
+### Token::Row and parse_atom
+
+`ROW` is a reserved keyword tokenized as `Token::Row`, not `Token::Ident("row")`.
+`parse_atom` handles it directly with a dedicated arm before the `other => Err(...)` fallback:
+
+```rust
+Token::Row => {
+    p.advance();
+    p.expect(&Token::LParen)?;
+    let mut elems = Vec::new();
+    if !matches!(p.peek(), Token::RParen) {
+        elems.push(parse_expr(p)?);
+        while p.eat(&Token::Comma) { elems.push(parse_expr(p)?); }
+    }
+    p.expect(&Token::RParen)?;
+    Ok(Expr::Row(elems))
+}
+```
+
+A handler for `"row"` as an identifier in `parse_ident_or_call` is unreachable
+because the lexer never produces `Token::Ident("row")`.
+
+### Dot-notation (FieldAccess)
+
+`parse_postfix` in `expr.rs` checks for `Token::Dot` after a qualified column name expression.
+When the next token after `.` is an identifier, the expression is wrapped:
+
+```rust
+Expr::FieldAccess { expr: Box::new(col_expr), field: ident }
+```
+
+### Analyzer
+
+- `bind_expr(Expr::Row(fields))` → `BoundExpr::Row(bound_fields)`
+- `bind_expr(Expr::FieldAccess { expr, field })` → `BoundExpr::FieldAccess { expr: bound, field }`
+- `eval_bound_expr(BoundExpr::FieldAccess { expr, field })` finds the field index in the
+  composite type definition via the catalog and indexes into `Value::Composite(vec)`.
+  Returns `Value::Null` when the composite value is `Value::Null`.
+
+### Self-describing composite codec
+
+The binary encoding stores field type information inline so `decode_row` can reconstruct
+the schema without catalog access (avoiding a cyclic dependency between `axiomdb-types`
+and `axiomdb-catalog`):
+
+```
+4 bytes LE    total inner length
+1 byte        N = number of fields
+N bytes       ColumnType tag for each field (from array_codec::ColumnType)
+remaining     field bytes (encoded via recursive encode_row)
+```
+
+Helper functions in `axiomdb-types/src/codec.rs`:
+- `value_to_col_type(v: &Value) → array_codec::ColumnType`
+- `col_type_to_data_type(ct) → DataType`
+- `decode_composite_inner(inner: &[u8]) → Result<Value, DbError>`
+
+### Wire protocol
+
+`DataType::Composite(_)` maps to MySQL type `0xfd` (`VAR_STRING`).  
+`build_column_def` uses `results_collation.id` (not binary charset 63) so that
+Python pymysql clients receive the value as `str` instead of `bytes`.  
+`value_to_text` formats `Value::Composite(fields)` via its `Display` impl: `(f1,f2,...)`.

@@ -579,6 +579,7 @@ fn column_type_to_is_data_type(col: &axiomdb_catalog::ColumnDef) -> String {
         ColumnType::Array => "array",
         ColumnType::Range => "range",
         ColumnType::Money => "money",
+        ColumnType::Composite => "composite",
     }
     .to_string()
 }
@@ -676,6 +677,7 @@ fn scalar_type_name_for_is(ct: ColumnType) -> &'static str {
         ColumnType::Array => "array",
         ColumnType::Range => "range",
         ColumnType::Money => "money",
+        ColumnType::Composite => "composite",
     }
 }
 
@@ -696,6 +698,7 @@ fn scalar_type_to_column_type_str(ct: ColumnType) -> &'static str {
         ColumnType::Array => "array",
         ColumnType::Range => "range",
         ColumnType::Money => "money",
+        ColumnType::Composite => "composite",
     }
 }
 

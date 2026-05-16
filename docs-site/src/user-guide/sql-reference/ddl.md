@@ -1755,3 +1755,90 @@ DROP EXCHANGE RATE IF EXISTS 'GBP' TO 'EUR';
 
 - With `IF EXISTS`: succeeds silently if the rate does not exist.
 - Without `IF EXISTS`: returns `InvalidValue` if the rate is not found.
+
+---
+
+## CREATE TYPE … AS (…)
+
+Creates a named composite type whose instances are tuples of typed fields.
+
+```sql
+CREATE TYPE type_name AS (field_name field_type [, ...])
+```
+
+```sql
+CREATE TYPE address AS (city TEXT, zip INT);
+CREATE TYPE point AS (x REAL, y REAL);
+CREATE TYPE contact AS (name TEXT, phone TEXT, email TEXT);
+```
+
+- `type_name` must be unique within the schema (default `public`).
+- At least one field is required; an empty field list is a parse error.
+- Field types may be any scalar type (`INT`, `TEXT`, `REAL`, `DECIMAL`, `BOOL`, `DATE`, `TIMESTAMP`, `UUID`, `BYTES`).
+- The type name is case-insensitive and stored in the catalog.
+
+### Using a composite type as a column
+
+```sql
+CREATE TABLE orders (id INT PRIMARY KEY, home address);
+CREATE TABLE geometry (id INT, origin point, destination point);
+```
+
+The composite type must exist in the catalog before it is referenced in a `CREATE TABLE`.
+
+### Inserting composite values
+
+Use the `ROW(expr, ...)` constructor to supply composite values:
+
+```sql
+INSERT INTO orders VALUES (1, ROW('NYC', 10001));
+INSERT INTO orders VALUES
+    (1, ROW('NYC', 10001)),
+    (2, ROW('LA', 90001));
+```
+
+Field values must be given in the same order as the type definition.
+
+### Accessing composite fields
+
+Use dot notation to project individual fields:
+
+```sql
+-- Select a field
+SELECT id, home.city FROM orders;
+SELECT home.zip FROM orders WHERE id = 1;
+
+-- Filter on a field
+SELECT id FROM orders WHERE home.city = 'NYC';
+SELECT * FROM orders WHERE home.zip > 90000;
+```
+
+A `NULL` composite value propagates `NULL` to any field access:
+
+```sql
+INSERT INTO orders VALUES (3, NULL);
+SELECT home.city FROM orders WHERE id = 3;  -- returns NULL
+```
+
+### Wire representation
+
+Composite values are returned as text strings in the format `(field1,field2,...)`, for example `(NYC,10001)`.
+
+---
+
+## DROP TYPE
+
+Removes a composite or ENUM type from the catalog.
+
+```sql
+DROP TYPE [IF EXISTS] type_name
+```
+
+```sql
+DROP TYPE address;
+DROP TYPE IF EXISTS address;   -- succeeds even if type does not exist
+```
+
+- `IF EXISTS`: suppresses the error when the type is not found.
+- Works for both composite types (created with `AS (...)`) and ENUM types (created with `AS ENUM (...)`).
+- Dropping a type that is still referenced by a table column is currently permitted (no CASCADE check); behavior is undefined if columns of that type are then read.
