@@ -12,6 +12,7 @@ use axiomdb_catalog::{
     bootstrap::CatalogBootstrap,
     reader::CatalogReader,
     schema::{ColumnDef, ColumnType, EnumTypeDef, IndexDef, TableStorageLayout},
+    schema_composite::{CompositeField, CompositeTypeDef},
     writer::CatalogWriter,
 };
 use axiomdb_core::TransactionSnapshot;
@@ -739,6 +740,103 @@ fn test_create_enum_type_rejects_duplicate_labels() {
         matches!(err, axiomdb_core::DbError::InvalidValue { .. }),
         "expected InvalidValue, got {err}"
     );
+}
+
+// ── Composite type catalog tests (Phase 20.18) ───────────────────────────────
+
+#[test]
+fn test_composite_type_def_roundtrip() {
+    let def = CompositeTypeDef {
+        schema_name: "public".into(),
+        name: "address".into(),
+        fields: vec![
+            CompositeField { name: "street".into(), type_name: "TEXT".into() },
+            CompositeField { name: "city".into(), type_name: "TEXT".into() },
+            CompositeField { name: "zip".into(), type_name: "INT".into() },
+        ],
+    };
+    let bytes = def.to_bytes();
+    let (decoded, consumed) = CompositeTypeDef::from_bytes(&bytes).unwrap();
+    assert_eq!(consumed, bytes.len());
+    assert_eq!(decoded.schema_name, "public");
+    assert_eq!(decoded.name, "address");
+    assert_eq!(decoded.fields.len(), 3);
+    assert_eq!(decoded.fields[1].name, "city");
+    assert_eq!(decoded.fields[1].type_name, "TEXT");
+}
+
+#[test]
+fn test_composite_type_create_and_get() {
+    let (storage, txn) = setup();
+    let mut conn_txn = txn.begin().unwrap();
+
+    {
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
+        w.create_composite_type(CompositeTypeDef {
+            schema_name: "public".into(),
+            name: "point2d".into(),
+            fields: vec![
+                CompositeField { name: "x".into(), type_name: "REAL".into() },
+                CompositeField { name: "y".into(), type_name: "REAL".into() },
+            ],
+        })
+        .unwrap();
+    }
+    txn.commit(conn_txn).unwrap();
+
+    let snap = committed_snap(&txn);
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let found = reader.get_composite_type("public", "point2d").unwrap();
+    assert!(found.is_some());
+    let found = found.unwrap();
+    assert_eq!(found.fields.len(), 2);
+    assert_eq!(found.fields[0].name, "x");
+}
+
+#[test]
+fn test_composite_type_delete() {
+    let (storage, txn) = setup();
+    let mut conn_txn = txn.begin().unwrap();
+    {
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
+        w.create_composite_type(CompositeTypeDef {
+            schema_name: "public".into(),
+            name: "rect".into(),
+            fields: vec![CompositeField { name: "w".into(), type_name: "INT".into() }],
+        })
+        .unwrap();
+    }
+    txn.commit(conn_txn).unwrap();
+
+    let mut conn_txn2 = txn.begin().unwrap();
+    {
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn2).unwrap();
+        let deleted = w.delete_composite_type("public", "rect").unwrap();
+        assert!(deleted);
+    }
+    txn.commit(conn_txn2).unwrap();
+
+    let snap = committed_snap(&txn);
+    let mut reader = CatalogReader::new(&storage, snap).unwrap();
+    let found = reader.get_composite_type("public", "rect").unwrap();
+    assert!(found.is_none());
+}
+
+#[test]
+fn test_composite_type_rejects_empty_fields() {
+    let (storage, txn) = setup();
+    let mut conn_txn = txn.begin().unwrap();
+    let err = {
+        let mut w = CatalogWriter::new(&storage, &txn, &mut conn_txn).unwrap();
+        w.create_composite_type(CompositeTypeDef {
+            schema_name: "public".into(),
+            name: "empty".into(),
+            fields: vec![],
+        })
+        .unwrap_err()
+    };
+    txn.rollback(conn_txn, &storage).unwrap();
+    assert!(matches!(err, axiomdb_core::DbError::InvalidValue { .. }));
 }
 
 #[test]

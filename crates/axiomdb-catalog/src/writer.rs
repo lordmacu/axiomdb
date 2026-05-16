@@ -51,6 +51,7 @@ use crate::{
         IndexDef, RelationKind, SequenceDef, StatsDef, TableDatabaseDef, TableDef, TableId,
         TablePersistence, TableStorageLayout,
     },
+    schema_composite::CompositeTypeDef,
     schema_exchange_rate::ExchangeRateDef,
     schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
@@ -93,6 +94,8 @@ pub const SYSTEM_TABLE_FOREIGN_TABLES: u32 = u32::MAX - 14;
 pub const SYSTEM_TABLE_HOLIDAY_CALENDARS: u32 = u32::MAX - 15;
 /// WAL `table_id` used for inserts/deletes into `axiom_exchange_rates` (Phase 20.17).
 pub const SYSTEM_TABLE_EXCHANGE_RATES: u32 = u32::MAX - 16;
+/// WAL `table_id` used for inserts/deletes into `axiom_composite_types` (Phase 20.18).
+pub const SYSTEM_TABLE_COMPOSITE_TYPES: u32 = u32::MAX - 17;
 
 fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
     if def.labels.is_empty() {
@@ -340,6 +343,66 @@ impl<'a> CatalogWriter<'a> {
                 self.txn.record_delete(
                     self.conn,
                     SYSTEM_TABLE_ENUM_TYPES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // ── Composite type operations (Phase 20.18) ──────────────────────────────
+
+    pub fn create_composite_type(&mut self, def: CompositeTypeDef) -> Result<(), DbError> {
+        let root = if self.page_ids.composite_types != 0 {
+            self.page_ids.composite_types
+        } else {
+            let r = CatalogBootstrap::ensure_composite_types_root(self.storage)?;
+            self.page_ids.composite_types = r;
+            r
+        };
+        if def.fields.is_empty() {
+            return Err(DbError::InvalidValue {
+                reason: format!(
+                    "composite type '{}.{}' must have at least one field",
+                    def.schema_name, def.name
+                ),
+            });
+        }
+        let data = def.to_bytes();
+        let txn_id = self.conn.txn_id;
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        let key = format!("{}.{}", def.schema_name, def.name);
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_COMPOSITE_TYPES,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_composite_type(&mut self, schema: &str, name: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.composite_types;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = CompositeTypeDef::from_bytes(&data)?;
+            if def.schema_name == schema && def.name.eq_ignore_ascii_case(name) {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", def.schema_name, def.name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_COMPOSITE_TYPES,
                     key.as_bytes(),
                     &data,
                     page_id,

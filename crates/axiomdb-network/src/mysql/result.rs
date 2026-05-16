@@ -507,6 +507,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Array(_) => 0xfd,                                // VAR_STRING (PG text format)
         DataType::Range(_) => 0xfd,                                // VAR_STRING (text format)
         DataType::Money => 0xfd,                                   // VAR_STRING ("100.50 USD")
+        DataType::Composite(_) => 0xfd,                            // VAR_STRING (row literal)
     }
 }
 
@@ -525,6 +526,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Array(_) => 16_777_215, // PG text format, variable-length
         DataType::Range(_) => 64,         // range literal text e.g. "[1,5)"
         DataType::Money => 32,            // "100.50 USD" — mantissa + currency code
+        DataType::Composite(_) => 16_777_215, // variable-length row literal
     }
 }
 
@@ -647,6 +649,7 @@ fn value_to_text(v: &Value) -> String {
                 )
             }
         }
+        Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
     }
 }
 
