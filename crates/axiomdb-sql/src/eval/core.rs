@@ -574,6 +574,7 @@ impl Hash for HashableValue {
                     HashableValue(f.clone()).hash(state);
                 }
             }
+            Value::Ltree(s) => s.hash(state),
         }
     }
 }
@@ -1235,6 +1236,7 @@ enum ArrayElemType {
     Range,
     Money,
     Composite,
+    Ltree,
 }
 
 impl ArrayElemType {
@@ -1257,6 +1259,7 @@ impl ArrayElemType {
             Value::Range(_) => Self::Range,
             Value::Money(..) => Self::Money,
             Value::Composite(_) => Self::Composite,
+            Value::Ltree(_) => Self::Ltree,
         }
     }
 
@@ -1279,6 +1282,7 @@ impl ArrayElemType {
             Self::Range => None, // Range types not supported as array elements
             Self::Money => Some(DataType::Money),
             Self::Composite => None,
+            Self::Ltree => Some(DataType::Ltree),
         }
     }
 }

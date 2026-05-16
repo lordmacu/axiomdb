@@ -392,6 +392,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
                 feature: "JSON_TABLE with composite return type".into(),
             });
         }
+        DataType::Ltree => ColumnType::Ltree,
     })
 }
 

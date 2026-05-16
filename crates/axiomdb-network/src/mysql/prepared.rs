@@ -560,6 +560,7 @@ pub fn value_to_sql_literal(v: &Value) -> String {
             let s = Value::Composite(fields.clone()).to_string();
             format!("'{}'", s.replace('\'', "''"))
         }
+        Value::Ltree(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }
 

@@ -933,6 +933,7 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
         ColumnType::Composite => {
             return value;
         }
+        ColumnType::Ltree => DataType::Ltree,
     };
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }

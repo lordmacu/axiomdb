@@ -149,6 +149,10 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) -> Result<(), DbError> {
                 reason: "Composite values cannot be used as index keys".to_string(),
             });
         }
+        Value::Ltree(s) => {
+            buf.push(0x11);
+            encode_bytes_nul(s.as_bytes(), buf);
+        }
     }
     Ok(())
 }
