@@ -207,6 +207,22 @@ fn dispatch_ctx(
                     .expect("conn_txn must be set before dispatch_ctx"),
             )
         }
+        Stmt::CreateHolidayCalendar(s) => execute_create_holiday_calendar(
+            s,
+            storage,
+            txn,
+            ctx.conn_txn
+                .as_mut()
+                .expect("conn_txn must be set before dispatch_ctx"),
+        ),
+        Stmt::DropHolidayCalendar(s) => execute_drop_holiday_calendar(
+            s,
+            storage,
+            txn,
+            ctx.conn_txn
+                .as_mut()
+                .expect("conn_txn must be set before dispatch_ctx"),
+        ),
         Stmt::DropTable(s) => {
             ctx.invalidate_all();
             let search_path = ctx.search_path.clone();

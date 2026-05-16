@@ -132,6 +132,7 @@ include!("ddl_create_index.rs");
 include!("ddl_drop_index.rs");
 include!("ddl_analyze.rs");
 include!("ddl_fdw.rs");
+include!("ddl_holiday_calendar.rs");
 include!("fdw_http.rs");
 include!("copy_from.rs");
 include!("copy_to.rs");
