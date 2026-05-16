@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -794,6 +794,12 @@ pub struct SessionContext {
     /// PostgreSQL defines `CURRVAL` only after this session has successfully
     /// called `NEXTVAL` for the same sequence.
     pub sequence_currvals: HashMap<String, i64>,
+    /// Per-session holiday set cache keyed by upper-cased country code.
+    ///
+    /// Loaded lazily on first call to `IS_BUSINESS_DAY` / `NEXT_BUSINESS_DAY` /
+    /// `BUSINESS_DAYS_BETWEEN` for a given country code. Cleared whenever the
+    /// schema cache is invalidated (i.e., after any DDL statement).
+    pub holiday_cache: HashMap<String, Arc<HashSet<i32>>>,
 }
 
 impl Default for SessionContext {
@@ -839,6 +845,7 @@ impl SessionContext {
             pending_notifications: Vec::new(),
             cursors: HashMap::new(),
             sequence_currvals: HashMap::new(),
+            holiday_cache: HashMap::new(),
         }
     }
 
@@ -1069,6 +1076,7 @@ impl SessionContext {
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
         self.heap_tail.clear();
+        self.holiday_cache.clear();
     }
 
     // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────
