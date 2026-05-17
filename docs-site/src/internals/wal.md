@@ -699,3 +699,41 @@ full-page-write mode) to ~400 B/page (slot list only). For 10K-row batch INSERT:
 820 KB → 20 KB, matching MariaDB's InnoDB redo log density of ~50 B/row.
 </div>
 </div>
+
+---
+
+## Per-Transaction Durability Override
+
+`WalDurabilityPolicy` has three levels:
+
+| Level     | `commit()` does                       | SQLite analog          |
+|-----------|---------------------------------------|------------------------|
+| `Strict`  | `flush()` + `fdatasync()`             | `synchronous=FULL`     |
+| `Normal`  | `flush()` to OS page cache only       | `synchronous=NORMAL`   |
+| `Off`     | nothing                               | `synchronous=OFF`      |
+
+The TxnManager instance carries a default policy, but each `ConnectionTxn`
+exposes a `durability_override: Option<WalDurabilityPolicy>` slot. When set
+(via the SQL layer's `SET synchronous = '<value>'`), `commit()` uses the
+override; otherwise it falls back to the instance default.
+
+The override is captured at `BEGIN` and frozen on the `ConnectionTxn` until
+commit/rollback. A `SET synchronous` issued mid-transaction would therefore
+silently no-op until the next `BEGIN`; the SQL dispatcher rejects it
+outright with `InvalidValue` to match user expectations
+(mirrors SQLite's `pragma.c:1136`).
+
+Read-only transactions always use `flush_no_sync()` regardless of policy —
+there is nothing to make durable.
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Why per-ConnectionTxn, not per-instance</span>
+A connection pool can keep `STRICT` for transactional traffic and run a bulk
+loader at `NORMAL` on a single connection — without restarting the server.
+Storing the override on <code>ConnectionTxn</code> (not mutating the
+<code>TxnManager</code>) keeps concurrent connections on different policies
+free of races.
+</div>
+</div>

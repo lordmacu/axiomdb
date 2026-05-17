@@ -89,6 +89,40 @@ To group multiple statements atomically, always use explicit `BEGIN ... COMMIT`.
 
 ---
 
+## Durability — `SET synchronous`
+
+Per-session control over how aggressively AxiomDB pushes WAL data to disk on
+`COMMIT`. Mirrors SQLite's `PRAGMA synchronous` so workloads can opt into the
+same throughput / durability tradeoffs.
+
+```sql
+SET synchronous = 'STRICT';   -- default: fsync per commit. Durable on ACK.
+SET synchronous = 'NORMAL';   -- flush to OS only. Recent commits may be lost
+                              -- on OS crash, DB stays consistent.
+SET synchronous = 'OFF';      -- no flush, no fsync. Test/ephemeral only.
+SET synchronous = DEFAULT;    -- reset to STRICT.
+```
+
+For SQLite migration compatibility the parser also accepts `FULL` / `EXTRA`
+(both map to `STRICT`), `ON` (maps to `NORMAL`), and numeric forms
+`0..4` (same numbering as SQLite's `getSafetyLevel`).
+
+::: callout-design
+**Why per-session, not a startup flag**
+AxiomDB defaults to `STRICT` — no durability regression for users who don't
+opt in. A connection pool can keep `STRICT` for transactional traffic and
+issue `SET synchronous = 'NORMAL'` only on the connection running a bulk
+load, instead of restarting the server with a global flag.
+:::
+
+`SET synchronous` is rejected inside an open transaction (`InvalidValue`).
+The override is captured by `BEGIN` and frozen on the connection's
+transaction record, so a mid-txn change would silently no-op until the next
+transaction — matching SQLite's `PRAGMA synchronous` semantics
+(`research/sqlite/src/pragma.c:1136`).
+
+---
+
 ## SAVEPOINT — Partial Rollback
 
 Savepoints mark a point within a transaction to which you can roll back without

@@ -14,11 +14,77 @@ use axiomdb_catalog::{
 };
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
+use axiomdb_storage::WalDurabilityPolicy;
 use axiomdb_wal::ConnectionTxn;
 
 use crate::clustered_secondary::ClusteredSecondaryLayout;
 use crate::expr::Expr;
 use crate::result::{ColumnMeta, Row};
+
+// ── SessionDurability ─────────────────────────────────────────────────────────
+
+/// Session-level durability mode. Maps to [`axiomdb_wal::WalDurabilityPolicy`]
+/// at commit time via the per-transaction `ConnectionTxn.durability_override`
+/// slot (Attack 6).
+///
+/// Mirrors SQLite's `PRAGMA synchronous`
+/// ([`research/sqlite/src/pager.c:3590-3611`](research/sqlite/src/pager.c)),
+/// collapsed from SQLite's 5 levels (OFF/ON/NORMAL/FULL/EXTRA) to our 3.
+///
+/// Set via `SET synchronous = '<value>'`. The default is `Strict` — no
+/// durability regression for users who don't opt in. Users explicitly
+/// trade fsync-per-commit for throughput by issuing the SET.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionDurability {
+    /// **Default.** fsync per commit. Equivalent to SQLite
+    /// `synchronous=FULL`. Durable on commit ACK.
+    #[default]
+    Strict,
+    /// Flush to OS page cache only; no fsync per commit. Equivalent to
+    /// SQLite `synchronous=NORMAL` in WAL mode. Durable in COMMIT
+    /// ORDERING — recent commits may be lost on crash but the DB
+    /// remains internally consistent.
+    Normal,
+    /// No flush, no fsync. Equivalent to SQLite `synchronous=OFF`.
+    /// Data loss possible on crash. Intended for ephemeral / test DBs.
+    Off,
+}
+
+impl SessionDurability {
+    /// Maps this session-level enum to the WAL crate's policy enum.
+    pub fn to_wal_policy(self) -> WalDurabilityPolicy {
+        match self {
+            Self::Strict => WalDurabilityPolicy::Strict,
+            Self::Normal => WalDurabilityPolicy::Normal,
+            Self::Off => WalDurabilityPolicy::Off,
+        }
+    }
+}
+
+/// Parses `SET synchronous = '<value>'`.
+///
+/// Accepts canonical names (STRICT/NORMAL/OFF), case-insensitive,
+/// quoted or unquoted, plus SQLite aliases (FULL → Strict, EXTRA → Strict,
+/// ON → Normal) and numeric forms (0=Off, 1/2=Normal, 3/4=Strict).
+/// See SQLite's `getSafetyLevel` for the source numbering.
+pub fn parse_synchronous_setting(raw: &str) -> Result<SessionDurability, DbError> {
+    let s = raw
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "off" | "0" => Ok(SessionDurability::Off),
+        "normal" | "on" | "1" | "2" => Ok(SessionDurability::Normal),
+        "strict" | "full" | "extra" | "3" | "4" => Ok(SessionDurability::Strict),
+        _ => Err(DbError::InvalidValue {
+            reason: format!(
+                "invalid synchronous value '{raw}'; expected \
+                 STRICT | NORMAL | OFF | FULL | EXTRA | ON | 0..4 | DEFAULT"
+            ),
+        }),
+    }
+}
 
 // ── CompatMode ────────────────────────────────────────────────────────────────
 
@@ -729,6 +795,14 @@ pub struct SessionContext {
     ///
     /// Derived from `SET sql_mode = ...`.
     pub ansi_quotes: bool,
+    /// Attack 6 (perf-sqlite-gap deferred-fsync): per-session durability
+    /// override. Default = `Strict` (fsync per commit). Set via
+    /// `SET synchronous = '<value>'`; see `parse_synchronous_setting`.
+    /// Read via `SessionContext::synchronous()`. Applied to every
+    /// implicit/autocommit `txn.begin()` in the executor — see
+    /// `exec_with_ctx.rs`. Analog of SQLite's PRAGMA synchronous
+    /// (`research/sqlite/src/pager.c:3590-3611`).
+    synchronous: SessionDurability,
     /// How statement errors affect the current transaction (default: `RollbackStatement`).
     ///
     /// Set via `SET on_error = 'rollback_statement' | 'rollback_transaction' |
@@ -866,6 +940,7 @@ impl SessionContext {
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,
+            synchronous: SessionDurability::default(),
             on_error: OnErrorMode::RollbackStatement,
             compat_mode: CompatMode::Standard,
             explicit_collation: None,
@@ -895,6 +970,22 @@ impl SessionContext {
     /// Clears all accumulated warnings. Called before each statement.
     pub fn clear_warnings(&mut self) {
         self.warnings.clear();
+    }
+
+    /// Returns the current session-level durability mode.
+    ///
+    /// Attack 6 (perf-sqlite-gap deferred-fsync): consumed by every
+    /// implicit/autocommit `txn.begin()` to set `ConnectionTxn.durability_override`.
+    pub fn synchronous(&self) -> SessionDurability {
+        self.synchronous
+    }
+
+    /// Sets the session-level durability mode. Takes effect on the next
+    /// `txn.begin()`. Mirrors SQLite's PRAGMA synchronous semantics — must
+    /// be rejected inside an open transaction by the caller (the SET
+    /// dispatcher in `exec_dispatch.rs`).
+    pub fn set_synchronous(&mut self, mode: SessionDurability) {
+        self.synchronous = mode;
     }
 
     /// Discards any staged INSERT rows without writing to heap or WAL.

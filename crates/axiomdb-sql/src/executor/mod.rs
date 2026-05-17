@@ -71,8 +71,9 @@ use crate::{
     result::{ColumnMeta, QueryResult, Row},
     session::{
         normalize_sql_mode, parse_boolish_setting, parse_compat_mode_setting,
-        parse_on_error_setting, parse_session_collation_setting, sql_mode_is_strict, OnErrorMode,
-        SessionCollation, SessionContext, SessionSavepoint,
+        parse_on_error_setting, parse_session_collation_setting, parse_synchronous_setting,
+        sql_mode_is_strict, OnErrorMode, SessionCollation, SessionContext, SessionDurability,
+        SessionSavepoint,
     },
     table::TableEngine,
     text_semantics::compare_text,

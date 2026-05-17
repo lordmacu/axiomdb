@@ -844,6 +844,40 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
                 ctx.strict_mode = parse_boolish_setting(&raw)?;
             }
         },
+        "synchronous" => {
+            // Attack 6 (perf-sqlite-gap deferred-fsync): mirror SQLite's
+            // PRAGMA synchronous semantics — it cannot be changed inside
+            // an open transaction (research/sqlite/src/pragma.c:1136-1138).
+            // The override is read by every `txn.begin()` and frozen on
+            // the ConnectionTxn for the life of the transaction, so a
+            // mid-txn change would silently no-op until the next BEGIN.
+            // Rejecting outright matches the user's mental model.
+            if ctx.in_explicit_txn {
+                return Err(DbError::InvalidValue {
+                    reason: "synchronous cannot be changed inside a transaction".into(),
+                });
+            }
+            match stmt.value {
+                SetValue::Default => ctx.set_synchronous(SessionDurability::default()),
+                SetValue::Expr(expr) => {
+                    let v = eval(&expr, &[])?;
+                    let raw = match &v {
+                        Value::Text(s) => s.clone(),
+                        Value::Int(n) => n.to_string(),
+                        Value::BigInt(n) => n.to_string(),
+                        other => {
+                            return Err(DbError::InvalidValue {
+                                reason: format!(
+                                    "synchronous: unsupported value type {other:?}"
+                                ),
+                            });
+                        }
+                    };
+                    let mode = parse_synchronous_setting(&raw)?;
+                    ctx.set_synchronous(mode);
+                }
+            }
+        }
         "sql_mode" => match stmt.value {
             SetValue::Default => {
                 ctx.strict_mode = true;
