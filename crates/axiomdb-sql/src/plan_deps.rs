@@ -28,10 +28,7 @@
 
 use std::collections::HashMap;
 
-use axiomdb_catalog::{
-    schema::{TableId, DEFAULT_DATABASE_NAME},
-    CatalogReader,
-};
+use axiomdb_catalog::{schema::TableId, CatalogReader};
 use axiomdb_core::error::DbError;
 
 use crate::{
@@ -631,7 +628,16 @@ impl<'r, 'db> DepCollector<'r, 'db> {
 
     fn visit_tableref(&mut self, tref: &TableRef) -> Result<(), DbError> {
         let db = tref.database.as_deref().unwrap_or(self.database);
-        let schema = tref.schema.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
+        // Default to "public" (the bootstrapped default schema) when the
+        // ref is unqualified. Pre-Attack-2 the default used was
+        // `DEFAULT_DATABASE_NAME` which is the *database* name "axiomdb"
+        // — incorrect for schema lookup (tables live in "public" by
+        // default, not in "axiomdb"). The analyzer does not currently
+        // rewrite tref.schema, so this default is what reaches the
+        // catalog at deps-collection time. Walking the session
+        // search_path would be more correct but requires plumbing
+        // SessionContext through here; deferred to a follow-up.
+        let schema = tref.schema.as_deref().unwrap_or("public");
 
         match self.reader.get_table_in_database(db, schema, &tref.name)? {
             Some(table_def) => {

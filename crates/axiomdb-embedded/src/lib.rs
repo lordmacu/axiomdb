@@ -297,6 +297,16 @@ mod db {
                     operation: "database is in read-only degraded mode",
                 });
             }
+            // NOTE: Attack 2 (statement_cache::run_cached) was prototyped
+            // here but reverted — see specs/fase-perf-sqlite-gap/
+            // plan-statement-fingerprinting.md, "Step 2.4 outcome". The
+            // PlanDeps.is_stale catalog probe duplicates work already done
+            // by resolve_table_cached (Attack 3.A), causing a NET REGRESSION
+            // on INSERT (which has cheap analyze). The library code at
+            // axiomdb_sql::statement_cache is still useful: SELECT-heavy
+            // workloads benefit (+60% on point_lookup). A correct re-wire
+            // needs the cached plan to carry resolved table_defs so the
+            // executor can skip its own resolve_table call — deferred.
             let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
             let snap = if let Some(ref ct) = self.session.conn_txn {
                 self.txn.active_snapshot(ct)

@@ -154,6 +154,9 @@ mod harness {
             }
         }
 
+        /// Legacy parse + analyze + execute path. Mirrors `Db::run_inner`
+        /// after the Attack 2 wire-up was reverted (see plan Step 2.4
+        /// outcome).
         pub fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
             let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
             let snap = if let Some(ref ct) = self.session.conn_txn {
@@ -270,3 +273,11 @@ fn cache_stale_via_plan_deps_evicts() {
         "stale entry must be evicted"
     );
 }
+
+// NOTE: end-to-end "run_inner_*" tests were prototyped here for the
+// Step 2.4 wire-up and then removed when the wire-up was reverted (see
+// plan Step 2.4 outcome). The library-level tests above still cover
+// extract_literals / shape_hash / CachedPlan / SessionContext LRU /
+// stale-deps eviction — when run_cached is re-wired in a follow-up, the
+// end-to-end tests can be reinstated from git history (commit 662488d1
+// vs the revert commit).
