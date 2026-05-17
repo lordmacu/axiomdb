@@ -1060,6 +1060,31 @@ impl SessionContext {
         self.cache.get(&Self::key(database, schema, table))
     }
 
+    /// Returns the cached `ResolvedTable` for `(database, schema, table)` only
+    /// if its `def.schema_version` equals `expected_version`.
+    ///
+    /// Returns `None` on cache miss OR on version mismatch. Does NOT auto-evict
+    /// on mismatch — the caller is expected to re-resolve and overwrite via
+    /// [`Self::cache_table`].
+    ///
+    /// This is the cache-hit fast path for `resolve_table_cached` inside
+    /// explicit transactions, mirroring SQLite's schema-cookie check
+    /// (`research/sqlite/src/prepare.c:518-526`).
+    pub fn get_table_if_version(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        expected_version: u64,
+    ) -> Option<&ResolvedTable> {
+        let cached = self.cache.get(&Self::key(database, schema, table))?;
+        if cached.def.schema_version == expected_version {
+            Some(cached)
+        } else {
+            None
+        }
+    }
+
     pub fn cache_table(
         &mut self,
         database: &str,
