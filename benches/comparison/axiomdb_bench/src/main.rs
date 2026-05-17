@@ -20,7 +20,15 @@ const RUNS: usize = 5;
 // ── Engine helpers ────────────────────────────────────────────────────────────
 
 fn db_open(dir: &Path) -> Db {
-    Db::open(dir.join("bench.db")).expect("open db")
+    let mut db = Db::open(dir.join("bench.db")).expect("open db");
+    // Attack 6: match SQLite's PRAGMA synchronous=NORMAL for an
+    // apples-to-apples comparison on the insert_autocommit scenario.
+    // SqliteDb::open_file above sets the same level (line 464).
+    // Without this, AxiomDB pays fsync-per-commit while SQLite does not,
+    // and the bench is fundamentally unfair on durability cost.
+    db.run("SET synchronous = 'NORMAL'")
+        .expect("set synchronous=NORMAL");
+    db
 }
 
 fn db_sql(db: &mut Db, q: &str) -> QueryResult {
