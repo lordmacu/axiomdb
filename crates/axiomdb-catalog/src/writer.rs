@@ -1200,9 +1200,13 @@ impl<'a> CatalogWriter<'a> {
                     slot_id,
                 )?;
 
-                // Insert new row with updated root_page_id.
+                // Insert new row with updated root_page_id + bumped
+                // schema_version. The version bump tells any caller that
+                // cached this TableDef (resolve_table_cached, plan cache) to
+                // re-resolve, because cached `root_page_id` is now stale.
                 let new_def = TableDef {
                     root_page_id: new_root_page_id,
+                    schema_version: def.schema_version + 1,
                     ..def
                 };
                 let new_data = new_def.to_bytes();
@@ -1476,6 +1480,10 @@ impl<'a> CatalogWriter<'a> {
                     new_page_id,
                     new_slot_id,
                 )?;
+                // Bump the owning table's schema_version so any cached
+                // ResolvedTable / plan that listed this index re-resolves.
+                // Mirrors the bump in update_table_root for table-root rotation.
+                self.bump_table_schema_version(def.table_id)?;
                 return Ok(());
             }
         }
