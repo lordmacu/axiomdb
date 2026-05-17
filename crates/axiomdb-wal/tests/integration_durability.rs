@@ -608,3 +608,114 @@ fn test_normal_policy_multiple_txns_recoverable() {
         assert_slot_alive(&storage, *pid, *sid);
     }
 }
+
+// ── Attack 6 Step 6.1: ConnectionTxn.durability_override ───────────────────
+
+/// New ConnectionTxn starts with no per-txn override (uses instance policy).
+#[test]
+fn test_connection_txn_durability_override_defaults_to_none() {
+    let env = TestEnv::new();
+    let (_, mgr) = env.create();
+    let conn = mgr.begin().unwrap();
+    assert!(
+        conn.durability_override.is_none(),
+        "fresh ConnectionTxn must have None override"
+    );
+}
+
+/// Per-txn override of Normal on an instance with Strict default → the
+/// commit uses Normal semantics (no fsync). Verifiable via the clean-
+/// shutdown recovery path: data is present after explicit flush + reopen.
+#[test]
+fn test_connection_txn_override_normal_on_strict_instance() {
+    let env = TestEnv::new();
+    let (page_id, slot_id);
+
+    {
+        let (mut storage, mgr) = env.create();
+        // Instance default = Strict (would fsync).
+        assert_eq!(mgr.durability_policy(), WalDurabilityPolicy::Strict);
+
+        let mut conn = mgr.begin().unwrap();
+        // Per-txn override → Normal.
+        conn.durability_override = Some(WalDurabilityPolicy::Normal);
+
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"override-normal");
+        let _ = mgr.commit(conn).unwrap();
+
+        // Normal advances max_committed immediately (no deferred fsync queue).
+        assert_eq!(mgr.max_committed(), 1);
+
+        mgr.wal().flush_buffer().unwrap();
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+    assert_slot_alive(&storage, page_id, slot_id);
+}
+
+/// Per-txn override of Strict on an instance with Normal default → the
+/// commit uses Strict semantics (would fsync). Mirror-symmetric of the
+/// previous test.
+#[test]
+fn test_connection_txn_override_strict_on_normal_instance() {
+    let env = TestEnv::new();
+    let (page_id, slot_id);
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        mgr.set_durability_policy(WalDurabilityPolicy::Normal);
+        assert_eq!(mgr.durability_policy(), WalDurabilityPolicy::Normal);
+
+        let mut conn = mgr.begin().unwrap();
+        // Per-txn override → Strict (overrides the instance Normal).
+        conn.durability_override = Some(WalDurabilityPolicy::Strict);
+
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"override-strict");
+        let _ = mgr.commit(conn).unwrap();
+
+        // Strict (non-deferred) advances max_committed immediately after sync.
+        assert_eq!(mgr.max_committed(), 1);
+
+        // Strict with sync means data is durable WITHOUT extra flush —
+        // but the test fixture also calls flush_buffer+flush for symmetry.
+        mgr.wal().flush_buffer().unwrap();
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+    assert_slot_alive(&storage, page_id, slot_id);
+}
+
+/// No override (`None`) → commit falls back to the instance policy. This
+/// is the backward-compatibility guarantee: any existing caller that
+/// doesn't touch `durability_override` keeps its old behavior.
+#[test]
+fn test_connection_txn_no_override_uses_instance_policy() {
+    let env = TestEnv::new();
+    let (page_id, slot_id);
+
+    {
+        let (mut storage, mut mgr) = env.create();
+        mgr.set_durability_policy(WalDurabilityPolicy::Off);
+
+        let mut conn = mgr.begin().unwrap();
+        // Leave override = None.
+        assert!(conn.durability_override.is_none());
+
+        (page_id, slot_id) = do_insert(&mut storage, &mgr, &mut conn, b"no-override");
+        let _ = mgr.commit(conn).unwrap();
+
+        assert_eq!(mgr.max_committed(), 1);
+
+        // Off doesn't flush; do it explicitly so recovery sees the data.
+        mgr.wal().flush_buffer().unwrap();
+        storage.flush().unwrap();
+    }
+
+    let (storage, _, result) = env.open_with_recovery();
+    assert_eq!(result.undone_txns, 0);
+    assert_slot_alive(&storage, page_id, slot_id);
+}

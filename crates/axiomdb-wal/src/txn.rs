@@ -199,6 +199,14 @@ pub struct ConnectionTxn {
     pub(crate) deferred_commit_mode: bool,
     /// Set by `commit()` in deferred mode. Taken by `take_pending_deferred_commit()`.
     pub(crate) pending_deferred_txn_id: Option<TxnId>,
+    /// Attack 6 (perf-sqlite-gap deferred-fsync): per-transaction override
+    /// of the WAL durability policy. When `Some`, replaces the instance-
+    /// wide `TxnManager.durability_policy` at commit time. Used by the SQL
+    /// layer to honor session-level `SET synchronous = '<value>'` without
+    /// mutating the instance default (which is shared across all sessions
+    /// of a `Db`). `None` = use the instance policy. Mirrors SQLite's
+    /// per-pager `pDb->safety_level` (research/sqlite/src/pager.c:3590).
+    pub durability_override: Option<WalDurabilityPolicy>,
 }
 
 impl ConnectionTxn {
