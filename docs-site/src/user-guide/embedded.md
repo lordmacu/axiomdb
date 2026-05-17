@@ -142,6 +142,33 @@ db.begin()?;
 db.rollback()?;
 ```
 
+### Fast-path INSERT — `Appender`
+
+For bulk loads, `Db::appender(table)` opens an
+[`Appender`](https://docs.rs/axiomdb-embedded) that skips the SQL parser,
+analyzer, and dispatcher and writes typed [`Value`]s directly to the
+heap. Analog of DuckDB's Appender and SQLite's `sqlite3_bind_*` +
+`sqlite3_step`.
+
+```rust
+use axiomdb_types::Value;
+
+let mut app = db.appender("users")?;
+app.append_row(&[Value::Int(1), Value::Text("Alice".into())])?;
+app.append_row(&[Value::Int(2), Value::Text("Bob".into())])?;
+let n_inserted = app.finish()?; // flush + commit
+```
+
+The Appender holds a single transaction; `finish()` commits, `drop`
+without `finish` rolls back. v1 supports heap tables only — clustered
+tables, triggers, and `RETURNING` go through SQL `INSERT` for now.
+
+The Appender honors `SET synchronous` ([transactions
+docs](features/transactions.md#durability--set-synchronous)).
+
+See `specs/fase-perf-sqlite-gap/spec-embedded-appender.md` for the full
+design and `docs/perf-sqlite-gap.md` "Attack 7" for benchmark numbers.
+
 ### Error handling
 
 ```rust

@@ -59,10 +59,16 @@
 // ── Sync Rust API ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sync-api")]
+pub use appender::Appender;
+
+#[cfg(feature = "sync-api")]
 pub use db::Db;
 
 #[cfg(feature = "sync-api")]
 pub use db::Row;
+
+#[cfg(feature = "sync-api")]
+mod appender;
 
 #[cfg(feature = "sync-api")]
 mod db {
@@ -98,11 +104,11 @@ mod db {
     /// Every `execute()` and `query()` call is wrapped in an implicit BEGIN/COMMIT
     /// unless an explicit `begin()` is active.
     pub struct Db {
-        storage: MmapStorage,
-        txn: TxnManager,
-        bloom: BloomRegistry,
-        schema_cache: SchemaCache,
-        session: SessionContext,
+        pub(super) storage: MmapStorage,
+        pub(super) txn: TxnManager,
+        pub(super) bloom: BloomRegistry,
+        pub(super) schema_cache: SchemaCache,
+        pub(super) session: SessionContext,
         /// Set to `true` after the first `DiskFull` error. When degraded,
         /// all mutating operations are rejected immediately without touching
         /// WAL or storage again.
@@ -379,6 +385,37 @@ mod db {
     pub struct PreparedStatement {
         analyzed: Stmt,
         param_count: usize,
+    }
+
+    impl Db {
+        /// Opens an [`Appender`](crate::Appender) for high-throughput INSERT
+        /// into `table_name`.
+        ///
+        /// The Appender skips the SQL parser/analyzer/dispatcher and writes
+        /// typed [`Value`]s directly to the heap + WAL. Analogous to DuckDB's
+        /// Appender and SQLite's `sqlite3_bind_*` + `sqlite3_step` pattern.
+        ///
+        /// Holds an active transaction for its whole lifetime;
+        /// `Appender::finish()` commits, `Drop` rolls back.
+        ///
+        /// # Errors
+        /// - [`DbError::TableNotFound`] if `table_name` doesn't exist.
+        /// - [`DbError::NotImplemented`] if the table is clustered or has
+        ///   triggers (deferred to a future Attack).
+        /// - [`DbError::TransactionAlreadyActive`] if a SQL `BEGIN` is open.
+        /// - I/O errors from `txn.begin()`.
+        ///
+        /// ```rust,no_run
+        /// # let mut db = axiomdb_embedded::Db::open("./test.db").unwrap();
+        /// # db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+        /// use axiomdb_types::Value;
+        /// let mut app = db.appender("t").unwrap();
+        /// app.append_row(&[Value::Int(1), Value::Text("a".into())]).unwrap();
+        /// app.finish().unwrap();
+        /// ```
+        pub fn appender(&mut self, table_name: &str) -> Result<crate::Appender<'_>, DbError> {
+            crate::appender::Appender::open(self, table_name)
+        }
     }
 
     impl Db {
