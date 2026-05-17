@@ -448,7 +448,25 @@ resolution, and the DROP TABLE path.
 
 ---
 
-## Step 4 — Measure; if A.1 budget hit but A.2 stretch not, add per-txn fast path
+## Step 4 — Measurement + A.2 attempt (DEFERRED)
+
+**Outcome:** A.1 alone delivered 8.8K → 21K rows/s (2.4×). Per-call
+`execute_with_ctx` dropped from 55-110 µs to ~44 µs — short of the
+spec's ≤ 25 µs budget. A.2 was attempted (per-`ConnectionTxn`
+`catalog_dirty` flag) but reverted: a VACUUM or other DDL-bumping
+operation that runs in its own autocommit ConnectionTxn within the same
+session bumps the table's `schema_version`, but the next user-issued
+transaction starts with `catalog_dirty = false`, so the fast path
+serves a stale entry (caught by
+`integration_clustered_vacuum::vacuum_keeps_secondary_queries_working_after_bulk_cleanup`).
+
+The correct A.2 design needs session-level dirty tracking with
+clear-on-revalidate semantics, not per-`ConnectionTxn` tracking.
+Deferred as a follow-up; the per-call catalog probe stays in
+`try_cached_with_version` until that design lands.
+
+**Original Step 4 content kept below for historical reference and to
+guide the future correct A.2.**
 
 **Goal:** Confirm A.1 hits the spec's hard budget. If A.1 is hit but
 the stretch (≤ 12 µs/row, ≥ 80K rows/s) is not, add A.2.

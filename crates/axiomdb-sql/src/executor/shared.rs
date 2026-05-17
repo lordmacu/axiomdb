@@ -70,6 +70,15 @@ fn resolve_table_cached(
 /// Returns a cached `ResolvedTable` clone iff the cache entry's
 /// `schema_version` matches the current catalog version. Returns `None`
 /// on miss, on stale entry (evicts it), or on table not found.
+///
+/// **A.2 deferred:** an earlier attempt skipped this probe when the
+/// current `ConnectionTxn.catalog_dirty == false`. That works for the
+/// in-txn case but breaks when a previous autocommit (e.g. VACUUM) in
+/// the same session bumped a table's `schema_version` — the new txn
+/// starts with `catalog_dirty = false` and the fast path would serve a
+/// stale entry. The correct A.2 design needs session-level dirty
+/// tracking with proper clear-on-revalidate semantics; tracked as a
+/// follow-up to this spec.
 fn try_cached_with_version(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
