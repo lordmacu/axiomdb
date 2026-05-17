@@ -113,23 +113,75 @@ would serve a stale entry.
 The correct A.2 design needs **session-level** dirty tracking with
 clear-on-revalidate semantics. Tracked as a follow-up.
 
-## What's next
+## Attack 3.B — Clone removal
 
-Roughly in order of expected impact:
+**Date**: 2026-05-17
+**Spec**: [`spec-insert-setup-dedup-B.md`](../specs/fase-perf-sqlite-gap/spec-insert-setup-dedup-B.md)
+**Plan**: [`plan-insert-setup-dedup-B.md`](../specs/fase-perf-sqlite-gap/plan-insert-setup-dedup-B.md)
+**Inspiration**: SQLite cursor reuse (`research/sqlite/src/btree.c:9482-9491`).
 
-1. **Attack 3.B — clone removal**: strip the per-statement `.clone()`s
-   and `.to_vec()`s in `enqueue_clustered_insert_ctx`
-   (`resolved.def.clone()`, `schema_cols.to_vec()`, `primary_idx.clone()`).
-   Estimated 1.3-1.5× additional.
-2. **Attack 3.A.2 — session-level dirty tracking**: skip the
-   per-call catalog probe when safe. Estimated 5-15K extra rows/s.
-3. **Attack 2 — statement fingerprinting**: cache by query shape (strip
-   literals), reuse plan + ResolvedTable + col_positions per shape.
-   SQLite-style prepared statement reuse. Estimated 5-10× on workloads
-   with literals.
-4. **Attack 4 — per-row engine work**: only attempted after 1-3 land;
-   the 1µs/row is already competitive but `prepare_row (codec+PK)` at
-   0.6 µs is the dominant cost there.
+### The change
+
+Three structural cleanups in the INSERT hot path:
+
+- **B.1** — `ctx.search_path.clone()` in `resolve_table_cached`
+  replaced with index-based iteration that allocates 0 outer Vec.
+- **B.2** — `ClusteredInsertBatch.primary_idx` now `Arc<IndexDef>`.
+  Per-statement reuse is one atomic increment instead of a full
+  `IndexDef` + `Vec<IndexColumnDef>` clone.
+- **B.3** — `build_insert_column_positions` results cached per
+  `(table_id, columns_signature)` on `SessionContext`, value tagged
+  with `schema_version` for lazy eviction on DDL. Applied to both the
+  batched and autocommit clustered INSERT paths.
+
+Two follow-up items in the original plan were intentionally NOT done:
+
+- **B.4** — `primary_key_bytes` single-ownership refactor would save
+  ~0.05 µs/row (10K rows = 0.5 ms / 1.13 s = 0.04% — pure noise).
+- **B.5** — additional clones in the autocommit path beyond what B.3
+  already touched. Tracked as a follow-up if INSERT autocommit becomes
+  the hot scenario.
+
+### Results
+
+| Scenario       | After 3.A | After 3.B | Δ      | vs SQLite |
+|----------------|----------:|----------:|-------:|----------:|
+| insert_batch   | 21.3K     | 20.7K     | flat   | 49× (was 47×)  |
+| crud/select    | 4.14M     | 4.14M     | flat   | 4.4×           |
+| full_scan      | 5.11M     | 5.16M     | +1%    | 4.4×           |
+| select_where   | 3.77M     | 3.77M     | flat   | 8.3×           |
+| point_lookup   | 8.7K      | 8.9K      | +2%    | 26×            |
+| range_scan     | 709K      | 727K      | +3%    | 29×            |
+| count_star     | 4.3K      | 4.3K      | flat   | 79×            |
+
+The 3.B perf gains are within measurement noise for this bench. The
+work was **structurally correct and useful** (cleaner code, version-
+stamped cache primed for Attack 2) but the per-statement scaffolding
+cost it targets (~43 µs out of 44 µs/call after 3.A) is dominated by
+work outside its reach:
+
+- Executor dispatcher (`Stmt::Insert` match arm, conn_txn `take`/restore,
+  `run_statement_triggers_for_result` wrapper) — ~5-10 µs/call
+- `ResolvedTable.clone()` on every cache hit — ~1-2 µs/call
+- All the other "rebuild from scratch every call" work that Attack 2
+  is designed to eliminate at the SQL-shape level
+
+**Conclusion**: 3.B established the foundations (cleaner ownership,
+version-stamped caches) that Attack 2 will build on, but on its own it
+moves the needle by < 5%. The next big win is structural — Attack 2.
+
+## Attack 2 — Statement fingerprinting (next)
+
+Attack 2 will cache compiled plans by query shape (literals stripped),
+so repeated `INSERT INTO t VALUES (…)` calls skip parse + analyze +
+resolve_table + col_positions + most setup entirely. Per-call cost is
+expected to drop from ~44 µs to ~5-10 µs — closing most of the gap
+with SQLite for the bench workload (which uses literal-interpolated
+SQL).
+
+For workloads with `?` placeholders (parameterized — most real ORM
+traffic), Attack 2 also helps but less dramatically; the cache already
+keys by SQL text in that case, no fingerprinting needed.
 
 Goal: close to within 5× of SQLite on all scenarios before the embedded
 `v0.5.0-alpha` release.

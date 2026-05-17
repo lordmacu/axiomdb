@@ -375,7 +375,8 @@ fn col_positions_cached_across_inserts_same_shape() {
     // 10 INSERTs into the same table with the same column shape (None = all
     // columns in declaration order) must populate exactly 1 cache entry.
     let mut h = harness::Harness::new();
-    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     h.run("BEGIN").unwrap();
     for i in 1..=10 {
         h.run(&format!("INSERT INTO t VALUES ({i}, 'a')")).unwrap();

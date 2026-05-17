@@ -2,7 +2,7 @@
 
 Phase: perf-sqlite-gap — close embedded INSERT gap with SQLite
 Task: B — eliminate per-statement and per-row clones in the INSERT path
-Status: approved
+Status: implemented (B.1/B.2/B.3 done; B.4/B.5 deferred as noise-level)
 
 ## Context
 

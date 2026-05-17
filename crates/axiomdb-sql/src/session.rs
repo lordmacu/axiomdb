@@ -1177,8 +1177,10 @@ impl SessionContext {
         columns_signature: u64,
         col_positions: Vec<usize>,
     ) {
-        self.insert_col_positions
-            .insert((table_id, columns_signature), (schema_version, col_positions));
+        self.insert_col_positions.insert(
+            (table_id, columns_signature),
+            (schema_version, col_positions),
+        );
     }
 
     /// Diagnostic / test accessor for the cache size.
