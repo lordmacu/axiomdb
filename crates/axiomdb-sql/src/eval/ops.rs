@@ -779,10 +779,16 @@ fn decimal_arith(op: BinaryOp, m1: i128, s1: u8, m2: i128, s2: u8) -> Result<Val
             if m2 == 0 {
                 return Err(DbError::DivisionByZero);
             }
-            // Integer division of mantissas — scale preserved as s1 (truncation).
-            // Full precision division is Phase 4.18b.
-            let result = m1.checked_div(m2).ok_or(DbError::Overflow)?;
-            Ok(Value::Decimal(result, s1))
+            // Scale numerator by 10^(s2 + extra) so the result carries s1+extra
+            // fractional digits. extra is capped so total scale stays ≤ 38.
+            let extra = 6u8.min(38u8.saturating_sub(s1));
+            let scale_up = (s2 as u32) + (extra as u32);
+            let scaled = m1
+                .checked_mul(10i128.pow(scale_up))
+                .ok_or(DbError::Overflow)?;
+            let result = scaled.checked_div(m2).ok_or(DbError::Overflow)?;
+            let scale = s1.saturating_add(extra);
+            Ok(Value::Decimal(result, scale))
         }
         BinaryOp::Mod => {
             if m2 == 0 {

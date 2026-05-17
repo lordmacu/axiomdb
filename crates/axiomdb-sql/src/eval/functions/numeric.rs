@@ -96,6 +96,20 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                     };
                     Ok(Value::Real(rounded / factor))
                 }
+                Value::Decimal(m, s) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    use rust_decimal::{Decimal as RustDecimal, RoundingStrategy};
+                    let rd = RustDecimal::from_i128_with_scale(m, s as u32);
+                    let rounded = rd.round_dp_with_strategy(
+                        decimals,
+                        RoundingStrategy::MidpointAwayFromZero,
+                    );
+                    let new_scale = decimals as u8;
+                    let factor = RustDecimal::from(10i64.pow(decimals));
+                    let scaled = rounded * factor;
+                    let new_mantissa = scaled.to_i128().ok_or(DbError::Overflow)?;
+                    Ok(Value::Decimal(new_mantissa, new_scale))
+                }
                 other => Err(DbError::TypeMismatch {
                     expected: "numeric".into(),
                     got: other.variant_name().into(),
@@ -279,6 +293,13 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                 Value::Real(f) => {
                     let factor = 10f64.powi(d);
                     Ok(Value::Real((f * factor).trunc() / factor))
+                }
+                Value::Decimal(m, s) => {
+                    let new_scale = if d < 0 { 0u8 } else { (d as u8).min(s) };
+                    let digits_to_drop = s.saturating_sub(new_scale);
+                    let factor = 10i128.pow(digits_to_drop as u32);
+                    let new_mantissa = if m >= 0 { m / factor } else { -((-m) / factor) };
+                    Ok(Value::Decimal(new_mantissa, new_scale))
                 }
                 other => Err(DbError::TypeMismatch {
                     expected: "numeric".into(),

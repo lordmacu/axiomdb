@@ -128,15 +128,19 @@ fn decimal_exact_boundary_accepted() {
 }
 
 // ── Step 3: division precision + ROUND/TRUNC ─────────────────────────────────
+// Decimal literals like 1.2345 parse as Real, so we must load values through
+// DECIMAL columns to exercise the Decimal arms of these functions.
 
 #[test]
 fn decimal_division_produces_fractional_digits() {
     let (mut storage, mut txn) = common::setup();
-    let out = common::rows(common::run(
-        "SELECT 10.00 / 3.00",
+    common::run(
+        "CREATE TABLE t (a DECIMAL(10,2), b DECIMAL(10,2))",
         &mut storage,
         &mut txn,
-    ));
+    );
+    common::run("INSERT INTO t VALUES ('10.00', '3.00')", &mut storage, &mut txn);
+    let out = common::rows(common::run("SELECT a / b FROM t", &mut storage, &mut txn));
     match &out[0][0] {
         Value::Decimal(m, s) => {
             let f = *m as f64 / 10f64.powi(*s as i32);
@@ -152,8 +156,18 @@ fn decimal_division_produces_fractional_digits() {
 #[test]
 fn decimal_round_half_up_function() {
     let (mut storage, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (a DECIMAL(10,4), b DECIMAL(10,4), c DECIMAL(10,4))",
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        "INSERT INTO t VALUES ('1.2345', '1.2350', '1.2349')",
+        &mut storage,
+        &mut txn,
+    );
     let out = common::rows(common::run(
-        "SELECT ROUND(1.2345, 2), ROUND(1.2350, 2), ROUND(1.2349, 2)",
+        "SELECT ROUND(a, 2), ROUND(b, 2), ROUND(c, 2) FROM t",
         &mut storage,
         &mut txn,
     ));
@@ -165,8 +179,14 @@ fn decimal_round_half_up_function() {
 #[test]
 fn decimal_round_no_scale_arg() {
     let (mut storage, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (a DECIMAL(10,1), b DECIMAL(10,1), c DECIMAL(10,1))",
+        &mut storage,
+        &mut txn,
+    );
+    common::run("INSERT INTO t VALUES ('1.6', '1.4', '1.5')", &mut storage, &mut txn);
     let out = common::rows(common::run(
-        "SELECT ROUND(1.6), ROUND(1.4), ROUND(1.5)",
+        "SELECT ROUND(a), ROUND(b), ROUND(c) FROM t",
         &mut storage,
         &mut txn,
     ));
@@ -178,8 +198,14 @@ fn decimal_round_no_scale_arg() {
 #[test]
 fn decimal_trunc_function() {
     let (mut storage, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (a DECIMAL(10,3), b DECIMAL(10,3))",
+        &mut storage,
+        &mut txn,
+    );
+    common::run("INSERT INTO t VALUES ('1.999', '-1.999')", &mut storage, &mut txn);
     let out = common::rows(common::run(
-        "SELECT TRUNC(1.999, 1), TRUNC(1.999, 2), TRUNC(-1.999, 1)",
+        "SELECT TRUNC(a, 1), TRUNC(a, 2), TRUNC(b, 1) FROM t",
         &mut storage,
         &mut txn,
     ));
@@ -191,8 +217,10 @@ fn decimal_trunc_function() {
 #[test]
 fn decimal_truncate_alias() {
     let (mut storage, mut txn) = common::setup();
+    common::run("CREATE TABLE t (x DECIMAL(10,3))", &mut storage, &mut txn);
+    common::run("INSERT INTO t VALUES ('1.999')", &mut storage, &mut txn);
     let out = common::rows(common::run(
-        "SELECT TRUNCATE(1.999, 2)",
+        "SELECT TRUNCATE(x, 2) FROM t",
         &mut storage,
         &mut txn,
     ));
