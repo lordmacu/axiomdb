@@ -244,4 +244,44 @@ impl<'db> Appender<'db> {
         }
         Ok(())
     }
+
+    /// Flush remaining rows, commit the transaction, and consume the
+    /// Appender. Returns the total number of rows inserted across all
+    /// flushes during the Appender's lifetime.
+    ///
+    /// On error, the transaction is rolled back and the error returned —
+    /// the caller does NOT need to retry rollback separately.
+    pub fn finish(mut self) -> Result<u64, DbError> {
+        // Flush any remaining rows. On flush error, roll back the txn
+        // (we still own conn_txn) before propagating.
+        if let Err(e) = self.flush() {
+            if let Some(conn_txn) = self.conn_txn.take() {
+                let _ = self.db.txn.rollback(conn_txn, &self.db.storage);
+            }
+            return Err(e);
+        }
+        let conn_txn = self
+            .conn_txn
+            .take()
+            .expect("Appender::finish called twice");
+        // Immediate commit (we don't drive the fsync pipeline from the
+        // embedded fast path). The Attack 6 durability override stamped
+        // at open time controls fsync vs flush-only via WAL.
+        self.db.txn.commit(conn_txn)?;
+        // Drain post-commit page-batch state (mirrors
+        // commit_active_txn in exec_with_ctx.rs).
+        self.db.txn.drain_committed_page_batches(&self.db.storage)?;
+        Ok(self.rows_inserted)
+    }
+}
+
+impl Drop for Appender<'_> {
+    fn drop(&mut self) {
+        if let Some(conn_txn) = self.conn_txn.take() {
+            // Silent rollback. Errors here are unrecoverable from a Drop
+            // context (panicking would be worse). If the caller wanted
+            // commit semantics they should have called finish().
+            let _ = self.db.txn.rollback(conn_txn, &self.db.storage);
+        }
+    }
 }

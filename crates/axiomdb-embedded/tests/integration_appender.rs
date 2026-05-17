@@ -191,3 +191,84 @@ fn appender_flush_on_table_with_index_returns_unsupported() {
         "expected NotImplemented (Step 5 wires this), got {err:?}"
     );
 }
+
+// ── Step 4 — finish + Drop rollback ───────────────────────────────────────────
+
+#[test]
+fn finish_commits_and_returns_count() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 0..5 {
+        app.append_row(&[Value::Int(i), Value::Text(format!("row{i}"))])
+            .unwrap();
+    }
+    let n = app.finish().unwrap();
+    assert_eq!(n, 5);
+    // Rows are visible to subsequent queries on the same Db.
+    let rows = db.query("SELECT id, v FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0][0], Value::Int(0));
+    assert_eq!(rows[4][1], Value::Text("row4".into()));
+}
+
+#[test]
+fn finish_flushes_remaining_buffered_rows() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    // No explicit flush — finish() must flush before committing.
+    app.append_row(&[Value::Int(42)]).unwrap();
+    let n = app.finish().unwrap();
+    assert_eq!(n, 1);
+    let rows = db.query("SELECT id FROM t").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Int(42));
+}
+
+#[test]
+fn finish_with_no_appends_commits_empty_txn() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    let app = db.appender("t").unwrap();
+    let n = app.finish().unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(db.query("SELECT COUNT(*) FROM t").unwrap()[0][0], Value::BigInt(0));
+}
+
+#[test]
+fn drop_without_finish_rolls_back() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    {
+        let mut app = db.appender("t").unwrap();
+        app.append_row(&[Value::Int(1)]).unwrap();
+        app.append_row(&[Value::Int(2)]).unwrap();
+        // Drop without finish — txn rolled back; rows must NOT persist.
+    }
+    let count = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
+    assert_eq!(count, Value::BigInt(0));
+    // Subsequent appender works (no leaked txn state).
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(7)]).unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT id FROM t").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Int(7));
+}
+
+#[test]
+fn drop_after_partial_flush_rolls_back_remaining_buffer() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    {
+        let mut app = db.appender("t").unwrap();
+        app.append_row(&[Value::Int(1)]).unwrap();
+        app.flush().unwrap(); // row 1 written to heap, txn still open
+        app.append_row(&[Value::Int(2)]).unwrap(); // buffered, not flushed
+        // Drop here — rollback should undo BOTH the flushed row and the
+        // buffered row (the whole txn aborts).
+    }
+    let count = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
+    assert_eq!(count, Value::BigInt(0), "ALL rows including flushed ones roll back");
+}
