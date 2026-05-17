@@ -3,13 +3,17 @@
 //! Spec: `specs/fase-perf-sqlite-gap/spec-deferred-fsync.md`
 //! Plan: `specs/fase-perf-sqlite-gap/plan-deferred-fsync.md`
 //!
-//! Step 6.2 (this file at first): unit tests for the SessionDurability
-//! enum + parse_synchronous_setting + SessionContext getter/setter.
-//! Subsequent steps add end-to-end tests through the SET dispatcher
-//! and the autocommit wire-up.
+//! Step 6.2: unit tests for the SessionDurability enum +
+//! parse_synchronous_setting + SessionContext getter/setter.
+//! Step 6.3: end-to-end tests through the SET dispatcher and the
+//! autocommit wire-up in execute_with_ctx.
 
+mod common;
+
+use axiomdb_core::error::DbError;
 use axiomdb_sql::session::{parse_synchronous_setting, SessionDurability};
 use axiomdb_sql::SessionContext;
+use common::*;
 
 // ── Parser tests ──────────────────────────────────────────────────────────
 
@@ -155,4 +159,139 @@ fn session_durability_maps_to_wal_policy() {
         SessionDurability::Off.to_wal_policy(),
         WalDurabilityPolicy::Off
     );
+}
+
+// ── End-to-end SET dispatcher tests (Step 6.3) ────────────────────────────
+
+#[test]
+fn set_synchronous_through_dispatcher_updates_session() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    for (sql, expected) in [
+        ("SET synchronous = 'NORMAL'", SessionDurability::Normal),
+        ("SET synchronous = 'OFF'", SessionDurability::Off),
+        ("SET synchronous = 'STRICT'", SessionDurability::Strict),
+        ("SET synchronous = 'FULL'", SessionDurability::Strict),
+        ("SET synchronous = 'EXTRA'", SessionDurability::Strict),
+        ("SET synchronous = 'ON'", SessionDurability::Normal),
+        ("SET synchronous = DEFAULT", SessionDurability::Strict),
+    ] {
+        run_ctx(sql, &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+        assert_eq!(ctx.synchronous(), expected, "after: {sql}");
+    }
+}
+
+#[test]
+fn set_synchronous_numeric_form_through_dispatcher() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    for (sql, expected) in [
+        ("SET synchronous = 0", SessionDurability::Off),
+        ("SET synchronous = 1", SessionDurability::Normal),
+        ("SET synchronous = 2", SessionDurability::Normal),
+        ("SET synchronous = 3", SessionDurability::Strict),
+        ("SET synchronous = 4", SessionDurability::Strict),
+    ] {
+        run_ctx(sql, &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+        assert_eq!(ctx.synchronous(), expected, "after: {sql}");
+    }
+}
+
+#[test]
+fn set_synchronous_invalid_value_returns_error() {
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    let result = run_ctx(
+        "SET synchronous = 'banana'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    assert!(
+        matches!(result, Err(DbError::InvalidValue { .. })),
+        "expected InvalidValue, got {result:?}"
+    );
+    // Mode unchanged on error.
+    assert_eq!(ctx.synchronous(), SessionDurability::Strict);
+}
+
+#[test]
+fn set_synchronous_inside_explicit_txn_is_rejected() {
+    // SQLite analog: research/sqlite/src/pragma.c:1136-1138 — `PRAGMA
+    // synchronous` is rejected inside a transaction. The override is
+    // captured by `BEGIN` and frozen on the ConnectionTxn until the next
+    // BEGIN, so a mid-txn change would silently no-op.
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx("BEGIN", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    let result = run_ctx(
+        "SET synchronous = 'NORMAL'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    assert!(
+        matches!(&result, Err(DbError::InvalidValue { reason }) if reason.contains("transaction")),
+        "expected InvalidValue mentioning 'transaction', got {result:?}"
+    );
+    // Mode unchanged.
+    assert_eq!(ctx.synchronous(), SessionDurability::Strict);
+    // Cleanup: end the transaction so the txn manager isn't left dangling.
+    run_ctx("ROLLBACK", &mut storage, &mut txn, &mut bloom, &mut ctx).unwrap();
+    // After ROLLBACK, SET succeeds again.
+    run_ctx(
+        "SET synchronous = 'NORMAL'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(ctx.synchronous(), SessionDurability::Normal);
+}
+
+#[test]
+fn autocommit_insert_under_synchronous_normal_still_works() {
+    // Functional smoke: changing the durability mode must not break the
+    // autocommit INSERT path. The override is injected at txn.begin() via
+    // begin_session_txn; commit() in the WAL layer then routes through
+    // flush_no_sync() instead of commit_data_sync().
+    let (mut storage, mut txn, mut bloom, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "SET synchronous = 'NORMAL'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(ctx.synchronous(), SessionDurability::Normal);
+    // A plain autocommit INSERT must succeed.
+    run_ctx(
+        "INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    // And the data must be visible to a subsequent SELECT in the same session.
+    let res = run_ctx(
+        "SELECT id, v FROM t ORDER BY id",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    )
+    .unwrap();
+    let axiomdb_sql::QueryResult::Rows { rows, .. } = res else {
+        panic!("expected Rows, got {res:?}");
+    };
+    assert_eq!(rows.len(), 2, "INSERT under NORMAL should still persist");
 }

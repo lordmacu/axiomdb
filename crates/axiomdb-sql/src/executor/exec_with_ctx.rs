@@ -8,6 +8,33 @@ pub fn execute_with_ctx(
     execute_with_ctx_locked(stmt, storage, txn, bloom, None, ctx)
 }
 
+/// Attack 6: opens a `ConnectionTxn` and stamps it with the session's
+/// current `synchronous` durability override. Every `txn.begin()` site
+/// in `execute_with_ctx_locked` routes through here so `commit()` sees
+/// the per-session policy.
+#[inline]
+fn begin_session_txn(
+    txn: &TxnManager,
+    ctx: &SessionContext,
+) -> Result<axiomdb_wal::ConnectionTxn, DbError> {
+    let mut t = txn.begin()?;
+    t.durability_override = Some(ctx.synchronous().to_wal_policy());
+    Ok(t)
+}
+
+/// Like [`begin_session_txn`] but with an explicit isolation level
+/// (used by `BEGIN ... ISOLATION LEVEL ...`).
+#[inline]
+fn begin_session_txn_with_isolation(
+    txn: &TxnManager,
+    level: axiomdb_core::IsolationLevel,
+    ctx: &SessionContext,
+) -> Result<axiomdb_wal::ConnectionTxn, DbError> {
+    let mut t = txn.begin_with_isolation(level)?;
+    t.durability_override = Some(ctx.synchronous().to_wal_policy());
+    Ok(t)
+}
+
 /// Like [`execute_with_ctx`] but accepts an optional `LockManager` for
 /// row-level lock acquisition (Phase 40.11).
 pub fn execute_with_ctx_locked(
@@ -136,7 +163,7 @@ pub fn execute_with_ctx_locked(
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             txn.drain_committed_page_batches(storage)?;
             if let Some(lm) = lock_mgr { lm.release_all_for_txn(pre_tid); }
-            ctx.conn_txn = Some(txn.begin()?);
+            ctx.conn_txn = Some(begin_session_txn(txn, ctx)?);
             let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
             return match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                 Ok(result) => {
@@ -231,7 +258,7 @@ pub fn execute_with_ctx_locked(
         match stmt {
             Stmt::Begin => {
                 let level = ctx.effective_isolation();
-                ctx.conn_txn = Some(txn.begin_with_isolation(level)?);
+                ctx.conn_txn = Some(begin_session_txn_with_isolation(txn, level, ctx)?);
                 ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
@@ -252,7 +279,7 @@ pub fn execute_with_ctx_locked(
                 Err(DbError::NoActiveTransaction)
             }
             other => {
-                ctx.conn_txn = Some(txn.begin()?);
+                ctx.conn_txn = Some(begin_session_txn(txn, ctx)?);
                 // NOTE: `in_explicit_txn` is NOT set here — this is an implicit
                 // autocommit transaction. Single-statement INSERTs use the existing
                 // multi-row batch path inside execute_insert_ctx, not the staging buffer.
@@ -281,7 +308,7 @@ pub fn execute_with_ctx_locked(
     } else {
         match stmt {
             Stmt::Begin => {
-                ctx.conn_txn = Some(txn.begin()?);
+                ctx.conn_txn = Some(begin_session_txn(txn, ctx)?);
                 ctx.in_explicit_txn = true;
                 Ok(QueryResult::Empty)
             }
@@ -299,7 +326,7 @@ pub fn execute_with_ctx_locked(
                 Ok(QueryResult::Empty)
             }
             Stmt::Select(_) => {
-                ctx.conn_txn = Some(txn.begin()?);
+                ctx.conn_txn = Some(begin_session_txn(txn, ctx)?);
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(stmt, &exec_ctx2, ctx) {
                     Ok(result) => {
@@ -330,7 +357,7 @@ pub fn execute_with_ctx_locked(
                 }
             }
             other if is_ddl(&other) => {
-                ctx.conn_txn = Some(txn.begin()?);
+                ctx.conn_txn = Some(begin_session_txn(txn, ctx)?);
                 let exec_ctx2 = ExecutionContext::new(storage, txn, bloom, lock_mgr);
                 match dispatch_ctx(other, &exec_ctx2, ctx) {
                     Ok(result) => {
@@ -346,7 +373,7 @@ pub fn execute_with_ctx_locked(
                 }
             }
             other => {
-                ctx.conn_txn = Some(txn.begin()?);
+                ctx.conn_txn = Some(begin_session_txn(txn, ctx)?);
                 let sp_opt: Option<SessionSavepoint> = if ctx.on_error == OnErrorMode::Savepoint
                     || ctx.on_error == OnErrorMode::Ignore
                 {
