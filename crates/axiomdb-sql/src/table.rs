@@ -371,6 +371,12 @@ pub fn scan_clustered_table_masked(
 }
 
 /// Point lookup on a clustered B-tree by primary key bytes.
+///
+/// Wrapper that forwards to [`lookup_clustered_row_with_hint`] with no
+/// session hint — pays a full B-tree descent on every call. Hot-path
+/// callers (the SELECT executors) should pass their session hint slot
+/// via the `_with_hint` variant instead to skip the descent when the
+/// previous lookup landed on the same leaf.
 pub fn lookup_clustered_row(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
@@ -378,13 +384,39 @@ pub fn lookup_clustered_row(
     pk_key: &[u8],
     snap: TransactionSnapshot,
 ) -> Result<Option<(RecordId, Vec<Value>)>, DbError> {
+    lookup_clustered_row_with_hint(storage, table_def, columns, pk_key, snap, None)
+}
+
+/// Point lookup variant that consults / updates a per-session leaf
+/// hint (Attack 5 — `LeafCursorHint`). When the hint covers `pk_key`,
+/// skips the full B-tree descent and reads the cached leaf directly.
+pub fn lookup_clustered_row_with_hint(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    pk_key: &[u8],
+    snap: TransactionSnapshot,
+    hint: Option<&mut Option<axiomdb_storage::clustered_tree::LeafCursorHint>>,
+) -> Result<Option<(RecordId, Vec<Value>)>, DbError> {
     let col_types = column_data_types(columns);
-    match axiomdb_storage::clustered_tree::lookup(
-        storage,
-        Some(table_def.root_page_id),
-        pk_key,
-        &snap,
-    )? {
+    let row_opt = match hint {
+        Some(slot) => axiomdb_storage::clustered_tree::lookup_with_hint(
+            storage,
+            Some(table_def.root_page_id),
+            pk_key,
+            table_def.id,
+            table_def.schema_version,
+            slot,
+        )?
+        .filter(|r| r.row_header.is_visible(&snap)),
+        None => axiomdb_storage::clustered_tree::lookup(
+            storage,
+            Some(table_def.root_page_id),
+            pk_key,
+            &snap,
+        )?,
+    };
+    match row_opt {
         Some(row) => {
             let values = decode_row(&row.row_data, &col_types)?;
             Ok(Some((CLUSTERED_DUMMY_RID, values)))

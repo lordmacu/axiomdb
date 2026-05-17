@@ -589,12 +589,15 @@ fn execute_select_ctx(
             {
                 // ── Clustered PK point lookup (Phase 39.15) ──────────────────
                 // Direct B-tree search returns full row inline — no heap fetch.
-                match crate::table::lookup_clustered_row(
+                // Attack 5: pass the session's leaf hint so consecutive PK
+                // lookups in the same leaf skip the descent.
+                match crate::table::lookup_clustered_row_with_hint(
                     storage,
                     &resolved.def,
                     &resolved.columns,
                     key,
                     snap,
+                    Some(ctx.clustered_leaf_hint_slot()),
                 )? {
                     Some(pair) => vec![pair],
                     None => vec![],
