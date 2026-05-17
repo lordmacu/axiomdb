@@ -650,7 +650,10 @@ pub struct ClusteredInsertBatch {
     pub table_id: u32,
     pub table_def: TableDef,
     pub columns: Vec<ColumnDef>,
-    pub primary_idx: IndexDef,
+    /// Wrapped in `Arc` so per-statement reuse is an atomic increment
+    /// instead of a full `IndexDef` clone (which allocates its inner
+    /// `Vec<IndexColumnDef>` and predicate string). See Attack 3.B Step 2.
+    pub primary_idx: std::sync::Arc<IndexDef>,
     pub secondary_indexes: Vec<IndexDef>,
     pub secondary_layouts: Vec<ClusteredSecondaryLayout>,
     pub compiled_preds: Vec<Option<Expr>>,

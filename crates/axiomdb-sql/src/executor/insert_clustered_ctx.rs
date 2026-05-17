@@ -338,9 +338,10 @@ fn enqueue_clustered_insert_ctx(
 
     // Initialize batch if none exists yet for this table.
     if ctx.clustered_insert_batch.is_none() {
-        let primary_idx =
+        let primary_idx = std::sync::Arc::new(
             crate::clustered_table::primary_index(&resolved.indexes, &resolved.def.table_name)?
-                .clone();
+                .clone(),
+        );
         let secondary_indexes: Vec<IndexDef> = resolved
             .indexes
             .iter()
@@ -369,14 +370,12 @@ fn enqueue_clustered_insert_ctx(
         });
     }
 
-    // Clone primary_idx to avoid a simultaneous borrow conflict with ctx when
-    // calling prepare_row_with_ctx (which takes &mut ctx).
-    let primary_idx = ctx
-        .clustered_insert_batch
-        .as_ref()
-        .unwrap()
-        .primary_idx
-        .clone();
+    // Cheap Arc::clone (atomic increment) to drop the borrow on ctx before
+    // the per-row loop calls prepare_row_with_ctx (which takes &mut ctx).
+    // Replaces a full IndexDef clone (which would allocate Vec<IndexColumnDef>).
+    let primary_idx = std::sync::Arc::clone(
+        &ctx.clustered_insert_batch.as_ref().unwrap().primary_idx,
+    );
 
     let col_positions =
         build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
