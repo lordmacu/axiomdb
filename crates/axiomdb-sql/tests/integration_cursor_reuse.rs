@@ -26,9 +26,7 @@ fn fake_hint(table_id: u32, root: u64, leaf: u64, version: u64) -> LeafCursorHin
 fn leaf_hint_starts_absent() {
     let ctx = SessionContext::default();
     assert!(!ctx.clustered_leaf_hint_present());
-    assert!(ctx
-        .get_clustered_leaf_hint(1, 100, 1, &[10u8])
-        .is_none());
+    assert!(ctx.get_clustered_leaf_hint(1, 100, 1, &[10u8]).is_none());
 }
 
 #[test]
@@ -50,17 +48,11 @@ fn leaf_hint_get_returns_none_on_mismatches() {
     ctx.set_clustered_leaf_hint(fake_hint(1, 100, 200, 1));
 
     // Different table_id.
-    assert!(ctx
-        .get_clustered_leaf_hint(2, 100, 1, &[10u8])
-        .is_none());
+    assert!(ctx.get_clustered_leaf_hint(2, 100, 1, &[10u8]).is_none());
     // Different root.
-    assert!(ctx
-        .get_clustered_leaf_hint(1, 999, 1, &[10u8])
-        .is_none());
+    assert!(ctx.get_clustered_leaf_hint(1, 999, 1, &[10u8]).is_none());
     // Different schema_version (DDL bump).
-    assert!(ctx
-        .get_clustered_leaf_hint(1, 100, 2, &[10u8])
-        .is_none());
+    assert!(ctx.get_clustered_leaf_hint(1, 100, 2, &[10u8]).is_none());
     // Key outside [min_key=[0], max_key=[255]] — use 2-byte key to force
     // a comparison that returns out-of-range.
     assert!(ctx

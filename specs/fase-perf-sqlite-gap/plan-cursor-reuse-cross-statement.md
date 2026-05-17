@@ -3,7 +3,9 @@
 Phase: perf-sqlite-gap — close embedded gap with SQLite
 Task: Attack 5 — last-touched clustered leaf hint
 Spec: specs/fase-perf-sqlite-gap/spec-cursor-reuse-cross-statement.md
-Status: in-progress
+Status: done (cursor reuse correctness verified at 100% hit rate;
+bench perf budget NOT met due to orthogonal bottlenecks documented
+in docs/perf-sqlite-gap.md "Attack 5" section)
 
 ## Summary
 

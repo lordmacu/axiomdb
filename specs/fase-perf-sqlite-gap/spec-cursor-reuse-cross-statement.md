@@ -4,7 +4,9 @@ Phase: perf-sqlite-gap — close embedded gap with SQLite
 Task: Attack 5 — cache the most-recently-touched clustered leaf on
 `SessionContext`; skip the B-tree descent when the next key falls in
 that leaf's range
-Status: approved
+Status: implemented (cursor reuse 100% hit rate verified; bench numbers
+masked by orthogonal bottlenecks — fsync per autocommit + bench's
+distributed point-lookup pattern. See plan close section + docs.)
 
 ## Context
 

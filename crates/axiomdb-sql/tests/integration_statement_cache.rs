@@ -15,11 +15,7 @@ use axiomdb_sql::{
 
 #[test]
 fn extract_then_substitute_roundtrips_simple_insert() {
-    let original = parse(
-        "INSERT INTO t VALUES (1, 'hello', 3.14, TRUE, NULL)",
-        None,
-    )
-    .unwrap();
+    let original = parse("INSERT INTO t VALUES (1, 'hello', 3.14, TRUE, NULL)", None).unwrap();
     let mut stmt = original.clone();
     let extracted = extract_literals(&mut stmt);
     assert_eq!(
@@ -33,11 +29,7 @@ fn extract_then_substitute_roundtrips_simple_insert() {
 
 #[test]
 fn extract_handles_select_where_binary_op() {
-    let original = parse(
-        "SELECT id FROM t WHERE id = 42 AND name = 'alice'",
-        None,
-    )
-    .unwrap();
+    let original = parse("SELECT id FROM t WHERE id = 42 AND name = 'alice'", None).unwrap();
     let mut stmt = original.clone();
     let extracted = extract_literals(&mut stmt);
     assert_eq!(extracted.len(), 2);
@@ -47,11 +39,7 @@ fn extract_handles_select_where_binary_op() {
 
 #[test]
 fn extract_handles_multi_row_values() {
-    let original = parse(
-        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        None,
-    )
-    .unwrap();
+    let original = parse("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')", None).unwrap();
     let mut stmt = original.clone();
     let extracted = extract_literals(&mut stmt);
     assert_eq!(extracted.len(), 6, "3 rows × 2 cols");

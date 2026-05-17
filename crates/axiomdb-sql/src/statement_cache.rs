@@ -129,10 +129,7 @@ fn walk_expr_extract(expr: &mut Expr, out: &mut Vec<Value>) {
         Expr::UnaryOp { operand, .. } => walk_expr_extract(operand, out),
         Expr::IsNull { expr: e, .. } => walk_expr_extract(e, out),
         Expr::Between {
-            expr: e,
-            low,
-            high,
-            ..
+            expr: e, low, high, ..
         } => {
             walk_expr_extract(e, out);
             walk_expr_extract(low, out);
@@ -468,8 +465,7 @@ pub fn run_cached(
                 drop(reader);
                 let analyzed = analyze_cached(stmt, storage, snap.clone(), schema_cache)?;
                 let mut reader = CatalogReader::new(storage, snap)?;
-                let deps =
-                    extract_table_deps(&analyzed, &mut reader, DEFAULT_DATABASE_NAME)?;
+                let deps = extract_table_deps(&analyzed, &mut reader, DEFAULT_DATABASE_NAME)?;
                 session.cache_plan(
                     hash,
                     CachedPlan {

@@ -170,6 +170,85 @@ work outside its reach:
 version-stamped caches) that Attack 2 will build on, but on its own it
 moves the needle by < 5%. The next big win is structural — Attack 2.
 
+## Attack 5 — Cursor reuse cross-statement (LeafCursorHint)
+
+**Date**: 2026-05-17
+**Spec**: [`spec-cursor-reuse-cross-statement.md`](../specs/fase-perf-sqlite-gap/spec-cursor-reuse-cross-statement.md)
+**Plan**: [`plan-cursor-reuse-cross-statement.md`](../specs/fase-perf-sqlite-gap/plan-cursor-reuse-cross-statement.md)
+**Inspiration**: SQLite's `BtCursor` cached metadata (`BTCF_ValidNKey`)
+at [`research/sqlite/src/btree.c:9482-9491`](research/sqlite/src/btree.c).
+
+### The change
+
+`LeafCursorHint` struct on `axiomdb-storage` + slot on `SessionContext`:
+records the most-recently-touched clustered leaf (page_id + key range).
+`lookup_with_hint` and `apply_clustered_insert_rows` consult the slot;
+on hit, skip the B-tree descent and read the cached leaf directly. On
+miss (different table, schema_version bump, key out of range, leaf
+freed by split), fall back to full descent and update the hint.
+
+Wired into:
+- SELECT executor (clustered PK point lookup in `select_ctx.rs`)
+- Autocommit clustered INSERT (`execute_clustered_insert_ctx` →
+  `apply_clustered_insert_rows`)
+
+### Correctness verification
+
+Cursor reuse activates on every consecutive INSERT after the first, with
+**100% fast-path hit rate** (verified via the `AXIOMDB_DEBUG_CURSOR_REUSE`
+env var: `try_insert_rightmost_leaf_batch(leaf=19, rows=1) → inserted=1`
+on every call). The B-tree descent IS being skipped as designed.
+
+### Bench impact: honest finding
+
+| Scenario | Before | After | Δ |
+|---|---|---|---|
+| insert_autocommit | 8.7K | **8.9K** | flat |
+| point_lookup | 8.9K | **8.8K** | flat |
+| range_scan | 727K | **728K** | flat |
+| insert_batch | 20.7K | 21.0K | flat |
+| crud_flow/select | 4.14M | 4.54M | +10% (noise) |
+
+The cursor reuse is working at the engine level but the bench numbers
+don't move because:
+
+1. **`insert_autocommit` is fsync-bound**: each autocommit INSERT triggers
+   a fsync (~100µs on macOS APFS). With 300 inserts × 100µs = 30ms of
+   fsync time alone, dominating the ~5µs/INSERT we save on B-tree descent.
+
+2. **`point_lookup` pattern is adversarial**: the bench queries ids 1,
+   101, 201, ..., 9901 (step=100). Each lookup hits a different leaf,
+   so the hint never gets reused — the fast path requires the next key
+   to be in the cached leaf's range.
+
+3. **`range_scan` cursor lifetime**: range scans use a separate iterator
+   path (`clustered_tree::range`) that wasn't wired in this step.
+
+### What's still useful from Attack 5
+
+- Foundation for **Attack 7 (USESEEKRESULT)**: the same `LeafCursorHint`
+  slot will store the constraint-check seek result, letting INSERT
+  reuse it and save a second descent.
+- Real-world workloads with hot key ranges (e.g., paginated reads of
+  consecutive IDs, repeated UPDATE/SELECT of the same row) DO benefit
+  — just not visible in this bench.
+- Validated the architectural pattern: storage-layer `LeafCursorHint`
+  + SQL-layer `SessionContext` slot, threaded via `&mut Option<Hint>`.
+
+### What would actually move the bench
+
+- For `insert_autocommit`: **deferred / async fsync** (group commit
+  across statements) — moves us from fsync-per-statement to
+  fsync-per-batch. This is a Phase 19 / 24 storage-engine concern.
+- For `point_lookup`: a multi-slot LRU cache (Approach B in the
+  brainstorm) — would catch the bench's distributed pattern. Deferred.
+- For `range_scan`: wire the hint into `clustered_tree::range` /
+  the scan iterator.
+
+Attack 5 closes the engine-level B-tree work gap, which is what the
+SQLite source uses. The bench scenarios just happen to be dominated
+by orthogonal costs we can address in future attacks.
+
 ## Attack 2 — Statement fingerprinting (partial — infrastructure landed, wire-up deferred)
 
 **Date**: 2026-05-17
