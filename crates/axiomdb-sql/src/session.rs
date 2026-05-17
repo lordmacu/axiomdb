@@ -690,6 +690,14 @@ pub struct SessionContext {
     /// shape (when the INSERT has no column list). Other shapes hash the
     /// column-name list with `DefaultHasher`.
     insert_col_positions: HashMap<(u32, u64), (u64, Vec<usize>)>,
+    /// Attack 2 (statement-fingerprinting): cached `CachedPlan` keyed by
+    /// `shape_hash`. Value is `(plan, lru_seq)`. Capacity capped at
+    /// `STATEMENT_CACHE_MAX_ENTRIES`; eviction picks min seq on insert
+    /// over capacity. Staleness handled lazily on lookup via
+    /// `PlanDeps::is_stale`.
+    statement_cache: HashMap<u64, (crate::statement_cache::CachedPlan, u64)>,
+    /// Monotonically increasing sequence counter for `statement_cache` LRU.
+    statement_lru_seq: u64,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -845,6 +853,8 @@ impl SessionContext {
             cache: HashMap::new(),
             heap_tail: HashMap::new(),
             insert_col_positions: HashMap::new(),
+            statement_cache: HashMap::new(),
+            statement_lru_seq: 0,
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,
@@ -1186,6 +1196,72 @@ impl SessionContext {
     /// Diagnostic / test accessor for the cache size.
     pub fn insert_col_positions_count(&self) -> usize {
         self.insert_col_positions.len()
+    }
+
+    // ── Statement cache (Attack 2 — auto-prepared statements) ─────────────────
+
+    /// Returns the cached plan for `shape_hash` only if its `PlanDeps`
+    /// are still valid against the live catalog.
+    ///
+    /// Stale entries are lazy-evicted on lookup (removed from the cache
+    /// and returned as `None`), reusing the existing version-check pattern.
+    ///
+    /// On hit, the entry's LRU sequence is bumped so it survives longer.
+    pub fn get_cached_plan(
+        &mut self,
+        shape_hash: u64,
+        reader: &mut axiomdb_catalog::CatalogReader<'_>,
+    ) -> Result<Option<&crate::statement_cache::CachedPlan>, DbError> {
+        // Step 1: validate deps (immutable borrow on the entry, no LRU bump yet).
+        let stale = match self.statement_cache.get(&shape_hash) {
+            None => return Ok(None),
+            Some((plan, _)) => plan.deps.is_stale(reader)?,
+        };
+        if stale {
+            self.statement_cache.remove(&shape_hash);
+            return Ok(None);
+        }
+        // Step 2: bump LRU + return.
+        self.statement_lru_seq += 1;
+        if let Some((_, seq)) = self.statement_cache.get_mut(&shape_hash) {
+            *seq = self.statement_lru_seq;
+        }
+        Ok(self.statement_cache.get(&shape_hash).map(|(p, _)| p))
+    }
+
+    /// Inserts a compiled plan into the cache, evicting the oldest entry
+    /// (by LRU sequence) if at capacity. Capacity is
+    /// `STATEMENT_CACHE_MAX_ENTRIES` (see `statement_cache` module).
+    pub fn cache_plan(&mut self, shape_hash: u64, plan: crate::statement_cache::CachedPlan) {
+        if self.statement_cache.len() >= crate::statement_cache::STATEMENT_CACHE_MAX_ENTRIES
+            && !self.statement_cache.contains_key(&shape_hash)
+        {
+            // Linear scan for min seq. At cap = 256 this is sub-µs and avoids
+            // the complexity of a LinkedHashMap or LRU crate. Profile-driven
+            // upgrade later if it ever shows up.
+            if let Some(&oldest_key) = self
+                .statement_cache
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(k, _)| k)
+            {
+                self.statement_cache.remove(&oldest_key);
+            }
+        }
+        self.statement_lru_seq += 1;
+        self.statement_cache
+            .insert(shape_hash, (plan, self.statement_lru_seq));
+    }
+
+    /// Diagnostic / test accessor for the statement cache size.
+    pub fn statement_cache_count(&self) -> usize {
+        self.statement_cache.len()
+    }
+
+    /// Clears the statement cache. Used by tests and by any DDL path
+    /// that wants to force a cold start.
+    pub fn invalidate_statement_cache(&mut self) {
+        self.statement_cache.clear();
     }
 
     // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────

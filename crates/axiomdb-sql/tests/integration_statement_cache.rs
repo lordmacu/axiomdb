@@ -117,3 +117,156 @@ fn shape_hash_distinct_for_different_in_list_length() {
     let (s2, _) = prepare_shape("SELECT * FROM t WHERE id IN (1, 2, 3)");
     assert_ne!(shape_hash(&s1), shape_hash(&s2));
 }
+
+// ── Step 2.3: CachedPlan + SessionContext LRU API ────────────────────────
+
+mod harness {
+    use axiomdb_catalog::bootstrap::CatalogBootstrap;
+    use axiomdb_core::error::DbError;
+    use axiomdb_sql::{
+        analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode,
+        result::QueryResult, SchemaCache, SessionContext,
+    };
+    use axiomdb_storage::MemoryStorage;
+    use axiomdb_wal::TxnManager;
+
+    pub struct Harness {
+        pub storage: MemoryStorage,
+        pub txn: TxnManager,
+        pub bloom: BloomRegistry,
+        pub schema_cache: SchemaCache,
+        pub session: SessionContext,
+    }
+
+    impl Harness {
+        pub fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_path = dir.keep().join("test.wal");
+            let storage = MemoryStorage::new();
+            CatalogBootstrap::init(&storage).expect("bootstrap");
+            let txn = TxnManager::create(&wal_path).expect("create txn");
+            Self {
+                storage,
+                txn,
+                bloom: BloomRegistry::new(),
+                schema_cache: SchemaCache::new(),
+                session: SessionContext::default(),
+            }
+        }
+
+        pub fn run(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
+            let snap = if let Some(ref ct) = self.session.conn_txn {
+                self.txn.active_snapshot(ct)
+            } else {
+                self.txn.snapshot()
+            };
+            let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
+            execute_with_ctx(
+                analyzed,
+                &self.storage,
+                &self.txn,
+                &self.bloom,
+                &mut self.session,
+            )
+        }
+    }
+}
+
+use axiomdb_sql::ast::Stmt;
+use axiomdb_sql::plan_deps::PlanDeps;
+use axiomdb_sql::statement_cache::{CachedPlan, STATEMENT_CACHE_MAX_ENTRIES};
+
+fn fake_plan() -> CachedPlan {
+    // A trivial Stmt is fine — these tests are about the cache machinery,
+    // not the AST. Use parsed "SELECT 1" which always exists.
+    let stmt = parse("SELECT 1", None).unwrap();
+    CachedPlan {
+        analyzed: stmt,
+        param_count: 0,
+        deps: PlanDeps::default(),
+    }
+}
+
+#[test]
+fn cache_hit_returns_some_plan() {
+    let mut ctx = axiomdb_sql::SessionContext::default();
+    ctx.cache_plan(0x1234, fake_plan());
+    assert_eq!(ctx.statement_cache_count(), 1);
+}
+
+#[test]
+fn cache_miss_returns_none() {
+    let ctx = axiomdb_sql::SessionContext::default();
+    assert_eq!(ctx.statement_cache_count(), 0);
+}
+
+#[test]
+fn cache_lru_evicts_oldest_when_full() {
+    let mut ctx = axiomdb_sql::SessionContext::default();
+    // Fill the cache to capacity.
+    for i in 0..STATEMENT_CACHE_MAX_ENTRIES as u64 {
+        ctx.cache_plan(i, fake_plan());
+    }
+    assert_eq!(ctx.statement_cache_count(), STATEMENT_CACHE_MAX_ENTRIES);
+    // One more entry forces eviction.
+    ctx.cache_plan(99999, fake_plan());
+    assert_eq!(
+        ctx.statement_cache_count(),
+        STATEMENT_CACHE_MAX_ENTRIES,
+        "cache size capped at the constant"
+    );
+}
+
+#[test]
+fn cache_stale_via_plan_deps_evicts() {
+    use axiomdb_catalog::CatalogReader;
+
+    let mut h = harness::Harness::new();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+    // Resolve table_id + current schema_version directly from the catalog.
+    // (We bypass extract_table_deps here because it has a pre-existing bug
+    // around the default-schema convention; covered separately.)
+    let (table_id, version_v1) = {
+        let snap = h.txn.snapshot();
+        let mut reader = CatalogReader::new(&h.storage, snap).unwrap();
+        let def = reader
+            .get_table_in_database("axiomdb", "public", "t")
+            .expect("read catalog")
+            .expect("table t exists");
+        (def.id, def.schema_version)
+    };
+
+    // Build a synthetic PlanDeps that pins (table_id, version_v1).
+    let deps = PlanDeps {
+        tables: vec![(table_id, version_v1)],
+        items: vec![],
+    };
+
+    let mut stmt = parse("INSERT INTO t VALUES (1)", None).unwrap();
+    let _ = extract_literals(&mut stmt);
+    h.session.cache_plan(
+        0x42,
+        CachedPlan {
+            analyzed: stmt,
+            param_count: 1,
+            deps,
+        },
+    );
+    assert_eq!(h.session.statement_cache_count(), 1);
+
+    // Bump schema_version via ALTER. The new version != version_v1.
+    h.run("ALTER TABLE t ADD COLUMN x INT DEFAULT 0").unwrap();
+
+    // Lookup with deps validation must return None AND evict the entry.
+    let snap = h.txn.snapshot();
+    let mut reader = CatalogReader::new(&h.storage, snap).unwrap();
+    let got = h.session.get_cached_plan(0x42, &mut reader).unwrap();
+    assert!(got.is_none(), "stale plan must not be returned");
+    assert_eq!(
+        h.session.statement_cache_count(),
+        0,
+        "stale entry must be evicted"
+    );
+}

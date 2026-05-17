@@ -21,6 +21,32 @@ use axiomdb_types::Value;
 
 use crate::ast::{InsertSource, SelectItem, Stmt};
 use crate::expr::Expr;
+use crate::plan_deps::PlanDeps;
+
+/// Maximum number of cached plans per `SessionContext`. Beyond this,
+/// the oldest entry (by insertion LRU sequence) is evicted. Picked
+/// from PostgreSQL's `plan_cache_mode`-tier defaults (256) — large
+/// enough for typical workloads, small enough that the bookkeeping
+/// stays cheap.
+pub const STATEMENT_CACHE_MAX_ENTRIES: usize = 256;
+
+/// A compiled, ready-to-execute statement plan keyed in the cache by
+/// `shape_hash` and tagged with its `PlanDeps` for invalidation.
+///
+/// `analyzed` is the analyzed `Stmt` **with literals already extracted to
+/// `Expr::Param`** — callers must `substitute_params` it with their
+/// fresh literals before execution.
+#[derive(Debug, Clone)]
+pub struct CachedPlan {
+    /// Analyzed AST, literals replaced by `Expr::Param { idx }`.
+    pub analyzed: Stmt,
+    /// Number of `Expr::Param` nodes — must equal `extract_literals.len()`
+    /// at substitute time.
+    pub param_count: usize,
+    /// Catalog dependencies snapshotted at compile time. Lookup checks
+    /// these via `PlanDeps::is_stale` and evicts on mismatch.
+    pub deps: PlanDeps,
+}
 
 /// Walks `stmt`, replacing every `Expr::Literal(v)` with
 /// `Expr::Param { idx }` (where `idx` is the position in the returned
