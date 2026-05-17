@@ -304,3 +304,111 @@ Two options:
 Goal: close to within 5× of SQLite on all scenarios before the embedded
 `v0.5.0-alpha` release. Current INSERT gap is 50×, SELECT gap is 4-9×.
 The SELECT side is closer to ready.
+
+---
+
+## Attack 6 — Deferred fsync via `SET synchronous` (2026-05-17)
+
+### Why this matters: the bench was not apples-to-apples
+
+While reviewing the SQLite source for the `insert_autocommit` gap, we
+discovered the comparison was fundamentally unfair on durability:
+
+- **SQLite bench** sets `PRAGMA synchronous=NORMAL` at startup
+  (`axiomdb_bench/src/main.rs:464` — present from the first `--compare`
+  run).
+- **AxiomDB bench** used the engine's default, which is
+  `WalDurabilityPolicy::Strict` — `fsync` per commit.
+
+For autocommit (1 commit per row), each row paid the full fsync cost on
+AxiomDB while SQLite paid only a `flush()`. The bench measured AxiomDB's
+*conservative default* against SQLite's *tuned default*, not the engines
+themselves.
+
+SQLite's `pager.c:3590-3611` documents the contract: at
+`synchronous=NORMAL` in WAL mode, recent commits may be lost on OS
+crash but the database stays internally consistent.
+
+### The change
+
+1. `WalDurabilityPolicy` already existed in `axiomdb-storage` and was
+   honored by `TxnManager::commit`. The TxnManager carried a single
+   policy for the whole instance.
+2. **`ConnectionTxn.durability_override: Option<WalDurabilityPolicy>`** —
+   per-transaction slot. When set, `commit()` uses it; otherwise falls
+   back to the instance default. Per-connection, not per-instance: one
+   bulk-loader connection can run at NORMAL while transactional traffic
+   stays at STRICT.
+3. **`SessionDurability` enum + `parse_synchronous_setting()`** mirror
+   SQLite's PRAGMA synchronous:
+   ```sql
+   SET synchronous = 'STRICT';   -- default; fsync per commit
+   SET synchronous = 'NORMAL';   -- flush only (SQLite NORMAL in WAL mode)
+   SET synchronous = 'OFF';      -- no flush
+   SET synchronous = DEFAULT;    -- reset to STRICT
+   ```
+   Parser also accepts SQLite aliases (`FULL`, `EXTRA`, `ON`) and
+   numeric forms (`0`..`4`) for migration compatibility.
+4. SET dispatcher rejects `synchronous` inside an open transaction
+   (mirrors `research/sqlite/src/pragma.c:1136-1138`): the override is
+   captured by `BEGIN` and frozen on `ConnectionTxn`, so a mid-txn
+   change would silently no-op until the next BEGIN.
+5. All 7 `txn.begin()` sites in `exec_with_ctx` routed through tiny
+   helpers (`begin_session_txn`, `begin_session_txn_with_isolation`)
+   that stamp the override at every BEGIN — autocommit, DDL, explicit
+   BEGIN, SELECT, all paths.
+6. **Bench**: `axiomdb_bench::db_open` now issues
+   `SET synchronous = 'NORMAL'` immediately after `Db::open` so AxiomDB
+   matches SQLite's setup.
+
+### Results — Lima VM virtio disk (2026-05-17)
+
+Run: `axiomdb_bench --scenario insert_autocommit --rows 5000`, 3
+iterations each:
+
+| Mode                          | Throughput      | Notes                                    |
+|-------------------------------|-----------------|------------------------------------------|
+| STRICT (fsync per commit)     | ~2.9K ops/s     | Baseline: AxiomDB's conservative default |
+| NORMAL (flush only)           | ~4.9K ops/s     | After Attack 6 + bench fairness          |
+
+**Speedup**: 1.65× on Lima's virtio-backed disk.
+
+Lima's fsync is unusually cheap (~50 µs) compared to SSDs
+(~250 µs – 1 ms) or spinning disks (5 – 10 ms). On the project's
+canonical Docker bench infrastructure (real block storage), the gain
+is expected to be larger. The spec target of `~50 – 100K rows/s`
+requires the Docker validation run.
+
+Even on Lima, the *bench fairness* fix is critical: previously the
+comparison was AxiomDB-STRICT vs SQLite-NORMAL, which inflated the gap
+artificially. The 1.65× gain confirms the wire-up is correct.
+
+### Cross-path impact
+
+`--diagnose-insert` (5000 rows, BEGIN/COMMIT batch, Lima):
+
+```
+parse_with_sql_mode      4.40 µs ( 2.7%)
+txn.snapshot             0.04 µs ( 0.0%)
+analyze_cached           0.81 µs ( 0.5%)
+execute_with_ctx       157.55 µs (96.8%)
+COMMIT (fsync, amortized over batch)  5 µs/row
+```
+
+For batch INSERT the fsync cost is amortized to ~5 µs/row. The 96.8%
+spent in `execute_with_ctx` is what Attacks 3.A/3.B/2/5 (and any future
+attacks) need to chip away at. Attack 6 ensures the *commit* part of
+the budget matches SQLite.
+
+### What's next
+
+Attack 6 closes the durability fairness issue. The remaining gap on
+`insert_autocommit` (Lima: AxiomDB ~5K vs SQLite ~80K, both at NORMAL)
+is now firmly in the executor hot path, not in the WAL. Continue with:
+
+- **Validate on Docker bench** — confirm the gain is larger on real
+  block storage and update the table above.
+- **Attack 7 candidate** — find the dominant cost inside
+  `execute_with_ctx` (96.8% per `--diagnose-insert`). Likely
+  candidates: per-row plan substitution, ResolvedTable build, INSERT
+  row codec.

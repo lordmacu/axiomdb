@@ -4,7 +4,7 @@ Phase: perf-sqlite-gap
 Task: Attack 6 — expose `SET synchronous = STRICT|NORMAL|OFF` and make
 the bench apples-to-apples
 Spec: specs/fase-perf-sqlite-gap/spec-deferred-fsync.md
-Status: in-progress
+Status: done
 
 ## Summary
 

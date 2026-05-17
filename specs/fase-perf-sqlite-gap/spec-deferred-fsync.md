@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap — close embedded gap with SQLite
 Task: Attack 6 — expose per-session durability mode via `SET synchronous`;
 make the comparison bench apples-to-apples
-Status: approved
+Status: implemented
 
 ## Context
 
