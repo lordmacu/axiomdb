@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap — close embedded INSERT gap with SQLite
 Task: A — `ResolvedTable` cache validated by `schema_version`
 Spec: specs/fase-perf-sqlite-gap/spec-insert-setup-dedup-A.md
-Status: in-progress
+Status: done (A.1 implemented; A.2 deferred — see Step 4)
 
 ## Summary
 

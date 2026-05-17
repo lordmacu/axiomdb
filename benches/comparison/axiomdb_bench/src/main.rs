@@ -280,8 +280,8 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
 fn diagnose_insert(data_dir: &Path, n_rows: usize) {
     use axiomdb_catalog::bootstrap::CatalogBootstrap;
     use axiomdb_sql::{
-        analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode,
-        SchemaCache, SessionContext,
+        analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode, SchemaCache,
+        SessionContext,
     };
     use axiomdb_storage::MmapStorage;
     use axiomdb_wal::TxnManager;
@@ -906,8 +906,8 @@ fn main() {
 fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
     use axiomdb_catalog::bootstrap::CatalogBootstrap;
     use axiomdb_sql::{
-        analyze_cached, bench_timings, bloom::BloomRegistry, execute_with_ctx,
-        parse_with_sql_mode, SchemaCache, SessionContext,
+        analyze_cached, bench_timings, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode,
+        SchemaCache, SessionContext,
     };
     use axiomdb_storage::MmapStorage;
     use axiomdb_wal::TxnManager;
@@ -1015,7 +1015,12 @@ fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
     eprintln!("║  Phase                              µs/row      % of measured    ║");
     eprintln!("║  ──────────────────────────────────────────────────────────      ║");
     for (name, ns) in &measured {
-        eprintln!("║  {:<32} {}    {}        ║", name, fmt_us(*ns), pct(*ns, total));
+        eprintln!(
+            "║  {:<32} {}    {}        ║",
+            name,
+            fmt_us(*ns),
+            pct(*ns, total)
+        );
     }
     eprintln!("║  ──────────────────────────────────────────────────────────      ║");
     eprintln!(

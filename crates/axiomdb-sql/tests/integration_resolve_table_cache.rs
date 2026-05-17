@@ -145,7 +145,8 @@ fn cached_inside_txn_after_first_insert() {
     // After this change: the first INSERT populates the cache; the next 99
     // hit it (validated by schema_version). cached_count() == 1.
     let mut h = harness::Harness::new();
-    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     h.run("BEGIN").unwrap();
 
     let before = h.session.cached_count();
@@ -205,7 +206,11 @@ fn alter_table_mid_txn_forces_re_resolve() {
     h.run("INSERT INTO t(id, x) VALUES (2, 99)").unwrap();
     let values = select_int_col(&mut h, "SELECT x FROM t WHERE id=2");
     h.run("COMMIT").unwrap();
-    assert_eq!(values, vec![99], "post-ALTER INSERT must see the new column");
+    assert_eq!(
+        values,
+        vec![99],
+        "post-ALTER INSERT must see the new column"
+    );
 }
 
 #[test]
@@ -246,7 +251,8 @@ fn drop_index_mid_txn_forces_re_resolve() {
             integration_delete_apply::test_bulk_delete_savepoint_rollback_restores_data"]
 fn truncate_mid_txn_keeps_cache_logically_consistent() {
     let mut h = harness::Harness::new();
-    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     h.run("INSERT INTO t VALUES (1, 'before')").unwrap();
     h.run("BEGIN").unwrap();
     h.run("TRUNCATE TABLE t").unwrap();
@@ -261,7 +267,8 @@ fn bulk_delete_mid_txn_keeps_data_consistent() {
     // Bulk DELETE rotates the heap root (which now bumps schema_version).
     // Cache is correctly invalidated; subsequent INSERT goes to the new root.
     let mut h = harness::Harness::new();
-    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     h.run("INSERT INTO t VALUES (1, 'a')").unwrap();
     h.run("INSERT INTO t VALUES (2, 'b')").unwrap();
     h.run("BEGIN").unwrap();

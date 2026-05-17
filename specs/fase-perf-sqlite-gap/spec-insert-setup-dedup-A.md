@@ -2,7 +2,7 @@
 
 Phase: perf-sqlite-gap — close the embedded-mode INSERT gap with SQLite
 Task: A — ResolvedTable cache validated by `schema_version` (works inside explicit txn)
-Status: approved
+Status: implemented (A.1 only; A.2 deferred — see plan)
 
 ## Context
 
