@@ -13,8 +13,8 @@ use axiomdb_catalog::{
     IndexDef, ResolvedTable,
 };
 use axiomdb_core::error::DbError;
-use axiomdb_types::Value;
 use axiomdb_storage::WalDurabilityPolicy;
+use axiomdb_types::Value;
 use axiomdb_wal::ConnectionTxn;
 
 use crate::clustered_secondary::ClusteredSecondaryLayout;
