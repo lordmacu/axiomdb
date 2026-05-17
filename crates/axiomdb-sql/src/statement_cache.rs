@@ -129,6 +129,25 @@ fn walk_expr_extract(expr: &mut Expr, out: &mut Vec<Value>) {
     }
 }
 
+/// Computes a 64-bit hash from a "shape-only" statement (one where
+/// `extract_literals` has already replaced literals with `Expr::Param`).
+///
+/// Two statements with structurally identical ASTs (modulo Param indices,
+/// which are deterministic) hash to the same value. Structurally distinct
+/// statements hash to different values with overwhelming probability.
+///
+/// Implementation uses Debug-format hashing for now — it is stable within
+/// a process and includes every field of every variant. A future
+/// optimization could replace it with a hand-rolled recursive `Hash`
+/// traversal if profiling shows it as a bottleneck.
+pub fn shape_hash(stmt: &Stmt) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    format!("{stmt:?}").hash(&mut h);
+    h.finish()
+}
+
 /// Walks `stmt`, replacing every `Expr::Param { idx }` with
 /// `Expr::Literal(params[idx])`. Inverse of [`extract_literals`].
 ///

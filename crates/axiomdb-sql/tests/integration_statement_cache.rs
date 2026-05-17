@@ -10,7 +10,7 @@
 
 use axiomdb_sql::{
     parse,
-    statement_cache::{extract_literals, substitute_params},
+    statement_cache::{extract_literals, shape_hash, substitute_params},
 };
 
 #[test]
@@ -68,4 +68,52 @@ fn extract_handles_no_literals() {
     assert!(extracted.is_empty());
     let restored = substitute_params(stmt, &extracted).unwrap();
     assert_eq!(restored, original);
+}
+
+// ── Step 2.2: shape_hash ─────────────────────────────────────────────────
+
+fn prepare_shape(sql: &str) -> (axiomdb_sql::ast::Stmt, Vec<axiomdb_types::Value>) {
+    let mut stmt = parse(sql, None).unwrap();
+    let extracted = extract_literals(&mut stmt);
+    (stmt, extracted)
+}
+
+#[test]
+fn shape_hash_equal_for_same_shape_different_literals() {
+    // Same INSERT, different literal values → same shape → same hash.
+    let (s1, _) = prepare_shape("INSERT INTO t VALUES (1, 'a')");
+    let (s2, _) = prepare_shape("INSERT INTO t VALUES (99, 'zzz')");
+    assert_eq!(
+        shape_hash(&s1),
+        shape_hash(&s2),
+        "different literals must collapse to the same shape hash"
+    );
+}
+
+#[test]
+fn shape_hash_distinct_for_different_table() {
+    let (s1, _) = prepare_shape("INSERT INTO t1 VALUES (1)");
+    let (s2, _) = prepare_shape("INSERT INTO t2 VALUES (1)");
+    assert_ne!(shape_hash(&s1), shape_hash(&s2));
+}
+
+#[test]
+fn shape_hash_distinct_for_different_column_list() {
+    let (s1, _) = prepare_shape("INSERT INTO t(a, b) VALUES (1, 2)");
+    let (s2, _) = prepare_shape("INSERT INTO t(a, c) VALUES (1, 2)");
+    assert_ne!(shape_hash(&s1), shape_hash(&s2));
+}
+
+#[test]
+fn shape_hash_distinct_for_different_values_count() {
+    let (s1, _) = prepare_shape("INSERT INTO t VALUES (1, 2)");
+    let (s2, _) = prepare_shape("INSERT INTO t VALUES (1, 2, 3)");
+    assert_ne!(shape_hash(&s1), shape_hash(&s2));
+}
+
+#[test]
+fn shape_hash_distinct_for_different_in_list_length() {
+    let (s1, _) = prepare_shape("SELECT * FROM t WHERE id IN (1, 2)");
+    let (s2, _) = prepare_shape("SELECT * FROM t WHERE id IN (1, 2, 3)");
+    assert_ne!(shape_hash(&s1), shape_hash(&s2));
 }
