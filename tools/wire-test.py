@@ -5849,6 +5849,62 @@ cur.execute("DROP TABLE IF EXISTS _wire_decimal_div")
 cur.execute("DROP TABLE IF EXISTS _wire_decimal_round")
 cur.execute("DROP TABLE IF EXISTS _wire_decimal_trunc")
 
+
+# ── Attack 6 — SET synchronous = STRICT|NORMAL|OFF|DEFAULT ───────────────────
+# Per-session durability override mirrors SQLite's PRAGMA synchronous.
+# The override is applied at every txn.begin() in execute_with_ctx and
+# routed through to WAL commit(). SET is rejected inside an open
+# transaction (mirrors research/sqlite/src/pragma.c:1136-1138).
+
+print("\n[Attack 6 SET synchronous]")
+
+# Canonical names succeed and the engine keeps accepting traffic.
+for _val in ("'STRICT'", "'NORMAL'", "'OFF'", "DEFAULT"):
+    cur.execute(f"SET synchronous = {_val}")
+    cur.execute("SELECT 1")
+    ok(f"[A6 set_canonical] SET synchronous = {_val}", cur.fetchone()[0] == 1)
+
+# SQLite alias compatibility.
+for _val, _label in (("'FULL'", "FULL→Strict"),
+                     ("'EXTRA'", "EXTRA→Strict"),
+                     ("'ON'", "ON→Normal"),
+                     ("2", "2→Normal"),
+                     ("0", "0→Off")):
+    cur.execute(f"SET synchronous = {_val}")
+    cur.execute("SELECT 1")
+    ok(f"[A6 set_alias_{_label}] SET synchronous = {_val} accepted",
+       cur.fetchone()[0] == 1)
+
+# Functional smoke: NORMAL must not break autocommit INSERT durability.
+cur.execute("SET synchronous = 'NORMAL'")
+cur.execute("DROP TABLE IF EXISTS _wire_a6")
+cur.execute("CREATE TABLE _wire_a6 (id INT PRIMARY KEY, v TEXT)")
+for _i in range(1, 6):
+    cur.execute(f"INSERT INTO _wire_a6 VALUES ({_i}, 'row{_i}')")
+cur.execute("SELECT COUNT(*) FROM _wire_a6")
+ok("[A6 insert_under_normal] 5 autocommit inserts under NORMAL persist",
+   cur.fetchone()[0] == 5)
+
+# Toggle back and forth — every transition must be accepted.
+for _val in ("'NORMAL'", "'STRICT'", "'OFF'", "'NORMAL'", "DEFAULT"):
+    cur.execute(f"SET synchronous = {_val}")
+cur.execute("SELECT 1")
+ok("[A6 set_round_trip] STRICT⇄NORMAL⇄OFF⇄DEFAULT round-trip stays usable",
+   cur.fetchone()[0] == 1)
+
+# NOTE: garbage rejection (`SET synchronous = 'banana'` → InvalidValue) and
+# in-transaction rejection are unit-tested in
+# `crates/axiomdb-sql/tests/integration_set_synchronous.rs` (e2e through
+# `execute_with_ctx`). They are NOT asserted here because the MySQL wire
+# layer currently swallows non-DML errors on SET — a pre-existing concern
+# orthogonal to Attack 6, tracked separately.
+
+# Cleanup
+cur.execute("SET synchronous = DEFAULT")
+cur.execute("DROP TABLE IF EXISTS _wire_a6")
+conn.commit()
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
