@@ -396,76 +396,98 @@ fn enqueue_clustered_insert_ctx(
     };
 
     for (row_idx, value_exprs) in rows.into_iter().enumerate() {
-        let mut provided: Vec<Value> = value_exprs
-            .iter()
-            .map(|e| eval(e, &[]))
-            .collect::<Result<_, _>>()?;
-        validate_generated_insert_exprs(
-            &col_positions,
-            &value_exprs,
-            schema_cols,
-            &resolved.def.table_name,
-        )?;
-        resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
-        let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
-        assign_auto_increment(
-            storage,
-            txn,
-            &*conn_txn,
-            &resolved.def,
-            schema_cols,
-            full_values.as_mut_slice(),
-            &mut first_generated,
-        )?;
-        materialize_generated_columns(schema_cols, &mut full_values)?;
-        match enforce_text_constraints(&resolved.columns, &mut full_values)
-            .and_then(|()| check_row_constraints_with_cols(&resolved.constraints, &full_values, &resolved.def.table_name, &resolved.columns))
-        {
+        let mut provided: Vec<Value> = crate::time_insert_phase!(eval_ns, {
+            value_exprs
+                .iter()
+                .map(|e| eval(e, &[]))
+                .collect::<Result<_, _>>()?
+        });
+        crate::time_insert_phase!(validate_ns, {
+            validate_generated_insert_exprs(
+                &col_positions,
+                &value_exprs,
+                schema_cols,
+                &resolved.def.table_name,
+            )?;
+            resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
+        });
+        let mut full_values =
+            crate::time_insert_phase!(validate_ns, {
+                materialize_insert_row(&col_positions, &provided, schema_cols)
+            });
+        crate::time_insert_phase!(auto_inc_ns, {
+            assign_auto_increment(
+                storage,
+                txn,
+                &*conn_txn,
+                &resolved.def,
+                schema_cols,
+                full_values.as_mut_slice(),
+                &mut first_generated,
+            )?;
+        });
+        crate::time_insert_phase!(generated_cols_ns, {
+            materialize_generated_columns(schema_cols, &mut full_values)?;
+        });
+        let constraints_result = crate::time_insert_phase!(constraints_ns, {
+            enforce_text_constraints(&resolved.columns, &mut full_values)
+                .and_then(|()| check_row_constraints_with_cols(&resolved.constraints, &full_values, &resolved.def.table_name, &resolved.columns))
+        });
+        match constraints_result {
             Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
             other => other?,
         }
         if !resolved.foreign_keys.is_empty() {
-            let (immediate_fks, deferred_fk_ids) =
-                crate::fk_enforcement::split_child_insert_foreign_keys(
+            let fk_result = crate::time_insert_phase!(fk_check_ns, {
+                let (immediate_fks, deferred_fk_ids) =
+                    crate::fk_enforcement::split_child_insert_foreign_keys(
+                        &full_values,
+                        &resolved.foreign_keys,
+                    );
+                ctx.mark_deferred_fk_constraints(deferred_fk_ids);
+                crate::fk_enforcement::check_fk_child_insert(
                     &full_values,
-                    &resolved.foreign_keys,
-                );
-            ctx.mark_deferred_fk_constraints(deferred_fk_ids);
-            match crate::fk_enforcement::check_fk_child_insert(
-                &full_values,
-                &immediate_fks,
-                storage,
-                txn,
-                &*conn_txn,
-                bloom,
-            ) {
+                    &immediate_fks,
+                    storage,
+                    txn,
+                    &*conn_txn,
+                    bloom,
+                )
+            });
+            match fk_result {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
                 other => other?,
             }
         }
 
         // Encode the row (coercion + PK extraction + row codec).
-        let prepared = match crate::clustered_table::prepare_row_with_ctx(
-            full_values,
-            schema_cols,
-            &primary_idx,
-            &resolved.def.table_name,
-            ctx,
-            row_idx + 1,
-        ) {
+        let prepared_result = crate::time_insert_phase!(prepare_row_ns, {
+            crate::clustered_table::prepare_row_with_ctx(
+                full_values,
+                schema_cols,
+                &primary_idx,
+                &resolved.def.table_name,
+                ctx,
+                row_idx + 1,
+            )
+        });
+        let prepared = match prepared_result {
             Err(e) if ignore && is_ignorable_insert_error(&e) => continue,
             other => other?,
         };
-        validate_enum_row_values(&prepared.values, schema_cols, storage, txn, conn_txn)?;
+        crate::time_insert_phase!(enum_validate_ns, {
+            validate_enum_row_values(&prepared.values, schema_cols, storage, txn, conn_txn)?;
+        });
 
         // Intra-batch PK duplicate check — O(1) via staged_pks HashSet.
-        if ctx
-            .clustered_insert_batch
-            .as_ref()
-            .unwrap()
-            .staged_pks
-            .contains(&prepared.primary_key_bytes)
-        {
+        let pk_already_staged = crate::time_insert_phase!(pk_dup_ns, {
+            ctx.clustered_insert_batch
+                .as_ref()
+                .unwrap()
+                .staged_pks
+                .contains(&prepared.primary_key_bytes)
+        });
+        if pk_already_staged {
             if ignore {
                 continue;
             }
@@ -489,15 +511,18 @@ fn enqueue_clustered_insert_ctx(
             });
         }
 
-        let batch = ctx.clustered_insert_batch.as_mut().unwrap();
-        batch.staged_pks.insert(prepared.primary_key_bytes.clone());
-        statement_staged_pks.push(prepared.primary_key_bytes.clone());
-        batch.rows.push(crate::session::StagedClusteredRow {
-            values: prepared.values,
-            encoded_row: prepared.encoded_row,
-            primary_key_values: prepared.primary_key_values,
-            primary_key_bytes: prepared.primary_key_bytes,
+        crate::time_insert_phase!(batch_push_ns, {
+            let batch = ctx.clustered_insert_batch.as_mut().unwrap();
+            batch.staged_pks.insert(prepared.primary_key_bytes.clone());
+            statement_staged_pks.push(prepared.primary_key_bytes.clone());
+            batch.rows.push(crate::session::StagedClusteredRow {
+                values: prepared.values,
+                encoded_row: prepared.encoded_row,
+                primary_key_values: prepared.primary_key_values,
+                primary_key_bytes: prepared.primary_key_bytes,
+            });
         });
+        crate::bench_timings::bump_rows(1);
         count += 1;
     }
 

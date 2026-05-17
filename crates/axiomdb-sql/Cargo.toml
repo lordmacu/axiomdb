@@ -5,6 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables thread-local timing accumulators in the INSERT path for the
+# `axiomdb_bench --diagnose-insert-deep` diagnostic. ZERO cost when disabled.
+bench-timings = []
+
 [dependencies]
 axiomdb-core    = { workspace = true }
 axiomdb-types   = { workspace = true }

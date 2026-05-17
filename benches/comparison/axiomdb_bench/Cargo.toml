@@ -8,6 +8,13 @@ publish = false
 name = "axiomdb_bench"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forwards to axiomdb-sql/bench-timings so --diagnose-insert-deep can read
+# the thread-local INSERT phase counters. Enable with:
+#   cargo run -p axiomdb-bench-comparison --release --features bench-timings -- ...
+bench-timings = ["axiomdb-sql/bench-timings"]
+
 [dependencies]
 axiomdb-embedded = { path = "../../../crates/axiomdb-embedded" }
 axiomdb-catalog  = { path = "../../../crates/axiomdb-catalog" }
