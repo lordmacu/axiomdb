@@ -19,10 +19,9 @@ use axiomdb_wal::ConnectionTxn;
 
 use crate::Db;
 
-/// Auto-flush threshold. After this many buffered rows, the next
-/// `append_row` triggers a `flush()` to keep memory bounded. Wired in
-/// Step 6 of plan-embedded-appender.md.
-#[allow(dead_code)] // used from Step 6 onward
+/// Auto-flush threshold. After this many buffered rows, `append_row`
+/// triggers a `flush()` to keep memory bounded even for very large
+/// loads.
 pub(crate) const APPENDER_BATCH_FLUSH: usize = 1024;
 
 /// A fast-path INSERT builder for the embedded API.
@@ -195,6 +194,13 @@ impl<'db> Appender<'db> {
             }
         }
         self.buffer.push(coerced);
+        // Auto-flush keeps memory bounded — even a million-row load
+        // never holds more than APPENDER_BATCH_FLUSH rows in memory at
+        // once. The flush call inside append_row writes to heap+WAL but
+        // keeps the txn open, so the appender is still usable after.
+        if self.buffer.len() >= APPENDER_BATCH_FLUSH {
+            self.flush()?;
+        }
         Ok(())
     }
 
