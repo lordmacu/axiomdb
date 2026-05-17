@@ -676,6 +676,20 @@ pub struct SessionContext {
     /// Key: `table_id`. Value: `(root_page_id, tail_page_id)`.
     /// Cleared whenever the schema cache is invalidated or a root rotation is detected.
     heap_tail: HashMap<u32, (u64, u64)>,
+    /// Attack 3.B Step 3: cached `build_insert_column_positions` results
+    /// keyed by `(table_id, columns_signature)`. Skips ~1-3 µs per INSERT
+    /// call by avoiding the per-column name lookup + Vec allocation.
+    ///
+    /// The value is `(schema_version, positions)`. On lookup, callers pass
+    /// the current schema_version; a mismatch causes lazy eviction +
+    /// recompute. This keeps the cache correct across DDL without coupling
+    /// it to specific invalidation paths (which are scattered across
+    /// invalidate_all, invalidate_table, root rotations, etc.).
+    ///
+    /// `columns_signature = 0` is the "all columns in declaration order"
+    /// shape (when the INSERT has no column list). Other shapes hash the
+    /// column-name list with `DefaultHasher`.
+    insert_col_positions: HashMap<(u32, u64), (u64, Vec<usize>)>,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -830,6 +844,7 @@ impl SessionContext {
             session_id: NOTIFICATION_SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             cache: HashMap::new(),
             heap_tail: HashMap::new(),
+            insert_col_positions: HashMap::new(),
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,
@@ -1102,6 +1117,10 @@ impl SessionContext {
     pub fn invalidate_table(&mut self, database: &str, schema: &str, table: &str) {
         // Also clear any heap-tail hint for this table so a stale tail is not
         // reused after a DDL change or root rotation.
+        //
+        // `insert_col_positions` is NOT cleared here — its entries carry a
+        // schema_version stamp and get lazy-evicted on the next lookup that
+        // sees a mismatch (see `get_insert_col_positions`).
         if let Some(resolved) = self.cache.get(&Self::key(database, schema, table)) {
             self.heap_tail.remove(&resolved.def.id);
         }
@@ -1111,8 +1130,60 @@ impl SessionContext {
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
         self.heap_tail.clear();
+        // `insert_col_positions` is intentionally NOT cleared. Its entries
+        // carry a schema_version stamp and get lazy-evicted on the next
+        // lookup with a mismatching version (see get_insert_col_positions).
+        // Avoids clearing on every commit (staging.rs flush) which would
+        // defeat the cache's purpose.
         self.holiday_cache.clear();
         self.exchange_rate_cache.clear();
+    }
+
+    // ── Insert col_positions cache (Attack 3.B Step 3) ────────────────────────
+
+    /// Returns the cached column-position vector for `table_id` and the
+    /// statement's `columns_signature`, but only if its stored
+    /// `schema_version` matches `expected_schema_version`.
+    ///
+    /// On stale entries the cache lazily evicts and returns `None`, so the
+    /// caller recomputes and re-caches under the new version. This keeps
+    /// the cache correct across DDL without coupling it to specific
+    /// invalidation paths.
+    pub fn get_insert_col_positions(
+        &mut self,
+        table_id: u32,
+        expected_schema_version: u64,
+        columns_signature: u64,
+    ) -> Option<&Vec<usize>> {
+        let key = (table_id, columns_signature);
+        let stale = self
+            .insert_col_positions
+            .get(&key)
+            .map(|(ver, _)| *ver != expected_schema_version)
+            .unwrap_or(false);
+        if stale {
+            self.insert_col_positions.remove(&key);
+            return None;
+        }
+        self.insert_col_positions.get(&key).map(|(_, pos)| pos)
+    }
+
+    /// Caches a `build_insert_column_positions` result tagged with the
+    /// current schema_version (so future lookups can lazy-evict on stale).
+    pub fn cache_insert_col_positions(
+        &mut self,
+        table_id: u32,
+        schema_version: u64,
+        columns_signature: u64,
+        col_positions: Vec<usize>,
+    ) {
+        self.insert_col_positions
+            .insert((table_id, columns_signature), (schema_version, col_positions));
+    }
+
+    /// Diagnostic / test accessor for the cache size.
+    pub fn insert_col_positions_count(&self) -> usize {
+        self.insert_col_positions.len()
     }
 
     // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────

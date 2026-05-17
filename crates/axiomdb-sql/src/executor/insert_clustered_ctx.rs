@@ -1,3 +1,27 @@
+/// Hashes the INSERT statement's column list into a stable u64.
+///
+/// `None` (= "INSERT without column list, use all columns in declaration
+/// order") returns 0. Other shapes hash with `DefaultHasher`; we mix in a
+/// non-zero discriminant when the hash happens to be 0 so a column list
+/// cannot collide with the None sentinel.
+fn columns_signature(columns: Option<&Vec<String>>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    match columns {
+        None => 0,
+        Some(c) => {
+            let mut h = DefaultHasher::new();
+            c.hash(&mut h);
+            let r = h.finish();
+            if r == 0 {
+                1
+            } else {
+                r
+            }
+        }
+    }
+}
+
 fn execute_clustered_insert_ctx(
     stmt: InsertStmt,
     exec_ctx: &ExecutionContext,
@@ -63,8 +87,33 @@ fn execute_clustered_insert_ctx(
             .collect::<Result<_, _>>()?;
     let compiled_preds =
         crate::partial_index::compile_index_predicates(&secondary_indexes, schema_cols)?;
-    let col_positions =
-        build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
+    // Attack 3.B Step 3: cache col_positions by (table_id, columns_signature),
+    // version-stamped with schema_version for lazy eviction on DDL.
+    // Skips ~1-3 µs per INSERT call (Vec<usize> alloc + per-column name lookup).
+    let sig = columns_signature(stmt.columns.as_ref());
+    let table_id_for_cache = resolved.def.id;
+    let schema_version = resolved.def.schema_version;
+    let col_positions = match ctx.get_insert_col_positions(
+        table_id_for_cache,
+        schema_version,
+        sig,
+    ) {
+        Some(cached) => cached.clone(),
+        None => {
+            let computed = build_insert_column_positions(
+                schema_cols,
+                &stmt.columns,
+                &resolved.def.table_name,
+            )?;
+            ctx.cache_insert_col_positions(
+                table_id_for_cache,
+                schema_version,
+                sig,
+                computed.clone(),
+            );
+            computed
+        }
+    };
     let ignore = stmt.ignore;
 
     let mut prepared_rows = Vec::new();
@@ -377,8 +426,33 @@ fn enqueue_clustered_insert_ctx(
         &ctx.clustered_insert_batch.as_ref().unwrap().primary_idx,
     );
 
-    let col_positions =
-        build_insert_column_positions(schema_cols, &stmt.columns, &resolved.def.table_name)?;
+    // Attack 3.B Step 3: cache col_positions by (table_id, columns_signature),
+    // version-stamped with schema_version for lazy eviction on DDL.
+    // Skips ~1-3 µs per INSERT call (Vec<usize> alloc + per-column name lookup).
+    let sig = columns_signature(stmt.columns.as_ref());
+    let table_id_for_cache = resolved.def.id;
+    let schema_version = resolved.def.schema_version;
+    let col_positions = match ctx.get_insert_col_positions(
+        table_id_for_cache,
+        schema_version,
+        sig,
+    ) {
+        Some(cached) => cached.clone(),
+        None => {
+            let computed = build_insert_column_positions(
+                schema_cols,
+                &stmt.columns,
+                &resolved.def.table_name,
+            )?;
+            ctx.cache_insert_col_positions(
+                table_id_for_cache,
+                schema_version,
+                sig,
+                computed.clone(),
+            );
+            computed
+        }
+    };
     let ignore = stmt.ignore;
 
     let mut count = 0u64;

@@ -367,3 +367,85 @@ fn create_index_outside_txn_invalidates_cache_via_version_bump() {
     let ids = select_int_col(&mut h, "SELECT id FROM t WHERE v = 100");
     assert_eq!(ids, vec![1]);
 }
+
+// ── Step B.3: col_positions cache tests ───────────────────────────────────
+
+#[test]
+fn col_positions_cached_across_inserts_same_shape() {
+    // 10 INSERTs into the same table with the same column shape (None = all
+    // columns in declaration order) must populate exactly 1 cache entry.
+    let mut h = harness::Harness::new();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    h.run("BEGIN").unwrap();
+    for i in 1..=10 {
+        h.run(&format!("INSERT INTO t VALUES ({i}, 'a')")).unwrap();
+    }
+    h.run("COMMIT").unwrap();
+    assert_eq!(
+        h.session.insert_col_positions_count(),
+        1,
+        "same shape across 10 INSERTs → 1 cache entry"
+    );
+}
+
+#[test]
+fn col_positions_distinct_for_distinct_column_lists() {
+    // Two INSERTs into the same table with different column lists must
+    // produce two distinct cache entries.
+    let mut h = harness::Harness::new();
+    h.run("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT)")
+        .unwrap();
+    h.run("INSERT INTO t(a, b) VALUES (1, 2)").unwrap();
+    h.run("INSERT INTO t(a, c) VALUES (3, 4)").unwrap();
+    assert_eq!(
+        h.session.insert_col_positions_count(),
+        2,
+        "different column lists → 2 cache entries"
+    );
+}
+
+#[test]
+fn col_positions_evicted_on_schema_bump() {
+    // ALTER TABLE bumps schema_version. Eviction happens LAZILY in
+    // get_insert_col_positions: the next lookup with the new schema_version
+    // sees a stamp mismatch on the (table_id, sig) entry, evicts it, and
+    // forces a recompute. The cache size stays at 1 (old entry evicted +
+    // new entry inserted under the same key).
+    let mut h = harness::Harness::new();
+    h.run("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    h.run("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(h.session.insert_col_positions_count(), 1);
+
+    h.run("ALTER TABLE t ADD COLUMN x INT DEFAULT 0").unwrap();
+    // Eviction hasn't run yet (no INSERT since the ALTER).
+
+    h.run("INSERT INTO t VALUES (2, 99)").unwrap();
+    // Stale entry evicted, fresh entry stored under the same (table_id, sig)
+    // key but with new schema_version.
+    assert_eq!(
+        h.session.insert_col_positions_count(),
+        1,
+        "stale entry evicted, fresh entry stored under same key"
+    );
+
+    // Verify the post-ALTER schema is what runs (the new column reads back).
+    let rows = select_int_col(&mut h, "SELECT x FROM t WHERE id=2");
+    assert_eq!(rows, vec![99]);
+}
+
+#[test]
+fn col_positions_isolated_per_table() {
+    // INSERTs into two different tables produce two cache entries, each
+    // keyed by its own table_id. No cross-contamination.
+    let mut h = harness::Harness::new();
+    h.run("CREATE TABLE t1 (id INT PRIMARY KEY)").unwrap();
+    h.run("CREATE TABLE t2 (id INT PRIMARY KEY)").unwrap();
+    h.run("INSERT INTO t1 VALUES (1)").unwrap();
+    h.run("INSERT INTO t2 VALUES (1)").unwrap();
+    h.run("INSERT INTO t1 VALUES (2)").unwrap();
+    assert_eq!(
+        h.session.insert_col_positions_count(),
+        2,
+        "one entry per table"
+    );
+}
