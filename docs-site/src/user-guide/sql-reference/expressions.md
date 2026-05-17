@@ -482,7 +482,8 @@ SELECT flags & 0xFF FROM events;   -- bitmask with hex constant
 | `ABS(x)`          | Absolute value                           | `ABS(-5)` → `5`       |
 | `CEIL(x)`         | Ceiling (round up)                       | `CEIL(1.2)` → `2`     |
 | `FLOOR(x)`        | Floor (round down)                       | `FLOOR(1.9)` → `1`    |
-| `ROUND(x, d)`     | Round to `d` decimal places              | `ROUND(3.14159, 2)` → `3.14` |
+| `ROUND(x, d)`     | Round to `d` decimal places (HALF_UP); returns `DECIMAL` for Decimal inputs, `REAL` for float | `ROUND(3.14159, 2)` → `3.14` |
+| `TRUNC(x, d)`     | Truncate to `d` decimal places (no rounding); `TRUNCATE` is an alias | `TRUNC(1.999, 1)` → `1.9` |
 | `MOD(x, y)`       | Modulo                                   | `MOD(10, 3)` → `1`    |
 | `POWER(x, y)`     | x raised to the power y                  | `POWER(2, 8)` → `256` |
 | `SQRT(x)`         | Square root                              | `SQRT(16)` → `4`      |

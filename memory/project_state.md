@@ -1,19 +1,20 @@
 # Project State
 
-## Current (2026-05-16)
+## Current (2026-05-17)
 
 **Active phase:** Phase 24 — Complete Type System
-**Active subphase:** Phase 24.2 — REAL/FLOAT4 vs DOUBLE/FLOAT8 COMPLETE.
-`DataType::Float` (f32, 4-byte LE) is now distinct from `DataType::Real` (f64, 8-byte LE).
-`ColumnType::Float32 = 21` added to catalog. REAL/FLOAT/FLOAT4 → Float; DOUBLE/FLOAT8/DOUBLE PRECISION → Real.
-Schema-aware encode_row dispatches 4 vs 8 bytes per column. 8 new integration tests, 4 wire assertions.
-4321/4321 workspace tests, clippy+fmt clean.
+**Active subphase:** Phase 24.3 — Exact DECIMAL(p,s) COMPLETE.
+`DECIMAL(p,s)` parser captures precision/scale into `ColumnDef.type_len=(p<<8)|s`.
+`enforce_decimal_precision` enforces ROUND_HALF_UP and integer overflow rejection.
+Division produces ~6 extra fractional digits. ROUND/TRUNC Decimal arms via `rust_decimal`.
+SHOW COLUMNS now displays `decimal(p,s)` (both `ddl_show.rs` and `exec_entry.rs` paths fixed).
+4338/4338 workspace tests, clippy clean, fmt clean. 11 wire assertions pass.
 
-**Last verified gates:** Phase 24.2 closeout passed 4321/4321 tests, clippy clean, fmt clean.
+**Last verified gates:** Phase 24.3 closeout passed 4338/4338 tests, clippy clean, fmt clean, 639/652 wire pass (13 pre-existing unrelated failures).
 
-**Recently completed:** 24.1 — TINYINT/SMALLINT/BIGSERIAL (2026-05-16). 24.1b — SERIAL/SMALLSERIAL (2026-05-16). 24.2 — REAL vs DOUBLE (2026-05-16).
+**Recently completed:** 24.1 — TINYINT/SMALLINT/BIGSERIAL (2026-05-16). 24.1b — SERIAL/SMALLSERIAL (2026-05-16). 24.2 — REAL vs DOUBLE (2026-05-16). 24.3 — Exact DECIMAL (2026-05-17).
 
-**Next:** Phase 24.1c (GENERATED ALWAYS AS IDENTITY) or 24.3 (Exact DECIMAL).
+**Next:** Phase 24.1c (GENERATED ALWAYS AS IDENTITY) or 24.4 (CITEXT).
 
 ### Phase 21 subphase status
 

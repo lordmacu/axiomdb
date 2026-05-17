@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 220/442 subphases (49.8%) — Phase 11, 13, 20, 21 complete; Phase 22b complete; Phase 24 next**
+> **MySQL+PG parity path: 221/442 subphases (50.0%) — Phase 11, 13, 20, 21 complete; Phase 22b complete; Phase 24 active (24.1, 24.1b, 24.2, 24.3 done)**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
@@ -270,7 +270,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [x] 24.1b ✅ SERIAL / SMALLSERIAL type shorthands — `SERIAL` (→ INT AUTO_INCREMENT) and `SMALLSERIAL` (→ SMALLINT AUTO_INCREMENT) added as pre-type-position shorthands in `parse_column_def`, alongside existing BIGSERIAL; `Token::Serial` already existed as trailing-constraint synonym (INT SERIAL), now also detected at type position; 4 integration tests + 4 wire assertions. Completed 2026-05-16.
 - [ ] 24.1c ⏳ GENERATED ALWAYS AS IDENTITY — modern SQL standard for auto-increment
 - [x] 24.2 ✅ REAL/FLOAT4 vs DOUBLE/FLOAT8 — `DataType::Float` (f32, 4-byte LE) + `ColumnType::Float32=21` distinct from `DataType::Real` (f64, 8-byte LE); REAL/FLOAT/FLOAT4 → f32; DOUBLE/DOUBLE PRECISION/FLOAT8 → f64; wire 0x04 FLOAT vs 0x05 DOUBLE; precision-truncating coerce; batch.rs SIMD path; 8 integration tests + 4 wire assertions. Completed 2026-05-16.
-- [ ] 24.3 ⏳ Exact DECIMAL — `rust_decimal` with fast path `i64+scale`
+- [x] 24.3 ✅ Exact DECIMAL(p,s) — `DECIMAL(p,s)` parser captures precision/scale into `type_len=(p<<8)|s`; `enforce_decimal_precision` enforces ROUND_HALF_UP to scale and rejects integer overflow; `decimal_arith` Div produces ~6 extra fractional digits; ROUND/TRUNC Decimal arms via `rust_decimal`; SHOW COLUMNS displays `decimal(p,s)` (fixed both `ddl_show.rs` + `exec_entry.rs` dispatch paths); 17 integration tests + 11 wire assertions. Completed 2026-05-17.
 - [ ] 24.4 ⏳ CITEXT — automatic case-insensitive comparisons
 - [ ] 24.5 ⏳ BYTEA/BLOB — binary with automatic TOAST
 - [ ] 24.6 ⏳ BIT(n) / VARBIT(n) — bit strings with `bitvec`

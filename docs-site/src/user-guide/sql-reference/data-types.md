@@ -88,25 +88,40 @@ CREATE TABLE experiments (
 | SQL Type         | Aliases           | Storage  | Rust type | Notes                         |
 |------------------|-------------------|----------|-----------|-------------------------------|
 | `DECIMAL(p, s)`  | `NUMERIC(p, s)`   | 17 bytes | `i128` + `u8` scale | Exact arithmetic, no float error |
+| `DECIMAL`        | `NUMERIC`         | 17 bytes | `i128` + `u8` scale | Defaults to `DECIMAL(10, 0)` |
+
+**Parameters:** `p` is the total precision (significant digits, 1–38); `s` is the scale
+(digits after the decimal point, 0–p). Bare `DECIMAL` is equivalent to `DECIMAL(10, 0)`.
+
+**Rounding at insert:** Values are rounded to `s` decimal places using ROUND_HALF_UP
+(banker's round-half-up, not banker's rounding). The integer part must fit within `p − s`
+digits — an overflow error is raised otherwise.
 
 **Always use `DECIMAL` for money.** Floating-point types cannot represent
 `0.1 + 0.2` exactly; `DECIMAL` always can.
 
 ```sql
 CREATE TABLE invoices (
-    id       BIGINT       PRIMARY KEY AUTO_INCREMENT,
-    subtotal DECIMAL      NOT NULL,    -- DECIMAL without precision = DECIMAL(38,0)
-    tax_rate DECIMAL      NOT NULL,
-    total    DECIMAL      NOT NULL
+    id       BIGINT          PRIMARY KEY AUTO_INCREMENT,
+    subtotal DECIMAL(12, 2)  NOT NULL,   -- up to 9,999,999,999.99
+    tax_rate DECIMAL(5, 4)   NOT NULL,   -- e.g. 0.1900
+    total    DECIMAL(12, 2)  NOT NULL
 );
 
--- Insert with exact values
+-- Insert rounds to declared scale automatically
 INSERT INTO invoices (subtotal, tax_rate, total)
-VALUES (199.99, 0.19, 237.99);
+VALUES ('199.999', '0.19', '237.99');
+-- subtotal stored as 200.00 (rounded HALF_UP)
 
 -- Arithmetic is always exact
 SELECT subtotal * tax_rate AS computed_tax FROM invoices WHERE id = 1;
--- Returns: 37.9981  (never 37.99809999999...)
+```
+
+**SHOW COLUMNS** displays the declared precision and scale:
+```sql
+SHOW COLUMNS FROM invoices;
+-- Field     Type           ...
+-- subtotal  decimal(12,2)  ...
 ```
 
 The internal codec stores `DECIMAL` as a 16-byte little-endian `i128` mantissa followed

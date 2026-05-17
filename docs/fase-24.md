@@ -186,6 +186,74 @@ Wire smoke: 4 assertions in `tools/wire-test.py` under `[24.2 float]`.
 
 ---
 
+## 24.3 — Exact DECIMAL(p,s) Precision (2026-05-17)
+
+### Problem
+
+DECIMAL columns accepted values without enforcing precision or scale:
+- `DECIMAL(10,2)` would store 7-digit fractional values unchanged
+- No rounding on insert
+- Division produced truncated integer mantissa (e.g., `10/3 = 3`)
+- ROUND() and TRUNC() had no Decimal arm (fell through to TypeMismatch)
+- SHOW COLUMNS/SHOW CREATE TABLE returned bare "DECIMAL" instead of "decimal(10,2)"
+- A second SHOW COLUMNS dispatch path in `exec_entry.rs` bypassed `column_sql_type_display`
+
+### Solution
+
+**Parser** (`parser/ddl.rs`): `parse_decimal_params` captures `DECIMAL(p,s)` and
+validates `1 ≤ p ≤ 38`, `0 ≤ s ≤ p`. Parameters are encoded as
+`type_len = (precision << 8) | scale` in `ColumnDef.type_len`. Bare `DECIMAL` →
+`(10, 0)`. The field already existed and was already persisted to disk (flags bit2).
+
+**Enforcement at insert** (`table.rs`): `enforce_decimal_precision(value, p, s)` uses
+`rust_decimal::RoundingStrategy::MidpointAwayFromZero` (ROUND_HALF_UP) to round to `s`
+decimal places, then rejects if the integer part exceeds `p - s` digits.
+Called from `coerce_values` and `coerce_values_with_ctx` for Decimal columns.
+
+**Division** (`eval/ops.rs`): `decimal_arith` Div arm now scales the numerator by
+`10^(s2 + extra)` where `extra = min(6, 38 - s1)`, producing up to 6 extra fractional
+digits instead of integer-division truncation.
+
+**ROUND / TRUNC** (`eval/functions/numeric.rs`): Added `Value::Decimal` arms:
+- `round`: uses `rust_decimal::round_dp_with_strategy(MidpointAwayFromZero)`, returns `Decimal(mantissa, new_scale)`
+- `truncate`/`trunc`: pure i128 arithmetic — divide mantissa by `10^(s - new_scale)`
+
+**SHOW COLUMNS / SHOW CREATE TABLE**: Fixed both dispatch paths:
+- `executor/ddl_show.rs::execute_show_columns` → already used `column_sql_type_display`
+- `executor/exec_entry.rs::Stmt::ShowColumns` → was using `column_type_to_sql_name` (returned "DECIMAL"); fixed to use `column_sql_type_display`
+- `executor/exec_entry.rs::Stmt::ShowCreateTable` → same fix
+
+### Files changed
+
+| Crate | File | Change |
+|-------|------|--------|
+| axiomdb-sql | `src/parser/ddl.rs` | `parse_decimal_params` — captures (p,s) into type_len |
+| axiomdb-sql | `src/executor/ddl_show.rs` | `column_sql_type_display`: Decimal early-return → "decimal(p,s)" |
+| axiomdb-sql | `src/executor/exec_entry.rs` | ShowColumns + ShowCreateTable: use `column_sql_type_display` |
+| axiomdb-sql | `src/executor/information_schema_exec.rs` | IS.COLUMNS: NUMERIC_PRECISION/SCALE from type_len |
+| axiomdb-sql | `src/table.rs` | `enforce_decimal_precision` + `decimal_precision_scale` helper |
+| axiomdb-sql | `src/eval/ops.rs` | `decimal_arith` Div: scale_up = s2 + extra fractional digits |
+| axiomdb-sql | `src/eval/functions/numeric.rs` | `round`/`trunc`/`truncate`: Value::Decimal arms |
+| axiomdb-sql | `Cargo.toml` | `rust_decimal = "1"` dependency |
+| axiomdb-sql | `tests/integration_decimal_precision.rs` | 17 new integration tests (NEW FILE) |
+| axiomdb-sql | `tests/integration_date_decimal_columns.rs` | Updated: bare DECIMAL now rounds to scale 0 |
+| tools | `wire-test.py` | 11 new [24.3 decimal] assertions |
+
+### Tests
+
+17 integration tests in `crates/axiomdb-sql/tests/integration_decimal_precision.rs`:
+- Parser: stores decimal(p,s), rejects precision=0, precision>38, scale>precision
+- NUMERIC alias maps to decimal(p,s)  
+- Insert: rounds to scale (HALF_UP), rejects integer overflow, handles NULL
+- Bare DECIMAL rounds to 0 decimal places
+- Division: produces ~6 extra fractional digits
+- ROUND(decimal, n): HALF_UP, no-arg form
+- TRUNC/TRUNCATE(decimal, n): truncates without rounding
+
+Wire smoke: 11 assertions in `tools/wire-test.py` under `[24.3 decimal]`.
+
+---
+
 ## Subphases planned
 
 | ID | Status | Description |
@@ -194,7 +262,7 @@ Wire smoke: 4 assertions in `tools/wire-test.py` under `[24.2 float]`.
 | 24.1b | ✅ Done | SERIAL / SMALLSERIAL aliases |
 | 24.1c | ⏳ | GENERATED ALWAYS AS IDENTITY |
 | 24.2 | ✅ Done | REAL/FLOAT4 distinct from DOUBLE |
-| 24.3 | ⏳ | Exact DECIMAL (rust_decimal) |
+| 24.3 | ✅ Done | Exact DECIMAL(p,s) — precision enforcement, rounding, display |
 | 24.4 | ⏳ | CITEXT |
 | 24.5 | ⏳ | BYTEA/BLOB with TOAST |
 | 24.6 | ⏳ | BIT(n) / VARBIT(n) |
