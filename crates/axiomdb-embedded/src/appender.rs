@@ -232,15 +232,56 @@ impl<'db> Appender<'db> {
             &batch,
         )?;
         self.rows_inserted += rids.len() as u64;
-        // TODO Step 5: secondary index maintenance (insert_into_indexes_with_undo)
-        // For Step 3 we explicitly reject tables with indexes at flush time
-        // to avoid silent data loss for index lookups.
+
+        // Step 5: secondary index maintenance. v1 supports regular B-Tree,
+        // BRIN, FTS, GIN, and Trigram indexes — partial-index predicates
+        // and expression indexes are NOT supported (we pass empty Vecs;
+        // the SQL INSERT path computes those at analyze time which the
+        // Appender bypasses by design). Index roots that grow during
+        // insert are written back via CatalogWriter and the in-memory
+        // `self.indexes` is updated so subsequent flushes see the new
+        // root.
         if !self.indexes.is_empty() {
-            return Err(DbError::NotImplemented {
-                feature: "Appender flush with secondary indexes — wired \
-                          in Step 5 of plan-embedded-appender.md"
-                    .to_string(),
-            });
+            let n_idx = self.indexes.len();
+            let empty_preds: Vec<Option<axiomdb_sql::Expr>> = vec![None; n_idx];
+            let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> =
+                vec![Vec::new(); n_idx];
+            let snap = self.db.txn.active_snapshot(conn_txn);
+            for (rid, values) in rids.iter().zip(batch.iter()) {
+                let updated = axiomdb_sql::index_maintenance::insert_into_indexes_with_undo(
+                    &self.indexes,
+                    values,
+                    *rid,
+                    &self.db.storage,
+                    &self.db.bloom,
+                    &empty_preds,
+                    &empty_idx_exprs,
+                    snap.clone(),
+                    Some(&self.db.txn),
+                    Some(conn_txn),
+                )?;
+                // Persist root changes (B-Tree splits) to the catalog so
+                // subsequent reads find the new root. Mirrors
+                // insert_heap_ctx.rs:366-377.
+                for (index_id, new_root) in updated {
+                    axiomdb_catalog::CatalogWriter::new(
+                        &self.db.storage,
+                        &self.db.txn,
+                        conn_txn,
+                    )?
+                    .update_index_root(index_id, new_root)?;
+                    if let Some(idx) = self
+                        .indexes
+                        .iter_mut()
+                        .find(|i| i.index_id == index_id)
+                    {
+                        idx.root_page_id = new_root;
+                    }
+                    // Schema cache invalidation — the catalog version
+                    // bumped; future SQL operations need a fresh resolve.
+                    self.db.session.invalidate_all();
+                }
+            }
         }
         Ok(())
     }

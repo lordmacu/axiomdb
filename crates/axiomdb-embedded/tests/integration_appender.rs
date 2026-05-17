@@ -176,21 +176,8 @@ fn appender_on_table_with_auto_increment_returns_unsupported() {
     );
 }
 
-#[test]
-fn appender_flush_on_table_with_index_returns_unsupported() {
-    // Step 3 explicitly rejects flush on tables with indexes; Step 5 wires it.
-    let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
-    db.run("CREATE INDEX idx_v ON t (v)").unwrap();
-    let mut app = db.appender("t").unwrap();
-    app.append_row(&[Value::Int(1), Value::Text("a".into())])
-        .unwrap();
-    let err = app.flush().unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "expected NotImplemented (Step 5 wires this), got {err:?}"
-    );
-}
+// (Step 3's "flush on indexed table → NotImplemented" test was removed
+// once Step 5 wired index maintenance. Positive index tests live below.)
 
 // ── Step 4 — finish + Drop rollback ───────────────────────────────────────────
 
@@ -271,4 +258,67 @@ fn drop_after_partial_flush_rolls_back_remaining_buffer() {
     }
     let count = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
     assert_eq!(count, Value::BigInt(0), "ALL rows including flushed ones roll back");
+}
+
+// ── Step 5 — Secondary index maintenance ──────────────────────────────────────
+
+#[test]
+fn appender_maintains_secondary_btree_index() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+    db.run("CREATE INDEX idx_v ON t (v)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Text("alpha".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(2), Value::Text("beta".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(3), Value::Text("gamma".into())])
+        .unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT id FROM t WHERE v = 'beta'").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Int(2));
+}
+
+#[test]
+fn appender_unique_index_violation_rolls_back_batch() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+    db.run("CREATE UNIQUE INDEX idx_v ON t (v)").unwrap();
+    db.run("INSERT INTO t VALUES (1, 'dup')").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(2), Value::Text("ok".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(3), Value::Text("dup".into())])
+        .unwrap();
+    let err = app.finish().unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. }),
+        "expected UniqueViolation, got {err:?}"
+    );
+    let n = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
+    assert_eq!(n, Value::BigInt(1));
+}
+
+#[test]
+fn appender_supports_table_with_multiple_indexes() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, age INT, name TEXT)").unwrap();
+    db.run("CREATE INDEX idx_age ON t (age)").unwrap();
+    db.run("CREATE INDEX idx_name ON t (name)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 0..50 {
+        app.append_row(&[
+            Value::Int(i),
+            Value::Int(20 + i % 30),
+            Value::Text(format!("user_{i}")),
+        ])
+        .unwrap();
+    }
+    app.finish().unwrap();
+    let by_age = db.query("SELECT COUNT(*) FROM t WHERE age = 25").unwrap();
+    assert!(matches!(by_age[0][0], Value::BigInt(n) if n > 0));
+    let by_name = db.query("SELECT id FROM t WHERE name = 'user_42'").unwrap();
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0][0], Value::Int(42));
 }
