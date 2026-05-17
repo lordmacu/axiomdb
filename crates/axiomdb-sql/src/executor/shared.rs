@@ -39,16 +39,22 @@ fn resolve_table_cached(
     }
 
     // Unqualified name: scan search_path in order until a match is found.
-    let search_path: Vec<String> = ctx.search_path.clone();
-    for schema in &search_path {
+    // Iterate by index to avoid cloning the whole search_path Vec on every
+    // call — only clone the one schema string per iteration that the
+    // borrow checker forces (try_cached_with_version takes &mut ctx).
+    // search_path is typically 1 entry ("public") so this is at most one
+    // String alloc per call instead of an outer Vec + per-entry String.
+    let n_schemas = ctx.search_path.len();
+    for schema_idx in 0..n_schemas {
+        let schema = ctx.search_path[schema_idx].clone();
         if let Some(hit) = try_cached_with_version(
-            storage, txn, ctx, conn_txn, &database, schema, &tref.name,
+            storage, txn, ctx, conn_txn, &database, &schema, &tref.name,
         )? {
             return Ok(hit);
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
-        if let Ok(resolved) = resolver.resolve_table(Some(schema), &tref.name) {
-            ctx.cache_table(&database, schema, &tref.name, resolved.clone());
+        if let Ok(resolved) = resolver.resolve_table(Some(&schema), &tref.name) {
+            ctx.cache_table(&database, &schema, &tref.name, resolved.clone());
             return Ok(resolved);
         }
 
@@ -57,7 +63,7 @@ fn resolve_table_cached(
             .map(|c| txn.active_snapshot(c))
             .unwrap_or_else(|| txn.snapshot());
         let mut reader = CatalogReader::new(storage, snap)?;
-        if let Some(ftable) = reader.get_foreign_table(schema, &tref.name)? {
+        if let Some(ftable) = reader.get_foreign_table(&schema, &tref.name)? {
             return Ok(fdw_resolved_table(ftable));
         }
     }
