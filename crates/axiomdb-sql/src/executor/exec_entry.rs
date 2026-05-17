@@ -163,7 +163,7 @@ pub fn execute_read_only_with_ctx(
             let rows: Vec<Row> = columns
                 .iter()
                 .map(|c| {
-                    let type_str = column_type_to_sql_name(c.col_type);
+                    let type_str = column_sql_type_display(c);
                     let null_str = if c.nullable { "YES" } else { "NO" };
                     let extra = if c.auto_increment {
                         "auto_increment"
@@ -350,7 +350,7 @@ pub fn execute_read_only_with_ctx(
             };
             let mut ddl = format!("{create_prefix} `{}` (\n", table_def.table_name);
             for col in &columns {
-                let type_str = column_type_to_sql_name(col.col_type);
+                let type_str = column_sql_type_display(col);
                 let null_str = if col.nullable { "" } else { " NOT NULL" };
                 let extra = if col.auto_increment {
                     " AUTO_INCREMENT"

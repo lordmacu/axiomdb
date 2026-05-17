@@ -1503,7 +1503,7 @@ fn parse_decimal_params(p: &mut Parser) -> Result<(u8, u8), DbError> {
             });
         }
     };
-    if prec < 1 || prec > 38 {
+    if !(1..=38).contains(&prec) {
         return Err(DbError::ParseError {
             message: format!("DECIMAL precision must be between 1 and 38, got {prec}"),
             position: Some(p.current_pos()),
@@ -1518,8 +1518,7 @@ fn parse_decimal_params(p: &mut Parser) -> Result<(u8, u8), DbError> {
             }
             _ => {
                 return Err(DbError::ParseError {
-                    message: "expected scale integer after comma in DECIMAL type parameters"
-                        .into(),
+                    message: "expected scale integer after comma in DECIMAL type parameters".into(),
                     position: Some(p.current_pos()),
                 });
             }
@@ -1536,7 +1535,6 @@ fn parse_decimal_params(p: &mut Parser) -> Result<(u8, u8), DbError> {
     p.expect(&Token::RParen)?;
     Ok((prec as u8, scale as u8))
 }
-
 
 fn eat_optional_length(p: &mut Parser) -> Result<u16, DbError> {
     if p.eat(&Token::LParen) {

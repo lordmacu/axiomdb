@@ -5785,6 +5785,70 @@ ok("[24.2 float] FLOAT8 alias stores as f64", abs(_ff[1] - 1.5) < 1e-13, _ff[1])
 cur.execute("DROP TABLE IF EXISTS _wire_float")
 cur.execute("DROP TABLE IF EXISTS _wire_float4f8")
 
+# ── 24.3 Exact DECIMAL(p,s) ───────────────────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_decimal")
+cur.execute("CREATE TABLE _wire_decimal (price DECIMAL(10,2), qty DECIMAL(5,0), bare DECIMAL)")
+
+# SHOW COLUMNS must display correct type_len-derived display
+cur.execute("SHOW COLUMNS FROM _wire_decimal")
+_dc_cols = {row[0]: row[1] for row in cur.fetchall()}
+ok("[24.3 decimal] SHOW COLUMNS price → decimal(10,2)", _dc_cols.get("price") == "decimal(10,2)", _dc_cols.get("price"))
+ok("[24.3 decimal] SHOW COLUMNS qty → decimal(5,0)",   _dc_cols.get("qty")   == "decimal(5,0)",  _dc_cols.get("qty"))
+ok("[24.3 decimal] SHOW COLUMNS bare → decimal(10,0)", _dc_cols.get("bare")  == "decimal(10,0)", _dc_cols.get("bare"))
+
+# Insert with rounding
+cur.execute("INSERT INTO _wire_decimal VALUES ('123.456', '4.9', '1.5')")
+cur.execute("SELECT price, qty, bare FROM _wire_decimal")
+_dr = cur.fetchone()
+# price: 123.456 → round to 2dp HALF_UP → 123.46
+ok("[24.3 decimal] price rounds to 2dp HALF_UP",  str(_dr[0]) == "123.46", _dr[0])
+# qty: 4.9 → round to 0dp HALF_UP → 5
+ok("[24.3 decimal] qty rounds to 0dp HALF_UP",    str(_dr[1]) == "5",      _dr[1])
+# bare (10,0): 1.5 → 2
+ok("[24.3 decimal] bare DECIMAL rounds to 0dp",   str(_dr[2]) == "2",      _dr[2])
+
+# Overflow rejected: DECIMAL(10,2) allows up to 8 integer digits (10-2=8)
+# 123456789 has 9 digits → overflow
+try:
+    cur.execute("INSERT INTO _wire_decimal VALUES ('123456789.99', '0', '0')")
+    conn.commit()
+    ok("[24.3 decimal] overflow DECIMAL(10,2) rejected", False, "no error raised")
+except Exception:
+    conn.rollback()
+    ok("[24.3 decimal] overflow DECIMAL(10,2) rejected", True)
+
+# Division precision
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_div")
+cur.execute("CREATE TABLE _wire_decimal_div (a DECIMAL(10,2), b DECIMAL(10,2))")
+cur.execute("INSERT INTO _wire_decimal_div VALUES ('10.00', '3.00')")
+cur.execute("SELECT a / b FROM _wire_decimal_div")
+_div_res = cur.fetchone()[0]
+ok("[24.3 decimal] division produces fractional digits ~3.333333",
+   _div_res is not None and abs(float(_div_res) - 3.333333) < 1e-4, _div_res)
+
+# ROUND on DECIMAL column values
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_round")
+cur.execute("CREATE TABLE _wire_decimal_round (x DECIMAL(10,4))")
+cur.execute("INSERT INTO _wire_decimal_round VALUES ('1.2350')")
+cur.execute("SELECT ROUND(x, 2) FROM _wire_decimal_round")
+_rr = cur.fetchone()[0]
+ok("[24.3 decimal] ROUND(DECIMAL,2) HALF_UP 1.2350→1.24", str(_rr) == "1.24", _rr)
+
+# TRUNC / TRUNCATE on DECIMAL column values
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_trunc")
+cur.execute("CREATE TABLE _wire_decimal_trunc (x DECIMAL(10,3))")
+cur.execute("INSERT INTO _wire_decimal_trunc VALUES ('1.999')")
+cur.execute("SELECT TRUNC(x, 1), TRUNCATE(x, 2) FROM _wire_decimal_trunc")
+_tr = cur.fetchone()
+ok("[24.3 decimal] TRUNC(DECIMAL,1) truncates 1.999→1.9",   str(_tr[0]) == "1.9",  _tr[0])
+ok("[24.3 decimal] TRUNCATE(DECIMAL,2) alias 1.999→1.99",   str(_tr[1]) == "1.99", _tr[1])
+
+cur.execute("DROP TABLE IF EXISTS _wire_decimal")
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_div")
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_round")
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_trunc")
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()
