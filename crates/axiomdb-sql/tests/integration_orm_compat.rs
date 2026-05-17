@@ -6,7 +6,6 @@
 
 mod common;
 
-use axiomdb_core::error::DbError;
 use axiomdb_sql::{bloom::BloomRegistry, QueryResult, SessionContext};
 use axiomdb_storage::MemoryStorage;
 use axiomdb_types::Value;
@@ -181,18 +180,13 @@ fn show_full_fields_is_alias_of_show_full_columns() {
 fn orm_tier2_documents_identity_gap_and_deferrable_fk_baseline() {
     let (mut storage, mut txn, mut bloom, mut ctx) = setup();
 
-    let identity_err = run_ctx(
+    run_ok(
         "CREATE TABLE identity_probe (id INT GENERATED ALWAYS AS IDENTITY, email TEXT)",
         &mut storage,
         &mut txn,
         &mut bloom,
         &mut ctx,
-    )
-    .unwrap_err();
-    match identity_err {
-        DbError::ParseError { .. } | DbError::NotImplemented { .. } => {}
-        other => panic!("unexpected identity error: {other:?}"),
-    }
+    );
 
     run_ok(
         "CREATE TABLE parent_probe (id INT PRIMARY KEY)",
