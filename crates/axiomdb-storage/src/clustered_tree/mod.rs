@@ -490,6 +490,125 @@ pub fn lookup(
     Ok(Some(row))
 }
 
+/// A per-session cached pointer to the most-recently-touched clustered
+/// leaf page. Mirrors SQLite's `BtCursor` cached metadata (BTCF_ValidNKey
+/// at `research/sqlite/src/btree.c:9482`).
+///
+/// Used by [`lookup_with_hint`] (and Attack 7's `try_append_with_hint`)
+/// to skip the B-tree descent when the next key falls in the cached
+/// leaf's range. The SQL layer owns the `Option<LeafCursorHint>` slot
+/// inside its `SessionContext`; storage-side functions take a
+/// `&mut Option<LeafCursorHint>` and update it in place.
+#[derive(Debug, Clone)]
+pub struct LeafCursorHint {
+    /// Owner table. Different tables don't share the hint.
+    pub table_id: u32,
+    /// `TableDef.root_page_id` when the hint was recorded — detects
+    /// root rotation (bulk DELETE, REBUILD, etc.).
+    pub root_page_id: u64,
+    /// The leaf page itself.
+    pub leaf_page_id: u64,
+    /// Lowest key stored in the leaf (cell 0) at hint time.
+    pub min_key: Vec<u8>,
+    /// Highest key stored in the leaf (cell N-1) at hint time.
+    pub max_key: Vec<u8>,
+    /// `TableDef.schema_version` — invalidated on DDL bump.
+    pub schema_version: u64,
+}
+
+/// Hint-aware variant of [`lookup_physical`]. Skips the B-tree descent
+/// when `hint` points at a leaf whose key range covers `key`.
+///
+/// Behavior:
+/// - Fast path: hint matches `(table_id, root_pid, schema_version)`
+///   AND `key ∈ [min_key, max_key]` → re-read the cached leaf page,
+///   binary-search for `key`, return the row (or `None`).
+/// - Stale leaf (page type changed / leaf merged away / search returns
+///   out-of-range due to concurrent split) → fall back to full descent.
+/// - Miss (any field mismatch) → full descent via [`descend_to_leaf`].
+///
+/// In all paths, `hint` is updated to point at the leaf the lookup
+/// actually consulted, so the NEXT call can hit the fast path.
+///
+/// MVCC visibility is NOT checked; callers should filter by
+/// `row_header.is_visible(&snapshot)` afterwards (the existing
+/// [`lookup`] wrapper does this).
+pub fn lookup_with_hint(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    table_id: u32,
+    schema_version: u64,
+    hint: &mut Option<LeafCursorHint>,
+) -> Result<Option<ClusteredRow>, DbError> {
+    let Some(root_pid) = root_pid else {
+        return Ok(None);
+    };
+
+    // ── Fast path: hint may serve ──
+    if let Some(h) = hint.as_ref() {
+        if h.table_id == table_id
+            && h.root_page_id == root_pid
+            && h.schema_version == schema_version
+            && key >= h.min_key.as_slice()
+            && key <= h.max_key.as_slice()
+        {
+            let leaf = storage.read_page(h.leaf_page_id)?;
+            if clustered_page_type(&leaf)? == PageType::ClusteredLeaf
+                && clustered_leaf::num_cells(&leaf) > 0
+            {
+                if let Ok(search_result) = leaf_search_checked(&leaf, key) {
+                    return match search_result {
+                        Ok(pos) => {
+                            let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+                            let row_data = reconstruct_row_data(storage, &cell)?;
+                            Ok(Some(ClusteredRow {
+                                key: cell.key.to_vec(),
+                                row_header: cell.row_header,
+                                row_data,
+                            }))
+                        }
+                        Err(_) => Ok(None),
+                    };
+                }
+                // search_checked failed → fall through to descent
+            }
+            // Page no longer a valid leaf → fall through to descent
+        }
+    }
+
+    // ── Slow path: descend from root ──
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+
+    // Update the hint with the leaf we just landed on (if it has any
+    // cells — empty leaf can't bound a key range usefully).
+    let nc = clustered_leaf::num_cells(&leaf);
+    if nc > 0 {
+        let first = clustered_leaf::read_cell(&leaf, 0)?;
+        let last = clustered_leaf::read_cell(&leaf, nc - 1)?;
+        *hint = Some(LeafCursorHint {
+            table_id,
+            root_page_id: root_pid,
+            leaf_page_id: leaf.header().page_id,
+            min_key: first.key.to_vec(),
+            max_key: last.key.to_vec(),
+            schema_version,
+        });
+    }
+
+    let pos = match leaf_search_checked(&leaf, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(None),
+    };
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    let row_data = reconstruct_row_data(storage, &cell)?;
+    Ok(Some(ClusteredRow {
+        key: cell.key.to_vec(),
+        row_header: cell.row_header,
+        row_data,
+    }))
+}
+
 /// Looks up the current physical row for `key` regardless of MVCC visibility.
 pub fn lookup_physical(
     storage: &dyn StorageEngine,
