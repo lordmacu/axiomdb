@@ -698,6 +698,13 @@ pub struct SessionContext {
     statement_cache: HashMap<u64, (crate::statement_cache::CachedPlan, u64)>,
     /// Monotonically increasing sequence counter for `statement_cache` LRU.
     statement_lru_seq: u64,
+    /// Attack 5 (cursor-reuse-cross-statement): cached pointer to the
+    /// most-recently-touched clustered leaf in this session. Used by
+    /// `clustered_tree::lookup_with_hint` to skip the B-tree descent
+    /// when the next key falls in this leaf's range. Cleared by
+    /// `invalidate_all` and `invalidate_table`. Mirrors SQLite's
+    /// `BtCursor` cached metadata (BTCF_ValidNKey).
+    clustered_leaf_hint: Option<axiomdb_storage::clustered_tree::LeafCursorHint>,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -855,6 +862,7 @@ impl SessionContext {
             insert_col_positions: HashMap::new(),
             statement_cache: HashMap::new(),
             statement_lru_seq: 0,
+            clustered_leaf_hint: None,
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,
@@ -1135,6 +1143,10 @@ impl SessionContext {
             self.heap_tail.remove(&resolved.def.id);
         }
         self.cache.remove(&Self::key(database, schema, table));
+        // Attack 5: clear the leaf hint conservatively. Could be more
+        // precise (only clear when invalidated table matches the hint's
+        // table_id), but the hint is a single slot so the cost is small.
+        self.clustered_leaf_hint = None;
     }
 
     pub fn invalidate_all(&mut self) {
@@ -1147,6 +1159,10 @@ impl SessionContext {
         // defeat the cache's purpose.
         self.holiday_cache.clear();
         self.exchange_rate_cache.clear();
+        // Attack 5: clear the clustered leaf hint. invalidate_all fires on
+        // DDL, batch flush, etc — all of these can move pages around or
+        // change a leaf's contents, so the cached pid+range may be stale.
+        self.clustered_leaf_hint = None;
     }
 
     // ── Insert col_positions cache (Attack 3.B Step 3) ────────────────────────
@@ -1262,6 +1278,72 @@ impl SessionContext {
     /// that wants to force a cold start.
     pub fn invalidate_statement_cache(&mut self) {
         self.statement_cache.clear();
+    }
+
+    // ── Clustered leaf hint (Attack 5 — cursor reuse cross-statement) ─────────
+
+    /// Returns the cached clustered-leaf hint only if it can serve `key`.
+    ///
+    /// "Can serve" means:
+    /// - `table_id` matches,
+    /// - `root_page_id` matches the caller's current root,
+    /// - `schema_version` matches the caller's current version,
+    /// - `key` falls in `[min_key, max_key]`.
+    ///
+    /// Returns `None` on any mismatch — the caller must descend from
+    /// root via `clustered_tree::descend_to_leaf` (which `lookup_with_hint`
+    /// does automatically when this returns `None`).
+    pub fn get_clustered_leaf_hint(
+        &self,
+        table_id: u32,
+        root_page_id: u64,
+        schema_version: u64,
+        key: &[u8],
+    ) -> Option<&axiomdb_storage::clustered_tree::LeafCursorHint> {
+        let h = self.clustered_leaf_hint.as_ref()?;
+        if h.table_id == table_id
+            && h.root_page_id == root_page_id
+            && h.schema_version == schema_version
+            && key >= h.min_key.as_slice()
+            && key <= h.max_key.as_slice()
+        {
+            Some(h)
+        } else {
+            None
+        }
+    }
+
+    /// Stores a fresh hint. Called after a successful descent or
+    /// `try_append_with_hint`.
+    pub fn set_clustered_leaf_hint(
+        &mut self,
+        hint: axiomdb_storage::clustered_tree::LeafCursorHint,
+    ) {
+        self.clustered_leaf_hint = Some(hint);
+    }
+
+    /// Explicitly clears the hint. Used by callers that mutate the
+    /// underlying leaf in ways the hint can't track (e.g., page split,
+    /// merge, root rotation outside the catalog DDL path).
+    pub fn invalidate_clustered_leaf_hint(&mut self) {
+        self.clustered_leaf_hint = None;
+    }
+
+    /// Diagnostic / test accessor — reports whether a hint is currently
+    /// stored. Says nothing about whether the hint matches any particular
+    /// `(table_id, root, version, key)` tuple — use `get_clustered_leaf_hint`
+    /// for that.
+    pub fn clustered_leaf_hint_present(&self) -> bool {
+        self.clustered_leaf_hint.is_some()
+    }
+
+    /// Returns a mutable reference to the underlying slot so that
+    /// storage-layer helpers (`clustered_tree::lookup_with_hint` etc.)
+    /// can read + update it in place.
+    pub fn clustered_leaf_hint_slot(
+        &mut self,
+    ) -> &mut Option<axiomdb_storage::clustered_tree::LeafCursorHint> {
+        &mut self.clustered_leaf_hint
     }
 
     // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────
