@@ -41,16 +41,21 @@ pub enum ColumnType {
     Float = 4, // f64
     Text = 5,
     Bytes = 6,
-    Timestamp = 7, // i64 microseconds
-    Uuid = 8,      // [u8; 16]
-    Json = 9,      // validated UTF-8 JSON text
-    Jsonb = 10,    // binary JSONB blob
-    Decimal = 11,  // i128 mantissa + u8 scale
-    Date = 12,     // i32 days since 1970-01-01
-    Array = 13,    // PostgreSQL array
-    Range = 14,      // SQL range type
-    Money = 15,      // SQL MONEY type (Phase 20.17)
-    Composite = 16,  // SQL composite type (Phase 20.18)
+    Timestamp = 7,  // i64 microseconds
+    Uuid = 8,       // [u8; 16]
+    Json = 9,       // validated UTF-8 JSON text
+    Jsonb = 10,     // binary JSONB blob
+    Decimal = 11,   // i128 mantissa + u8 scale
+    Date = 12,      // i32 days since 1970-01-01
+    Array = 13,     // PostgreSQL array
+    Range = 14,     // SQL range type
+    Money = 15,     // SQL MONEY type (Phase 20.17)
+    Composite = 16, // SQL composite type (Phase 20.18)
+    Ltree = 17,     // SQL ltree hierarchical path (Phase 20.19)
+    Xml = 18,       // SQL XML / XMLTYPE (Phase 20.20)
+    TinyInt = 19,   // SQL TINYINT — i8 range, wire 0x01 TINY (Phase 24.1)
+    SmallInt = 20,  // SQL SMALLINT — i16 range, wire 0x02 SHORT (Phase 24.1)
+    Float32 = 21,   // SQL REAL/FLOAT4 — 4-byte f32 LE, wire 0x04 FLOAT (Phase 24.2)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -73,6 +78,11 @@ impl TryFrom<u8> for ColumnType {
             14 => Ok(Self::Range),
             15 => Ok(Self::Money),
             16 => Ok(Self::Composite),
+            17 => Ok(Self::Ltree),
+            18 => Ok(Self::Xml),
+            19 => Ok(Self::TinyInt),
+            20 => Ok(Self::SmallInt),
+            21 => Ok(Self::Float32),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -105,8 +115,11 @@ const MAX_ARRAY_INLINE: usize = 0xFF_FFFF; // 16,777,215
 pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
     match dt {
         crate::types::DataType::Bool => ColumnType::Bool,
+        crate::types::DataType::TinyInt => ColumnType::TinyInt,
+        crate::types::DataType::SmallInt => ColumnType::SmallInt,
         crate::types::DataType::Int => ColumnType::Int,
         crate::types::DataType::BigInt => ColumnType::BigInt,
+        crate::types::DataType::Float => ColumnType::Float32,
         crate::types::DataType::Real => ColumnType::Float,
         crate::types::DataType::Text => ColumnType::Text,
         crate::types::DataType::Bytes => ColumnType::Bytes,
@@ -120,6 +133,8 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Range(_) => ColumnType::Range,
         crate::types::DataType::Money => ColumnType::Money,
         crate::types::DataType::Composite(_) => ColumnType::Composite,
+        crate::types::DataType::Ltree => ColumnType::Ltree,
+        crate::types::DataType::Xml => ColumnType::Xml,
     }
 }
 
@@ -151,7 +166,7 @@ fn encode_element(
             };
             buf.push(if b { 1 } else { 0 });
         }
-        ColumnType::Int | ColumnType::Date => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::Date => {
             let n = match elem {
                 Value::Int(n) => *n,
                 Value::Date(d) => *d,
@@ -172,6 +187,26 @@ fn encode_element(
             };
             buf.extend_from_slice(&n.to_le_bytes());
         }
+        ColumnType::Float32 => match elem {
+            Value::Real(f) => {
+                if f.is_nan() {
+                    return Err(DbError::InvalidValue {
+                        reason: "NaN is not a valid SQL real value".into(),
+                    });
+                }
+                buf.extend_from_slice(&(*f as f32).to_le_bytes());
+            }
+            Value::Null => {
+                buf.extend_from_slice(&0f32.to_le_bytes());
+                return Ok(4);
+            }
+            _ => {
+                return Err(DbError::TypeMismatch {
+                    expected: "REAL".to_string(),
+                    got: elem.variant_name().to_string(),
+                });
+            }
+        },
         ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp => match elem {
             Value::BigInt(n) => buf.extend_from_slice(&n.to_le_bytes()),
             Value::Real(f) => {
@@ -320,6 +355,16 @@ fn encode_element(
                 reason: "Composite type cannot be used as an array element type".to_string(),
             });
         }
+        ColumnType::Ltree => {
+            return Err(DbError::InvalidValue {
+                reason: "Ltree type cannot be used as an array element type".to_string(),
+            });
+        }
+        ColumnType::Xml => {
+            return Err(DbError::InvalidValue {
+                reason: "Xml type cannot be used as an array element type".to_string(),
+            });
+        }
     }
     Ok(buf.len() - start_len)
 }
@@ -350,7 +395,7 @@ fn decode_element(
             *pos += 1;
             Ok((Value::Bool(b), 1))
         }
-        ColumnType::Int | ColumnType::Date => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::Date => {
             if *pos + 4 > blob.len() {
                 return Err(DbError::ParseError {
                     message: "truncated: expected 4 bytes for Int/Date element".to_string(),
@@ -364,6 +409,17 @@ fn decode_element(
                 _ => Value::Int(n),
             };
             Ok((value, 4))
+        }
+        ColumnType::Float32 => {
+            if *pos + 4 > blob.len() {
+                return Err(DbError::ParseError {
+                    message: "truncated: expected 4 bytes for Float32 element".to_string(),
+                    position: None,
+                });
+            }
+            let f = f32::from_le_bytes(blob[*pos..*pos + 4].try_into().map_err(|_| slice_err())?);
+            *pos += 4;
+            Ok((Value::Real(f as f64), 4))
         }
         ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp => {
             if *pos + 8 > blob.len() {
@@ -505,6 +561,14 @@ fn decode_element(
         }),
         ColumnType::Composite => Err(DbError::ParseError {
             message: "Composite element type not supported as array element".to_string(),
+            position: None,
+        }),
+        ColumnType::Ltree => Err(DbError::ParseError {
+            message: "Ltree element type not supported as array element".to_string(),
+            position: None,
+        }),
+        ColumnType::Xml => Err(DbError::ParseError {
+            message: "Xml element type not supported as array element".to_string(),
             position: None,
         }),
     }

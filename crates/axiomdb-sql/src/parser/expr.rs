@@ -908,6 +908,22 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             })
         }
 
+        // ROW(expr, ...) — composite value constructor (Phase 20.18).
+        // Token::Row is a keyword token; handle it here before the `other` fallback.
+        Token::Row => {
+            p.advance();
+            p.expect(&Token::LParen)?;
+            let mut elems = Vec::new();
+            if !matches!(p.peek(), Token::RParen) {
+                elems.push(parse_expr(p)?);
+                while p.eat(&Token::Comma) {
+                    elems.push(parse_expr(p)?);
+                }
+            }
+            p.expect(&Token::RParen)?;
+            Ok(Expr::Row(elems))
+        }
+
         other => Err(DbError::ParseError {
             message: format!("unexpected token {:?} in expression", other,),
             position: Some(pos),
@@ -951,6 +967,21 @@ fn parse_ident_or_call(p: &mut Parser) -> Result<Expr, DbError> {
         if let Some(kind) = sql_json_kind {
             if matches!(p.peek(), Token::LParen) {
                 return parse_sql_json_query(p, kind);
+            }
+        }
+    }
+
+    // Phase 20.20 — SQL/XML constructor special forms.
+    {
+        let lower = name.to_ascii_lowercase();
+        if matches!(p.peek(), Token::LParen) {
+            match lower.as_str() {
+                "xmlelement" => return parse_xmlelement(p),
+                "xmlforest" => return parse_xmlforest(p),
+                "xmlroot" => return parse_xmlroot(p),
+                "xmlconcat" => return parse_xmlconcat(p),
+                "xmlquery" => return parse_xmlquery(p),
+                _ => {}
             }
         }
     }
@@ -1733,4 +1764,215 @@ fn parse_array_constructor(p: &mut Parser) -> Result<Expr, DbError> {
     p.expect(&Token::RBracket)?;
 
     Ok(Expr::ArrayConstructor { elements })
+}
+
+// ── Phase 20.20 — SQL/XML constructor parsers ─────────────────────────────────
+
+/// `XMLELEMENT(NAME tag [, XMLATTRIBUTES(v AS name, ...) ] [, content ...])`
+fn parse_xmlelement(p: &mut Parser) -> Result<Expr, DbError> {
+    p.expect(&Token::LParen)?;
+
+    // NAME keyword
+    let name_kw = p.parse_identifier()?;
+    if !name_kw.eq_ignore_ascii_case("NAME") {
+        return Err(DbError::ParseError {
+            message: format!("expected NAME in XMLELEMENT, got '{name_kw}'"),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    let tag = p.parse_identifier()?;
+    let mut attrs: Vec<(Expr, String)> = Vec::new();
+    let mut content: Vec<Expr> = Vec::new();
+
+    while p.eat(&Token::Comma) {
+        // Check for XMLATTRIBUTES(...)
+        if let Token::Ident(s) = p.peek().clone() {
+            if s.eq_ignore_ascii_case("XMLATTRIBUTES") {
+                p.advance();
+                p.expect(&Token::LParen)?;
+                loop {
+                    let v_expr = parse_expr(p)?;
+                    p.expect(&Token::As)?;
+                    let a_name = p.parse_identifier()?;
+                    attrs.push((v_expr, a_name));
+                    if !p.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                p.expect(&Token::RParen)?;
+                continue;
+            }
+        }
+        // Otherwise it's a content expression
+        content.push(parse_expr(p)?);
+    }
+
+    p.expect(&Token::RParen)?;
+    Ok(Expr::XmlElement {
+        tag,
+        attrs,
+        content,
+    })
+}
+
+/// `XMLFOREST(expr AS name [, ...])`
+fn parse_xmlforest(p: &mut Parser) -> Result<Expr, DbError> {
+    p.expect(&Token::LParen)?;
+    let mut items: Vec<(Expr, String)> = Vec::new();
+
+    if !matches!(p.peek(), Token::RParen) {
+        loop {
+            let expr = parse_expr(p)?;
+            p.expect(&Token::As)?;
+            let name = p.parse_identifier()?;
+            items.push((expr, name));
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+    }
+
+    p.expect(&Token::RParen)?;
+    Ok(Expr::XmlForest { items })
+}
+
+/// `XMLROOT(xml_expr, VERSION string [, STANDALONE YES|NO|NO VALUE])`
+fn parse_xmlroot(p: &mut Parser) -> Result<Expr, DbError> {
+    p.expect(&Token::LParen)?;
+
+    let doc = Box::new(parse_expr(p)?);
+    p.expect(&Token::Comma)?;
+
+    // VERSION keyword
+    let ver_kw = p.parse_identifier()?;
+    if !ver_kw.eq_ignore_ascii_case("VERSION") {
+        return Err(DbError::ParseError {
+            message: format!("expected VERSION in XMLROOT, got '{ver_kw}'"),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    let version = match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected version string in XMLROOT, got {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+
+    let mut standalone: Option<bool> = None;
+    if p.eat(&Token::Comma) {
+        let sa_kw = p.parse_identifier()?;
+        if !sa_kw.eq_ignore_ascii_case("STANDALONE") {
+            return Err(DbError::ParseError {
+                message: format!("expected STANDALONE in XMLROOT, got '{sa_kw}'"),
+                position: Some(p.current_pos()),
+            });
+        }
+        match p.peek().clone() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("YES") => {
+                p.advance();
+                standalone = Some(true);
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("NO") => {
+                p.advance();
+                // Check for "NO VALUE"
+                if let Token::Ident(s2) = p.peek().clone() {
+                    if s2.eq_ignore_ascii_case("VALUE") {
+                        p.advance();
+                        standalone = None;
+                    } else {
+                        standalone = Some(false);
+                    }
+                } else {
+                    standalone = Some(false);
+                }
+            }
+            other => {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "expected YES, NO, or NO VALUE after STANDALONE, got {other:?}"
+                    ),
+                    position: Some(p.current_pos()),
+                })
+            }
+        }
+    }
+
+    p.expect(&Token::RParen)?;
+    Ok(Expr::XmlRoot {
+        doc,
+        version,
+        standalone,
+    })
+}
+
+/// `XMLCONCAT(xml1 [, xml2, ...])`
+fn parse_xmlconcat(p: &mut Parser) -> Result<Expr, DbError> {
+    p.expect(&Token::LParen)?;
+    let mut args: Vec<Expr> = Vec::new();
+
+    if !matches!(p.peek(), Token::RParen) {
+        args.push(parse_expr(p)?);
+        while p.eat(&Token::Comma) {
+            args.push(parse_expr(p)?);
+        }
+    }
+
+    p.expect(&Token::RParen)?;
+    Ok(Expr::XmlConcat { args })
+}
+
+/// `XMLQUERY(xpath_string PASSING xml_expr [RETURNING CONTENT])`
+fn parse_xmlquery(p: &mut Parser) -> Result<Expr, DbError> {
+    p.expect(&Token::LParen)?;
+
+    let xpath = match p.peek().clone() {
+        Token::StringLit(s) => {
+            p.advance();
+            s
+        }
+        other => {
+            return Err(DbError::ParseError {
+                message: format!("expected XPath string in XMLQUERY, got {other:?}"),
+                position: Some(p.current_pos()),
+            })
+        }
+    };
+
+    // PASSING keyword
+    let passing_kw = p.parse_identifier()?;
+    if !passing_kw.eq_ignore_ascii_case("PASSING") {
+        return Err(DbError::ParseError {
+            message: format!("expected PASSING in XMLQUERY, got '{passing_kw}'"),
+            position: Some(p.current_pos()),
+        });
+    }
+
+    let doc = Box::new(parse_expr(p)?);
+
+    // Optional RETURNING CONTENT
+    if let Token::Ident(s) = p.peek().clone() {
+        if s.eq_ignore_ascii_case("RETURNING") {
+            p.advance();
+            let content_kw = p.parse_identifier()?;
+            if !content_kw.eq_ignore_ascii_case("CONTENT") {
+                return Err(DbError::ParseError {
+                    message: format!(
+                        "expected CONTENT after RETURNING in XMLQUERY, got '{content_kw}'"
+                    ),
+                    position: Some(p.current_pos()),
+                });
+            }
+        }
+    }
+
+    p.expect(&Token::RParen)?;
+    Ok(Expr::XmlQuery { xpath, doc })
 }

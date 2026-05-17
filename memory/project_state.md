@@ -1,21 +1,20 @@
 # Project State
 
-## Current (2026-05-15)
+## Current (2026-05-17)
 
-**Active phase:** Phase 20 — Types + import/export
-**Active subphase:** Phase 20.11 — TABLESAMPLE COMPLETE.
-AST: `TableSampleMethod` enum + `TableSample { method, percent: f64 }` added to `TableRef`
-(f64 required removing `Eq` derive cascade in 4 structs). Parser: `parse_optional_tablesample`
-with implicit-alias guard + negated-literal handling + REPEATABLE→NotImplemented. Scan:
-`scan_table_sampled` in `TableEngine` (SYSTEM=page-level, BERNOULLI=row-level, 0/100 shortcuts,
-clustered fallback). Executor: `select_core.rs` branches to sampled scan. 16 integration tests,
-3 wire assertions, 4060/4060 workspace tests, clippy+fmt clean.
+**Active phase:** Phase 24 — Complete Type System
+**Active subphase:** Phase 24.3 — Exact DECIMAL(p,s) COMPLETE.
+`DECIMAL(p,s)` parser captures precision/scale into `ColumnDef.type_len=(p<<8)|s`.
+`enforce_decimal_precision` enforces ROUND_HALF_UP and integer overflow rejection.
+Division produces ~6 extra fractional digits. ROUND/TRUNC Decimal arms via `rust_decimal`.
+SHOW COLUMNS now displays `decimal(p,s)` (both `ddl_show.rs` and `exec_entry.rs` paths fixed).
+4338/4338 workspace tests, clippy clean, fmt clean. 11 wire assertions pass.
 
-**Last verified gates:** Phase 20.11 closeout passed 4060/4060 tests, clippy clean, fmt clean.
+**Last verified gates:** Phase 24.3 closeout passed 4338/4338 tests, clippy clean, fmt clean, 639/652 wire pass (13 pre-existing unrelated failures).
 
-**Recently completed:** 20.11 — TABLESAMPLE (2026-05-15). 20.12 — ORDER BY RANDOM() (2026-05-15). 20.15 — Regex operators (2026-05-15).
+**Recently completed:** 24.1 — TINYINT/SMALLINT/BIGSERIAL (2026-05-16). 24.1b — SERIAL/SMALLSERIAL (2026-05-16). 24.2 — REAL vs DOUBLE (2026-05-16). 24.3 — Exact DECIMAL (2026-05-17).
 
-**Next:** Phase 20.13 (Range types) or next pending Phase 20 subphase.
+**Next:** Phase 24.1c (GENERATED ALWAYS AS IDENTITY) or 24.4 (CITEXT).
 
 ### Phase 21 subphase status
 

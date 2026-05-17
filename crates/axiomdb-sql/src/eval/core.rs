@@ -473,24 +473,50 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
             Ok(Value::Composite(vals?))
         }
         Expr::FieldAccess { col_idx, field_idx } => {
-            let composite = row.get(*col_idx).cloned().ok_or(DbError::ColumnIndexOutOfBounds {
-                idx: *col_idx,
-                len: row.len(),
-            })?;
+            let composite = row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: row.len(),
+                })?;
             match composite {
-                Value::Composite(fields) => fields
-                    .into_iter()
-                    .nth(*field_idx)
-                    .ok_or(DbError::ColumnIndexOutOfBounds {
-                        idx: *field_idx,
-                        len: 0,
-                    }),
+                Value::Composite(fields) => {
+                    fields
+                        .into_iter()
+                        .nth(*field_idx)
+                        .ok_or(DbError::ColumnIndexOutOfBounds {
+                            idx: *field_idx,
+                            len: 0,
+                        })
+                }
                 Value::Null => Ok(Value::Null),
                 _ => Err(DbError::TypeMismatch {
                     expected: "composite".into(),
                     got: format!("{composite:?}"),
                 }),
             }
+        }
+
+        // Phase 20.20 — XML constructor special forms.
+        Expr::XmlElement {
+            tag,
+            attrs,
+            content,
+        } => super::functions::xml::eval_xmlelement(tag, attrs, content, row, &mut NoSubquery),
+        Expr::XmlForest { items } => {
+            super::functions::xml::eval_xmlforest(items, row, &mut NoSubquery)
+        }
+        Expr::XmlRoot {
+            doc,
+            version,
+            standalone,
+        } => super::functions::xml::eval_xmlroot(doc, version, *standalone, row, &mut NoSubquery),
+        Expr::XmlConcat { args } => {
+            super::functions::xml::eval_xmlconcat(args, row, &mut NoSubquery)
+        }
+        Expr::XmlQuery { xpath, doc } => {
+            super::functions::xml::eval_xmlquery(xpath, doc, row, &mut NoSubquery)
         }
     }
 }
@@ -569,6 +595,7 @@ impl Hash for HashableValue {
                     HashableValue(f.clone()).hash(state);
                 }
             }
+            Value::Ltree(s) | Value::Xml(s) => s.hash(state),
         }
     }
 }
@@ -1085,18 +1112,23 @@ pub fn eval_with<R: SubqueryRunner>(
             Ok(Value::Composite(vals?))
         }
         Expr::FieldAccess { col_idx, field_idx } => {
-            let composite = row.get(*col_idx).cloned().ok_or(DbError::ColumnIndexOutOfBounds {
-                idx: *col_idx,
-                len: row.len(),
-            })?;
+            let composite = row
+                .get(*col_idx)
+                .cloned()
+                .ok_or(DbError::ColumnIndexOutOfBounds {
+                    idx: *col_idx,
+                    len: row.len(),
+                })?;
             match composite {
-                Value::Composite(fields) => fields
-                    .into_iter()
-                    .nth(*field_idx)
-                    .ok_or(DbError::ColumnIndexOutOfBounds {
-                        idx: *field_idx,
-                        len: 0,
-                    }),
+                Value::Composite(fields) => {
+                    fields
+                        .into_iter()
+                        .nth(*field_idx)
+                        .ok_or(DbError::ColumnIndexOutOfBounds {
+                            idx: *field_idx,
+                            len: 0,
+                        })
+                }
                 Value::Null => Ok(Value::Null),
                 _ => Err(DbError::TypeMismatch {
                     expected: "composite".into(),
@@ -1104,6 +1136,21 @@ pub fn eval_with<R: SubqueryRunner>(
                 }),
             }
         }
+
+        // Phase 20.20 — XML constructor special forms.
+        Expr::XmlElement {
+            tag,
+            attrs,
+            content,
+        } => super::functions::xml::eval_xmlelement(tag, attrs, content, row, sq),
+        Expr::XmlForest { items } => super::functions::xml::eval_xmlforest(items, row, sq),
+        Expr::XmlRoot {
+            doc,
+            version,
+            standalone,
+        } => super::functions::xml::eval_xmlroot(doc, version, *standalone, row, sq),
+        Expr::XmlConcat { args } => super::functions::xml::eval_xmlconcat(args, row, sq),
+        Expr::XmlQuery { xpath, doc } => super::functions::xml::eval_xmlquery(xpath, doc, row, sq),
     }
 }
 
@@ -1225,6 +1272,8 @@ enum ArrayElemType {
     Range,
     Money,
     Composite,
+    Ltree,
+    Xml,
 }
 
 impl ArrayElemType {
@@ -1247,6 +1296,8 @@ impl ArrayElemType {
             Value::Range(_) => Self::Range,
             Value::Money(..) => Self::Money,
             Value::Composite(_) => Self::Composite,
+            Value::Ltree(_) => Self::Ltree,
+            Value::Xml(_) => Self::Xml,
         }
     }
 
@@ -1269,6 +1320,8 @@ impl ArrayElemType {
             Self::Range => None, // Range types not supported as array elements
             Self::Money => Some(DataType::Money),
             Self::Composite => None,
+            Self::Ltree => Some(DataType::Ltree),
+            Self::Xml => Some(DataType::Xml),
         }
     }
 }

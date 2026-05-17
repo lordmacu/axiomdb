@@ -334,7 +334,7 @@ fn json_value_to_axiom(
             serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0).unwrap_or(false),
             _ => false,
         })),
-        ColumnType::Int => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int => {
             let n = match v {
                 serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
                 serde_json::Value::String(s) => s.parse().unwrap_or(0),
@@ -351,6 +351,15 @@ fn json_value_to_axiom(
                 _ => 0,
             };
             Ok(Value::BigInt(n))
+        }
+        ColumnType::Float32 => {
+            let f = match v {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32 as f64,
+                serde_json::Value::String(s) => s.parse::<f32>().unwrap_or(0.0) as f64,
+                serde_json::Value::Bool(b) => f64::from(*b),
+                _ => 0.0,
+            };
+            Ok(Value::Real(f))
         }
         ColumnType::Float => {
             let f = match v {
@@ -373,7 +382,9 @@ fn json_value_to_axiom(
         | ColumnType::Array
         | ColumnType::Range
         | ColumnType::Money
-        | ColumnType::Composite => {
+        | ColumnType::Composite
+        | ColumnType::Ltree
+        | ColumnType::Xml => {
             let s = match v {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -518,6 +529,7 @@ fn value_to_url_string(v: &Value) -> String {
         Value::Range(rv) => rv.to_display_string(),
         Value::Money(m, s, c) => Value::Money(*m, *s, *c).to_string(),
         Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
+        Value::Ltree(s) | Value::Xml(s) => s.clone(),
         Value::Null => String::new(),
     }
 }

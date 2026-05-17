@@ -11,9 +11,11 @@ pub mod codec;
 pub mod coerce;
 pub mod field_patch;
 pub mod jsonb;
+pub mod ltree;
 pub mod range_value;
 pub mod types;
 pub mod value;
+pub mod xml;
 
 pub use array_codec::{decode_array, encode_array, encode_array_nd};
 pub use array_io::{array_to_text, text_to_array};
@@ -23,6 +25,11 @@ pub use jsonb::{
     jsonb_contains, jsonb_merge_patch, jsonb_overlaps, JsonbDecoder, JsonbEncoder, JsonbRef,
     JsonbValue,
 };
+pub use ltree::{
+    lquery_match, ltree_concat, ltree_index, ltree_is_ancestor, ltree_lca, ltree_nlevel,
+    ltree_subpath, validate_ltree_path,
+};
 pub use range_value::RangeValue;
 pub use types::DataType;
 pub use value::Value;
+pub use xml::validate_xml_text;

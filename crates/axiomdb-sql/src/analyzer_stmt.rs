@@ -519,6 +519,14 @@ fn analyze_select_with_outer(
             FromClause::ReadParquet(rp) => {
                 join.table = FromClause::ReadParquet(rp);
             }
+            // Phase 20.20 — XMLTABLE: resolve the PASSING expressions.
+            FromClause::XmlTable(mut xt) => {
+                for (expr, _) in &mut xt.passing {
+                    let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                    *expr = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
+                }
+                join.table = FromClause::XmlTable(xt);
+            }
         }
         // Phase 21.18 — NATURAL JOIN: compute the shared-column list between
         // the accumulated left-side scope and this join's right-side BoundTable,
@@ -938,7 +946,12 @@ fn expr_contains_window(expr: &Expr) -> bool {
         | Expr::Subscript { .. }
         | Expr::AnyOf { .. }
         | Expr::AllOf { .. }
-        | Expr::FieldAccess { .. } => false,
+        | Expr::FieldAccess { .. }
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => false,
     }
 }
 
@@ -1032,7 +1045,13 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::Subscript { .. }
         | Expr::AnyOf { .. }
         | Expr::AllOf { .. }
-        | Expr::FieldAccess { .. } => false,
+        | Expr::FieldAccess { .. }
+        // Phase 20.20 — XML constructor forms (treat as non-aggregate leaves).
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => false,
     }
 }
 
@@ -1212,7 +1231,13 @@ fn rewrite_custom_aggregates_in_expr(
         | Expr::Exists { .. }
         | Expr::ArrayConstructor { .. }
         | Expr::Subscript { .. }
-        | Expr::FieldAccess { .. } => {}
+        | Expr::FieldAccess { .. }
+        // Phase 20.20 — XML constructor forms: no custom aggregates inside.
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => {}
     }
     Ok(())
 }
@@ -1356,6 +1381,19 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
             }
         }
         Expr::FieldAccess { .. } => {}
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { populate_grouping_indices(e, universe); }
+            for e in content { populate_grouping_indices(e, universe); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { populate_grouping_indices(e, universe); }
+        }
+        Expr::XmlRoot { doc, .. } => populate_grouping_indices(doc, universe),
+        Expr::XmlConcat { args } => {
+            for e in args { populate_grouping_indices(e, universe); }
+        }
+        Expr::XmlQuery { doc, .. } => populate_grouping_indices(doc, universe),
     }
 }
 

@@ -17,11 +17,20 @@
 pub enum DataType {
     /// SQL BOOLEAN — stored as 1 byte (0x00 / 0x01).
     Bool,
+    /// SQL TINYINT — i8 range (-128..=127). Stored as Value::Int(i64) at runtime.
+    /// Distinct from Bool: TINYINT is a numeric type, not boolean. Wire: 0x01 TINY.
+    TinyInt,
+    /// SQL SMALLINT — i16 range (-32768..=32767). Stored as Value::Int(i64) at runtime.
+    /// Wire: 0x02 SHORT.
+    SmallInt,
     /// SQL INT / INTEGER — stored as 4-byte little-endian i32.
     Int,
     /// SQL BIGINT — stored as 8-byte little-endian i64.
     BigInt,
-    /// SQL REAL / DOUBLE PRECISION / FLOAT — stored as 8-byte LE f64 (IEEE 754).
+    /// SQL REAL / FLOAT4 / FLOAT — f32 precision, stored as 4-byte LE IEEE 754.
+    /// Runtime: Value::Real(f64) (widened on decode). Wire: 0x04 FLOAT (Phase 24.2).
+    Float,
+    /// SQL DOUBLE / DOUBLE PRECISION / FLOAT8 — stored as 8-byte LE f64 (IEEE 754).
     Real,
     /// SQL DECIMAL / NUMERIC — stored as 16-byte LE i128 mantissa + 1-byte scale.
     /// Represents `mantissa × 10^(-scale)`.
@@ -57,6 +66,12 @@ pub enum DataType {
     /// Inner vec holds `(field_name, field_type)` in declaration order.
     /// On disk: `[u32 LE data_len][encode_row(field_values, field_types)]`.
     Composite(Vec<(String, DataType)>),
+    /// SQL ltree — hierarchical label path (Phase 20.19).
+    /// On disk: `[u32 LE data_len][UTF-8 path bytes]`.
+    Ltree,
+    /// SQL XML / XMLTYPE — validated well-formed UTF-8 XML text (Phase 20.20).
+    /// On disk: `[u32 LE data_len][UTF-8 XML bytes]`.
+    Xml,
 }
 
 impl DataType {
@@ -68,9 +83,12 @@ impl DataType {
     pub fn name(&self) -> String {
         match self {
             Self::Bool => "BOOL".into(),
+            Self::TinyInt => "TINYINT".into(),
+            Self::SmallInt => "SMALLINT".into(),
             Self::Int => "INT".into(),
             Self::BigInt => "BIGINT".into(),
-            Self::Real => "REAL".into(),
+            Self::Float => "REAL".into(),
+            Self::Real => "DOUBLE".into(),
             Self::Decimal => "DECIMAL".into(),
             Self::Text => "TEXT".into(),
             Self::Bytes => "BYTES".into(),
@@ -90,6 +108,8 @@ impl DataType {
             },
             Self::Money => "MONEY".into(),
             Self::Composite(_) => "COMPOSITE".into(),
+            Self::Ltree => "LTREE".into(),
+            Self::Xml => "XML".into(),
         }
     }
 }

@@ -386,6 +386,11 @@ fn explain_select(
                 message: "unlowered PIVOT reached EXPLAIN".into(),
             })
         }
+        crate::ast::FromClause::XmlTable(_) => {
+            return Err(DbError::Other(
+                "EXPLAIN for XMLTABLE FROM not yet supported".into(),
+            ))
+        }
     };
 
     let conn = ctx.conn_txn.take();

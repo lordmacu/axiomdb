@@ -553,6 +553,7 @@ impl std::hash::Hash for HashableValue {
                     HashableValue(f.clone()).hash(state);
                 }
             }
+            Value::Ltree(s) | Value::Xml(s) => s.hash(state),
         }
     }
 }

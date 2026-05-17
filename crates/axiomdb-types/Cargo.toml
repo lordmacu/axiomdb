@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 axiomdb-core    = { workspace = true }
 thiserror    = { workspace = true }
+roxmltree    = { workspace = true }
 lz4_flex     = { workspace = true }
 unicode-normalization = { workspace = true }
 serde_json   = { workspace = true }

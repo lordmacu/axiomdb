@@ -272,6 +272,11 @@ pub(crate) fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbE
         return eval_binary_money(op, l, r);
     }
 
+    // ── Ltree operator dispatch (Phase 20.19) ─────────────────────────────────
+    if matches!(&l, Value::Ltree(_)) {
+        return eval_binary_ltree(op, l, r);
+    }
+
     // NULL propagation for all other binary ops.
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
@@ -774,10 +779,16 @@ fn decimal_arith(op: BinaryOp, m1: i128, s1: u8, m2: i128, s2: u8) -> Result<Val
             if m2 == 0 {
                 return Err(DbError::DivisionByZero);
             }
-            // Integer division of mantissas — scale preserved as s1 (truncation).
-            // Full precision division is Phase 4.18b.
-            let result = m1.checked_div(m2).ok_or(DbError::Overflow)?;
-            Ok(Value::Decimal(result, s1))
+            // Scale numerator by 10^(s2 + extra) so the result carries s1+extra
+            // fractional digits. extra is capped so total scale stays ≤ 38.
+            let extra = 6u8.min(38u8.saturating_sub(s1));
+            let scale_up = (s2 as u32) + (extra as u32);
+            let scaled = m1
+                .checked_mul(10i128.pow(scale_up))
+                .ok_or(DbError::Overflow)?;
+            let result = scaled.checked_div(m2).ok_or(DbError::Overflow)?;
+            let scale = s1.saturating_add(extra);
+            Ok(Value::Decimal(result, scale))
         }
         BinaryOp::Mod => {
             if m2 == 0 {
@@ -1691,6 +1702,94 @@ fn align_and_add(
         reason: "money arithmetic overflow".into(),
     })?;
     Ok((result, scale))
+}
+
+// ── Ltree operators (Phase 20.19) ────────────────────────────────────────────
+
+/// Handles binary operators when LHS is `Value::Ltree`.
+///
+/// | Operator           | BinaryOp          | Semantics                                  |
+/// |--------------------|-------------------|--------------------------------------------|
+/// | `@>`               | JsonContains      | left is ancestor-or-equal of right         |
+/// | `<@`               | JsonContainedBy   | left is descendant-or-equal of right       |
+/// | `~`                | RegexpTilde       | left path matches lquery pattern (right)   |
+/// | `\|\|`             | Concat            | concatenate left || right → new ltree      |
+/// | `=`, `<`, `>`, … | comparison ops    | lexicographic string comparison            |
+fn eval_binary_ltree(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
+    use axiomdb_types::{lquery_match, ltree_concat, ltree_is_ancestor};
+
+    // NULL propagation: Ltree operators return NULL when either operand is NULL.
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let lpath = match &l {
+        Value::Ltree(s) => s.as_str(),
+        _ => unreachable!("dispatch guarantees LHS is Ltree"),
+    };
+
+    match op {
+        // @> — left is ancestor-or-equal of right
+        BinaryOp::JsonContains => {
+            let rpath = ltree_rhs_path(&r)?;
+            Ok(Value::Bool(ltree_is_ancestor(lpath, rpath)))
+        }
+
+        // <@ — left is descendant-or-equal of right (right is ancestor of left)
+        BinaryOp::JsonContainedBy => {
+            let rpath = ltree_rhs_path(&r)?;
+            Ok(Value::Bool(ltree_is_ancestor(rpath, lpath)))
+        }
+
+        // ~ — lquery pattern match; RHS is the pattern (Text or Ltree string)
+        BinaryOp::RegexpTilde => {
+            let pattern = ltree_rhs_text(&r)?;
+            Ok(Value::Bool(lquery_match(lpath, pattern)))
+        }
+
+        // || — concatenate two ltree paths
+        BinaryOp::Concat => {
+            let rpath = ltree_rhs_path(&r)?;
+            Ok(Value::Ltree(ltree_concat(lpath, rpath)))
+        }
+
+        // Comparison operators — compare ltree paths lexicographically
+        BinaryOp::Eq => Ok(Value::Bool(lpath == ltree_rhs_path(&r)?)),
+        BinaryOp::NotEq => Ok(Value::Bool(lpath != ltree_rhs_path(&r)?)),
+        BinaryOp::Lt => Ok(Value::Bool(lpath < ltree_rhs_path(&r)?)),
+        BinaryOp::LtEq => Ok(Value::Bool(lpath <= ltree_rhs_path(&r)?)),
+        BinaryOp::Gt => Ok(Value::Bool(lpath > ltree_rhs_path(&r)?)),
+        BinaryOp::GtEq => Ok(Value::Bool(lpath >= ltree_rhs_path(&r)?)),
+
+        _ => Err(DbError::TypeMismatch {
+            expected: "ltree operator (@>, <@, ~, ||, =, <, >)".into(),
+            got: format!("{} on Ltree", op_variant_name(&op)),
+        }),
+    }
+}
+
+/// Extracts the path string from an ltree RHS value.
+/// Accepts `Value::Ltree` or `Value::Text` (implicit coerce).
+fn ltree_rhs_path(r: &Value) -> Result<&str, DbError> {
+    match r {
+        Value::Ltree(s) | Value::Text(s) => Ok(s.as_str()),
+        _ => Err(DbError::TypeMismatch {
+            expected: "LTREE".into(),
+            got: r.variant_name().into(),
+        }),
+    }
+}
+
+/// Extracts a pattern string from an lquery RHS value.
+/// Accepts `Value::Text` or `Value::Ltree` (pattern may contain `*`).
+fn ltree_rhs_text(r: &Value) -> Result<&str, DbError> {
+    match r {
+        Value::Text(s) | Value::Ltree(s) => Ok(s.as_str()),
+        _ => Err(DbError::TypeMismatch {
+            expected: "TEXT (lquery pattern)".into(),
+            got: r.variant_name().into(),
+        }),
+    }
 }
 
 /// Compares two same-currency money amounts by aligning their scales.

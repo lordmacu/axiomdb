@@ -750,9 +750,18 @@ fn test_composite_type_def_roundtrip() {
         schema_name: "public".into(),
         name: "address".into(),
         fields: vec![
-            CompositeField { name: "street".into(), type_name: "TEXT".into() },
-            CompositeField { name: "city".into(), type_name: "TEXT".into() },
-            CompositeField { name: "zip".into(), type_name: "INT".into() },
+            CompositeField {
+                name: "street".into(),
+                type_name: "TEXT".into(),
+            },
+            CompositeField {
+                name: "city".into(),
+                type_name: "TEXT".into(),
+            },
+            CompositeField {
+                name: "zip".into(),
+                type_name: "INT".into(),
+            },
         ],
     };
     let bytes = def.to_bytes();
@@ -776,8 +785,14 @@ fn test_composite_type_create_and_get() {
             schema_name: "public".into(),
             name: "point2d".into(),
             fields: vec![
-                CompositeField { name: "x".into(), type_name: "REAL".into() },
-                CompositeField { name: "y".into(), type_name: "REAL".into() },
+                CompositeField {
+                    name: "x".into(),
+                    type_name: "REAL".into(),
+                },
+                CompositeField {
+                    name: "y".into(),
+                    type_name: "REAL".into(),
+                },
             ],
         })
         .unwrap();
@@ -802,7 +817,10 @@ fn test_composite_type_delete() {
         w.create_composite_type(CompositeTypeDef {
             schema_name: "public".into(),
             name: "rect".into(),
-            fields: vec![CompositeField { name: "w".into(), type_name: "INT".into() }],
+            fields: vec![CompositeField {
+                name: "w".into(),
+                type_name: "INT".into(),
+            }],
         })
         .unwrap();
     }

@@ -424,6 +424,9 @@ pub enum FromClause {
     /// Phase 20.6 — `READ_PARQUET('path') [AS alias [(col1, col2, ...)]]`.
     /// Schema is discovered at bind time from the Parquet file metadata.
     ReadParquet(Box<ReadParquetClause>),
+    /// Phase 20.20 — `XMLTABLE(row_xpath PASSING xml_expr COLUMNS ...) [AS alias]`.
+    /// Table-valued function that shreds an XML document into rows.
+    XmlTable(Box<XmlTable>),
 }
 
 /// Phase 20.6 — `READ_PARQUET('path') [AS alias [(col1, col2, ...)]]`.
@@ -615,6 +618,32 @@ pub enum JsonTableColumn {
         path: String,
         columns: Vec<JsonTableColumn>,
     },
+}
+
+/// Phase 20.20 — `XMLTABLE(row_xpath PASSING xml_expr COLUMNS ...)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XmlTable {
+    /// XPath expression selecting one context node per output row (e.g. `'/root/item'`).
+    pub row_path: String,
+    /// `PASSING expr [AS name]` bindings. The expr is the XML document.
+    pub passing: Vec<(Expr, Option<String>)>,
+    /// Column declarations inside `COLUMNS(...)`.
+    pub columns: Vec<XmlTableColumn>,
+    /// Table alias (`AS t`). Defaults to `"xmltable"` when absent.
+    pub alias: Option<String>,
+}
+
+/// One column declaration inside `XMLTABLE(...COLUMNS(...))`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XmlTableColumn {
+    pub name: String,
+    pub col_type: axiomdb_types::DataType,
+    /// Column XPath relative to the row context node. `None` = use column name.
+    pub path: Option<String>,
+    pub default_expr: Option<Expr>,
+    pub not_null: bool,
+    /// `FOR ORDINALITY` — 1-based row counter (replaces col_type).
+    pub ordinality: bool,
 }
 
 /// A `JOIN` attached to a `SELECT` statement.

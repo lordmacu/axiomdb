@@ -152,6 +152,11 @@ impl BatchPredicate {
                 let lit_val = i64::from_le_bytes(lit_bytes.try_into().unwrap_or_default());
                 cmp_ord(col_val, lit_val, check.op)
             }
+            DataType::Float => {
+                let col_val = f32::from_le_bytes(col_bytes.try_into().unwrap_or_default()) as f64;
+                let lit_val = f32::from_le_bytes(lit_bytes.try_into().unwrap_or_default()) as f64;
+                cmp_f64(col_val, lit_val, check.op)
+            }
             DataType::Real => {
                 let col_val = f64::from_le_bytes(col_bytes.try_into().unwrap_or_default());
                 let lit_val = f64::from_le_bytes(lit_bytes.try_into().unwrap_or_default());
@@ -263,6 +268,33 @@ impl BatchPredicate {
                 let lit =
                     i64::from_le_bytes(check.literal_bytes[..8].try_into().unwrap_or_default());
                 super::simd::batch_cmp_i64(&vals, lit, check.op, output);
+            }
+            DataType::Float => {
+                let mut vals = vec![0.0f64; n];
+                for (i, row) in rows.iter().enumerate() {
+                    if !output[i] {
+                        continue;
+                    }
+                    if is_null_bit(&row[..self.bitmap_len], check.col_idx) {
+                        output[i] = false;
+                        continue;
+                    }
+                    if let Some(off) = self.col_offset(row, check) {
+                        if off + 4 <= row.len() {
+                            vals[i] = f32::from_le_bytes(
+                                row[off..off + 4].try_into().unwrap_or_default(),
+                            ) as f64;
+                        } else {
+                            output[i] = false;
+                        }
+                    } else {
+                        output[i] = false;
+                    }
+                }
+                let lit =
+                    f32::from_le_bytes(check.literal_bytes[..4].try_into().unwrap_or_default())
+                        as f64;
+                super::simd::batch_cmp_f64(&vals, lit, check.op, output);
             }
             DataType::Real => {
                 let mut vals = vec![0.0f64; n];
@@ -445,6 +477,10 @@ fn encode_literal(v: &Value, dt: DataType) -> Option<([u8; 8], u8)> {
             buf[..8].copy_from_slice(&(*n as i64).to_le_bytes());
             Some((buf, 8))
         }
+        (DataType::Float, Value::Real(f)) => {
+            buf[..4].copy_from_slice(&(*f as f32).to_le_bytes());
+            Some((buf, 4))
+        }
         (DataType::Real, Value::Real(f)) => {
             buf[..8].copy_from_slice(&f.to_le_bytes());
             Some((buf, 8))
@@ -507,7 +543,11 @@ fn is_null_bit(bitmap: &[u8], col: usize) -> bool {
 fn fixed_size(dt: DataType) -> Option<usize> {
     match dt {
         DataType::Bool => Some(1),
-        DataType::Int | DataType::Date => Some(4),
+        DataType::TinyInt
+        | DataType::SmallInt
+        | DataType::Int
+        | DataType::Float
+        | DataType::Date => Some(4),
         DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
         DataType::Text
         | DataType::Json
@@ -518,7 +558,9 @@ fn fixed_size(dt: DataType) -> Option<usize> {
         | DataType::Array(_)
         | DataType::Range(_)
         | DataType::Money
-        | DataType::Composite(_) => None,
+        | DataType::Composite(_)
+        | DataType::Ltree
+        | DataType::Xml => None,
     }
 }
 

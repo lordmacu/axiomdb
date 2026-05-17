@@ -274,6 +274,11 @@ pub enum ColumnType {
     Range = 14,      // SQL range type (Phase 20.13)
     Money = 15,      // SQL MONEY type (Phase 20.17)
     Composite = 16,  // SQL composite user-defined type (Phase 20.18)
+    Ltree = 17,      // SQL ltree hierarchical path (Phase 20.19)
+    Xml = 18,        // SQL XML / XMLTYPE (Phase 20.20)
+    TinyInt = 19,    // SQL TINYINT — i8 range (-128..=127), wire 0x01 TINY (Phase 24.1)
+    SmallInt = 20,   // SQL SMALLINT — i16 range (-32768..=32767), wire 0x02 SHORT (Phase 24.1)
+    Float32 = 21,    // SQL REAL/FLOAT4 — 4-byte f32 LE; wire 0x04 FLOAT (Phase 24.2)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -297,6 +302,11 @@ impl TryFrom<u8> for ColumnType {
             14 => Ok(Self::Range),
             15 => Ok(Self::Money),
             16 => Ok(Self::Composite),
+            17 => Ok(Self::Ltree),
+            18 => Ok(Self::Xml),
+            19 => Ok(Self::TinyInt),
+            20 => Ok(Self::SmallInt),
+            21 => Ok(Self::Float32),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,

@@ -240,6 +240,16 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                     key.push(0);
                 }
             }
+            Value::Ltree(s) => {
+                key.push(17);
+                key.extend_from_slice(s.as_bytes());
+                key.push(0);
+            }
+            Value::Xml(s) => {
+                key.push(18);
+                key.extend_from_slice(s.as_bytes());
+                key.push(0);
+            }
         }
     }
     key

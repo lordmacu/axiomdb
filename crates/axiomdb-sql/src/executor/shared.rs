@@ -380,6 +380,19 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
                 mask[*col_idx] = true;
             }
         }
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { collect_column_refs(e, mask); }
+            for e in content { collect_column_refs(e, mask); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { collect_column_refs(e, mask); }
+        }
+        Expr::XmlRoot { doc, .. } => collect_column_refs(doc, mask),
+        Expr::XmlConcat { args } => {
+            for e in args { collect_column_refs(e, mask); }
+        }
+        Expr::XmlQuery { doc, .. } => collect_column_refs(doc, mask),
     }
 }
 
@@ -402,8 +415,11 @@ fn make_resolver_with_database<'a>(
 fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
     match dt {
         DataType::Bool => Ok(ColumnType::Bool),
+        DataType::TinyInt => Ok(ColumnType::TinyInt),
+        DataType::SmallInt => Ok(ColumnType::SmallInt),
         DataType::Int => Ok(ColumnType::Int),
         DataType::BigInt => Ok(ColumnType::BigInt),
+        DataType::Float => Ok(ColumnType::Float32),
         DataType::Real => Ok(ColumnType::Float),
         DataType::Text => Ok(ColumnType::Text),
         DataType::Json => Ok(ColumnType::Json),
@@ -417,6 +433,8 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Range(_) => Ok(ColumnType::Range),
         DataType::Money => Ok(ColumnType::Money),
         DataType::Composite(_) => Ok(ColumnType::Composite),
+        DataType::Ltree => Ok(ColumnType::Ltree),
+        DataType::Xml => Ok(ColumnType::Xml),
     }
 }
 
@@ -424,8 +442,11 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
 fn column_type_to_datatype(ct: ColumnType) -> DataType {
     match ct {
         ColumnType::Bool => DataType::Bool,
+        ColumnType::TinyInt => DataType::TinyInt,
+        ColumnType::SmallInt => DataType::SmallInt,
         ColumnType::Int => DataType::Int,
         ColumnType::BigInt => DataType::BigInt,
+        ColumnType::Float32 => DataType::Float,
         ColumnType::Float => DataType::Real,
         ColumnType::Text => DataType::Text,
         ColumnType::Json => DataType::Json,
@@ -439,6 +460,8 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
         ColumnType::Money => DataType::Money,
         ColumnType::Composite => DataType::Composite(vec![]),
+        ColumnType::Ltree => DataType::Ltree,
+        ColumnType::Xml => DataType::Xml,
     }
 }
 
@@ -476,6 +499,8 @@ fn datatype_of_value(v: &Value) -> DataType {
         Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
         Value::Money(..) => DataType::Money,
         Value::Composite(_) => DataType::Composite(vec![]),
+        Value::Ltree(_) => DataType::Ltree,
+        Value::Xml(_) => DataType::Xml,
     }
 }
 
@@ -822,7 +847,18 @@ fn build_derived_output_columns(
                 let name = alias
                     .clone()
                     .unwrap_or_else(|| expr_column_name(expr, None));
-                out.push(ColumnMeta::computed(name, axiomdb_types::DataType::Text));
+                // For bare column references into a derived table (TVF or subquery),
+                // look up the typed ColumnMeta from derived_cols so the wire protocol
+                // sends the correct MySQL type code.
+                let data_type = match expr {
+                    crate::expr::Expr::Column { col_idx, .. } => derived_cols
+                        .get(*col_idx)
+                        .map(|m| m.data_type.clone())
+                        .unwrap_or(axiomdb_types::DataType::Text),
+                    _ => axiomdb_types::DataType::Text,
+                };
+                let nullable = true;
+                out.push(ColumnMeta::new(name, data_type, nullable, None));
             }
         }
     }
@@ -1483,6 +1519,11 @@ fn validate_enum_column_value(
     txn: &TxnManager,
     conn_txn: &ConnectionTxn,
 ) -> Result<(), DbError> {
+    // Composite columns reuse enum_type_name to store the qualified type name
+    // but are not enum columns — skip enum label validation for them.
+    if column.col_type == axiomdb_catalog::ColumnType::Composite {
+        return Ok(());
+    }
     let Some(type_name) = column.enum_type_name.as_deref() else {
         return Ok(());
     };

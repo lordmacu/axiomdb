@@ -224,7 +224,10 @@ fn format_element_text(elem: &crate::value::Value) -> String {
         }
         crate::value::Value::Range(rv) => rv.to_display_string(),
         crate::value::Value::Money(m, s, c) => crate::value::Value::Money(*m, *s, *c).to_string(),
-        crate::value::Value::Composite(fields) => crate::value::Value::Composite(fields.clone()).to_string(),
+        crate::value::Value::Composite(fields) => {
+            crate::value::Value::Composite(fields.clone()).to_string()
+        }
+        crate::value::Value::Ltree(s) | crate::value::Value::Xml(s) => quote_text_element(s),
     }
 }
 
@@ -717,7 +720,7 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
                 reason: format!("invalid input syntax for type boolean: \"{}\"", text),
             }),
         },
-        ColumnType::Int | ColumnType::Date => {
+        ColumnType::TinyInt | ColumnType::SmallInt | ColumnType::Int | ColumnType::Date => {
             // For Date, we store as i32 days. Parse as integer.
             let n: i64 = unescaped.parse().map_err(|_| DbError::InvalidValue {
                 reason: format!("invalid input syntax for type integer: \"{}\"", text),
@@ -733,7 +736,7 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
             })?;
             Ok(crate::value::Value::BigInt(n))
         }
-        ColumnType::Float => {
+        ColumnType::Float32 | ColumnType::Float => {
             // Handle special values
             match unescaped.to_uppercase().as_str() {
                 "INFINITY" | "INF" => Ok(crate::value::Value::Real(f64::INFINITY)),
@@ -814,6 +817,12 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
         }),
         ColumnType::Composite => Err(DbError::InvalidValue {
             reason: "array element type cannot be composite".to_string(),
+        }),
+        ColumnType::Ltree => Err(DbError::InvalidValue {
+            reason: "array element type cannot be ltree".to_string(),
+        }),
+        ColumnType::Xml => Err(DbError::InvalidValue {
+            reason: "array element type cannot be xml".to_string(),
         }),
     }
 }

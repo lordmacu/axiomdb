@@ -358,6 +358,41 @@ fn execute_select_with_joins_first_materialized(
                         message: "unlowered PIVOT reached join executor".into(),
                     });
                 }
+                // Phase 20.20 — XMLTABLE on the right side of a JOIN.
+                FromClause::XmlTable(xt) => {
+                    let spec = crate::xml_table::compile_xml_table(xt)?;
+                    let column_metas = crate::xml_table::column_metas_for_spec(&spec);
+                    let alias = xt.alias.clone().unwrap_or_else(|| "xmltable".into());
+                    col_offsets.push(running_offset);
+                    running_offset += column_metas.len();
+                    all_sources.push(join_source_schema_from_derived(&alias, column_metas));
+                    // Check if any PASSING expression is correlated.
+                    let is_correlated = crate::xml_table::xmltable_is_correlated(xt);
+                    if is_correlated {
+                        // Defer to per-outer-row loop.
+                        scanned.push(Vec::new());
+                        correlated_unnest.push(None);
+                        correlated_jt.push(None);
+                        correlated_srf.push(None);
+                        correlated_sub.push(None);
+                        // Store spec for later — we'll handle via correlated_jt slot.
+                        // XMLTABLE correlated evaluation happens in the combine loop
+                        // using the passing expressions evaluated against the outer row.
+                    } else {
+                        // Non-correlated: evaluate PASSING exprs with empty row.
+                        let xml_val = if let Some((expr, _)) = xt.passing.first() {
+                            crate::eval::eval(expr, &[])?
+                        } else {
+                            axiomdb_types::Value::Null
+                        };
+                        let rows = crate::xml_table::materialize_xml_table(&spec, &xml_val)?;
+                        scanned.push(rows);
+                        correlated_unnest.push(None);
+                        correlated_jt.push(None);
+                        correlated_srf.push(None);
+                        correlated_sub.push(None);
+                    }
+                }
             }
         }
     }

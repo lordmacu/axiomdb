@@ -21,11 +21,26 @@ types for temporal and numeric overlaps).
 | `UBIGINT`  | `UINT8`        | 8 bytes | `u64`     | 0 to 18.4 × 10¹⁸ (used for LSN, page_id)|
 | `HUGEINT`  | `INT16`        | 16 bytes| `i128`    | ±1.7 × 10³⁸ (cryptography, checksums)   |
 
+**Auto-increment shorthands:** `SERIAL`, `SMALLSERIAL`, and `BIGSERIAL` expand to
+the corresponding integer type with `AUTO_INCREMENT` added automatically.
+
+| Shorthand | Expands to |
+|-----------|-----------|
+| `SERIAL` | `INT AUTO_INCREMENT` |
+| `SMALLSERIAL` | `SMALLINT AUTO_INCREMENT` |
+| `BIGSERIAL` | `BIGINT AUTO_INCREMENT` |
+
 ```sql
--- Typical primary key
+-- Using BIGSERIAL shorthand (most common for primary keys)
 CREATE TABLE users (
-    id   BIGINT PRIMARY KEY AUTO_INCREMENT,
+    id   BIGSERIAL PRIMARY KEY,
     age  SMALLINT NOT NULL
+);
+
+-- Using SERIAL (32-bit auto-increment)
+CREATE TABLE events (
+    id   SERIAL PRIMARY KEY,
+    name TEXT
 );
 
 -- Unsigned counter that never goes negative
@@ -34,6 +49,10 @@ CREATE TABLE page_views (
     views    UINT NOT NULL DEFAULT 0
 );
 ```
+
+> **Range enforcement:** `TINYINT` and `SMALLINT` enforce their ranges at insert
+> time. Inserting a value out of range (e.g. `128` into a TINYINT column) returns
+> `DbError::InvalidValue` — the row is rejected and no partial write occurs.
 
 ---
 
@@ -69,25 +88,40 @@ CREATE TABLE experiments (
 | SQL Type         | Aliases           | Storage  | Rust type | Notes                         |
 |------------------|-------------------|----------|-----------|-------------------------------|
 | `DECIMAL(p, s)`  | `NUMERIC(p, s)`   | 17 bytes | `i128` + `u8` scale | Exact arithmetic, no float error |
+| `DECIMAL`        | `NUMERIC`         | 17 bytes | `i128` + `u8` scale | Defaults to `DECIMAL(10, 0)` |
+
+**Parameters:** `p` is the total precision (significant digits, 1–38); `s` is the scale
+(digits after the decimal point, 0–p). Bare `DECIMAL` is equivalent to `DECIMAL(10, 0)`.
+
+**Rounding at insert:** Values are rounded to `s` decimal places using ROUND_HALF_UP
+(banker's round-half-up, not banker's rounding). The integer part must fit within `p − s`
+digits — an overflow error is raised otherwise.
 
 **Always use `DECIMAL` for money.** Floating-point types cannot represent
 `0.1 + 0.2` exactly; `DECIMAL` always can.
 
 ```sql
 CREATE TABLE invoices (
-    id       BIGINT       PRIMARY KEY AUTO_INCREMENT,
-    subtotal DECIMAL      NOT NULL,    -- DECIMAL without precision = DECIMAL(38,0)
-    tax_rate DECIMAL      NOT NULL,
-    total    DECIMAL      NOT NULL
+    id       BIGINT          PRIMARY KEY AUTO_INCREMENT,
+    subtotal DECIMAL(12, 2)  NOT NULL,   -- up to 9,999,999,999.99
+    tax_rate DECIMAL(5, 4)   NOT NULL,   -- e.g. 0.1900
+    total    DECIMAL(12, 2)  NOT NULL
 );
 
--- Insert with exact values
+-- Insert rounds to declared scale automatically
 INSERT INTO invoices (subtotal, tax_rate, total)
-VALUES (199.99, 0.19, 237.99);
+VALUES ('199.999', '0.19', '237.99');
+-- subtotal stored as 200.00 (rounded HALF_UP)
 
 -- Arithmetic is always exact
 SELECT subtotal * tax_rate AS computed_tax FROM invoices WHERE id = 1;
--- Returns: 37.9981  (never 37.99809999999...)
+```
+
+**SHOW COLUMNS** displays the declared precision and scale:
+```sql
+SHOW COLUMNS FROM invoices;
+-- Field     Type           ...
+-- subtotal  decimal(12,2)  ...
 ```
 
 The internal codec stores `DECIMAL` as a 16-byte little-endian `i128` mantissa followed
@@ -617,6 +651,230 @@ WHERE a.id < b.id AND a.slot && b.slot;
 
 <div class="callout-advantage">
 **Advantage over application-level checks:** range operators evaluate containment and overlap in a single expression, eliminating the four-way `lo1 < hi2 AND hi1 > lo2` check that is easy to get wrong when mixing inclusive/exclusive bounds.
+</div>
+
+---
+
+## LTREE — Hierarchical Path Type
+
+`LTREE` stores a dot-separated label path where every label matches `[A-Za-z0-9_]+`.
+It is designed for tree-structured data: org charts, file-system paths, category
+hierarchies, DNS zones.
+
+```sql
+CREATE TABLE categories (id INT, path LTREE);
+
+INSERT INTO categories VALUES
+  (1, 'electronics'),
+  (2, 'electronics.phones'),
+  (3, 'electronics.phones.smartphones'),
+  (4, 'electronics.laptops');
+
+-- All descendants of electronics.phones
+SELECT id FROM categories
+WHERE 'electronics.phones'::LTREE @> path;
+-- Returns ids 2 and 3
+```
+
+### LTREE Operators
+
+| Operator | Meaning | Example |
+|---|---|---|
+| `@>` | Left is ancestor of (or equal to) right | `'a.b'::LTREE @> 'a.b.c'::LTREE` → true |
+| `<@` | Left is descendant of (or equal to) right | `'a.b.c'::LTREE <@ 'a.b'::LTREE` → true |
+| `~` | Left matches lquery pattern | `'a.b.c'::LTREE ~ 'a.*.c'` → true |
+| `\|\|` | Concatenate two ltree paths | `'a.b'::LTREE \|\| 'c'::LTREE` → `'a.b.c'` |
+| `=`, `<>` | Exact path equality | |
+| `<`, `<=`, `>`, `>=` | Lexicographic path order | |
+
+**lquery patterns**: Use `*` to match one or more labels at that position.
+`'a.*.c'` matches any path that starts with `a`, ends with `c`, and has exactly
+one label in between.
+
+### LTREE Functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `nlevel(path)` | `INT` | Number of labels |
+| `subpath(path, offset[, len])` | `LTREE` | Suffix starting at offset (negative = from end) |
+| `subltree(path, start, end)` | `LTREE` | Labels `[start, end)` |
+| `index(path, subpath[, offset])` | `INT` | First position of subpath (-1 if not found) |
+| `lca(path, ...)` | `LTREE` | Longest common ancestor of all arguments |
+| `text2ltree(text)` | `LTREE` | Parse and validate text as an ltree path |
+| `ltree2text(path)` | `TEXT` | Extract the raw path string |
+
+```sql
+SELECT nlevel('a.b.c.d'::LTREE);          -- 4
+SELECT subpath('a.b.c.d'::LTREE, 1, 2);   -- 'b.c'
+SELECT subltree('a.b.c.d'::LTREE, 0, 2);  -- 'a.b'
+SELECT index('a.b.c.a.b'::LTREE, 'a.b'::LTREE); -- 0
+SELECT lca('a.b.c'::LTREE, 'a.b.d'::LTREE);     -- 'a.b'
+SELECT text2ltree('org.eng');                     -- 'org.eng'::LTREE
+SELECT ltree2text('org.eng'::LTREE);              -- 'org.eng'
+```
+
+### Cast to/from TEXT
+
+```sql
+SELECT 'org.eng.backend'::LTREE;           -- Ltree literal
+SELECT CAST('org.eng.backend'::LTREE AS TEXT); -- text string
+```
+
+Invalid paths (empty labels, double dots, illegal characters) raise an error:
+
+```sql
+SELECT 'a..b'::LTREE;  -- Error: empty label
+SELECT 'a b'::LTREE;   -- Error: space is not a valid label character
+```
+
+<div class="callout-advantage">
+<strong>AxiomDB vs. TEXT columns for hierarchies.</strong>
+Without <code>LTREE</code> the common workaround is to store a materialized path in a
+<code>TEXT</code> column and use <code>LIKE 'org.eng%'</code>. That requires a leading-
+wildcard safe index and breaks the moment a label contains a dot. <code>LTREE</code>
+validates the label grammar, provides semantically correct ancestor/descendant operators,
+and exposes the <code>lca</code> and <code>subpath</code> functions that are impossible
+to replicate with plain strings.
+</div>
+
+---
+
+## XML / XMLTYPE — Document Type (Phase 20.20)
+
+`XML` (alias `XMLTYPE`) stores a UTF-8 XML text value. The stored string must be
+well-formed XML (either a complete document or a valid XML fragment). Validation
+is performed on write.
+
+```sql
+CREATE TABLE docs (id INT, content XML);
+
+INSERT INTO docs VALUES (1, '<root><item id="1">hello</item></root>');
+
+SELECT content FROM docs WHERE id = 1;
+-- Returns: <root><item id="1">hello</item></root>
+```
+
+### XML Coercions
+
+```sql
+-- Cast a text literal to XML (validates well-formedness)
+SELECT CAST('<root/>' AS XML);
+SELECT '<root/>'::XML;
+
+-- Cast XML back to TEXT
+SELECT CAST('<root/>'::XML AS TEXT);
+
+-- Invalid XML raises an error
+SELECT CAST('<broken' AS XML);  -- Error: InvalidCoercion
+```
+
+### XML Functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `xml_is_well_formed(text)` | `INT` | 1 if the string is valid XML, 0 if not, NULL if input is NULL |
+
+```sql
+SELECT xml_is_well_formed('<a/>');           -- 1
+SELECT xml_is_well_formed('<?xml version="1.0"?><root/>'); -- 1
+SELECT xml_is_well_formed('<broken');        -- 0
+SELECT xml_is_well_formed(NULL);             -- NULL
+```
+
+### XML Constructor Functions
+
+AxiomDB implements the SQL/XML constructor functions defined in SQL:2006.
+
+| Form | Returns | Description |
+|---|---|---|
+| `XMLELEMENT(NAME tag [, XMLATTRIBUTES(v AS a, ...) ] [, content ...])` | `XML` | Build an element with optional attributes and content |
+| `XMLFOREST(expr AS name [, ...])` | `XML` | Build a sequence of sibling elements |
+| `XMLROOT(xml_expr, VERSION str [, STANDALONE YES\|NO])` | `XML` | Wrap XML with an XML declaration |
+| `XMLCONCAT(xml1, ...)` | `XML` | Concatenate XML fragments (NULLs skipped) |
+| `XMLQUERY(xpath PASSING xml_expr [RETURNING CONTENT])` | `TEXT` | Evaluate a minimal XPath expression |
+
+```sql
+-- Build an element
+SELECT XMLELEMENT(NAME person,
+    XMLATTRIBUTES(42 AS id),
+    XMLFOREST('Alice' AS name, 30 AS age));
+-- <person id="42"><name>Alice</name><age>30</age></person>
+
+-- Wrap with XML declaration
+SELECT XMLROOT('<root/>'::XML, VERSION '1.0', STANDALONE YES);
+-- <?xml version="1.0" standalone="yes"?><root/>
+
+-- Concatenate fragments
+SELECT XMLCONCAT('<a/>'::XML, '<b/>'::XML);
+-- <a/><b/>
+
+-- XPath extraction
+SELECT XMLQUERY('/root/item/text()' PASSING '<root><item>hello</item></root>'::XML);
+-- 'hello'
+
+-- Attribute extraction
+SELECT XMLQUERY('/doc/elem/@id' PASSING '<doc><elem id="99"/></doc>'::XML);
+-- '99'
+```
+
+**XPath support**: `XMLQUERY` supports absolute paths (`/elem/...`) with `text()` and `@attr` terminal steps. Element names without a terminal step return the element's text content.
+
+### XMLTABLE — Shred XML into Rows
+
+`XMLTABLE` is a table-valued function (TVF) that turns an XML document into a set of rows. It appears in the `FROM` clause.
+
+```sql
+SELECT col1, col2
+FROM XMLTABLE(
+    'row_xpath'           -- XPath that selects one node per output row
+    PASSING xml_expr      -- expression that produces the XML document
+    COLUMNS
+        col1  TYPE [PATH 'xpath'] [DEFAULT expr],
+        col2  TYPE [PATH 'xpath'],
+        ord   FOR ORDINALITY     -- 1-based row counter
+) AS t;
+```
+
+**Column PATH**: XPath relative to the row node. Defaults to the column name as a child element path. Use `@attr` for attribute values.
+
+**FOR ORDINALITY**: Integer column auto-assigned 1, 2, 3, … for each row in document order.
+
+**DEFAULT**: Value used when the PATH matches no node (instead of NULL).
+
+**NULL propagation**: If the PASSING expression evaluates to NULL or unparseable text, XMLTABLE returns zero rows.
+
+```sql
+-- Basic shredding
+SELECT name, age
+FROM XMLTABLE(
+    '/rows/row'
+    PASSING '<rows><row><name>Alice</name><age>30</age></row></rows>'
+    COLUMNS name TEXT, age INT
+) AS t;
+-- name='Alice', age=30
+
+-- Attribute extraction
+SELECT id, val
+FROM XMLTABLE(
+    '/items/item'
+    PASSING '<items><item id="1">hello</item></items>'
+    COLUMNS id INT PATH '@id', val TEXT
+) AS t;
+-- id=1, val='hello'
+
+-- Ordinality + custom path + default
+SELECT ord, label
+FROM XMLTABLE(
+    '/data/entry'
+    PASSING '<data><entry/><entry><lbl>x</lbl></entry></data>'
+    COLUMNS ord FOR ORDINALITY, label TEXT PATH 'lbl' DEFAULT 'n/a'
+) AS t;
+-- row 1: ord=1, label='n/a'
+-- row 2: ord=2, label='x'
+```
+
+<div class="callout-advantage">
+<strong>AxiomDB advantage vs MySQL</strong>: MySQL has no XMLTABLE — XML shredding requires application-side parsing. AxiomDB's XMLTABLE follows the SQL:2006 / PostgreSQL 10+ standard and supports full <code>WHERE</code>, <code>ORDER BY</code>, <code>JOIN</code>, and aggregation against the derived table.
 </div>
 
 ---

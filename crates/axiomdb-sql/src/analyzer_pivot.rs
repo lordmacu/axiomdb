@@ -35,6 +35,7 @@ fn pivot_result_alias(pivot: &crate::ast::PivotClause) -> String {
             gs.alias.clone().unwrap_or_else(|| "generate_series".into())
         }
         FromClause::ReadParquet(rp) => rp.alias.clone().unwrap_or_else(|| "read_parquet".into()),
+        FromClause::XmlTable(xt) => xt.alias.clone().unwrap_or_else(|| "xmltable".into()),
     }
 }
 

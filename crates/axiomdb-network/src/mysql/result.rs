@@ -228,8 +228,11 @@ fn encode_binary_cell(
 ) -> Result<(), DbError> {
     match (data_type, value) {
         (DataType::Bool, Value::Bool(v)) => buf.push(u8::from(*v)),
+        (DataType::TinyInt, Value::Int(v)) => buf.push(*v as i8 as u8), // 1-byte TINY
+        (DataType::SmallInt, Value::Int(v)) => buf.extend_from_slice(&(*v as i16).to_le_bytes()), // 2-byte SHORT
         (DataType::Int, Value::Int(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::BigInt, Value::BigInt(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (DataType::Float, Value::Real(v)) => buf.extend_from_slice(&(*v as f32).to_le_bytes()),
         (DataType::Real, Value::Real(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (DataType::Decimal, Value::Decimal(m, s)) => {
             let s_text = format_decimal(*m, *s);
@@ -254,6 +257,16 @@ fn encode_binary_cell(
             let blob = encode_array(value, elem_ct)?;
             let text = array_to_text(&blob)?;
             let encoded = charset::encode_text(results_collation.charset, &text)?;
+            write_lenenc_str(buf, &encoded);
+        }
+        (DataType::Ltree, Value::Ltree(s)) => {
+            // Ltree in binary protocol: send path string as length-prefixed text
+            let encoded = charset::encode_text(results_collation.charset, s)?;
+            write_lenenc_str(buf, &encoded);
+        }
+        (DataType::Xml, Value::Xml(s)) => {
+            // Xml in binary protocol: send XML text as length-prefixed text
+            let encoded = charset::encode_text(results_collation.charset, s)?;
             write_lenenc_str(buf, &encoded);
         }
         // Any mismatch is a QueryResult invariant violation — not a user-visible error.
@@ -377,7 +390,9 @@ fn build_column_def(col: &ColumnMeta, results_collation: &'static CollationDef) 
         | DataType::Array(_)
         | DataType::Range(_)
         | DataType::Money
-        | DataType::Composite(_) => results_collation.id,
+        | DataType::Composite(_)
+        | DataType::Ltree
+        | DataType::Xml => results_collation.id,
         _ => BINARY_COLLATION_DEF.id, // 63
     };
     buf.extend_from_slice(&charset_id.to_le_bytes());
@@ -503,8 +518,11 @@ fn build_row_packet(
 fn datatype_to_mysql_type(dt: DataType) -> u8 {
     match dt {
         DataType::Bool => 0x01,                                    // TINY
+        DataType::TinyInt => 0x01,                                 // TINY (signed)
+        DataType::SmallInt => 0x02,                                // SHORT (signed)
         DataType::Int => 0x03,                                     // LONG
         DataType::BigInt => 0x08,                                  // LONGLONG
+        DataType::Float => 0x04,                                   // FLOAT (4-byte)
         DataType::Real => 0x05,                                    // DOUBLE
         DataType::Decimal => 0xf6,                                 // NEWDECIMAL
         DataType::Text | DataType::Json | DataType::Jsonb => 0xfd, // VAR_STRING
@@ -516,14 +534,19 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Range(_) => 0xfd,                                // VAR_STRING (text format)
         DataType::Money => 0xfd,                                   // VAR_STRING ("100.50 USD")
         DataType::Composite(_) => 0xfd,                            // VAR_STRING (row literal)
+        DataType::Ltree => 0xfd,                                   // VAR_STRING (path string)
+        DataType::Xml => 0xfd,                                     // VAR_STRING (XML text)
     }
 }
 
 fn column_display_len(dt: DataType) -> u32 {
     match dt {
         DataType::Bool => 1,
+        DataType::TinyInt => 4,  // "-128"
+        DataType::SmallInt => 6, // "-32768"
         DataType::Int => 11,
         DataType::BigInt => 20,
+        DataType::Float => 12,
         DataType::Real => 22,
         DataType::Decimal => 65,
         DataType::Text | DataType::Json | DataType::Jsonb => 16_777_215,
@@ -535,6 +558,8 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Range(_) => 64,         // range literal text e.g. "[1,5)"
         DataType::Money => 32,            // "100.50 USD" — mantissa + currency code
         DataType::Composite(_) => 16_777_215, // variable-length row literal
+        DataType::Ltree => 65_535,        // ltree path string — up to 65535 chars
+        DataType::Xml => 16_777_215,      // XML document — MEDIUMBLOB-size limit
     }
 }
 
@@ -549,6 +574,7 @@ fn column_flags(dt: DataType) -> u16 {
 
 fn column_decimals(dt: DataType) -> u8 {
     match dt {
+        DataType::Float => 31,
         DataType::Real => 31,
         DataType::Decimal => 10,
         _ => 0,
@@ -658,6 +684,7 @@ fn value_to_text(v: &Value) -> String {
             }
         }
         Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
+        Value::Ltree(s) | Value::Xml(s) => s.clone(),
     }
 }
 

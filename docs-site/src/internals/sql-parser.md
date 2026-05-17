@@ -1562,3 +1562,15 @@ Helper functions in `axiomdb-types/src/codec.rs`:
 `build_column_def` uses `results_collation.id` (not binary charset 63) so that
 Python pymysql clients receive the value as `str` instead of `bytes`.  
 `value_to_text` formats `Value::Composite(fields)` via its `Display` impl: `(f1,f2,...)`.
+
+## XML / XMLTYPE (Phase 20.20)
+
+`XML` and `XMLTYPE` are parsed as `DataType::Xml` in the DDL column type parser
+(`parser/ddl.rs`). `ColumnType::Xml = 18` is the on-disk discriminant.
+
+On-disk codec: 4-byte LE length prefix + raw UTF-8 bytes (same pattern as `Ltree`).
+
+Validation on coerce (`Text → Xml`): `roxmltree::Document::parse()` with a fragment
+fallback (`<_>…</_>`) for XML fragments without a root element.
+
+`DataType::Xml` maps to MySQL wire type `0xfd` (VAR_STRING) with `display_len = 16_777_215`.

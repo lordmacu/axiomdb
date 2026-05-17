@@ -953,9 +953,12 @@ pub(crate) fn execute_show_collation() -> QueryResult {
 fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "BOOL",
+        ColumnType::TinyInt => "TINYINT",
+        ColumnType::SmallInt => "SMALLINT",
         ColumnType::Int => "INT",
         ColumnType::BigInt => "BIGINT",
-        ColumnType::Float => "REAL",
+        ColumnType::Float32 => "REAL",
+        ColumnType::Float => "DOUBLE",
         ColumnType::Decimal => "DECIMAL",
         ColumnType::Text => "TEXT",
         ColumnType::Json => "JSON",
@@ -968,6 +971,8 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Range => "RANGE",
         ColumnType::Money => "MONEY",
         ColumnType::Composite => "COMPOSITE",
+        ColumnType::Ltree => "LTREE",
+        ColumnType::Xml => "XML",
     }
 }
 
@@ -975,9 +980,12 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
 fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
     match ct {
         ColumnType::Bool => "BOOL",
+        ColumnType::TinyInt => "TINYINT",
+        ColumnType::SmallInt => "SMALLINT",
         ColumnType::Int => "INT",
         ColumnType::BigInt => "BIGINT",
-        ColumnType::Float => "REAL",
+        ColumnType::Float32 => "REAL",
+        ColumnType::Float => "DOUBLE",
         ColumnType::Decimal => "DECIMAL",
         ColumnType::Text => "TEXT",
         ColumnType::Json => "JSON",
@@ -990,12 +998,24 @@ fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Range => "RANGE",
         ColumnType::Money => "MONEY",
         ColumnType::Composite => "COMPOSITE",
+        ColumnType::Ltree => "LTREE",
+        ColumnType::Xml => "XML",
     }
 }
 
 fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
     if let Some(ref enum_name) = col.enum_type_name {
         return enum_name.clone();
+    }
+
+    // DECIMAL(p,s): type_len encodes precision in upper byte, scale in lower byte.
+    if col.col_type == ColumnType::Decimal {
+        let (prec, scale) = if col.type_len != 0 {
+            ((col.type_len >> 8) as u8, (col.type_len & 0xFF) as u8)
+        } else {
+            (10u8, 0u8)
+        };
+        return format!("decimal({prec},{scale})");
     }
 
     // Handle array types: reconstruct e.g. "INT[]", "TEXT[][]", "FLOAT[3][3]"
@@ -1005,8 +1025,6 @@ fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
             .map(scalar_type_to_sql_name)
             .unwrap_or("TEXT");
         let ndims = col.array_ndims.unwrap_or(1) as usize;
-        // For now, we reconstruct unbounded arrays (no size hints stored yet)
-        // Size hints would come from col.array_size_hints if we add that field
         format!("{}{}", element_name, "[]".repeat(ndims))
     } else {
         column_type_to_sql_name(col.col_type).into()

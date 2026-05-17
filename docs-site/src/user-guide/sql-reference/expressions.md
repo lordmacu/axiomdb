@@ -482,7 +482,8 @@ SELECT flags & 0xFF FROM events;   -- bitmask with hex constant
 | `ABS(x)`          | Absolute value                           | `ABS(-5)` → `5`       |
 | `CEIL(x)`         | Ceiling (round up)                       | `CEIL(1.2)` → `2`     |
 | `FLOOR(x)`        | Floor (round down)                       | `FLOOR(1.9)` → `1`    |
-| `ROUND(x, d)`     | Round to `d` decimal places              | `ROUND(3.14159, 2)` → `3.14` |
+| `ROUND(x, d)`     | Round to `d` decimal places (HALF_UP); returns `DECIMAL` for Decimal inputs, `REAL` for float | `ROUND(3.14159, 2)` → `3.14` |
+| `TRUNC(x, d)`     | Truncate to `d` decimal places (no rounding); `TRUNCATE` is an alias | `TRUNC(1.999, 1)` → `1.9` |
 | `MOD(x, y)`       | Modulo                                   | `MOD(10, 3)` → `1`    |
 | `POWER(x, y)`     | x raised to the power y                  | `POWER(2, 8)` → `256` |
 | `SQRT(x)`         | Square root                              | `SQRT(16)` → `4`      |
@@ -1487,4 +1488,29 @@ SELECT home.city FROM orders WHERE id = 3;  -- NULL if home column is NULL
 ```
 
 Dot notation is resolved at analysis time against the composite type's field list.
+
+---
+
+## LTREE Operators
+
+`LTREE` (hierarchical path type) operators use existing SQL operator symbols — dispatch
+is by value type at evaluation time.
+
+| Operator | Operands | Returns | Meaning |
+|---|---|---|---|
+| `@>` | `LTREE @> LTREE` | `BOOL` | Left is ancestor of (or equal to) right |
+| `<@` | `LTREE <@ LTREE` | `BOOL` | Left is descendant of (or equal to) right |
+| `~` | `LTREE ~ TEXT` | `BOOL` | Left matches lquery pattern (`*` = 0+ labels) |
+| `\|\|` | `LTREE \|\| LTREE` | `LTREE` | Concatenate two paths |
+| `=`, `<>` | `LTREE op LTREE` | `BOOL` | Exact label-by-label comparison |
+| `<`, `<=`, `>`, `>=` | `LTREE op LTREE` | `BOOL` | Lexicographic path order |
+
+```sql
+'a.b'::LTREE @> 'a.b.c'::LTREE   -- true (ancestor)
+'a.b.c'::LTREE <@ 'a.b'::LTREE   -- true (descendant)
+'a.b.c'::LTREE ~ 'a.*.c'         -- true (wildcard)
+'a.b'::LTREE || 'c.d'::LTREE     -- 'a.b.c.d'
+```
+
+All LTREE operators propagate NULL when either operand is NULL.
 Accessing a field that does not exist in the type definition raises an `InvalidValue` error.

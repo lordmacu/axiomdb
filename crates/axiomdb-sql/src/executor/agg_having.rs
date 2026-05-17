@@ -83,6 +83,16 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
             buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        Value::Ltree(s) => {
+            buf.push(0x11);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Xml(s) => {
+            buf.push(0x12);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
     }
     buf
 }

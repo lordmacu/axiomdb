@@ -414,6 +414,18 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             }
             // Phase 20.6 — READ_PARQUET TVF (path is a literal, no subexpressions).
             FromClause::ReadParquet(_) => Ok(()),
+            // Phase 20.20 — XMLTABLE TVF.
+            FromClause::XmlTable(xt) => {
+                for (expr, _) in &xt.passing {
+                    self.visit_expr(expr)?;
+                }
+                for col in &xt.columns {
+                    if let Some(def_expr) = &col.default_expr {
+                        self.visit_expr(def_expr)?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -588,6 +600,30 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 Ok(())
             }
             Expr::FieldAccess { .. } => Ok(()),
+            // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+            Expr::XmlElement { attrs, content, .. } => {
+                for (e, _) in attrs {
+                    self.visit_expr(e)?;
+                }
+                for e in content {
+                    self.visit_expr(e)?;
+                }
+                Ok(())
+            }
+            Expr::XmlForest { items } => {
+                for (e, _) in items {
+                    self.visit_expr(e)?;
+                }
+                Ok(())
+            }
+            Expr::XmlRoot { doc, .. } => self.visit_expr(doc),
+            Expr::XmlConcat { args } => {
+                for e in args {
+                    self.visit_expr(e)?;
+                }
+                Ok(())
+            }
+            Expr::XmlQuery { doc, .. } => self.visit_expr(doc),
         }
     }
 

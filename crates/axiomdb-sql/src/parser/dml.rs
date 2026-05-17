@@ -837,6 +837,15 @@ fn parse_from_item(p: &mut Parser) -> Result<FromClause, DbError> {
         }
     }
 
+    // Phase 20.20 — `XMLTABLE(...)` table-valued function.
+    if let Token::Ident(s) = p.peek() {
+        if s.eq_ignore_ascii_case("XMLTABLE") && matches!(p.peek_at(1), Token::LParen) {
+            p.advance(); // consume XMLTABLE identifier
+            let from = crate::parser::xml_table::parse_xmltable_call(p)?;
+            return parse_optional_pivot_clause(p, from);
+        }
+    }
+
     // Phase 20.4, Step 7 — `FROM UNNEST(expr [, expr2, ...]) [AS alias(col1, col2, ...)]]`.
     // UNNEST is tokenized as Token::Unnest (not Token::Ident), so we check both.
     let peek_token = p.peek();
@@ -2091,7 +2100,8 @@ fn parse_update(p: &mut Parser) -> Result<Stmt, DbError> {
         | FromClause::Pivot(_)
         | FromClause::Unnest(_)
         | FromClause::GenerateSeries(_)
-        | FromClause::ReadParquet(_) => {
+        | FromClause::ReadParquet(_)
+        | FromClause::XmlTable(_) => {
             return Err(DbError::ParseError {
                 message: "UPDATE target must be a table".into(),
                 position: Some(p.current_pos()),
@@ -2309,7 +2319,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::Pivot(_)
             | FromClause::Unnest(_)
             | FromClause::GenerateSeries(_)
-            | FromClause::ReadParquet(_) => {
+            | FromClause::ReadParquet(_)
+            | FromClause::XmlTable(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE target must be a table".into(),
                     position: Some(p.current_pos()),
@@ -2331,7 +2342,8 @@ fn parse_delete(p: &mut Parser) -> Result<Stmt, DbError> {
             | FromClause::Pivot(_)
             | FromClause::Unnest(_)
             | FromClause::GenerateSeries(_)
-            | FromClause::ReadParquet(_) => {
+            | FromClause::ReadParquet(_)
+            | FromClause::XmlTable(_) => {
                 return Err(DbError::ParseError {
                     message: "DELETE FROM source must be a table".into(),
                     position: Some(p.current_pos()),

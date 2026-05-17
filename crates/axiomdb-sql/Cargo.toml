@@ -30,6 +30,8 @@ chrono                = { version = "0.4", default-features = false, features = 
 unicode-normalization = "0.1"
 regex                 = { workspace = true }
 parquet               = { version = "54", default-features = false, features = ["snap"] }
+roxmltree             = { workspace = true }
+rust_decimal          = { version = "1", default-features = false, features = ["maths"] }
 
 [dev-dependencies]
 criterion    = { workspace = true }

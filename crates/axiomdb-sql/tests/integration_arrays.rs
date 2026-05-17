@@ -60,7 +60,7 @@ fn parse_1d_bool_array() {
 fn parse_1d_real_array() {
     let ct = create_table("CREATE TABLE t (scores REAL[])");
     let col = &ct.columns[0];
-    assert_eq!(col.data_type, DataType::Real);
+    assert_eq!(col.data_type, DataType::Float);
     assert_eq!(col.array_ndims, Some(1));
 }
 
@@ -146,7 +146,7 @@ fn parse_1d_array_with_size_hint() {
 fn parse_2d_array_with_size_hints() {
     let ct = create_table("CREATE TABLE t (m FLOAT[3][3])");
     let col = &ct.columns[0];
-    assert_eq!(col.data_type, DataType::Real);
+    assert_eq!(col.data_type, DataType::Float);
     assert_eq!(col.array_ndims, Some(2));
     assert_eq!(col.array_size_hints.len(), 2);
     assert_eq!(col.array_size_hints[0], Some(3));
@@ -193,7 +193,7 @@ fn parse_multiple_array_columns() {
 
     let data = &ct.columns[2];
     assert_eq!(data.name, "data");
-    assert_eq!(data.data_type, DataType::Real);
+    assert_eq!(data.data_type, DataType::Float);
     assert_eq!(data.array_ndims, Some(2));
     assert_eq!(data.array_size_hints, vec![Some(3), Some(3)]);
 }

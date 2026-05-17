@@ -75,6 +75,8 @@ pub fn column_defs_for_values(vc: &ValuesClause) -> Vec<ColumnDef> {
 
 fn datatype_to_column_type(dt: DataType) -> ColumnType {
     match dt {
+        DataType::TinyInt => ColumnType::TinyInt,
+        DataType::SmallInt => ColumnType::SmallInt,
         DataType::Int => ColumnType::Int,
         DataType::BigInt => ColumnType::BigInt,
         DataType::Bool => ColumnType::Bool,

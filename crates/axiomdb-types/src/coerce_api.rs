@@ -26,11 +26,71 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         (Value::Int(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
         (Value::BigInt(n), DataType::Bool) => Ok(Value::Bool(n != 0)),
 
+        // ── TinyInt / SmallInt coercion with range check ──────────────────────
+        (Value::Int(n), DataType::TinyInt) => {
+            if n < i8::MIN as i32 || n > i8::MAX as i32 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for TINYINT ({}..={})", n, i8::MIN, i8::MAX),
+                })
+            } else {
+                Ok(Value::Int(n))
+            }
+        }
+        (Value::Int(n), DataType::SmallInt) => {
+            if n < i16::MIN as i32 || n > i16::MAX as i32 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for SMALLINT ({}..={})", n, i16::MIN, i16::MAX),
+                })
+            } else {
+                Ok(Value::Int(n))
+            }
+        }
+        (Value::BigInt(n), DataType::TinyInt) => {
+            if n < i8::MIN as i64 || n > i8::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for TINYINT ({}..={})", n, i8::MIN, i8::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+        (Value::BigInt(n), DataType::SmallInt) => {
+            if n < i16::MIN as i64 || n > i16::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for SMALLINT ({}..={})", n, i16::MIN, i16::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+        (Value::Text(s), DataType::TinyInt) => {
+            let n = parse_text_to_bigint(&s, mode, "TINYINT")?;
+            if n < i8::MIN as i64 || n > i8::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for TINYINT ({}..={})", n, i8::MIN, i8::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+        (Value::Text(s), DataType::SmallInt) => {
+            let n = parse_text_to_bigint(&s, mode, "SMALLINT")?;
+            if n < i16::MIN as i64 || n > i16::MAX as i64 {
+                Err(DbError::InvalidValue {
+                    reason: format!("value {} out of range for SMALLINT ({}..={})", n, i16::MIN, i16::MAX),
+                })
+            } else {
+                Ok(Value::Int(n as i32))
+            }
+        }
+
         // ── Numeric widening (lossless) ───────────────────────────────────────
         (Value::Int(n), DataType::BigInt) => Ok(Value::BigInt(n as i64)),
+        (Value::Int(n), DataType::Float) => Ok(Value::Real(n as f32 as f64)),
         (Value::Int(n), DataType::Real) => Ok(Value::Real(n as f64)),
         (Value::Int(n), DataType::Decimal) => Ok(Value::Decimal(n as i128, 0)),
 
+        (Value::BigInt(n), DataType::Float) => Ok(Value::Real(n as f32 as f64)),
         (Value::BigInt(n), DataType::Real) => Ok(Value::Real(n as f64)),
         (Value::BigInt(n), DataType::Decimal) => Ok(Value::Decimal(n as i128, 0)),
 
@@ -65,6 +125,10 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         (Value::Text(s), DataType::BigInt) => {
             let n = parse_text_to_bigint(&s, mode, "BIGINT")?;
             Ok(Value::BigInt(n))
+        }
+        (Value::Text(s), DataType::Float) => {
+            let f = parse_text_to_float(&s, mode, "REAL")?;
+            Ok(Value::Real(f as f32 as f64))
         }
         (Value::Text(s), DataType::Real) => {
             let f = parse_text_to_float(&s, mode, "REAL")?;
@@ -161,8 +225,43 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // ── Range identity ────────────────────────────────────────────────────
         (v @ Value::Range(_), DataType::Range(_)) => Ok(v),
 
+        // ── Composite identity (Phase 20.18) ─────────────────────────────────
+        (v @ Value::Composite(_), DataType::Composite(_)) => Ok(v),
+
         // ── Money identity ────────────────────────────────────────────────────
         (v @ Value::Money(..), DataType::Money) => Ok(v),
+
+        // ── Ltree coercions (Phase 20.19) ─────────────────────────────────────
+        // Text → Ltree: validate the path then wrap in Value::Ltree.
+        (Value::Text(s), DataType::Ltree) => {
+            crate::ltree::validate_ltree_path(&s).map_err(|e| DbError::InvalidCoercion {
+                from: "Text".into(),
+                to: "LTREE".into(),
+                value: format!("'{s}'"),
+                reason: e.to_string(),
+            })?;
+            Ok(Value::Ltree(s))
+        }
+        // Ltree → Text: strip the type wrapper.
+        (Value::Ltree(s), DataType::Text) => Ok(Value::Text(s)),
+        // Ltree identity.
+        (v @ Value::Ltree(_), DataType::Ltree) => Ok(v),
+
+        // ── Xml coercions (Phase 20.20) ───────────────────────────────────────
+        // Text → Xml: parse with roxmltree to validate well-formedness.
+        (Value::Text(s), DataType::Xml) => {
+            crate::xml::validate_xml_text(&s).map_err(|reason| DbError::InvalidCoercion {
+                from: "Text".into(),
+                to: "XML".into(),
+                value: format!("'{s}'"),
+                reason,
+            })?;
+            Ok(Value::Xml(s))
+        }
+        // Xml → Text: strip the type wrapper.
+        (Value::Xml(s), DataType::Text) => Ok(Value::Text(s)),
+        // Xml identity.
+        (v @ Value::Xml(_), DataType::Xml) => Ok(v),
 
         // ── Everything else is an error ───────────────────────────────────────
         (value, target) => Err(DbError::InvalidCoercion {

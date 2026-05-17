@@ -63,10 +63,15 @@ fn execute_select_ctx(
         return execute_select(stmt, storage, txn, conn_txn);
     }
 
+    // XMLTABLE in FROM (Phase 20.20): delegate to execute_select which handles it.
+    if matches!(stmt.from, Some(FromClause::XmlTable(_))) {
+        return execute_select(stmt, storage, txn, conn_txn);
+    }
+
     let from_table_ref = match stmt.from.take() {
         Some(FromClause::Table(tref)) => tref,
         _ => unreachable!(
-            "already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte, GenerateSeries, ReadParquet above"
+            "already handled None, Subquery, JsonTable, JsonbSrf, Values, RecursiveCte, GenerateSeries, ReadParquet, XmlTable above"
         ),
     };
 
@@ -343,6 +348,19 @@ fn execute_select_ctx(
                         mask[*col_idx] = true;
                     }
                 }
+                // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+                crate::expr::Expr::XmlElement { attrs, content, .. } => {
+                    for (e, _) in attrs { collect_expr_columns(e, mask); }
+                    for e in content { collect_expr_columns(e, mask); }
+                }
+                crate::expr::Expr::XmlForest { items } => {
+                    for (e, _) in items { collect_expr_columns(e, mask); }
+                }
+                crate::expr::Expr::XmlRoot { doc, .. } => collect_expr_columns(doc, mask),
+                crate::expr::Expr::XmlConcat { args } => {
+                    for e in args { collect_expr_columns(e, mask); }
+                }
+                crate::expr::Expr::XmlQuery { doc, .. } => collect_expr_columns(doc, mask),
             }
         }
 

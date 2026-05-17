@@ -502,6 +502,19 @@ fn collect_col_idxs_non_agg(expr: &Expr, out: &mut Vec<usize>) {
             }
         }
         Expr::FieldAccess { col_idx, .. } => out.push(*col_idx),
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { collect_col_idxs_non_agg(e, out); }
+            for e in content { collect_col_idxs_non_agg(e, out); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { collect_col_idxs_non_agg(e, out); }
+        }
+        Expr::XmlRoot { doc, .. } => collect_col_idxs_non_agg(doc, out),
+        Expr::XmlConcat { args } => {
+            for e in args { collect_col_idxs_non_agg(e, out); }
+        }
+        Expr::XmlQuery { doc, .. } => collect_col_idxs_non_agg(doc, out),
     }
 }
 
@@ -605,5 +618,18 @@ fn collect_non_agg_col_idxs_in_expr(expr: &Expr, inside_agg: bool, out: &mut Vec
         }
         Expr::FieldAccess { col_idx, .. } if !inside_agg => out.push(*col_idx),
         Expr::FieldAccess { .. } => {}
+        // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
+        Expr::XmlElement { attrs, content, .. } => {
+            for (e, _) in attrs { collect_non_agg_col_idxs_in_expr(e, inside_agg, out); }
+            for e in content { collect_non_agg_col_idxs_in_expr(e, inside_agg, out); }
+        }
+        Expr::XmlForest { items } => {
+            for (e, _) in items { collect_non_agg_col_idxs_in_expr(e, inside_agg, out); }
+        }
+        Expr::XmlRoot { doc, .. } => collect_non_agg_col_idxs_in_expr(doc, inside_agg, out),
+        Expr::XmlConcat { args } => {
+            for e in args { collect_non_agg_col_idxs_in_expr(e, inside_agg, out); }
+        }
+        Expr::XmlQuery { doc, .. } => collect_non_agg_col_idxs_in_expr(doc, inside_agg, out),
     }
 }

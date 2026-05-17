@@ -656,6 +656,9 @@ mod ffi {
                 let disp = Value::Money(m, s, c).to_string();
                 CellValue::Text(CString::new(disp).unwrap_or_else(|_| CString::new("").unwrap()))
             }
+            Value::Ltree(s) | Value::Xml(s) => CellValue::Text(
+                CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()),
+            ),
         }
     }
 

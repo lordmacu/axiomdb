@@ -8,6 +8,7 @@ pub(crate) mod array;
 mod binary;
 pub(crate) mod datetime;
 mod json;
+mod ltree;
 mod nulls;
 mod numeric;
 pub(crate) mod range;
@@ -15,6 +16,7 @@ mod sql_json_query;
 mod string;
 mod system;
 mod uuid;
+pub(crate) mod xml;
 
 pub(crate) use json::{
     execute_jsonpath_owned as execute_jsonpath_owned_public, execute_jsonpath_owned_env,
@@ -164,6 +166,14 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         "money" => eval_money_constructor_pure(args, row),
         "currency_of" => eval_currency_of_pure(args, row),
         "amount_of" => eval_amount_of_pure(args, row),
+
+        // Phase 20.19: ltree scalar functions.
+        "nlevel" | "subpath" | "subltree" | "index" | "lca" | "text2ltree" | "ltree2text" => {
+            ltree::eval(lower.as_str(), args, row)
+        }
+
+        // Phase 20.20: XML scalar functions.
+        "xml_is_well_formed" => xml::eval_is_well_formed(args, row),
 
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),

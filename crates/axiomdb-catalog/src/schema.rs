@@ -60,6 +60,11 @@ mod tests {
             ColumnType::Range,
             ColumnType::Money,
             ColumnType::Composite,
+            ColumnType::Ltree,
+            ColumnType::Xml,
+            ColumnType::TinyInt,
+            ColumnType::SmallInt,
+            ColumnType::Float32,
         ];
         for v in variants {
             let byte: u8 = v.into();
@@ -68,11 +73,11 @@ mod tests {
         }
     }
 
-    // Discriminants 0, 17-254, and 255 are invalid; 1-16 are valid (Composite = 16)
+    // Discriminants 0, 22-254, and 255 are invalid; 1-21 are valid (Float32 = 21)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(17).is_err());
+        assert!(ColumnType::try_from(22).is_err());
         assert!(ColumnType::try_from(255).is_err());
     }
 

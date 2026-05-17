@@ -102,6 +102,9 @@ logos = "0.14"
 # Regular expression engine (REGEXP/RLIKE operator)
 regex = "1"
 
+# Pure-Rust zero-copy XML parser (Phase 20.20 XMLType)
+roxmltree = "0.20"
+
 # Character-set transcoding (MySQL transport layer)
 encoding_rs = "0.8"
 socket2 = "0.5"

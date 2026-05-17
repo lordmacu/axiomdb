@@ -558,9 +558,32 @@ fn is_table_constraint_start(p: &Parser) -> bool {
 
 fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
     let name = p.parse_identifier()?;
+
+    // Serial shorthands: BIGSERIAL → BigInt, SERIAL → Int, SMALLSERIAL → SmallInt.
+    let serial_type: Option<DataType> = if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("BIGSERIAL"))
+    {
+        p.advance();
+        Some(DataType::BigInt)
+    } else if matches!(p.peek(), Token::Serial) {
+        p.advance();
+        Some(DataType::Int)
+    } else if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("SMALLSERIAL")) {
+        p.advance();
+        Some(DataType::SmallInt)
+    } else {
+        None
+    };
+
     let (data_type, type_len, is_char, declared_type_name, array_ndims, array_size_hints) =
-        parse_column_data_type(p)?;
+        if let Some(dt) = serial_type.clone() {
+            (dt, 0u16, false, None::<crate::ast::TableRef>, 0u8, vec![])
+        } else {
+            parse_column_data_type(p)?
+        };
     let mut constraints = Vec::new();
+    if serial_type.is_some() {
+        constraints.push(ColumnConstraint::AutoIncrement);
+    }
     let mut collation = None;
 
     loop {
@@ -1166,14 +1189,32 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             p.advance();
             (DataType::BigInt, 0, false)
         }
-        Token::TyReal | Token::TyDouble | Token::TyFloat => {
+        Token::TyReal | Token::TyFloat => {
+            p.advance();
+            eat_optional_length(p)?; // FLOAT(n) — precision hint, ignored
+            (DataType::Float, 0, false)
+        }
+        Token::TyDouble => {
+            p.advance();
+            // eat optional PRECISION keyword: DOUBLE PRECISION
+            if matches!(p.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("PRECISION")) {
+                p.advance();
+            }
+            (DataType::Real, 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("FLOAT4") => {
+            p.advance();
+            (DataType::Float, 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("FLOAT8") => {
             p.advance();
             (DataType::Real, 0, false)
         }
         Token::TyDecimal | Token::TyNumeric => {
             p.advance();
-            eat_optional_precision_scale(p)?;
-            (DataType::Decimal, 0, false)
+            let (prec, scale) = parse_decimal_params(p)?;
+            let type_len = ((prec as u16) << 8) | (scale as u16);
+            (DataType::Decimal, type_len, false)
         }
         Token::TyBool | Token::TyBoolean => {
             p.advance();
@@ -1220,12 +1261,12 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
         Token::Ident(s) if s.eq_ignore_ascii_case("TINYINT") => {
             p.advance();
             eat_optional_length(p)?; // TINYINT(N) — display width, ignored
-            (DataType::Bool, 0, false)
+            (DataType::TinyInt, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("SMALLINT") => {
             p.advance();
             eat_optional_length(p)?;
-            (DataType::Int, 0, false)
+            (DataType::SmallInt, 0, false)
         }
         Token::Ident(s) if s.eq_ignore_ascii_case("MEDIUMINT") => {
             p.advance();
@@ -1264,6 +1305,14 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
         Token::Ident(s) if s.eq_ignore_ascii_case("MONEY") => {
             p.advance();
             (DataType::Money, 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("LTREE") => {
+            p.advance();
+            (DataType::Ltree, 0, false)
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("XML") || s.eq_ignore_ascii_case("XMLTYPE") => {
+            p.advance();
+            (DataType::Xml, 0, false)
         }
         other => {
             return Err(DbError::ParseError {
@@ -1434,27 +1483,57 @@ fn parse_state_type_name(p: &mut Parser) -> Result<String, DbError> {
     Ok(name)
 }
 
-fn eat_optional_precision_scale(p: &mut Parser) -> Result<(), DbError> {
-    if p.eat(&Token::LParen) {
-        if !matches!(p.peek(), Token::Integer(_)) {
+/// Parse optional `(precision [, scale])` for DECIMAL/NUMERIC.
+/// Returns `(precision, scale)` — defaults to `(10, 0)` when omitted.
+/// Validates: 1 ≤ precision ≤ 38, 0 ≤ scale ≤ precision.
+fn parse_decimal_params(p: &mut Parser) -> Result<(u8, u8), DbError> {
+    if !p.eat(&Token::LParen) {
+        return Ok((10, 0));
+    }
+    let prec = match p.peek() {
+        Token::Integer(n) => {
+            let v = *n;
+            p.advance();
+            v
+        }
+        _ => {
             return Err(DbError::ParseError {
-                message: "expected precision integer in type parameters".into(),
+                message: "expected precision integer in DECIMAL type parameters".into(),
                 position: Some(p.current_pos()),
             });
         }
-        p.advance();
-        if p.eat(&Token::Comma) {
-            if !matches!(p.peek(), Token::Integer(_)) {
+    };
+    if !(1..=38).contains(&prec) {
+        return Err(DbError::ParseError {
+            message: format!("DECIMAL precision must be between 1 and 38, got {prec}"),
+            position: Some(p.current_pos()),
+        });
+    }
+    let scale = if p.eat(&Token::Comma) {
+        match p.peek() {
+            Token::Integer(n) => {
+                let v = *n;
+                p.advance();
+                v
+            }
+            _ => {
                 return Err(DbError::ParseError {
-                    message: "expected scale integer after comma in type parameters".into(),
+                    message: "expected scale integer after comma in DECIMAL type parameters".into(),
                     position: Some(p.current_pos()),
                 });
             }
-            p.advance();
         }
-        p.expect(&Token::RParen)?;
+    } else {
+        0
+    };
+    if scale > prec {
+        return Err(DbError::ParseError {
+            message: format!("DECIMAL scale ({scale}) cannot exceed precision ({prec})"),
+            position: Some(p.current_pos()),
+        });
     }
-    Ok(())
+    p.expect(&Token::RParen)?;
+    Ok((prec as u8, scale as u8))
 }
 
 fn eat_optional_length(p: &mut Parser) -> Result<u16, DbError> {
@@ -2138,8 +2217,11 @@ fn fdw_datatype_to_column_type(
     use axiomdb_types::DataType;
     match dt {
         DataType::Bool => Ok(ColumnType::Bool),
+        DataType::TinyInt => Ok(ColumnType::TinyInt),
+        DataType::SmallInt => Ok(ColumnType::SmallInt),
         DataType::Int => Ok(ColumnType::Int),
         DataType::BigInt => Ok(ColumnType::BigInt),
+        DataType::Float => Ok(ColumnType::Float32),
         DataType::Real => Ok(ColumnType::Float),
         DataType::Text => Ok(ColumnType::Text),
         DataType::Bytes => Ok(ColumnType::Bytes),
@@ -2153,6 +2235,8 @@ fn fdw_datatype_to_column_type(
         DataType::Range(_) => Ok(ColumnType::Range),
         DataType::Money => Ok(ColumnType::Money),
         DataType::Composite(_) => Ok(ColumnType::Composite),
+        DataType::Ltree => Ok(ColumnType::Ltree),
+        DataType::Xml => Ok(ColumnType::Xml),
     }
 }
 

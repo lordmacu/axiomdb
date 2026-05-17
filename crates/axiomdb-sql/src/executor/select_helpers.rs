@@ -117,6 +117,12 @@ fn execute_select_with_joins(
                         message: "unlowered PIVOT reached non-ctx join executor".into(),
                     });
                 }
+                // Phase 20.20 — XMLTABLE via the non-ctx executor path.
+                FromClause::XmlTable(_) => {
+                    return Err(DbError::NotImplemented {
+                        feature: "XMLTABLE JOIN via the non-ctx executor path".into(),
+                    });
+                }
             }
         }
     }

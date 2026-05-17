@@ -163,6 +163,7 @@ fn value_to_csv_field(v: &Value) -> String {
         Value::Range(rv) => rv.to_display_string(),
         Value::Money(m, s, c) => Value::Money(*m, *s, *c).to_string(),
         Value::Composite(fields) => Value::Composite(fields.clone()).to_string(),
+        Value::Ltree(s) | Value::Xml(s) => s.clone(),
         Value::Array(elems) => {
             let json_arr: Vec<serde_json::Value> =
                 elems.iter().map(value_to_json_val).collect();
@@ -261,6 +262,7 @@ fn value_to_json_val(v: &Value) -> serde_json::Value {
         Value::Composite(fields) => {
             serde_json::Value::String(Value::Composite(fields.clone()).to_string())
         }
+        Value::Ltree(s) | Value::Xml(s) => serde_json::Value::String(s.clone()),
     }
 }
 

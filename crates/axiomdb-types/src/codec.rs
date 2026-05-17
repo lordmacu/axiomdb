@@ -117,8 +117,11 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
     let ok = matches!(
         (value, dt.clone()),
         (Value::Bool(_), DataType::Bool)
+            | (Value::Int(_), DataType::TinyInt)
+            | (Value::Int(_), DataType::SmallInt)
             | (Value::Int(_), DataType::Int)
             | (Value::BigInt(_), DataType::BigInt)
+            | (Value::Real(_), DataType::Float)
             | (Value::Real(_), DataType::Real)
             | (Value::Decimal(..), DataType::Decimal)
             | (Value::Text(_), DataType::Text)
@@ -132,6 +135,8 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Range(_), DataType::Range(_))
             | (Value::Money(..), DataType::Money)
             | (Value::Composite(_), DataType::Composite(_))
+            | (Value::Ltree(_), DataType::Ltree)
+            | (Value::Xml(_), DataType::Xml)
     );
     if ok {
         Ok(())
@@ -170,9 +175,9 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
                 return crate::types::DataType::Range(Box::new(crate::types::DataType::Int))
             }
             Value::Money(..) => return crate::types::DataType::Money,
-            Value::Composite(_) => {
-                return crate::types::DataType::Composite(vec![])
-            }
+            Value::Composite(_) => return crate::types::DataType::Composite(vec![]),
+            Value::Ltree(_) => return crate::types::DataType::Ltree,
+            Value::Xml(_) => return crate::types::DataType::Xml,
         }
     }
     crate::types::DataType::Int // default
@@ -223,8 +228,11 @@ pub fn encoded_len(values: &[Value]) -> usize {
             }
             // Money: 16 bytes mantissa + 1 byte scale + 3 bytes currency = 20 bytes (fixed)
             Value::Money(..) => 20,
-            // Composite: 4-byte length prefix + recursively-encoded inner fields
+            // Ltree/Xml: 4-byte LE u32 length + UTF-8 bytes
+            Value::Ltree(s) | Value::Xml(s) => 4 + s.len(),
+            // Composite: 4-byte length + 1-byte field_count + N type_tags + field data
             Value::Composite(fields) => {
+                let n = fields.len();
                 let inner_len: usize = fields
                     .iter()
                     .map(|f| match f {
@@ -238,17 +246,109 @@ pub fn encoded_len(values: &[Value]) -> usize {
                         Value::Jsonb(b) => 3 + b.len(),
                         Value::Bytes(b) => 3 + b.len(),
                         Value::Money(..) => 20,
-                        // Nested composite/array: overestimate; encode never nests deeply
-                        Value::Array(_) | Value::Range(_) | Value::Composite(_) => 16,
+                        // Nested composite/array/ltree/xml: overestimate
+                        Value::Array(_)
+                        | Value::Range(_)
+                        | Value::Composite(_)
+                        | Value::Ltree(_)
+                        | Value::Xml(_) => 16,
                     })
                     .sum::<usize>()
-                    + bitmap_len(fields.len());
-                4 + inner_len
+                    + bitmap_len(n);
+                4 + 1 + n + inner_len
             }
         })
         .sum();
     blen + data
 }
+
+// ── Composite field helpers ────────────────────────────────────────────────────
+
+/// Returns the `ColumnType` tag for a composite field value.
+/// Null fields get `Int` as a placeholder — the null bitmap records the null,
+/// so the type tag is irrelevant during decode.
+fn value_to_col_type(v: &Value) -> array_codec::ColumnType {
+    match v {
+        Value::Bool(_) => array_codec::ColumnType::Bool,
+        Value::Int(_) => array_codec::ColumnType::Int,
+        Value::BigInt(_) => array_codec::ColumnType::BigInt,
+        Value::Real(_) => array_codec::ColumnType::Float,
+        Value::Decimal(..) => array_codec::ColumnType::Decimal,
+        Value::Text(_) => array_codec::ColumnType::Text,
+        Value::Json(_) => array_codec::ColumnType::Json,
+        Value::Jsonb(_) => array_codec::ColumnType::Jsonb,
+        Value::Bytes(_) => array_codec::ColumnType::Bytes,
+        Value::Date(_) => array_codec::ColumnType::Date,
+        Value::Timestamp(_) => array_codec::ColumnType::Timestamp,
+        Value::Uuid(_) => array_codec::ColumnType::Uuid,
+        Value::Array(_) => array_codec::ColumnType::Array,
+        Value::Range(_) => array_codec::ColumnType::Range,
+        Value::Money(..) => array_codec::ColumnType::Money,
+        Value::Ltree(_) => array_codec::ColumnType::Ltree,
+        Value::Xml(_) => array_codec::ColumnType::Xml,
+        Value::Composite(_) | Value::Null => array_codec::ColumnType::Int,
+    }
+}
+
+/// Converts a `ColumnType` tag to a `DataType` for use as an inner schema.
+fn col_type_to_data_type(ct: array_codec::ColumnType) -> DataType {
+    match ct {
+        array_codec::ColumnType::Bool => DataType::Bool,
+        array_codec::ColumnType::TinyInt => DataType::TinyInt,
+        array_codec::ColumnType::SmallInt => DataType::SmallInt,
+        array_codec::ColumnType::Int => DataType::Int,
+        array_codec::ColumnType::BigInt => DataType::BigInt,
+        array_codec::ColumnType::Float => DataType::Real,
+        array_codec::ColumnType::Float32 => DataType::Float,
+        array_codec::ColumnType::Decimal => DataType::Decimal,
+        array_codec::ColumnType::Text => DataType::Text,
+        array_codec::ColumnType::Json => DataType::Json,
+        array_codec::ColumnType::Jsonb => DataType::Jsonb,
+        array_codec::ColumnType::Bytes => DataType::Bytes,
+        array_codec::ColumnType::Date => DataType::Date,
+        array_codec::ColumnType::Timestamp => DataType::Timestamp,
+        array_codec::ColumnType::Uuid => DataType::Uuid,
+        array_codec::ColumnType::Array => DataType::Array(Box::new(DataType::Int)),
+        array_codec::ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
+        array_codec::ColumnType::Money => DataType::Money,
+        array_codec::ColumnType::Composite => DataType::Composite(vec![]),
+        array_codec::ColumnType::Ltree => DataType::Ltree,
+        array_codec::ColumnType::Xml => DataType::Xml,
+    }
+}
+
+/// Decodes a self-describing composite blob (produced by the `encode_row` composite arm).
+///
+/// Format inside the 4-byte-length-prefixed wrapper:
+/// ```text
+/// 1 byte: N (field count)
+/// N bytes: field ColumnType tags
+/// remaining: encode_row(fields, derived_schema) bytes
+/// ```
+fn decode_composite_inner(inner: &[u8]) -> Result<Value, DbError> {
+    if inner.is_empty() {
+        return Ok(Value::Composite(vec![]));
+    }
+    let n = inner[0] as usize;
+    if inner.len() < 1 + n {
+        return Err(DbError::ParseError {
+            message: "truncated composite: field type tags missing".into(),
+            position: None,
+        });
+    }
+    let inner_schema: Vec<DataType> = inner[1..1 + n]
+        .iter()
+        .map(|&tag| {
+            let ct = array_codec::ColumnType::try_from(tag)?;
+            Ok(col_type_to_data_type(ct))
+        })
+        .collect::<Result<_, DbError>>()?;
+    let field_bytes = &inner[1 + n..];
+    let inner_values = decode_row(field_bytes, &inner_schema)?;
+    Ok(Value::Composite(inner_values))
+}
+
+// ── Public codec API ───────────────────────────────────────────────────────────
 
 /// Encodes `values` into a compact binary row using `schema` for type validation.
 ///
@@ -284,7 +384,7 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
     }
 
     // Phase 3: encode non-null values in column order.
-    for (i, v) in values.iter().enumerate() {
+    for (i, (v, dt)) in values.iter().zip(schema.iter()).enumerate() {
         if is_null_bit(&buf[0..blen], i) {
             continue;
         }
@@ -298,7 +398,11 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                         reason: "NaN is not a valid SQL real value".into(),
                     });
                 }
-                buf.extend_from_slice(&f.to_le_bytes());
+                if *dt == DataType::Float {
+                    buf.extend_from_slice(&(*f as f32).to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
             }
             Value::Decimal(m, s) => {
                 buf.extend_from_slice(&m.to_le_bytes());
@@ -397,19 +501,31 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 buf.extend_from_slice(c);
             }
             Value::Composite(fields) => {
-                if let DataType::Composite(field_defs) = &schema[i] {
-                    let inner_schema: Vec<DataType> =
-                        field_defs.iter().map(|(_, dt)| dt.clone()).collect();
-                    let inner_bytes = encode_row(fields, &inner_schema)?;
-                    let len = inner_bytes.len() as u32;
-                    buf.extend_from_slice(&len.to_le_bytes());
-                    buf.extend_from_slice(&inner_bytes);
-                } else {
-                    return Err(DbError::TypeMismatch {
-                        expected: "Composite".to_string(),
-                        got: schema[i].name(),
-                    });
-                }
+                // Self-describing encoding: [1 byte N][N type_tags][encode_row bytes]
+                // Field types are stored inline so decode works without catalog access.
+                let n = fields.len();
+                let type_tags: Vec<u8> = fields
+                    .iter()
+                    .map(|f| u8::from(value_to_col_type(f)))
+                    .collect();
+                let inner_schema: Vec<DataType> = fields
+                    .iter()
+                    .map(|f| col_type_to_data_type(value_to_col_type(f)))
+                    .collect();
+                let field_bytes = encode_row(fields, &inner_schema)?;
+                let mut inner = Vec::with_capacity(1 + n + field_bytes.len());
+                inner.push(n as u8);
+                inner.extend_from_slice(&type_tags);
+                inner.extend_from_slice(&field_bytes);
+                let data_len = inner.len() as u32;
+                buf.extend_from_slice(&data_len.to_le_bytes());
+                buf.extend_from_slice(&inner);
+            }
+            Value::Ltree(s) | Value::Xml(s) => {
+                let bytes = s.as_bytes();
+                let data_len = bytes.len() as u32;
+                buf.extend_from_slice(&data_len.to_le_bytes());
+                buf.extend_from_slice(bytes);
             }
             Value::Null => unreachable!("null already skipped by bitmap check"),
         }
@@ -453,11 +569,17 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += 1;
                 Value::Bool(v)
             }
-            DataType::Int => {
+            DataType::TinyInt | DataType::SmallInt | DataType::Int => {
                 ensure_bytes(bytes, pos, 4)?;
                 let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
                 pos += 4;
                 Value::Int(v)
+            }
+            DataType::Float => {
+                ensure_bytes(bytes, pos, 4)?;
+                let v = f32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                Value::Real(v as f64)
             }
             DataType::BigInt => {
                 ensure_bytes(bytes, pos, 8)?;
@@ -630,18 +752,42 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 pos += 20;
                 Value::Money(m, s, c)
             }
-            DataType::Composite(field_defs) => {
+            DataType::Composite(_) => {
                 ensure_bytes(bytes, pos, 4)?;
-                let data_len =
-                    u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                let data_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
                 pos += 4;
                 ensure_bytes(bytes, pos, data_len)?;
-                let inner_bytes = &bytes[pos..pos + data_len];
+                let inner = &bytes[pos..pos + data_len];
                 pos += data_len;
-                let inner_schema: Vec<DataType> =
-                    field_defs.iter().map(|(_, dt)| dt.clone()).collect();
-                let inner_values = decode_row(inner_bytes, &inner_schema)?;
-                Value::Composite(inner_values)
+                decode_composite_inner(inner)?
+            }
+            DataType::Ltree => {
+                ensure_bytes(bytes, pos, 4)?;
+                let data_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                ensure_bytes(bytes, pos, data_len)?;
+                let s = std::str::from_utf8(&bytes[pos..pos + data_len])
+                    .map_err(|_| DbError::ParseError {
+                        message: format!("invalid UTF-8 in Ltree column at offset {pos}"),
+                        position: None,
+                    })?
+                    .to_string();
+                pos += data_len;
+                Value::Ltree(s)
+            }
+            DataType::Xml => {
+                ensure_bytes(bytes, pos, 4)?;
+                let data_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                ensure_bytes(bytes, pos, data_len)?;
+                let s = std::str::from_utf8(&bytes[pos..pos + data_len])
+                    .map_err(|_| DbError::ParseError {
+                        message: format!("invalid UTF-8 in Xml column at offset {pos}"),
+                        position: None,
+                    })?
+                    .to_string();
+                pos += data_len;
+                Value::Xml(s)
             }
         };
         values.push(v);
@@ -707,11 +853,17 @@ pub fn decode_row_masked(
                     pos += 1;
                     Value::Bool(v)
                 }
-                DataType::Int => {
+                DataType::TinyInt | DataType::SmallInt | DataType::Int => {
                     ensure_bytes(bytes, pos, 4)?;
                     let v = i32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
                     pos += 4;
                     Value::Int(v)
+                }
+                DataType::Float => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let v = f32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    Value::Real(v as f64)
                 }
                 DataType::BigInt => {
                     ensure_bytes(bytes, pos, 8)?;
@@ -853,18 +1005,45 @@ pub fn decode_row_masked(
                     pos += 20;
                     Value::Money(m, s, c)
                 }
-                DataType::Composite(field_defs) => {
+                DataType::Composite(_) => {
                     ensure_bytes(bytes, pos, 4)?;
                     let data_len =
                         u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     ensure_bytes(bytes, pos, data_len)?;
-                    let inner_bytes = &bytes[pos..pos + data_len];
+                    let inner = &bytes[pos..pos + data_len];
                     pos += data_len;
-                    let inner_schema: Vec<DataType> =
-                        field_defs.iter().map(|(_, dt)| dt.clone()).collect();
-                    let inner_values = decode_row(inner_bytes, &inner_schema)?;
-                    Value::Composite(inner_values)
+                    decode_composite_inner(inner)?
+                }
+                DataType::Ltree => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let data_len =
+                        u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    ensure_bytes(bytes, pos, data_len)?;
+                    let s = std::str::from_utf8(&bytes[pos..pos + data_len])
+                        .map_err(|_| DbError::ParseError {
+                            message: format!("invalid UTF-8 in Ltree column at offset {pos}"),
+                            position: None,
+                        })?
+                        .to_string();
+                    pos += data_len;
+                    Value::Ltree(s)
+                }
+                DataType::Xml => {
+                    ensure_bytes(bytes, pos, 4)?;
+                    let data_len =
+                        u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    ensure_bytes(bytes, pos, data_len)?;
+                    let s = std::str::from_utf8(&bytes[pos..pos + data_len])
+                        .map_err(|_| DbError::ParseError {
+                            message: format!("invalid UTF-8 in Xml column at offset {pos}"),
+                            position: None,
+                        })?
+                        .to_string();
+                    pos += data_len;
+                    Value::Xml(s)
                 }
             };
             values.push(v);
@@ -875,7 +1054,11 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 1)?;
                     pos += 1;
                 }
-                DataType::Int | DataType::Date => {
+                DataType::TinyInt
+                | DataType::SmallInt
+                | DataType::Int
+                | DataType::Float
+                | DataType::Date => {
                     ensure_bytes(bytes, pos, 4)?;
                     pos += 4;
                 }
@@ -895,7 +1078,7 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 20)?;
                     pos += 20;
                 }
-                DataType::Composite(_) => {
+                DataType::Composite(_) | DataType::Ltree | DataType::Xml => {
                     // Skip: read u32 data_len then skip that many bytes.
                     ensure_bytes(bytes, pos, 4)?;
                     let data_len =

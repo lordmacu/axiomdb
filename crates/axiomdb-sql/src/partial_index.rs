@@ -196,8 +196,14 @@ pub fn resolve_predicate_columns(expr: Expr, col_defs: &[ColumnDef]) -> Result<E
         | Expr::AnyOf { .. }
         | Expr::AllOf { .. }
         | Expr::Row(_)
-        | Expr::FieldAccess { .. } => Err(DbError::NotImplemented {
-            feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate/array/subscript/any/all)"
+        | Expr::FieldAccess { .. }
+        // Phase 20.20 — XML constructor forms not supported in partial index predicates.
+        | Expr::XmlElement { .. }
+        | Expr::XmlForest { .. }
+        | Expr::XmlRoot { .. }
+        | Expr::XmlConcat { .. }
+        | Expr::XmlQuery { .. } => Err(DbError::NotImplemented {
+            feature: "partial index predicate: unsupported expression (subquery/CASE/param/cast/aggregate/array/subscript/any/all/xml)"
                 .into(),
         }),
     }

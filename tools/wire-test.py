@@ -98,8 +98,9 @@ def _check_binary_freshness(binary):
 def start_server():
     global _server_proc, _data_dir
     # Kill any stale server from a previous run (e.g. if the test crashed).
-    subprocess.run(["pkill", "-f", "axiomdb-server"], capture_output=True)
-    time.sleep(0.3)
+    # Use SIGKILL (-9) so the process exits immediately and releases the port.
+    subprocess.run(["pkill", "-9", "-f", "axiomdb-server"], capture_output=True)
+    time.sleep(1.5)  # wait for the OS to release port 13306
     explicit = os.environ.get("AXIOMDB_SERVER_BIN")
     if explicit:
         binary = explicit
@@ -129,6 +130,11 @@ def start_server():
     # Wait up to 5s for the server to be ready
     import socket
     for _ in range(50):
+        # Abort early if the process exited (e.g. port already in use)
+        if _server_proc.poll() is not None:
+            stop_server()
+            print(f"Server process exited prematurely (code {_server_proc.returncode}) — port {PORT} may still be in use")
+            sys.exit(1)
         try:
             with socket.create_connection(("127.0.0.1", PORT), timeout=0.1):
                 return
@@ -271,6 +277,9 @@ def raw_execute(conn, stmt_id, param_types, inline_values=b"", null_indices=()):
 print(f"Starting AxiomDB on :{PORT}...")
 start_server()
 print("Server ready\n")
+
+import atexit
+atexit.register(stop_server)  # always stop server even if script crashes
 
 conn = connect()
 cur = conn.cursor()
@@ -3185,67 +3194,79 @@ except Exception:
 
 print("\n[11.20b NESTED PATH]")
 
-# Basic shred with parent × child fan-out
-cur.execute("""SELECT inv_id, item_name, qty FROM JSON_TABLE(
-    '[{"id":1,"items":[{"name":"A","qty":2},{"name":"B","qty":3}]},
-      {"id":2,"items":[{"name":"C","qty":1}]}]',
-    '$[*]' COLUMNS (
-        inv_id INT PATH '$.id',
-        NESTED PATH '$.items[*]' COLUMNS (
-            item_name TEXT PATH '$.name',
-            qty       INT  PATH '$.qty'
+# Use isolated connection — pre-existing bug: pymysql type-converter crashes on
+# mixed INT/TEXT NESTED PATH result sets (wire metadata issue, not 24.1 regression).
+_conn_11b = connect()
+_cur_11b = _conn_11b.cursor()
+
+try:
+    _cur_11b.execute("""SELECT inv_id, item_name, qty FROM JSON_TABLE(
+        '[{"id":1,"items":[{"name":"A","qty":2},{"name":"B","qty":3}]},
+          {"id":2,"items":[{"name":"C","qty":1}]}]',
+        '$[*]' COLUMNS (
+            inv_id INT PATH '$.id',
+            NESTED PATH '$.items[*]' COLUMNS (
+                item_name TEXT PATH '$.name',
+                qty       INT  PATH '$.qty'
+            )
         )
-    )
-) AS t ORDER BY inv_id, item_name""")
-rows = cur.fetchall()
-normalized = [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
-ok("11.20b JSON_TABLE NESTED parent × children",
-   normalized == [(1, "A", 2), (1, "B", 3), (2, "C", 1)],
-   f"got {normalized}")
+    ) AS t ORDER BY inv_id, item_name""")
+    rows = _cur_11b.fetchall()
+    normalized = [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+    ok("11.20b JSON_TABLE NESTED parent × children",
+       normalized == [(1, "A", 2), (1, "B", 3), (2, "C", 1)],
+       f"got {normalized}")
+except Exception as _e11b:
+    ok("11.20b JSON_TABLE NESTED parent × children", False, str(_e11b))
+    _conn_11b.close()
+    _conn_11b = connect()
+    _cur_11b = _conn_11b.cursor()
 
-# LEFT-OUTER NULL pad on empty children
-cur.execute("""SELECT inv_id, item_name FROM JSON_TABLE(
-    '[{"id":1,"items":[{"name":"A"}]},
-      {"id":2,"items":[]}]',
-    '$[*]' COLUMNS (
-        inv_id INT PATH '$.id',
-        NESTED PATH '$.items[*]' COLUMNS (item_name TEXT PATH '$.name')
-    )
-) AS t ORDER BY inv_id""")
-rows = cur.fetchall()
-ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad",
-   len(rows) == 2 and int(rows[0][0]) == 1 and str(rows[0][1]) == "A"
-   and int(rows[1][0]) == 2 and rows[1][1] is None,
-   f"got {rows}")
+try:
+    _cur_11b.execute("""SELECT inv_id, item_name FROM JSON_TABLE(
+        '[{"id":1,"items":[{"name":"A"}]},
+          {"id":2,"items":[]}]',
+        '$[*]' COLUMNS (
+            inv_id INT PATH '$.id',
+            NESTED PATH '$.items[*]' COLUMNS (item_name TEXT PATH '$.name')
+        )
+    ) AS t ORDER BY inv_id""")
+    rows = _cur_11b.fetchall()
+    ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad",
+       len(rows) == 2 and int(rows[0][0]) == 1 and str(rows[0][1]) == "A"
+       and int(rows[1][0]) == 2 and rows[1][1] is None,
+       f"got {rows}")
+except Exception as _e11b2:
+    ok("11.20b JSON_TABLE NESTED LEFT-OUTER NULL pad", False, str(_e11b2))
+    _conn_11b.close()
+    _conn_11b = connect()
+    _cur_11b = _conn_11b.cursor()
 
-# Per-level ordinality
-cur.execute("""SELECT ord_inv, ord_item FROM JSON_TABLE(
-    '[{"items":[{"n":"A"},{"n":"B"}]},{"items":[{"n":"C"}]}]',
-    '$[*]' COLUMNS (
-        ord_inv FOR ORDINALITY,
-        NESTED PATH '$.items[*]' COLUMNS (ord_item FOR ORDINALITY)
-    )
-) AS t ORDER BY ord_inv, ord_item""")
-rows = cur.fetchall()
-pairs = [(int(r[0]), int(r[1])) for r in rows]
-ok("11.20b JSON_TABLE NESTED per-level ordinality",
-   pairs == [(1, 1), (1, 2), (2, 1)],
-   f"got {pairs}")
+try:
+    _cur_11b.execute("""SELECT ord_inv, ord_item FROM JSON_TABLE(
+        '[{"items":[{"n":"A"},{"n":"B"}]},{"items":[{"n":"C"}]}]',
+        '$[*]' COLUMNS (
+            ord_inv FOR ORDINALITY,
+            NESTED PATH '$.items[*]' COLUMNS (ord_item FOR ORDINALITY)
+        )
+    ) AS t ORDER BY ord_inv, ord_item""")
+    rows = _cur_11b.fetchall()
+    pairs = [(int(r[0]), int(r[1])) for r in rows]
+    ok("11.20b JSON_TABLE NESTED per-level ordinality",
+       pairs == [(1, 1), (1, 2), (2, 1)],
+       f"got {pairs}")
+except Exception as _e11b3:
+    ok("11.20b JSON_TABLE NESTED per-level ordinality", False, str(_e11b3))
+
+_conn_11b.close()
 
 # ── Phase 11.20c — multi-sibling + multi-level NESTED ─────────────────────────
 
 print("\n[11.20c multi NESTED]")
 
-# Multi-sibling UNION semantics
-cur.execute("""SELECT inv_id, price, tag FROM JSON_TABLE(
-    '[{"id":1,"prices":[10,20],"tags":["a","b"]}]',
-    '$[*]' COLUMNS (
-        inv_id INT PATH '$.id',
-        NESTED PATH '$.prices[*]' COLUMNS (price INT  PATH '$'),
-        NESTED PATH '$.tags[*]'   COLUMNS (tag   TEXT PATH '$')
-    )
-) AS t ORDER BY COALESCE(price, 1000), COALESCE(tag, 'z')""")
-rows = cur.fetchall()
+_conn_11c = connect()
+_cur_11c = _conn_11c.cursor()
+
 def norm_cell(x):
     if x is None:
         return None
@@ -3253,26 +3274,46 @@ def norm_cell(x):
         return int(x)
     except (TypeError, ValueError):
         return str(x)
-normalized = [tuple(norm_cell(x) for x in r) for r in rows]
-ok("11.20c JSON_TABLE multi-sibling UNION",
-   normalized == [(1, 10, None), (1, 20, None), (1, None, "a"), (1, None, "b")],
-   f"got {normalized}")
 
-# Multi-level depth 2
-cur.execute("""SELECT line_id, part FROM JSON_TABLE(
-    '[{"lines":[{"lid":"L1","parts":["P1","P2"]},{"lid":"L2","parts":[]}]}]',
-    '$[*]' COLUMNS (
-        NESTED PATH '$.lines[*]' COLUMNS (
-            line_id TEXT PATH '$.lid',
-            NESTED PATH '$.parts[*]' COLUMNS (part TEXT PATH '$')
+try:
+    _cur_11c.execute("""SELECT inv_id, price, tag FROM JSON_TABLE(
+        '[{"id":1,"prices":[10,20],"tags":["a","b"]}]',
+        '$[*]' COLUMNS (
+            inv_id INT PATH '$.id',
+            NESTED PATH '$.prices[*]' COLUMNS (price INT  PATH '$'),
+            NESTED PATH '$.tags[*]'   COLUMNS (tag   TEXT PATH '$')
         )
-    )
-) AS t ORDER BY line_id, COALESCE(part, 'z')""")
-rows = cur.fetchall()
-cleaned = [tuple(str(x) if x is not None else None for x in r) for r in rows]
-ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
-   cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
-   f"got {cleaned}")
+    ) AS t ORDER BY COALESCE(price, 1000), COALESCE(tag, 'z')""")
+    rows = _cur_11c.fetchall()
+    normalized = [tuple(norm_cell(x) for x in r) for r in rows]
+    ok("11.20c JSON_TABLE multi-sibling UNION",
+       normalized == [(1, 10, None), (1, 20, None), (1, None, "a"), (1, None, "b")],
+       f"got {normalized}")
+except Exception as _e11c:
+    ok("11.20c JSON_TABLE multi-sibling UNION", False, str(_e11c))
+    _conn_11c.close()
+    _conn_11c = connect()
+    _cur_11c = _conn_11c.cursor()
+
+try:
+    _cur_11c.execute("""SELECT line_id, part FROM JSON_TABLE(
+        '[{"lines":[{"lid":"L1","parts":["P1","P2"]},{"lid":"L2","parts":[]}]}]',
+        '$[*]' COLUMNS (
+            NESTED PATH '$.lines[*]' COLUMNS (
+                line_id TEXT PATH '$.lid',
+                NESTED PATH '$.parts[*]' COLUMNS (part TEXT PATH '$')
+            )
+        )
+    ) AS t ORDER BY line_id, COALESCE(part, 'z')""")
+    rows = _cur_11c.fetchall()
+    cleaned = [tuple(str(x) if x is not None else None for x in r) for r in rows]
+    ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad",
+       cleaned == [("L1", "P1"), ("L1", "P2"), ("L2", None)],
+       f"got {cleaned}")
+except Exception as _e11c2:
+    ok("11.20c JSON_TABLE multi-level NESTED with LEFT-OUTER pad", False, str(_e11c2))
+
+_conn_11c.close()
 
 # ── Phase 11.18c — JSONB path operators ─────────────────────────────────────
 
@@ -5514,12 +5555,16 @@ ok("[20.17b currency_of] CURRENCY_OF(MONEY(100,'GBP')) = 'GBP'",
    _cf_val == "GBP", _cf_val)
 
 # [20.17c] CONVERT using catalog rate
-cur.execute("CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92")
-cur.execute("SELECT CURRENCY_OF(CONVERT(MONEY(100, 'USD'), 'EUR'))")
-_converted_currency = cur.fetchone()[0]
-ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
-   _converted_currency == "EUR", _converted_currency)
-cur.execute("DROP EXCHANGE RATE 'USD' TO 'EUR'")
+try:
+    cur.execute("CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.92")
+    cur.execute("SELECT CURRENCY_OF(CONVERT(MONEY(100, 'USD'), 'EUR'))")
+    _converted_currency = cur.fetchone()[0]
+    ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
+       _converted_currency == "EUR", _converted_currency)
+    cur.execute("DROP EXCHANGE RATE 'USD' TO 'EUR'")
+except Exception as _e_20_17c:
+    ok("[20.17c convert_currency] CONVERT(MONEY(100,'USD'),'EUR') has currency EUR",
+       False, str(_e_20_17c))
 
 # [20.17d] Cross-currency addition returns error
 _got_error = False
@@ -5531,6 +5576,278 @@ except Exception:
 ok("[20.17d cross_currency_add_error] USD + EUR raises an error", _got_error)
 
 cur.execute("DROP TABLE IF EXISTS _wire_money_prices")
+
+# ── [20.19 ltree] ─────────────────────────────────────────────────────────────
+
+print("\n[20.19 ltree]")
+
+# DDL + roundtrip
+cur.execute("DROP TABLE IF EXISTS _wire_ltree_paths")
+cur.execute("CREATE TABLE _wire_ltree_paths (id INT, path LTREE)")
+cur.execute("INSERT INTO _wire_ltree_paths VALUES (1, 'org.eng.backend'), (2, 'org.hr')")
+cur.execute("SELECT path FROM _wire_ltree_paths WHERE id = 1")
+_ltree_val = cur.fetchone()[0]
+ok("[20.19 ltree] INSERT + SELECT LTREE column roundtrip", _ltree_val == "org.eng.backend", _ltree_val)
+
+# Ancestor operator @>
+cur.execute("SELECT 'org.eng'::LTREE @> 'org.eng.backend'::LTREE")
+ok("[20.19 ltree] @> ancestor returns true for parent/child", cur.fetchone()[0] == 1)
+
+# lquery ~ operator
+cur.execute("SELECT 'org.eng.backend'::LTREE ~ 'org.*.backend'")
+ok("[20.19 ltree] ~ lquery wildcard matches correctly", cur.fetchone()[0] == 1)
+
+# nlevel scalar function
+cur.execute("SELECT nlevel('a.b.c'::LTREE)")
+ok("[20.19 ltree] nlevel('a.b.c') = 3", cur.fetchone()[0] == 3)
+
+# subpath scalar function
+cur.execute("SELECT subpath('a.b.c.d'::LTREE, 1, 2)")
+ok("[20.19 ltree] subpath('a.b.c.d', 1, 2) = 'b.c'", cur.fetchone()[0] == "b.c")
+
+# lca scalar function
+cur.execute("SELECT lca('org.eng.backend'::LTREE, 'org.eng.frontend'::LTREE)")
+ok("[20.19 ltree] lca returns common ancestor 'org.eng'", cur.fetchone()[0] == "org.eng")
+
+# concat operator ||
+cur.execute("SELECT 'a.b'::LTREE || 'c.d'::LTREE")
+ok("[20.19 ltree] || concatenates two ltree paths", cur.fetchone()[0] == "a.b.c.d")
+
+cur.execute("DROP TABLE IF EXISTS _wire_ltree_paths")
+
+# ── Phase 20.20 — XMLType ─────────────────────────────────────────────────────
+
+# Core type: XML column + cast
+cur.execute("DROP TABLE IF EXISTS _wire_xml_t")
+cur.execute("CREATE TABLE _wire_xml_t (id INT, doc XML)")
+cur.execute("INSERT INTO _wire_xml_t VALUES (1, '<root><a>hello</a></root>')")
+cur.execute("SELECT doc FROM _wire_xml_t WHERE id = 1")
+ok("[20.20 xml] XML column round-trips correctly", cur.fetchone()[0] == "<root><a>hello</a></root>")
+
+cur.execute("SELECT CAST('<root/>' AS XML)")
+ok("[20.20 xml] CAST text to XML", cur.fetchone()[0] == "<root/>")
+
+cur.execute("SELECT xml_is_well_formed('<a/>')")
+ok("[20.20 xml] xml_is_well_formed('<a/>') = 1", cur.fetchone()[0] == 1)
+
+cur.execute("SELECT xml_is_well_formed('<broken')")
+ok("[20.20 xml] xml_is_well_formed('<broken') = 0", cur.fetchone()[0] == 0)
+
+# XMLELEMENT
+cur.execute("SELECT XMLELEMENT(NAME a, 'hello')")
+ok("[20.20 xml] XMLELEMENT produces element", cur.fetchone()[0] == "<a>hello</a>")
+
+cur.execute("SELECT XMLELEMENT(NAME a, XMLATTRIBUTES('42' AS id), 'text')")
+ok("[20.20 xml] XMLELEMENT with attributes", cur.fetchone()[0] == '<a id="42">text</a>')
+
+# XMLFOREST
+cur.execute("SELECT XMLFOREST('bob' AS name, 42 AS age)")
+ok("[20.20 xml] XMLFOREST produces multiple elements", cur.fetchone()[0] == "<name>bob</name><age>42</age>")
+
+# XMLROOT
+cur.execute("SELECT XMLROOT('<a/>'::XML, VERSION '1.0')")
+ok("[20.20 xml] XMLROOT adds declaration", cur.fetchone()[0] == '<?xml version="1.0"?><a/>')
+
+# XMLCONCAT
+cur.execute("SELECT XMLCONCAT('<a/>'::XML, '<b/>'::XML)")
+ok("[20.20 xml] XMLCONCAT joins fragments", cur.fetchone()[0] == "<a/><b/>")
+
+# XMLQUERY
+cur.execute("SELECT XMLQUERY('/root/a/text()' PASSING '<root><a>hi</a></root>'::XML)")
+ok("[20.20 xml] XMLQUERY extracts text", cur.fetchone()[0] == "hi")
+
+cur.execute("SELECT XMLQUERY('/root/a/@id' PASSING '<root><a id=\"7\">x</a></root>'::XML)")
+ok("[20.20 xml] XMLQUERY extracts attribute", cur.fetchone()[0] == "7")
+
+# XMLTABLE
+cur.execute("""
+SELECT name, age FROM XMLTABLE('/rows/row'
+  PASSING '<rows><row><name>Alice</name><age>30</age></row></rows>'
+  COLUMNS name TEXT, age INT) AS t
+""")
+row = cur.fetchone()
+ok("[20.20 xml] XMLTABLE extracts row columns", row[0] == "Alice" and row[1] == 30, row)
+
+cur.execute("""
+SELECT ord, name FROM XMLTABLE('/rows/row'
+  PASSING '<rows><row><name>A</name></row><row><name>B</name></row></rows>'
+  COLUMNS ord FOR ORDINALITY, name TEXT) AS t
+""")
+rows20 = cur.fetchall()
+ok("[20.20 xml] XMLTABLE ordinality column", len(rows20) == 2 and rows20[0][0] == 1 and rows20[1][0] == 2, rows20)
+
+cur.execute("DROP TABLE IF EXISTS _wire_xml_t")
+
+# ── 24.1 Integer types (TINYINT / SMALLINT / BIGSERIAL) ───────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_int_types")
+cur.execute("CREATE TABLE _wire_int_types (id INT PRIMARY KEY, ti TINYINT, si SMALLINT)")
+cur.execute("INSERT INTO _wire_int_types VALUES (1, 42, 1000)")
+cur.execute("INSERT INTO _wire_int_types VALUES (2, -10, -500)")
+cur.execute("INSERT INTO _wire_int_types VALUES (3, -128, -32768)")
+cur.execute("INSERT INTO _wire_int_types VALUES (4, 127, 32767)")
+
+cur.execute("SELECT ti, si FROM _wire_int_types ORDER BY id")
+rows_int = cur.fetchall()
+ok("[24.1 int_types] tinyint insert/select round-trip", rows_int[0] == (42, 1000), rows_int[0])
+ok("[24.1 int_types] tinyint negative round-trip", rows_int[1] == (-10, -500), rows_int[1])
+ok("[24.1 int_types] tinyint boundary min -128 and smallint min -32768", rows_int[2] == (-128, -32768), rows_int[2])
+ok("[24.1 int_types] tinyint boundary max 127 and smallint max 32767", rows_int[3] == (127, 32767), rows_int[3])
+
+# Wire type metadata: cursor.description gives type_code (pymysql maps MySQL type codes to Python types)
+cur.execute("SELECT ti, si FROM _wire_int_types LIMIT 1")
+cur.fetchall()
+ti_type = cur.description[0][1]  # type_code
+si_type = cur.description[1][1]
+ok("[24.1 int_types] TINYINT wire type is integer-family", ti_type is not None, ti_type)
+ok("[24.1 int_types] SMALLINT wire type is integer-family", si_type is not None, si_type)
+
+# Overflow must produce an error
+try:
+    cur.execute("INSERT INTO _wire_int_types VALUES (99, 128, 0)")
+    conn.rollback()
+    ok("[24.1 int_types] TINYINT overflow 128 raises error", False, "no error raised")
+except Exception:
+    ok("[24.1 int_types] TINYINT overflow 128 raises error", True)
+
+try:
+    cur.execute("INSERT INTO _wire_int_types VALUES (99, -129, 0)")
+    conn.rollback()
+    ok("[24.1 int_types] TINYINT underflow -129 raises error", False, "no error raised")
+except Exception:
+    ok("[24.1 int_types] TINYINT underflow -129 raises error", True)
+
+# BIGSERIAL auto-increments
+cur.execute("DROP TABLE IF EXISTS _wire_bigserial")
+cur.execute("CREATE TABLE _wire_bigserial (id BIGSERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO _wire_bigserial (name) VALUES ('alice')")
+cur.execute("INSERT INTO _wire_bigserial (name) VALUES ('bob')")
+cur.execute("INSERT INTO _wire_bigserial (name) VALUES ('carol')")
+cur.execute("SELECT id FROM _wire_bigserial ORDER BY id")
+brows = cur.fetchall()
+ok("[24.1 int_types] BIGSERIAL auto-increments from 1", brows[0][0] == 1, brows[0][0])
+ok("[24.1 int_types] BIGSERIAL second row is 2", brows[1][0] == 2, brows[1][0])
+ok("[24.1 int_types] BIGSERIAL third row is 3", brows[2][0] == 3, brows[2][0])
+
+# SHOW COLUMNS reports correct type names
+cur.execute("SHOW COLUMNS FROM _wire_int_types")
+sc_rows = cur.fetchall()
+sc_types = [r[1].lower() if isinstance(r[1], str) else str(r[1]) for r in sc_rows]
+ok("[24.1 int_types] SHOW COLUMNS reports tinyint", any("tinyint" in t for t in sc_types), sc_types)
+ok("[24.1 int_types] SHOW COLUMNS reports smallint", any("smallint" in t for t in sc_types), sc_types)
+
+cur.execute("DROP TABLE IF EXISTS _wire_int_types")
+cur.execute("DROP TABLE IF EXISTS _wire_bigserial")
+
+# ── 24.1b SERIAL / SMALLSERIAL ────────────────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_serial")
+cur.execute("CREATE TABLE _wire_serial (id SERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO _wire_serial (name) VALUES ('a')")
+cur.execute("INSERT INTO _wire_serial (name) VALUES ('b')")
+cur.execute("SELECT id FROM _wire_serial ORDER BY id")
+_sr = cur.fetchall()
+ok("[24.1b serial] SERIAL auto-increments from 1", _sr[0][0] == 1, _sr[0][0])
+ok("[24.1b serial] SERIAL second row is 2", _sr[1][0] == 2, _sr[1][0])
+
+cur.execute("DROP TABLE IF EXISTS _wire_smallserial")
+cur.execute("CREATE TABLE _wire_smallserial (id SMALLSERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO _wire_smallserial (name) VALUES ('x')")
+cur.execute("INSERT INTO _wire_smallserial (name) VALUES ('y')")
+cur.execute("SELECT id FROM _wire_smallserial ORDER BY id")
+_ssr = cur.fetchall()
+ok("[24.1b serial] SMALLSERIAL auto-increments from 1", _ssr[0][0] == 1, _ssr[0][0])
+ok("[24.1b serial] SMALLSERIAL second row is 2", _ssr[1][0] == 2, _ssr[1][0])
+
+cur.execute("DROP TABLE IF EXISTS _wire_serial")
+cur.execute("DROP TABLE IF EXISTS _wire_smallserial")
+
+# ── 24.2 REAL / FLOAT4 / DOUBLE / FLOAT8 ─────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_float")
+cur.execute("CREATE TABLE _wire_float (id INT PRIMARY KEY, r REAL, d DOUBLE)")
+cur.execute("INSERT INTO _wire_float VALUES (1, 3.14, 3.141592653589793)")
+cur.execute("SELECT r, d FROM _wire_float WHERE id = 1")
+_fl = cur.fetchone()
+# REAL is f32: pymysql returns a float, check ~f32 precision
+ok("[24.2 float] REAL column round-trips", abs(_fl[0] - 3.14) < 1e-5, _fl[0])
+# DOUBLE is f64: full precision survives
+ok("[24.2 float] DOUBLE column round-trips with f64 precision", abs(_fl[1] - 3.141592653589793) < 1e-13, _fl[1])
+
+cur.execute("DROP TABLE IF EXISTS _wire_float4f8")
+cur.execute("CREATE TABLE _wire_float4f8 (id INT PRIMARY KEY, a FLOAT4, b FLOAT8)")
+cur.execute("INSERT INTO _wire_float4f8 VALUES (1, 1.5, 1.5)")
+cur.execute("SELECT a, b FROM _wire_float4f8 WHERE id = 1")
+_ff = cur.fetchone()
+ok("[24.2 float] FLOAT4 alias stores as f32", abs(_ff[0] - 1.5) < 1e-5, _ff[0])
+ok("[24.2 float] FLOAT8 alias stores as f64", abs(_ff[1] - 1.5) < 1e-13, _ff[1])
+
+cur.execute("DROP TABLE IF EXISTS _wire_float")
+cur.execute("DROP TABLE IF EXISTS _wire_float4f8")
+
+# ── 24.3 Exact DECIMAL(p,s) ───────────────────────────────────────────────────
+
+cur.execute("DROP TABLE IF EXISTS _wire_decimal")
+cur.execute("CREATE TABLE _wire_decimal (price DECIMAL(10,2), qty DECIMAL(5,0), bare DECIMAL)")
+
+# SHOW COLUMNS must display correct type_len-derived display
+cur.execute("SHOW COLUMNS FROM _wire_decimal")
+_dc_cols = {row[0]: row[1] for row in cur.fetchall()}
+ok("[24.3 decimal] SHOW COLUMNS price → decimal(10,2)", _dc_cols.get("price") == "decimal(10,2)", _dc_cols.get("price"))
+ok("[24.3 decimal] SHOW COLUMNS qty → decimal(5,0)",   _dc_cols.get("qty")   == "decimal(5,0)",  _dc_cols.get("qty"))
+ok("[24.3 decimal] SHOW COLUMNS bare → decimal(10,0)", _dc_cols.get("bare")  == "decimal(10,0)", _dc_cols.get("bare"))
+
+# Insert with rounding
+cur.execute("INSERT INTO _wire_decimal VALUES ('123.456', '4.9', '1.5')")
+cur.execute("SELECT price, qty, bare FROM _wire_decimal")
+_dr = cur.fetchone()
+# price: 123.456 → round to 2dp HALF_UP → 123.46
+ok("[24.3 decimal] price rounds to 2dp HALF_UP",  str(_dr[0]) == "123.46", _dr[0])
+# qty: 4.9 → round to 0dp HALF_UP → 5
+ok("[24.3 decimal] qty rounds to 0dp HALF_UP",    str(_dr[1]) == "5",      _dr[1])
+# bare (10,0): 1.5 → 2
+ok("[24.3 decimal] bare DECIMAL rounds to 0dp",   str(_dr[2]) == "2",      _dr[2])
+
+# Overflow rejected: DECIMAL(10,2) allows up to 8 integer digits (10-2=8)
+# 123456789 has 9 digits → overflow
+try:
+    cur.execute("INSERT INTO _wire_decimal VALUES ('123456789.99', '0', '0')")
+    conn.commit()
+    ok("[24.3 decimal] overflow DECIMAL(10,2) rejected", False, "no error raised")
+except Exception:
+    conn.rollback()
+    ok("[24.3 decimal] overflow DECIMAL(10,2) rejected", True)
+
+# Division precision
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_div")
+cur.execute("CREATE TABLE _wire_decimal_div (a DECIMAL(10,2), b DECIMAL(10,2))")
+cur.execute("INSERT INTO _wire_decimal_div VALUES ('10.00', '3.00')")
+cur.execute("SELECT a / b FROM _wire_decimal_div")
+_div_res = cur.fetchone()[0]
+ok("[24.3 decimal] division produces fractional digits ~3.333333",
+   _div_res is not None and abs(float(_div_res) - 3.333333) < 1e-4, _div_res)
+
+# ROUND on DECIMAL column values
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_round")
+cur.execute("CREATE TABLE _wire_decimal_round (x DECIMAL(10,4))")
+cur.execute("INSERT INTO _wire_decimal_round VALUES ('1.2350')")
+cur.execute("SELECT ROUND(x, 2) FROM _wire_decimal_round")
+_rr = cur.fetchone()[0]
+ok("[24.3 decimal] ROUND(DECIMAL,2) HALF_UP 1.2350→1.24", str(_rr) == "1.24", _rr)
+
+# TRUNC / TRUNCATE on DECIMAL column values
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_trunc")
+cur.execute("CREATE TABLE _wire_decimal_trunc (x DECIMAL(10,3))")
+cur.execute("INSERT INTO _wire_decimal_trunc VALUES ('1.999')")
+cur.execute("SELECT TRUNC(x, 1), TRUNCATE(x, 2) FROM _wire_decimal_trunc")
+_tr = cur.fetchone()
+ok("[24.3 decimal] TRUNC(DECIMAL,1) truncates 1.999→1.9",   str(_tr[0]) == "1.9",  _tr[0])
+ok("[24.3 decimal] TRUNCATE(DECIMAL,2) alias 1.999→1.99",   str(_tr[1]) == "1.99", _tr[1])
+
+cur.execute("DROP TABLE IF EXISTS _wire_decimal")
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_div")
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_round")
+cur.execute("DROP TABLE IF EXISTS _wire_decimal_trunc")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

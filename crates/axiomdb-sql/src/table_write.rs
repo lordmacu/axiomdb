@@ -562,6 +562,9 @@ fn toast_encode(
                 (DataType::Bool, Value::Bool(b)) => buf.push(u8::from(*b)),
                 (DataType::Int, Value::Int(n)) => buf.extend_from_slice(&n.to_le_bytes()),
                 (DataType::BigInt, Value::BigInt(n)) => buf.extend_from_slice(&n.to_le_bytes()),
+                (DataType::Float, Value::Real(f)) => {
+                    buf.extend_from_slice(&(*f as f32).to_le_bytes())
+                }
                 (DataType::Real, Value::Real(f)) => buf.extend_from_slice(&f.to_le_bytes()),
                 (DataType::Decimal, Value::Decimal(m, s)) => {
                     buf.extend_from_slice(&m.to_le_bytes());
