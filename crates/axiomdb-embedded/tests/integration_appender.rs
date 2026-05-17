@@ -364,3 +364,114 @@ fn appender_loads_50k_rows() {
         Value::BigInt(50_000)
     );
 }
+
+// ── Step 8 — Remaining edge cases from the spec ───────────────────────────────
+
+#[test]
+fn appender_on_table_with_fk_returns_unsupported() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+    db.run("CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id))")
+        .unwrap();
+    let err = db.appender("child").unwrap_err();
+    assert!(
+        matches!(err, DbError::NotImplemented { .. }),
+        "expected NotImplemented (FK deferred to v1.1), got {err:?}"
+    );
+}
+
+#[test]
+fn appender_on_table_with_generated_column_returns_unsupported() {
+    let (_dir, mut db) = open_db();
+    db.run(
+        "CREATE TABLE t (id INT, v INT, doubled INT GENERATED ALWAYS AS (v * 2) STORED)",
+    )
+    .unwrap();
+    let err = db.appender("t").unwrap_err();
+    assert!(
+        matches!(err, DbError::NotImplemented { .. }),
+        "expected NotImplemented (generated cols deferred to v1.1), got {err:?}"
+    );
+}
+
+#[test]
+fn appender_normalizes_text_nfc() {
+    // Both 'café' forms (NFC 5 bytes + NFD 6 bytes) must store identically.
+    // The Appender goes through encode_row which applies NFC.
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    let nfc = "café".to_string();
+    // 'cafe' + combining acute (U+0301) = NFD form, 6 bytes
+    let nfd = "cafe\u{0301}".to_string();
+    assert_ne!(nfc.as_bytes().len(), nfd.as_bytes().len()); // sanity
+    app.append_row(&[Value::Int(1), Value::Text(nfc)]).unwrap();
+    app.append_row(&[Value::Int(2), Value::Text(nfd)]).unwrap();
+    app.finish().unwrap();
+    // Both rows must compare equal under '='.
+    let rows = db
+        .query("SELECT COUNT(*) FROM t WHERE v = 'café'")
+        .unwrap();
+    assert_eq!(
+        rows[0][0],
+        Value::BigInt(2),
+        "both NFC and NFD inputs must normalize to the same stored form"
+    );
+}
+
+#[test]
+fn appender_writes_visible_only_after_finish() {
+    // The Appender holds &mut Db for its lifetime — the borrow checker
+    // enforces that no concurrent operation can run on the SAME Db
+    // handle while the appender is alive (compile-time guarantee). So
+    // this test verifies the post-finish visibility transition: rows
+    // appended into a dropped Appender are NOT visible, while rows
+    // committed via finish() ARE.
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    db.run("INSERT INTO t VALUES (1)").unwrap();
+    {
+        let mut app = db.appender("t").unwrap();
+        app.append_row(&[Value::Int(2)]).unwrap();
+        app.append_row(&[Value::Int(3)]).unwrap();
+        // Drop without finish — buffered writes discarded.
+    }
+    let n = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
+    assert_eq!(n, Value::BigInt(1), "dropped appender did not persist");
+    // Now the finish() path:
+    {
+        let mut app = db.appender("t").unwrap();
+        app.append_row(&[Value::Int(4)]).unwrap();
+        app.finish().unwrap();
+    }
+    let n = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
+    assert_eq!(n, Value::BigInt(2), "finished appender writes persist");
+}
+
+#[test]
+fn appender_honors_set_synchronous_normal() {
+    // Functional smoke: after SET synchronous = NORMAL the appender's
+    // commit uses flush_no_sync. Data must still persist within the
+    // process lifetime (we can query it back).
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    db.run("SET synchronous = 'NORMAL'").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 0..50 {
+        app.append_row(&[Value::Int(i)]).unwrap();
+    }
+    let n = app.finish().unwrap();
+    assert_eq!(n, 50);
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(50)
+    );
+}
+
+#[test]
+fn appender_pending_returns_zero_initially() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    let app = db.appender("t").unwrap();
+    assert_eq!(app.pending(), 0);
+}
