@@ -12,6 +12,7 @@ pub mod analyzer;
 pub mod ast;
 pub mod bench_timings;
 pub mod bloom;
+pub mod statement_cache;
 pub mod clustered_secondary;
 pub mod clustered_table;
 pub mod custom_aggregate;
