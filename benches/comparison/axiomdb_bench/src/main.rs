@@ -196,6 +196,49 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, ac_n, mean, "reset outside timing");
         }
 
+        "insert_appender" => {
+            // Attack 7: fast-path Appender API skips the SQL pipeline.
+            // v1 of the Appender supports heap tables only — clustered
+            // (PK-rooted) tables are deferred to a follow-up Attack.
+            // We use a parallel `bench_users_heap` table (same columns,
+            // no PRIMARY KEY) so the per-row work is comparable to
+            // bench_users but the row goes through the heap path the
+            // Appender supports.
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    &mut db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users_heap").unwrap();
+                for i in 1..=ac_n {
+                    let i32_i = i as i32;
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i32_i),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender, heap table (v1 limitation)");
+        }
+
         _ => {
             load_batch(&mut db, &inserts);
             let step = (n_rows.max(100) / 100).max(1);
@@ -565,6 +608,38 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
             t0.elapsed()
         }),
 
+        // Attack 7 comparison: SQLite analog of AxiomDB Appender.
+        // Uses prepare_cached + execute with bind params (no parsing
+        // per row, no fsync per row in NORMAL mode) — the canonical
+        // "fast bind" pattern SQLite users actually use for bulk loads.
+        "insert_appender" => measure_timed(|| {
+            db.reset();
+            let n = ac_inserts.len();
+            let t0 = Instant::now();
+            db.conn.execute_batch("BEGIN").unwrap();
+            {
+                let mut stmt = db
+                    .conn
+                    .prepare_cached(
+                        "INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .unwrap();
+                for i in 1..=n {
+                    let active = if i % 2 == 0 { 1i64 } else { 0 };
+                    let age = (18 + (i % 62)) as i64;
+                    let score = 100.0 + (i % 1000) as f64 * 0.1;
+                    let name = format!("user_{i:06}");
+                    let email = format!("u{i}@b.local");
+                    stmt.execute(rusqlite::params![
+                        i as i64, name, age, active, score, email
+                    ])
+                    .unwrap();
+                }
+            }
+            db.conn.execute_batch("COMMIT").unwrap();
+            t0.elapsed()
+        }),
+
         "crud_flow/insert" | "crud_flow/select" | "crud_flow/delete" => {
             // Run full crud_flow and return only the requested phase
             let mut ins_t = Vec::with_capacity(RUNS);
@@ -676,6 +751,7 @@ fn run_compare(n_rows: usize, sqlite_memory: bool) {
     let scenarios: &[(&str, usize)] = &[
         ("insert_batch", n_rows),
         ("insert_autocommit", n_rows.min(300)),
+        ("insert_appender", n_rows.min(300)),
         ("crud_flow/insert", n_rows),
         ("crud_flow/select", n_rows),
         ("crud_flow/delete", n_rows),
@@ -761,6 +837,42 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
             }
             t0.elapsed()
         }),
+
+        "insert_appender" => {
+            // Same scenario as the standalone path (line 199) — see
+            // there for the v1 heap-table limitation. Kept in sync.
+            use axiomdb_types::Value;
+            measure_timed(|| {
+                db_sql(db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users_heap").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            })
+        }
 
         "crud_flow/insert" | "crud_flow/select" | "crud_flow/delete" => {
             let mut ins_t = Vec::with_capacity(RUNS);
