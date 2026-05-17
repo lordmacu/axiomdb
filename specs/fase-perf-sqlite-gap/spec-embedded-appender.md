@@ -53,10 +53,17 @@ analyze, dispatch, and the per-statement scaffolding inside
 - **Multi-table writes / triggers / wire protocol.** Single table per
   Appender; triggers are deferred (TODO note in code if a table has
   triggers — error out, don't silently bypass).
-- **Schema validation beyond column count and type coercion.** CHECK
-  constraints, FK validation, and generated columns ARE honored (we
-  reuse `insert_rows_batch_with_ctx`). What we skip is the SQL-layer
-  scaffolding, not the data integrity rules.
+- **CHECK constraints, FK validation, AUTO_INCREMENT auto-assignment,
+  and GENERATED ALWAYS columns** are NOT enforced in v1 (revised
+  during implementation — `insert_rows_batch_with_ctx` only does
+  encode + heap + WAL, not the per-row constraint helpers in
+  `executor/insert_helpers.rs` which are `pub(crate)` to axiomdb-sql).
+  Callers MUST provide complete, valid rows. NOT NULL and type
+  coercion ARE honored (Step 2 implementation). Honoring the rest is
+  a v1.1 follow-up that exposes the SQL helpers or refactors them out
+  of the executor module. The Appender errors out on tables that
+  declare any of: CHECK, FK, AUTO_INCREMENT, generated columns —
+  pointing users to SQL INSERT until v1.1.
 
 ## Behavior
 

@@ -11,7 +11,7 @@
 //! Mirrors DuckDB's Appender API and SQLite's `sqlite3_bind_*` +
 //! `sqlite3_step` pattern.
 
-use axiomdb_catalog::schema::{ColumnDef, TableDef};
+use axiomdb_catalog::schema::{ColumnDef, IndexDef, TableDef};
 use axiomdb_catalog::SchemaResolver;
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
@@ -33,9 +33,12 @@ pub struct Appender<'db> {
     pub(crate) db: &'db mut Db,
     pub(crate) table_def: TableDef,
     pub(crate) columns: Vec<ColumnDef>,
+    /// Secondary indexes maintained on flush (Step 5). Captured at open
+    /// time so we don't re-resolve per flush.
+    #[allow(dead_code)] // wired in Step 5 (secondary index maintenance)
+    pub(crate) indexes: Vec<IndexDef>,
     /// The transaction held for the Appender's lifetime. `Some` while
     /// alive, `None` after `finish()` consumes it or Drop rolls it back.
-    #[allow(dead_code)] // wired in Step 3 (flush) and Step 4 (finish/Drop)
     pub(crate) conn_txn: Option<ConnectionTxn>,
     /// In-memory row buffer. Drained on `flush()`; cleared on Drop.
     pub(crate) buffer: Vec<Vec<Value>>,
@@ -78,6 +81,7 @@ impl<'db> Appender<'db> {
         let resolved = resolver.resolve_table(None, table_name)?;
         let table_def = resolved.def.clone();
         let columns = resolved.columns.clone();
+        let indexes = resolved.indexes.clone();
 
         if table_def.is_clustered() {
             return Err(DbError::NotImplemented {
@@ -88,8 +92,38 @@ impl<'db> Appender<'db> {
         }
         if !table_def.triggers.is_empty() {
             return Err(DbError::NotImplemented {
-                feature: "Appender on tables with triggers — use SQL INSERT \
-                          (deferred to a follow-up Attack)"
+                feature: "Appender on tables with triggers — use SQL INSERT"
+                    .to_string(),
+            });
+        }
+        // v1 limitations — see spec "Non-goals" (revised during impl).
+        // The SQL helpers for these are pub(crate) to axiomdb-sql; exposing
+        // them is a v1.1 follow-up.
+        if !resolved.constraints.is_empty() {
+            return Err(DbError::NotImplemented {
+                feature: "Appender on tables with CHECK constraints — use \
+                          SQL INSERT (v1 limitation)"
+                    .to_string(),
+            });
+        }
+        if !resolved.foreign_keys.is_empty() {
+            return Err(DbError::NotImplemented {
+                feature: "Appender on tables with FOREIGN KEY constraints — \
+                          use SQL INSERT (v1 limitation)"
+                    .to_string(),
+            });
+        }
+        if columns.iter().any(|c| c.auto_increment) {
+            return Err(DbError::NotImplemented {
+                feature: "Appender on tables with AUTO_INCREMENT/SERIAL — \
+                          use SQL INSERT (v1 limitation)"
+                    .to_string(),
+            });
+        }
+        if columns.iter().any(|c| c.generated_expr.is_some()) {
+            return Err(DbError::NotImplemented {
+                feature: "Appender on tables with GENERATED columns — \
+                          use SQL INSERT (v1 limitation)"
                     .to_string(),
             });
         }
@@ -103,6 +137,7 @@ impl<'db> Appender<'db> {
             db,
             table_def,
             columns,
+            indexes,
             conn_txn: Some(conn_txn),
             buffer: Vec::with_capacity(APPENDER_BATCH_FLUSH),
             rows_inserted: 0,
@@ -160,6 +195,53 @@ impl<'db> Appender<'db> {
             }
         }
         self.buffer.push(coerced);
+        Ok(())
+    }
+
+    /// Write all buffered rows to the heap + WAL in a single batched
+    /// pass via [`axiomdb_sql::TableEngine::insert_rows_batch_with_ctx`].
+    /// Keeps the transaction open so the Appender can continue to be
+    /// used after the call.
+    ///
+    /// Atomic: if any row fails (e.g. unique-index violation in Step 5),
+    /// the whole batch reverts within the txn.
+    ///
+    /// # Errors
+    /// - I/O errors from heap insert + WAL append
+    /// - Index/constraint violations from any row in the buffer
+    pub fn flush(&mut self) -> Result<(), DbError> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let conn_txn = self
+            .conn_txn
+            .as_mut()
+            .expect("Appender::flush called after finish or rollback");
+        // Drain the buffer — the helper takes &[Vec<Value>] so we move
+        // the rows out and pass a slice. On error, we don't restore the
+        // buffer (the rows are unrecoverable from the caller's POV;
+        // append semantics are write-and-forget).
+        let batch = std::mem::take(&mut self.buffer);
+        let rids = axiomdb_sql::TableEngine::insert_rows_batch_with_ctx(
+            &self.db.storage,
+            &self.db.txn,
+            &self.table_def,
+            &self.columns,
+            &mut self.db.session,
+            conn_txn,
+            &batch,
+        )?;
+        self.rows_inserted += rids.len() as u64;
+        // TODO Step 5: secondary index maintenance (insert_into_indexes_with_undo)
+        // For Step 3 we explicitly reject tables with indexes at flush time
+        // to avoid silent data loss for index lookups.
+        if !self.indexes.is_empty() {
+            return Err(DbError::NotImplemented {
+                feature: "Appender flush with secondary indexes — wired \
+                          in Step 5 of plan-embedded-appender.md"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 }

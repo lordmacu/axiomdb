@@ -121,3 +121,73 @@ fn append_row_type_coercion_succeeds_in_permissive() {
     app.append_row(&[Value::BigInt(7)]).unwrap();
     assert_eq!(app.pending(), 1);
 }
+
+// ── Step 3 — flush (visibility tests deferred to Step 4 / finish) ─────────────
+
+#[test]
+fn flush_empty_buffer_is_noop() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.flush().unwrap();
+    app.flush().unwrap();
+    assert_eq!(app.pending(), 0);
+}
+
+#[test]
+fn flush_drains_buffer_and_keeps_appender_usable() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Text("a".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(2), Value::Text("b".into())])
+        .unwrap();
+    assert_eq!(app.pending(), 2);
+    app.flush().unwrap();
+    assert_eq!(app.pending(), 0, "buffer drained after flush");
+    // Appender remains usable for more appends.
+    app.append_row(&[Value::Int(3), Value::Text("c".into())])
+        .unwrap();
+    assert_eq!(app.pending(), 1);
+}
+
+#[test]
+fn appender_on_table_with_check_returns_unsupported() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))")
+        .unwrap();
+    let err = db.appender("t").unwrap_err();
+    assert!(
+        matches!(err, DbError::NotImplemented { .. }),
+        "expected NotImplemented, got {err:?}"
+    );
+}
+
+#[test]
+fn appender_on_table_with_auto_increment_returns_unsupported() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT AUTO_INCREMENT, v TEXT)")
+        .unwrap();
+    let err = db.appender("t").unwrap_err();
+    assert!(
+        matches!(err, DbError::NotImplemented { .. }),
+        "expected NotImplemented, got {err:?}"
+    );
+}
+
+#[test]
+fn appender_flush_on_table_with_index_returns_unsupported() {
+    // Step 3 explicitly rejects flush on tables with indexes; Step 5 wires it.
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+    db.run("CREATE INDEX idx_v ON t (v)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Text("a".into())])
+        .unwrap();
+    let err = app.flush().unwrap_err();
+    assert!(
+        matches!(err, DbError::NotImplemented { .. }),
+        "expected NotImplemented (Step 5 wires this), got {err:?}"
+    );
+}
