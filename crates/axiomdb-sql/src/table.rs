@@ -870,7 +870,7 @@ fn decimal_precision_scale(col: &ColumnDef) -> (u8, u8) {
 /// - If permissive also fails, returns the permissive error (no warning emitted).
 ///
 /// `row_num` is 1-based and statement-local (used in the warning message).
-pub(crate) fn coerce_values_with_ctx(
+pub fn coerce_values_with_ctx(
     values: Vec<Value>,
     columns: &[ColumnDef],
     ctx: &mut SessionContext,

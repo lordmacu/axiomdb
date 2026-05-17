@@ -86,4 +86,4 @@ pub use parser::{parse, parse_expr_only_with_sql_mode, parse_with_sql_mode};
 pub use result::{ColumnMeta, QueryResult, Row};
 pub use schema_cache::SchemaCache;
 pub use session::SessionContext;
-pub use table::TableEngine;
+pub use table::{coerce_values_with_ctx, TableEngine};

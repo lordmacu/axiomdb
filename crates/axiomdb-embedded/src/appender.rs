@@ -35,6 +35,7 @@ pub struct Appender<'db> {
     pub(crate) columns: Vec<ColumnDef>,
     /// The transaction held for the Appender's lifetime. `Some` while
     /// alive, `None` after `finish()` consumes it or Drop rolls it back.
+    #[allow(dead_code)] // wired in Step 3 (flush) and Step 4 (finish/Drop)
     pub(crate) conn_txn: Option<ConnectionTxn>,
     /// In-memory row buffer. Drained on `flush()`; cleared on Drop.
     pub(crate) buffer: Vec<Vec<Value>>,
@@ -111,5 +112,54 @@ impl<'db> Appender<'db> {
     /// Number of rows currently buffered (not yet written to heap).
     pub fn pending(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Append one row.
+    ///
+    /// `values.len()` must equal the table's column count. NULL columns
+    /// must be passed explicitly as `Value::Null`. Type coercion uses
+    /// the session's current `strict_mode` (mirrors SQL INSERT).
+    ///
+    /// Errors are returned immediately — on error the row is NOT added
+    /// to the batch and subsequent calls remain valid.
+    ///
+    /// # Errors
+    /// - [`DbError::TypeMismatch`] if `values.len() != n_columns`.
+    /// - [`DbError::TypeMismatch`] if strict coercion fails.
+    /// - [`DbError::NotNullViolation`] if a `Value::Null` is appended for
+    ///   a `NOT NULL` column.
+    pub fn append_row(&mut self, values: &[Value]) -> Result<(), DbError> {
+        self.append_row_owned(values.to_vec())
+    }
+
+    /// Owned variant — consumes the `Vec` to skip the per-row clone of
+    /// `append_row(&[Value])`. Use this when the caller is producing
+    /// `Vec<Value>` natively (e.g. building rows in a loop).
+    pub fn append_row_owned(&mut self, values: Vec<Value>) -> Result<(), DbError> {
+        if values.len() != self.columns.len() {
+            return Err(DbError::TypeMismatch {
+                expected: format!("{} columns", self.columns.len()),
+                got: format!("{} values", values.len()),
+            });
+        }
+        // Coerce + emit warnings if permissive. row_num is 1-based per
+        // the SQL convention so the warning text reads correctly.
+        let coerced = axiomdb_sql::coerce_values_with_ctx(
+            values,
+            &self.columns,
+            &mut self.db.session,
+            self.buffer.len() + 1,
+        )?;
+        // NOT NULL check — same semantic as the SQL INSERT path.
+        for (col, v) in self.columns.iter().zip(coerced.iter()) {
+            if matches!(v, Value::Null) && !col.nullable {
+                return Err(DbError::NotNullViolation {
+                    table: self.table_def.table_name.clone(),
+                    column: col.name.clone(),
+                });
+            }
+        }
+        self.buffer.push(coerced);
+        Ok(())
     }
 }
