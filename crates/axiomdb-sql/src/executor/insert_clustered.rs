@@ -191,6 +191,7 @@ fn execute_clustered_insert(
                 &secondary_layouts,
                 &compiled_preds,
                 &prepared_rows[i..i + 1],
+                None, // legacy non-ctx path — no session hint available
             ) {
                 Ok(n) => total += n,
                 Err(e) if is_ignorable_insert_error(&e) => {} // skip row
@@ -210,6 +211,7 @@ fn execute_clustered_insert(
             &secondary_layouts,
             &compiled_preds,
             &prepared_rows,
+            None, // legacy non-ctx path — no session hint available
         )?
     };
 
@@ -236,6 +238,7 @@ fn apply_clustered_insert_rows(
     secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
     compiled_preds: &[Option<Expr>],
     rows: &[crate::clustered_table::PreparedClusteredInsertRow],
+    session_hint: Option<&mut Option<axiomdb_storage::clustered_tree::LeafCursorHint>>,
 ) -> Result<u64, DbError> {
     use std::time::{Duration, Instant};
 
@@ -251,7 +254,19 @@ fn apply_clustered_insert_rows(
     let append_biased = rows
         .windows(2)
         .all(|pair| pair[0].primary_key_bytes < pair[1].primary_key_bytes);
-    let mut rightmost_leaf_hint = None;
+    // Attack 5 step 5.4: prime the rightmost_leaf_hint from the session
+    // when it matches THIS table — that's how the autocommit per-row
+    // INSERT path can reuse the previous statement's leaf and trigger
+    // the try_insert_rightmost_leaf_batch fast path on the very first row.
+    let mut rightmost_leaf_hint: Option<u64> = session_hint
+        .as_ref()
+        .and_then(|slot| slot.as_ref())
+        .filter(|h| {
+            h.table_id == table_def.id
+                && h.root_page_id == current_root
+                && h.schema_version == table_def.schema_version
+        })
+        .map(|h| h.leaf_page_id);
     let debug_clustered_insert = std::env::var_os("AXIOMDB_DEBUG_CLUSTERED_INSERT").is_some();
     let mut fast_path_hits = 0u64;
     let mut physical_lookup_time = Duration::ZERO;
@@ -439,6 +454,39 @@ fn apply_clustered_insert_rows(
             secondary_time.as_secs_f64() * 1000.0,
             root_persist_time.as_secs_f64() * 1000.0,
         );
+    }
+
+    // Attack 5 step 5.4: persist the rightmost leaf as a session hint so
+    // the NEXT autocommit INSERT statement can prime its fast path and
+    // skip the descent entirely (the bench's insert_autocommit pattern).
+    if let (Some(slot), Some(leaf_pid), Some(last_row)) = (
+        session_hint,
+        rightmost_leaf_hint,
+        rows.last(),
+    ) {
+        // The leaf may have just been split inside try_insert_rightmost_leaf
+        // — read the current max key directly from the page rather than
+        // relying on the in-memory row data.
+        if let Ok(leaf) = storage.read_page(leaf_pid) {
+            use axiomdb_storage::clustered_leaf;
+            if clustered_leaf::num_cells(&leaf) > 0 {
+                let nc = clustered_leaf::num_cells(&leaf);
+                if let (Ok(first), Ok(last)) = (
+                    clustered_leaf::read_cell(&leaf, 0),
+                    clustered_leaf::read_cell(&leaf, nc - 1),
+                ) {
+                    *slot = Some(axiomdb_storage::clustered_tree::LeafCursorHint {
+                        table_id: table_def.id,
+                        root_page_id: current_root,
+                        leaf_page_id: leaf_pid,
+                        min_key: first.key.to_vec(),
+                        max_key: last.key.to_vec(),
+                        schema_version: table_def.schema_version,
+                    });
+                }
+            }
+        }
+        let _ = last_row; // suppress unused warning when assertion not used
     }
 
     Ok(rows.len() as u64)

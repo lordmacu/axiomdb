@@ -77,13 +77,33 @@ fn leaf_hint_invalidate_clears() {
 }
 
 #[test]
-fn leaf_hint_cleared_by_invalidate_all() {
+fn leaf_hint_survives_invalidate_all() {
+    // Intentional: invalidate_all does NOT clear the leaf hint. The hint
+    // is STRUCTURAL (leaf pid + key range) and survives data commits.
+    // Stale hints (DDL, root rotation, split) are caught lazily by
+    // schema_version + lazy validation in lookup_with_hint.
+    // Clearing on every commit would defeat Attack 5's
+    // autocommit-INSERT win.
     let mut ctx = SessionContext::default();
     ctx.set_clustered_leaf_hint(fake_hint(1, 100, 200, 1));
     ctx.invalidate_all();
     assert!(
+        ctx.clustered_leaf_hint_present(),
+        "hint must survive invalidate_all; lazy validation handles stale-ness"
+    );
+}
+
+#[test]
+fn leaf_hint_cleared_by_invalidate_table() {
+    // invalidate_table IS the DDL-style invalidation; it does clear the
+    // hint (conservatively — could be table_id-specific but the slot
+    // is single so the cost is small).
+    let mut ctx = SessionContext::default();
+    ctx.set_clustered_leaf_hint(fake_hint(1, 100, 200, 1));
+    ctx.invalidate_table("axiomdb", "public", "anything");
+    assert!(
         !ctx.clustered_leaf_hint_present(),
-        "invalidate_all must clear the hint"
+        "invalidate_table must clear the hint"
     );
 }
 

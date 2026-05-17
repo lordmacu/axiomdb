@@ -267,6 +267,7 @@ fn execute_clustered_insert_ctx(
                 &secondary_layouts,
                 &compiled_preds,
                 &prepared_rows[i..i + 1],
+                Some(ctx.clustered_leaf_hint_slot()),
             ) {
                 Ok(n) => total += n,
                 Err(e) if is_ignorable_insert_error(&e) => {}
@@ -275,6 +276,9 @@ fn execute_clustered_insert_ctx(
         }
         total
     } else {
+        // Attack 5 step 5.4: pass the session leaf hint so the autocommit
+        // per-row INSERT path can prime its fast path from the previous
+        // statement's leaf. This is the bench-mover for insert_autocommit.
         apply_clustered_insert_rows(
             storage,
             txn,
@@ -286,6 +290,7 @@ fn execute_clustered_insert_ctx(
             &secondary_layouts,
             &compiled_preds,
             &prepared_rows,
+            Some(ctx.clustered_leaf_hint_slot()),
         )?
     };
     ctx.stats.on_rows_changed(resolved.def.id, count);

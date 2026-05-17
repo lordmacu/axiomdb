@@ -1159,10 +1159,14 @@ impl SessionContext {
         // defeat the cache's purpose.
         self.holiday_cache.clear();
         self.exchange_rate_cache.clear();
-        // Attack 5: clear the clustered leaf hint. invalidate_all fires on
-        // DDL, batch flush, etc — all of these can move pages around or
-        // change a leaf's contents, so the cached pid+range may be stale.
-        self.clustered_leaf_hint = None;
+        // `clustered_leaf_hint` is also intentionally NOT cleared here.
+        // The hint is STRUCTURAL (leaf page id + key range stamped by
+        // schema_version), not data-content-dependent. Committed writes
+        // don't move the leaf; only DDL / root rotation / leaf split
+        // can, and those paths invalidate via schema_version bump or
+        // are caught by the lazy validation in lookup_with_hint
+        // (page type check + range re-check). Clearing on every commit
+        // would defeat Attack 5's autocommit-INSERT win.
     }
 
     // ── Insert col_positions cache (Attack 3.B Step 3) ────────────────────────
