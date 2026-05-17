@@ -170,18 +170,58 @@ work outside its reach:
 version-stamped caches) that Attack 2 will build on, but on its own it
 moves the needle by < 5%. The next big win is structural — Attack 2.
 
-## Attack 2 — Statement fingerprinting (next)
+## Attack 2 — Statement fingerprinting (partial — infrastructure landed, wire-up deferred)
 
-Attack 2 will cache compiled plans by query shape (literals stripped),
-so repeated `INSERT INTO t VALUES (…)` calls skip parse + analyze +
-resolve_table + col_positions + most setup entirely. Per-call cost is
-expected to drop from ~44 µs to ~5-10 µs — closing most of the gap
-with SQLite for the bench workload (which uses literal-interpolated
-SQL).
+**Date**: 2026-05-17
+**Spec**: [`spec-statement-fingerprinting.md`](../specs/fase-perf-sqlite-gap/spec-statement-fingerprinting.md)
+**Plan**: [`plan-statement-fingerprinting.md`](../specs/fase-perf-sqlite-gap/plan-statement-fingerprinting.md)
+**Inspiration**: SQLite's `sqlite3_prepare_v2` + `sqlite3_bind_*` lifecycle.
 
-For workloads with `?` placeholders (parameterized — most real ORM
-traffic), Attack 2 also helps but less dramatically; the cache already
-keys by SQL text in that case, no fingerprinting needed.
+### What landed
+
+- `extract_literals(stmt)` — AST walker replacing `Expr::Literal` with
+  `Expr::Param`, returning the original values in walk order.
+- `substitute_params(stmt, values)` — inverse walker (promoted from
+  the manual `PreparedStatement` in `axiomdb-embedded`).
+- `shape_hash(stmt)` — hand-rolled recursive hash over the AST
+  structure (after literal extraction). Replaces a Debug-format
+  prototype that turned out to cost ~10 µs/call by itself.
+- `CachedPlan` + `SessionContext::{get_cached_plan, cache_plan,
+  statement_cache_count, invalidate_statement_cache}` — LRU-bounded
+  per-session cache (256 entries) with `PlanDeps` staleness check.
+- `run_cached(...)` — the integration entrypoint.
+- Pre-existing bug fix: `plan_deps.rs` was using `DEFAULT_DATABASE_NAME`
+  ("axiomdb") as the default schema for unqualified table refs.
+  Changed to `"public"`.
+
+13 library/integration tests pass.
+
+### Why the wire-up was reverted
+
+Wiring `run_cached` into `Db::run_inner` produced a **net regression on
+INSERT** (-30%, 21K → 14K rows/s) while helping SELECT (+60% on
+`point_lookup`, +25% on `count_star`). Root cause: `PlanDeps.is_stale`
+does a per-call `get_table_schema_version` catalog probe that
+duplicates work `resolve_table_cached` already does (cached since
+Attack 3.A). On INSERT the cache-hit only saves ~0.5 µs of analyze
+(now-tiny thanks to 3.A) but adds ~10 µs of extract + hash + deps
+probe + substitute. Net negative.
+
+The fix is bigger than a one-line tweak: the `CachedPlan` would need
+to carry the resolved `TableDef`s so the executor can skip its own
+`resolve_table_cached` call. That's a multi-day refactor on top of
+what's already done.
+
+### What's next
+
+Two options:
+1. **Re-wire with carry-resolved-tables refactor** — close the
+   remaining gap on INSERT. Estimated 2-3 days.
+2. **Focus on a wider release-readiness audit** — accept current
+   performance (~50× INSERT vs SQLite) as good enough for an alpha,
+   ship `v0.5.0-embedded-alpha` with the SQL/MVCC/wire features that
+   matter for the embedded-first release.
 
 Goal: close to within 5× of SQLite on all scenarios before the embedded
-`v0.5.0-alpha` release.
+`v0.5.0-alpha` release. Current INSERT gap is 50×, SELECT gap is 4-9×.
+The SELECT side is closer to ready.

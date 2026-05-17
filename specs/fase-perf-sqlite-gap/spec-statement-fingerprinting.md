@@ -2,7 +2,7 @@
 
 Phase: perf-sqlite-gap — close embedded INSERT gap with SQLite
 Task: Attack 2 — automatic plan reuse by query shape (literals stripped)
-Status: approved
+Status: partially implemented (infrastructure landed; wire-up reverted — see plan)
 
 ## Context
 

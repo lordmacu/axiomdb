@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap
 Task: Attack 2 — automatic plan reuse by query shape
 Spec: specs/fase-perf-sqlite-gap/spec-statement-fingerprinting.md
-Status: in-progress
+Status: done (2.1-2.3 infrastructure landed; 2.4 wire-up reverted, follow-up needed)
 
 ## Summary
 
