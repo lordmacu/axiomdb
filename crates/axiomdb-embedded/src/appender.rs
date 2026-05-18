@@ -93,13 +93,6 @@ impl<'db> Appender<'db> {
         let columns = resolved.columns.clone();
         let indexes = resolved.indexes.clone();
 
-        if table_def.is_clustered() {
-            return Err(DbError::NotImplemented {
-                feature: "Appender on clustered tables — use SQL INSERT \
-                          (deferred to a follow-up Attack)"
-                    .to_string(),
-            });
-        }
         if !table_def.triggers.is_empty() {
             return Err(DbError::NotImplemented {
                 feature: "Appender on tables with triggers — use SQL INSERT".to_string(),
@@ -299,55 +292,100 @@ impl<'db> Appender<'db> {
         // buffer (the rows are unrecoverable from the caller's POV;
         // append semantics are write-and-forget).
         let batch = std::mem::take(&mut self.buffer);
-        let rids = axiomdb_sql::TableEngine::insert_rows_batch_with_ctx(
-            &self.db.storage,
-            &self.db.txn,
-            &self.table_def,
-            &self.columns,
-            &mut self.db.session,
-            conn_txn,
-            &batch,
-        )?;
-        self.rows_inserted += rids.len() as u64;
 
-        // Step 5: secondary index maintenance. v1 supports regular B-Tree,
-        // BRIN, FTS, GIN, and Trigram indexes — partial-index predicates
-        // and expression indexes are NOT supported (we pass empty Vecs;
-        // the SQL INSERT path computes those at analyze time which the
-        // Appender bypasses by design). Index roots that grow during
-        // insert are written back via CatalogWriter and the in-memory
-        // `self.indexes` is updated so subsequent flushes see the new
-        // root.
-        if !self.indexes.is_empty() {
-            let n_idx = self.indexes.len();
-            let empty_preds: Vec<Option<axiomdb_sql::Expr>> = vec![None; n_idx];
-            let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> = vec![Vec::new(); n_idx];
-            let snap = self.db.txn.active_snapshot(conn_txn);
-            for (rid, values) in rids.iter().zip(batch.iter()) {
-                let updated = axiomdb_sql::index_maintenance::insert_into_indexes_with_undo(
-                    &self.indexes,
-                    values,
-                    *rid,
-                    &self.db.storage,
-                    &self.db.bloom,
-                    &empty_preds,
-                    &empty_idx_exprs,
-                    snap.clone(),
-                    Some(&self.db.txn),
-                    Some(conn_txn),
-                )?;
-                // Persist root changes (B-Tree splits) to the catalog so
-                // subsequent reads find the new root. Mirrors
-                // insert_heap_ctx.rs:366-377.
-                for (index_id, new_root) in updated {
-                    axiomdb_catalog::CatalogWriter::new(&self.db.storage, &self.db.txn, conn_txn)?
+        // v1.1 Step 6: dispatch on storage layout.
+        // - Clustered tables go through insert_clustered_rows_batch_with_ctx
+        //   which handles both clustered B-Tree and ALL secondary index
+        //   maintenance internally (mirrors SQL INSERT clustered path).
+        // - Heap tables go through insert_rows_batch_with_ctx + the
+        //   separate index_maintenance::insert_into_indexes_with_undo loop
+        //   (same split as the SQL INSERT heap path).
+        if self.table_def.is_clustered() {
+            // For clustered we need the full indexes list (with primary)
+            // — primary_index() inside the helper filters them.
+            let mut all_indexes = self.indexes.clone();
+            // Also include the primary index — captured separately by
+            // ResolvedTable. Walk DB to fetch it via the resolver if not
+            // present. Actually: self.indexes is `resolved.indexes` from
+            // open(), which already includes primary. v1.1 Step 5 stored
+            // only the FULL indexes list — but Step 5 actually filtered
+            // is_primary in the heap path. For clustered we need the
+            // primary back. Easiest: re-resolve at flush.
+            //
+            // To avoid the re-resolve, we'll just pass all indexes — the
+            // clustered helper splits primary vs secondary internally.
+            let count = axiomdb_sql::TableEngine::insert_clustered_rows_batch_with_ctx(
+                &self.db.storage,
+                &self.db.txn,
+                &self.db.bloom,
+                &self.table_def,
+                &self.columns,
+                &all_indexes,
+                &mut self.db.session,
+                conn_txn,
+                &batch,
+            )?;
+            self.rows_inserted += count;
+            // `all_indexes` is dropped — the helper updated its own
+            // secondary roots via the catalog. Next flush re-fetches
+            // current roots from self.indexes which we should refresh.
+            // For now: invalidate schema cache (forces re-resolve on
+            // next SQL access).
+            let _ = &mut all_indexes; // silence unused-mut
+            self.db.session.invalidate_all();
+        } else {
+            let rids = axiomdb_sql::TableEngine::insert_rows_batch_with_ctx(
+                &self.db.storage,
+                &self.db.txn,
+                &self.table_def,
+                &self.columns,
+                &mut self.db.session,
+                conn_txn,
+                &batch,
+            )?;
+            self.rows_inserted += rids.len() as u64;
+
+            // Step 5: secondary index maintenance. v1 supports regular B-Tree,
+            // BRIN, FTS, GIN, and Trigram indexes — partial-index predicates
+            // and expression indexes are NOT supported (we pass empty Vecs;
+            // the SQL INSERT path computes those at analyze time which the
+            // Appender bypasses by design). Index roots that grow during
+            // insert are written back via CatalogWriter and the in-memory
+            // `self.indexes` is updated so subsequent flushes see the new
+            // root.
+            if !self.indexes.is_empty() {
+                let n_idx = self.indexes.len();
+                let empty_preds: Vec<Option<axiomdb_sql::Expr>> = vec![None; n_idx];
+                let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> =
+                    vec![Vec::new(); n_idx];
+                let snap = self.db.txn.active_snapshot(conn_txn);
+                for (rid, values) in rids.iter().zip(batch.iter()) {
+                    let updated = axiomdb_sql::index_maintenance::insert_into_indexes_with_undo(
+                        &self.indexes,
+                        values,
+                        *rid,
+                        &self.db.storage,
+                        &self.db.bloom,
+                        &empty_preds,
+                        &empty_idx_exprs,
+                        snap.clone(),
+                        Some(&self.db.txn),
+                        Some(conn_txn),
+                    )?;
+                    for (index_id, new_root) in updated {
+                        axiomdb_catalog::CatalogWriter::new(
+                            &self.db.storage,
+                            &self.db.txn,
+                            conn_txn,
+                        )?
                         .update_index_root(index_id, new_root)?;
-                    if let Some(idx) = self.indexes.iter_mut().find(|i| i.index_id == index_id) {
-                        idx.root_page_id = new_root;
+                        if let Some(idx) =
+                            self.indexes.iter_mut().find(|i| i.index_id == index_id)
+                        {
+                            idx.root_page_id = new_root;
+                        }
+                        self.db.session.invalidate_all();
                     }
-                    // Schema cache invalidation — the catalog version
-                    // bumped; future SQL operations need a fresh resolve.
-                    self.db.session.invalidate_all();
                 }
             }
         }

@@ -227,7 +227,7 @@ fn execute_clustered_insert(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_clustered_insert_rows(
+pub(crate) fn apply_clustered_insert_rows(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,

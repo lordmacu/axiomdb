@@ -611,3 +611,79 @@ fn appender_pending_returns_zero_initially() {
     let app = db.appender("t").unwrap();
     assert_eq!(app.pending(), 0);
 }
+
+// ── Step 6 (v1.1) — Clustered tables ──────────────────────────────────────────
+
+#[test]
+fn appender_works_on_clustered_table() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 1..=10 {
+        app.append_row(&[Value::Int(i), Value::Text(format!("row{i}"))])
+            .unwrap();
+    }
+    let n = app.finish().unwrap();
+    assert_eq!(n, 10);
+    let rows = db.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 10);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row[0], Value::Int((i + 1) as i32));
+    }
+}
+
+#[test]
+fn appender_clustered_pk_duplicate_returns_error() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.run("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(2), Value::Text("b".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(1), Value::Text("dup".into())])
+        .unwrap();
+    let err = app.finish().unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. } | DbError::DuplicateKey { .. }),
+        "expected UniqueViolation or DuplicateKey, got {err:?}"
+    );
+    // Pre-existing row 1 still there; appender rows rolled back.
+    let n = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
+    assert_eq!(n, Value::BigInt(1));
+}
+
+#[test]
+fn appender_clustered_with_secondary_index() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.run("CREATE INDEX idx_v ON t (v)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Text("alpha".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(2), Value::Text("beta".into())])
+        .unwrap();
+    app.append_row(&[Value::Int(3), Value::Text("gamma".into())])
+        .unwrap();
+    app.finish().unwrap();
+    // Lookup via the secondary index path.
+    let rows = db.query("SELECT id FROM t WHERE v = 'beta'").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Int(2));
+}
+
+#[test]
+fn appender_clustered_50k_rows() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 0..50_000i64 {
+        app.append_row(&[Value::Int(i as i32), Value::Int((i * 2) as i32)])
+            .unwrap();
+    }
+    let n = app.finish().unwrap();
+    assert_eq!(n, 50_000);
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(50_000)
+    );
+}

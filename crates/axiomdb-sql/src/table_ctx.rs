@@ -153,6 +153,85 @@ impl TableEngine {
             .collect())
     }
 
+    /// Clustered-table analog of [`Self::insert_rows_batch_with_ctx`]
+    /// (Attack 7 v1.1).
+    ///
+    /// Accepts pre-validated `Vec<Value>` rows (caller is responsible for
+    /// constraint/FK/auto_inc/generated — the embedded Appender does
+    /// this in its `append_row` pipeline) and writes them to the
+    /// clustered B-Tree via the same `apply_clustered_insert_rows`
+    /// helper the SQL `INSERT` path uses. Maintains both the primary
+    /// clustered index AND any secondary indexes (including BRIN/FTS/GIN/
+    /// trigram), via the existing dispatcher.
+    ///
+    /// Returns the rows-inserted count. Note that — unlike the heap
+    /// variant — clustered inserts don't expose stable `RecordId`s to
+    /// callers (the PK is the identifier), so the return type is `u64`,
+    /// not `Vec<RecordId>`.
+    ///
+    /// Partial-index predicates and expression indexes are honored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_clustered_rows_batch_with_ctx(
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
+        bloom: &crate::bloom::BloomRegistry,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        indexes: &[axiomdb_catalog::IndexDef],
+        ctx: &mut SessionContext,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
+        batch: &[Vec<Value>],
+    ) -> Result<u64, DbError> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let primary_idx = crate::clustered_table::primary_index(indexes, &table_def.table_name)?;
+        let mut secondary_indexes: Vec<axiomdb_catalog::IndexDef> = indexes
+            .iter()
+            .filter(|i| !i.is_primary && !i.columns.is_empty())
+            .cloned()
+            .collect();
+        let secondary_layouts = secondary_indexes
+            .iter()
+            .map(|idx| crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, primary_idx))
+            .collect::<Result<Vec<_>, _>>()?;
+        let compiled_preds =
+            crate::partial_index::compile_index_predicates(&secondary_indexes, columns)?;
+
+        // Prepare each row: encode + extract primary key.
+        let mut prepared: Vec<crate::clustered_table::PreparedClusteredInsertRow> =
+            Vec::with_capacity(batch.len());
+        for (i, values) in batch.iter().enumerate() {
+            let p = crate::clustered_table::prepare_row_with_ctx(
+                values.clone(),
+                columns,
+                primary_idx,
+                &table_def.table_name,
+                ctx,
+                i + 1,
+            )?;
+            prepared.push(p);
+        }
+
+        // Drop into the same helper used by the SQL INSERT path.
+        let count = crate::executor::apply_clustered_insert_rows(
+            storage,
+            txn,
+            conn_txn,
+            bloom,
+            table_def,
+            primary_idx,
+            &mut secondary_indexes,
+            &secondary_layouts,
+            &compiled_preds,
+            &prepared,
+            Some(ctx.clustered_leaf_hint_slot()),
+        )?;
+        ctx.stats.on_rows_changed(table_def.id, count);
+        Ok(count)
+    }
+
     /// Session-aware single-row update: applies strict or permissive coercion,
     /// emitting warning 1265 on permissive fallback.
     pub fn update_row_with_ctx(
