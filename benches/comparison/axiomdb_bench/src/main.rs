@@ -197,13 +197,38 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
         }
 
         "insert_appender" => {
-            // Attack 7: fast-path Appender API skips the SQL pipeline.
-            // v1 of the Appender supports heap tables only — clustered
-            // (PK-rooted) tables are deferred to a follow-up Attack.
-            // We use a parallel `bench_users_heap` table (same columns,
-            // no PRIMARY KEY) so the per-row work is comparable to
-            // bench_users but the row goes through the heap path the
-            // Appender supports.
+            // Attack 7 v1.1: Appender on the canonical clustered
+            // bench_users table (PRIMARY KEY id). Goes through the
+            // clustered B-Tree + all secondary indexes — same write
+            // path SQL INSERT uses for this schema.
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender, clustered (v1.1)");
+        }
+
+        "insert_appender_heap" => {
+            // Attack 7 v1 baseline kept for comparison: Appender on a
+            // parallel heap-only table (no PRIMARY KEY). Shows the
+            // ceiling of the Appender when the clustered B-Tree split
+            // overhead is removed.
             use axiomdb_types::Value;
             let mean = measure_timed(|| {
                 db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
@@ -221,10 +246,9 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users_heap").unwrap();
                 for i in 1..=ac_n {
-                    let i32_i = i as i32;
                     let active = i % 2 == 0;
                     app.append_row_owned(vec![
-                        Value::Int(i32_i),
+                        Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),
                         Value::Int((18 + (i % 62)) as i32),
                         Value::Bool(active),
@@ -236,7 +260,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 app.finish().unwrap();
                 t0.elapsed()
             });
-            out(scenario, ac_n, mean, "appender, heap table (v1 limitation)");
+            out(scenario, ac_n, mean, "appender, heap (v1 baseline)");
         }
 
         _ => {
@@ -612,7 +636,9 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
         // Uses prepare_cached + execute with bind params (no parsing
         // per row, no fsync per row in NORMAL mode) — the canonical
         // "fast bind" pattern SQLite users actually use for bulk loads.
-        "insert_appender" => measure_timed(|| {
+        "insert_appender" | "insert_appender_heap" => measure_timed(|| {
+            // Same SQLite fast-bind path for both — SQLite doesn't
+            // distinguish heap vs clustered (every table is a B-Tree).
             db.reset();
             let n = ac_inserts.len();
             let t0 = Instant::now();
@@ -748,6 +774,7 @@ fn run_compare(n_rows: usize, sqlite_memory: bool) {
         ("insert_batch", n_rows),
         ("insert_autocommit", n_rows.min(300)),
         ("insert_appender", n_rows.min(300)),
+        ("insert_appender_heap", n_rows.min(300)),
         ("crud_flow/insert", n_rows),
         ("crud_flow/select", n_rows),
         ("crud_flow/delete", n_rows),
@@ -835,8 +862,31 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
         }),
 
         "insert_appender" => {
-            // Same scenario as the standalone path (line 199) — see
-            // there for the v1 heap-table limitation. Kept in sync.
+            // v1.1: clustered bench_users (PRIMARY KEY id).
+            use axiomdb_types::Value;
+            measure_timed(|| {
+                reset(db);
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            })
+        }
+
+        "insert_appender_heap" => {
+            // v1 baseline retained: heap-only bench_users_heap.
             use axiomdb_types::Value;
             measure_timed(|| {
                 db_sql(db, "DROP TABLE IF EXISTS bench_users_heap");
