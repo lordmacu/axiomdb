@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap
 Task: Attack 7 v1.1 — production-ready Appender (clustered + constraints)
 Spec: specs/fase-perf-sqlite-gap/spec-appender-v11-complete.md
-Status: in-progress
+Status: done
 
 ## Summary
 

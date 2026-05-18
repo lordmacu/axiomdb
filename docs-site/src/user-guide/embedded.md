@@ -160,11 +160,25 @@ let n_inserted = app.finish()?; // flush + commit
 ```
 
 The Appender holds a single transaction; `finish()` commits, `drop`
-without `finish` rolls back. v1 supports heap tables only — clustered
-tables, triggers, `CHECK`/`FOREIGN KEY`, `AUTO_INCREMENT`, and
-`GENERATED ALWAYS` columns must go through SQL `INSERT` for now. The
+without `finish` rolls back. **v1.1 supports every table SQL `INSERT`
+supports except those with triggers**: clustered (PRIMARY KEY) tables,
+`CHECK` constraints, `FOREIGN KEY` constraints, `AUTO_INCREMENT` /
+`SERIAL` columns, and `GENERATED ALWAYS` columns all work. The
 Appender returns `DbError::NotImplemented` at `appender()` open time
-when any of these are detected, pointing the caller to SQL INSERT.
+only when the table has a trigger.
+
+For tables with constraints the per-row pipeline is:
+
+1. Arity check (n columns = n values)
+2. AUTO_INCREMENT assignment (if column is `AUTO_INCREMENT` and value
+   is `Value::Null`)
+3. STORED `GENERATED ALWAYS` column materialization
+4. Text constraints (CHAR padding, VARCHAR length)
+5. Type coercion (respects session `strict_mode`)
+6. NOT NULL check
+7. CHECK constraints
+8. FOREIGN KEY validation (immediate FKs per row, deferred FKs
+   queued and resolved at `finish()`/commit)
 
 The Appender honors `SET synchronous` ([transactions
 docs](features/transactions.md#durability--set-synchronous)) — the
@@ -175,14 +189,15 @@ transaction.
 <span class="callout-icon">🚀</span>
 <div class="callout-body">
 <span class="callout-label">Throughput</span>
-On Lima virtio (5000 rows, 5 iters): <strong>204K ops/s</strong> for
-the Appender vs 4.9K for the same row inserted via
-<code>db.run("INSERT ...")</code> — a <strong>42× speedup</strong>.
-The Appender is <strong>2.2× faster</strong> than SQLite's
-single-INSERT autocommit (94K), at the same SQL-API surface. The
-remaining 7.6× gap vs SQLite's prepared-bind+step path is the next
-target. See <code>docs/perf-sqlite-gap.md</code> "Attack 7" for the
-full breakdown.
+On Lima virtio (5000 rows, 5 iters): <strong>82K ops/s</strong> for
+the v1.1 Appender on clustered tables (PRIMARY KEY) and
+<strong>191K ops/s</strong> for heap-only tables, vs ~4.6K for the
+same row inserted via <code>db.run("INSERT ...")</code> — a
+<strong>~18-42× speedup</strong>. The remaining gap vs SQLite's
+prepared-bind+step (1.7M) is dominated by B-Tree split overhead on
+clustered tables, the next optimization target. See
+<code>docs/perf-sqlite-gap.md</code> "Attack 7 v1.1" for the full
+breakdown.
 </div>
 </div>
 

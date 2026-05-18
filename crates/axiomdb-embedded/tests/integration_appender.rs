@@ -171,7 +171,9 @@ fn appender_check_constraint_violation_returns_error() {
     db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))")
         .unwrap();
     let mut app = db.appender("t").unwrap();
-    let err = app.append_row(&[Value::Int(1), Value::Int(-5)]).unwrap_err();
+    let err = app
+        .append_row(&[Value::Int(1), Value::Int(-5)])
+        .unwrap_err();
     assert!(
         matches!(err, DbError::CheckViolation { .. }),
         "expected CheckViolation, got {err:?}"
@@ -617,7 +619,8 @@ fn appender_pending_returns_zero_initially() {
 #[test]
 fn appender_works_on_clustered_table() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     let mut app = db.appender("t").unwrap();
     for i in 1..=10 {
         app.append_row(&[Value::Int(i), Value::Text(format!("row{i}"))])
@@ -635,7 +638,8 @@ fn appender_works_on_clustered_table() {
 #[test]
 fn appender_clustered_pk_duplicate_returns_error() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.run("INSERT INTO t VALUES (1, 'a')").unwrap();
     let mut app = db.appender("t").unwrap();
     app.append_row(&[Value::Int(2), Value::Text("b".into())])
@@ -644,7 +648,10 @@ fn appender_clustered_pk_duplicate_returns_error() {
         .unwrap();
     let err = app.finish().unwrap_err();
     assert!(
-        matches!(err, DbError::UniqueViolation { .. } | DbError::DuplicateKey { .. }),
+        matches!(
+            err,
+            DbError::UniqueViolation { .. } | DbError::DuplicateKey { .. }
+        ),
         "expected UniqueViolation or DuplicateKey, got {err:?}"
     );
     // Pre-existing row 1 still there; appender rows rolled back.
@@ -655,7 +662,8 @@ fn appender_clustered_pk_duplicate_returns_error() {
 #[test]
 fn appender_clustered_with_secondary_index() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.run("CREATE INDEX idx_v ON t (v)").unwrap();
     let mut app = db.appender("t").unwrap();
     app.append_row(&[Value::Int(1), Value::Text("alpha".into())])
@@ -674,7 +682,8 @@ fn appender_clustered_with_secondary_index() {
 #[test]
 fn appender_clustered_50k_rows() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let mut app = db.appender("t").unwrap();
     for i in 0..50_000i64 {
         app.append_row(&[Value::Int(i as i32), Value::Int((i * 2) as i32)])

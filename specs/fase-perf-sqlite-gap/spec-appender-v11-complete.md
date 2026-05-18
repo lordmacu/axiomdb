@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap — close embedded gap with SQLite
 Task: Attack 7 v1.1 — lift every v1 limitation so the embedded Appender
 works on the same tables SQL `INSERT` works on
-Status: approved
+Status: implemented
 
 ## Context
 

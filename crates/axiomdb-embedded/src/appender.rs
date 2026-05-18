@@ -356,8 +356,7 @@ impl<'db> Appender<'db> {
             if !self.indexes.is_empty() {
                 let n_idx = self.indexes.len();
                 let empty_preds: Vec<Option<axiomdb_sql::Expr>> = vec![None; n_idx];
-                let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> =
-                    vec![Vec::new(); n_idx];
+                let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> = vec![Vec::new(); n_idx];
                 let snap = self.db.txn.active_snapshot(conn_txn);
                 for (rid, values) in rids.iter().zip(batch.iter()) {
                     let updated = axiomdb_sql::index_maintenance::insert_into_indexes_with_undo(
@@ -379,8 +378,7 @@ impl<'db> Appender<'db> {
                             conn_txn,
                         )?
                         .update_index_root(index_id, new_root)?;
-                        if let Some(idx) =
-                            self.indexes.iter_mut().find(|i| i.index_id == index_id)
+                        if let Some(idx) = self.indexes.iter_mut().find(|i| i.index_id == index_id)
                         {
                             idx.root_page_id = new_root;
                         }
