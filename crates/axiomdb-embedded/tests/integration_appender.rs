@@ -895,3 +895,93 @@ fn typed_builder_empty_row_then_end_row_is_error() {
     let err = app.end_row().unwrap_err(); // current_row_len = 0
     assert!(matches!(err, DbError::TypeMismatch { .. }));
 }
+
+// ── Attack 10 — Clustered batch-defer regression tests ───────────────────────
+
+#[test]
+fn appender_clustered_secondary_indexes_1000_rows() {
+    // Stresses the deferred-secondary path: large batch with TWO
+    // secondary indexes, point-query each to verify all rows reachable.
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, age INT, name TEXT)")
+        .unwrap();
+    db.run("CREATE INDEX idx_age ON t (age)").unwrap();
+    db.run("CREATE INDEX idx_name ON t (name)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 1..=1000i32 {
+        app.append_int(i).unwrap();
+        app.append_int(20 + i % 50).unwrap();
+        app.append_text(&format!("user_{i:04}")).unwrap();
+        app.end_row().unwrap();
+    }
+    app.finish().unwrap();
+    // Verify via secondary indexes:
+    let by_age = db.query("SELECT COUNT(*) FROM t WHERE age = 25").unwrap();
+    assert!(
+        matches!(by_age[0][0], Value::BigInt(n) if n > 0),
+        "no rows for age = 25"
+    );
+    let by_name = db
+        .query("SELECT id FROM t WHERE name = 'user_0500'")
+        .unwrap();
+    assert_eq!(by_name.len(), 1, "exactly one row for user_0500");
+    assert_eq!(by_name[0][0], Value::Int(500));
+    // And total count.
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(1000)
+    );
+}
+
+#[test]
+fn appender_clustered_unique_secondary_violation_rolls_back() {
+    // A pre-existing UNIQUE secondary forces a violation mid-batch.
+    // Verify the whole appender batch rolls back atomically.
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, code TEXT)").unwrap();
+    db.run("CREATE UNIQUE INDEX idx_code ON t (code)").unwrap();
+    db.run("INSERT INTO t VALUES (1, 'pre-existing')").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(2).unwrap();
+    app.append_text("ok").unwrap();
+    app.end_row().unwrap();
+    app.append_int(3).unwrap();
+    app.append_text("pre-existing").unwrap(); // collides
+    app.end_row().unwrap();
+    let err = app.finish().unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. }),
+        "got {err:?}"
+    );
+    // Pre-existing row 1 still there; appender rows rolled back.
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(1)
+    );
+}
+
+#[test]
+fn appender_clustered_many_root_splits_catalog_consistent() {
+    // Reverse-sorted long keys force splits at multiple levels.
+    // Verifies that after Attack 10 (deferred catalog persist), the
+    // table+index roots are correctly written at end of flush.
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id TEXT PRIMARY KEY, v INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in (0..2000).rev() {
+        app.append_text(&format!("key_{i:08}")).unwrap();
+        app.append_int(i).unwrap();
+        app.end_row().unwrap();
+    }
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(2000)
+    );
+    // Random spot-check via PK index.
+    let rows = db
+        .query("SELECT v FROM t WHERE id = 'key_00001000'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Int(1000));
+}

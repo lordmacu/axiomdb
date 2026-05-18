@@ -251,6 +251,12 @@ pub(crate) fn apply_clustered_insert_rows(
     let mut current_root = txn
         .clustered_root(table_def.id)
         .unwrap_or(table_def.root_page_id);
+
+    // Attack 10: snapshot the secondary index roots BEFORE the batch
+    // so flush_deferred_secondary_index_roots only fires
+    // update_index_root for indexes whose root actually changed.
+    let original_secondary_roots: Vec<u64> =
+        secondary_indexes.iter().map(|i| i.root_page_id).collect();
     let append_biased = rows
         .windows(2)
         .all(|pair| pair[0].primary_key_bytes < pair[1].primary_key_bytes);
@@ -320,8 +326,8 @@ pub(crate) fn apply_clustered_insert_rows(
                             &new_image,
                         )?;
 
-                        let (secondary_elapsed, root_persist_elapsed) =
-                            maintain_clustered_secondary_inserts(
+                        let secondary_elapsed =
+                            maintain_clustered_secondary_inserts_deferred(
                                 storage,
                                 txn,
                                 conn_txn,
@@ -334,7 +340,6 @@ pub(crate) fn apply_clustered_insert_rows(
                                 debug_clustered_insert,
                             )?;
                         secondary_time += secondary_elapsed;
-                        root_persist_time += root_persist_elapsed;
                     }
 
                     row_idx += inserted;
@@ -417,7 +422,7 @@ pub(crate) fn apply_clustered_insert_rows(
             );
         }
 
-        let (secondary_elapsed, root_persist_elapsed) = maintain_clustered_secondary_inserts(
+        let secondary_elapsed = maintain_clustered_secondary_inserts_deferred(
             storage,
             txn,
             conn_txn,
@@ -430,9 +435,23 @@ pub(crate) fn apply_clustered_insert_rows(
             debug_clustered_insert,
         )?;
         secondary_time += secondary_elapsed;
-        root_persist_time += root_persist_elapsed;
 
         row_idx += 1;
+    }
+
+    // Attack 10: flush deferred secondary-index root changes in ONE
+    // catalog write per CHANGED index (not per leaf split). Mirrors
+    // the existing update_table_root call below.
+    let persist_started = debug_clustered_insert.then(Instant::now);
+    flush_deferred_secondary_index_roots(
+        storage,
+        txn,
+        conn_txn,
+        secondary_indexes,
+        &original_secondary_roots,
+    )?;
+    if let Some(started) = persist_started {
+        root_persist_time += started.elapsed();
     }
 
     if current_root != table_def.root_page_id {
