@@ -696,3 +696,31 @@ fn appender_clustered_50k_rows() {
         Value::BigInt(50_000)
     );
 }
+
+// ── Attack 8 Step 1 — Typed builder setters ───────────────────────────────────
+
+#[test]
+fn typed_builder_setters_accumulate_in_progress_row() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (i INT, s TEXT, b BOOL, r REAL)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    assert_eq!(app.current_row_len(), 0);
+    app.append_int(7).unwrap();
+    assert_eq!(app.current_row_len(), 1);
+    app.append_text("hi").unwrap();
+    app.append_bool(true).unwrap();
+    app.append_real(3.14).unwrap();
+    assert_eq!(app.current_row_len(), 4);
+    // No commit yet — drop rolls back. Just confirms buffer semantics.
+}
+
+#[test]
+fn typed_builder_append_null_and_bigint_and_bytes() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (a BIGINT, b BLOB, c INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_bigint(1_000_000_000_000).unwrap();
+    app.append_bytes(&[1, 2, 3, 4]).unwrap();
+    app.append_null().unwrap();
+    assert_eq!(app.current_row_len(), 3);
+}

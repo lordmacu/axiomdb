@@ -52,6 +52,11 @@ pub struct Appender<'db> {
     pub(crate) conn_txn: Option<ConnectionTxn>,
     /// In-memory row buffer. Drained on `flush()`; cleared on Drop.
     pub(crate) buffer: Vec<Vec<Value>>,
+    /// In-progress row for the typed builder API (Attack 8). Each
+    /// `append_<type>` call pushes here; `end_row` drains into the
+    /// main buffer via append_row_owned. Independent of append_row;
+    /// the two APIs can be mixed on the same Appender.
+    pub(crate) in_progress_row: Vec<Value>,
     /// Total rows successfully written across all `flush()` calls.
     pub(crate) rows_inserted: u64,
 }
@@ -107,6 +112,7 @@ impl<'db> Appender<'db> {
         let constraints = resolved.constraints.clone();
         let foreign_keys = resolved.foreign_keys.clone();
 
+        let n_cols = columns.len();
         Ok(Self {
             db,
             table_def,
@@ -117,6 +123,7 @@ impl<'db> Appender<'db> {
             auto_inc_col,
             conn_txn: Some(conn_txn),
             buffer: Vec::with_capacity(APPENDER_BATCH_FLUSH),
+            in_progress_row: Vec::with_capacity(n_cols),
             rows_inserted: 0,
         })
     }
@@ -124,6 +131,62 @@ impl<'db> Appender<'db> {
     /// Number of rows currently buffered (not yet written to heap).
     pub fn pending(&self) -> usize {
         self.buffer.len()
+    }
+
+    // ── Typed builder API (Attack 8) ──────────────────────────────────────
+    //
+    // Per-column setters push values onto `in_progress_row`. Call
+    // `end_row()` to commit the in-progress row through the full v1.1
+    // validation pipeline. Mirrors DuckDB Appender's
+    // BeginRow/Append<T>/EndRow and SQLite's sqlite3_bind_*+step.
+
+    /// Returns the number of values appended in the in-progress row
+    /// (not yet committed via [`Self::end_row`]).
+    pub fn current_row_len(&self) -> usize {
+        self.in_progress_row.len()
+    }
+
+    /// Append an `INT` value to the in-progress row.
+    pub fn append_int(&mut self, v: i32) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::Int(v));
+        Ok(())
+    }
+
+    /// Append a `BIGINT` value to the in-progress row.
+    pub fn append_bigint(&mut self, v: i64) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::BigInt(v));
+        Ok(())
+    }
+
+    /// Append a `BOOL` value to the in-progress row.
+    pub fn append_bool(&mut self, v: bool) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::Bool(v));
+        Ok(())
+    }
+
+    /// Append a `REAL` / `DOUBLE` value to the in-progress row.
+    pub fn append_real(&mut self, v: f64) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::Real(v));
+        Ok(())
+    }
+
+    /// Append a `TEXT` value to the in-progress row. The string is
+    /// copied — internal storage owns the bytes.
+    pub fn append_text(&mut self, v: &str) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::Text(v.to_string()));
+        Ok(())
+    }
+
+    /// Append a `BYTES` value to the in-progress row.
+    pub fn append_bytes(&mut self, v: &[u8]) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::Bytes(v.to_vec()));
+        Ok(())
+    }
+
+    /// Append a NULL value to the in-progress row.
+    pub fn append_null(&mut self) -> Result<(), DbError> {
+        self.in_progress_row.push(Value::Null);
+        Ok(())
     }
 
     /// Append one row.
