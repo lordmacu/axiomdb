@@ -609,6 +609,19 @@ mod db {
 
 // ── C FFI ─────────────────────────────────────────────────────────────────────
 
+// Re-export the FFI surface so integration tests can drive the
+// `#[no_mangle] extern "C"` functions through Rust paths (without
+// needing dynamic linking).
+#[cfg(feature = "c-ffi")]
+pub use ffi::{
+    axiomdb_appender_append_bigint, axiomdb_appender_append_bool,
+    axiomdb_appender_append_bytes, axiomdb_appender_append_int,
+    axiomdb_appender_append_null, axiomdb_appender_append_real,
+    axiomdb_appender_append_text, axiomdb_appender_end_row, axiomdb_appender_finish,
+    axiomdb_appender_flush, axiomdb_appender_free, axiomdb_appender_open, axiomdb_close,
+    axiomdb_execute, axiomdb_last_error, axiomdb_open, AxiomDbAppender,
+};
+
 #[cfg(feature = "c-ffi")]
 mod ffi {
     use std::ffi::{CStr, CString};
@@ -1035,6 +1048,249 @@ mod ffi {
         match &(*db).error_msg {
             Some(s) => s.as_ptr(),
             None => std::ptr::null(),
+        }
+    }
+
+    // ── Appender C FFI (Attack 8) ────────────────────────────────────────────
+    //
+    // Opaque heap-allocated wrapper around the Rust `Appender<'_>`.
+    // The Appender's lifetime is widened to `'static` via transmute —
+    // SAFETY: the caller is responsible for keeping the `Db` pointer
+    // alive (no `axiomdb_close` calls) until the appender is finished
+    // or freed.
+    //
+    // Routing:
+    //   axiomdb_appender_open                → Db::appender(name)
+    //   axiomdb_appender_append_<type>       → Appender::append_<type>
+    //   axiomdb_appender_end_row             → Appender::end_row
+    //   axiomdb_appender_flush               → Appender::flush
+    //   axiomdb_appender_finish              → Appender::finish (consumes)
+    //   axiomdb_appender_free                → Drop (rollback)
+    //
+    // Errors set Db.error_msg so `axiomdb_last_error(db)` retrieves them.
+
+    /// Opaque appender handle. Internally owns an `Appender<'static>`
+    /// plus a back-pointer to the `Db` for error message routing.
+    pub struct AxiomDbAppender {
+        // Box<Appender<'static>> — but stored as a raw pointer so we
+        // can move out of it in `axiomdb_appender_finish`.
+        inner: Option<crate::appender::Appender<'static>>,
+        db: *mut Db,
+    }
+
+    /// Sets `Db.error_msg` from a `DbError`. Called by every FFI fn
+    /// before returning an error code.
+    unsafe fn set_db_error(db: *mut Db, e: &axiomdb_core::error::DbError) {
+        if db.is_null() {
+            return;
+        }
+        (*db).error_msg = CString::new(e.to_string()).ok();
+    }
+
+    /// Opens an Appender for `table_name`. Returns NULL on error;
+    /// the error message is in `axiomdb_last_error(db)`.
+    ///
+    /// The returned pointer must be freed with either
+    /// [`axiomdb_appender_finish`] (commits + frees) or
+    /// [`axiomdb_appender_free`] (rolls back + frees).
+    ///
+    /// # Safety
+    /// - `db` must be a valid pointer from `axiomdb_open` and remain
+    ///   alive until the appender is consumed.
+    /// - `table_name` must be a valid non-NULL UTF-8 NUL-terminated
+    ///   string.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_open(
+        db: *mut Db,
+        table_name: *const c_char,
+    ) -> *mut AxiomDbAppender {
+        if db.is_null() || table_name.is_null() {
+            return std::ptr::null_mut();
+        }
+        let name = match CStr::from_ptr(table_name).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let db_ref: &mut Db = &mut *db;
+        match db_ref.appender(name) {
+            Ok(app) => {
+                // SAFETY: widen the lifetime to 'static. The caller
+                // guarantees `db` outlives the appender.
+                let app_static: crate::appender::Appender<'static> =
+                    std::mem::transmute(app);
+                Box::into_raw(Box::new(AxiomDbAppender {
+                    inner: Some(app_static),
+                    db,
+                }))
+            }
+            Err(e) => {
+                set_db_error(db, &e);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    /// Macro: defines a typed appender FFI fn that delegates to a
+    /// method on the inner Rust `Appender`. Returns 0 on success,
+    /// -1 on error (with `Db.error_msg` set).
+    macro_rules! ffi_append_typed {
+        ($fn_name:ident, $rust_name:ident, $($arg:ident: $ty:ty),*) => {
+            #[no_mangle]
+            pub unsafe extern "C" fn $fn_name(
+                app: *mut AxiomDbAppender,
+                $($arg: $ty,)*
+            ) -> c_int {
+                if app.is_null() {
+                    return -1;
+                }
+                let wrapper = &mut *app;
+                let Some(ref mut inner) = wrapper.inner else {
+                    return -1;
+                };
+                match inner.$rust_name($($arg),*) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        set_db_error(wrapper.db, &e);
+                        -1
+                    }
+                }
+            }
+        };
+    }
+
+    ffi_append_typed!(axiomdb_appender_append_int, append_int, v: i32);
+    ffi_append_typed!(axiomdb_appender_append_bigint, append_bigint, v: i64);
+    ffi_append_typed!(axiomdb_appender_append_real, append_real, v: f64);
+
+    /// Appends a BOOL value. `v == 0` is false; any non-zero is true.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_append_bool(
+        app: *mut AxiomDbAppender,
+        v: c_int,
+    ) -> c_int {
+        if app.is_null() {
+            return -1;
+        }
+        let wrapper = &mut *app;
+        let Some(ref mut inner) = wrapper.inner else {
+            return -1;
+        };
+        match inner.append_bool(v != 0) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    /// Appends a TEXT value from a NUL-terminated UTF-8 cstring.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_append_text(
+        app: *mut AxiomDbAppender,
+        v: *const c_char,
+    ) -> c_int {
+        if app.is_null() || v.is_null() {
+            return -1;
+        }
+        let wrapper = &mut *app;
+        let s = match CStr::from_ptr(v).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                let e = axiomdb_core::error::DbError::InvalidValue {
+                    reason: "axiomdb_appender_append_text: invalid UTF-8".into(),
+                };
+                set_db_error(wrapper.db, &e);
+                return -1;
+            }
+        };
+        let Some(ref mut inner) = wrapper.inner else {
+            return -1;
+        };
+        match inner.append_text(s) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    /// Appends a BYTES value from a (data, len) pair. `data` may be
+    /// NULL only when `len == 0`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_append_bytes(
+        app: *mut AxiomDbAppender,
+        data: *const u8,
+        len: usize,
+    ) -> c_int {
+        if app.is_null() {
+            return -1;
+        }
+        let wrapper = &mut *app;
+        if data.is_null() && len > 0 {
+            let e = axiomdb_core::error::DbError::InvalidValue {
+                reason: "axiomdb_appender_append_bytes: NULL data with len > 0".into(),
+            };
+            set_db_error(wrapper.db, &e);
+            return -1;
+        }
+        let slice = if len == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(data, len)
+        };
+        let Some(ref mut inner) = wrapper.inner else {
+            return -1;
+        };
+        match inner.append_bytes(slice) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    ffi_append_typed!(axiomdb_appender_append_null, append_null,);
+    ffi_append_typed!(axiomdb_appender_end_row, end_row,);
+    ffi_append_typed!(axiomdb_appender_flush, flush,);
+
+    /// Flushes remaining rows, commits the transaction, and frees the
+    /// appender. Returns the total rows-inserted count, or -1 on
+    /// error. The appender pointer is invalid after this call.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_finish(app: *mut AxiomDbAppender) -> i64 {
+        if app.is_null() {
+            return -1;
+        }
+        let mut wrapper = Box::from_raw(app);
+        let inner = match wrapper.inner.take() {
+            Some(a) => a,
+            None => return -1,
+        };
+        match inner.finish() {
+            Ok(n) => n as i64,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    /// Rolls back the appender's transaction and frees the appender.
+    /// The pointer is invalid after this call. NULL is a no-op.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`, or NULL.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_free(app: *mut AxiomDbAppender) {
+        if !app.is_null() {
+            // Drop the Box → Drops the Appender → Drop impl rolls back.
+            drop(Box::from_raw(app));
         }
     }
 
