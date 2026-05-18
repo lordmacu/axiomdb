@@ -445,16 +445,55 @@ fn appender_loads_50k_rows() {
 
 // ── Step 8 — Remaining edge cases from the spec ───────────────────────────────
 
+// ── Step 5 (v1.1) — FOREIGN KEY constraints ───────────────────────────────────
+
 #[test]
-fn appender_on_table_with_fk_returns_unsupported() {
+fn appender_fk_to_existing_parent_succeeds() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+    db.run("INSERT INTO parent VALUES (1), (2)").unwrap();
+    db.run("CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id))")
+        .unwrap();
+    let mut app = db.appender("child").unwrap();
+    app.append_row(&[Value::Int(10), Value::Int(1)]).unwrap();
+    app.append_row(&[Value::Int(11), Value::Int(2)]).unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM child").unwrap()[0][0],
+        Value::BigInt(2)
+    );
+}
+
+#[test]
+fn appender_fk_to_missing_parent_returns_error() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+    db.run("INSERT INTO parent VALUES (1)").unwrap();
+    db.run("CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id))")
+        .unwrap();
+    let mut app = db.appender("child").unwrap();
+    let err = app
+        .append_row(&[Value::Int(10), Value::Int(999)])
+        .unwrap_err();
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "expected ForeignKeyViolation, got {err:?}"
+    );
+}
+
+#[test]
+fn appender_fk_null_child_is_match_simple_pass() {
+    // SQL standard MATCH SIMPLE: any NULL in the FK columns passes.
     let (_dir, mut db) = open_db();
     db.run("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
     db.run("CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id))")
         .unwrap();
-    let err = db.appender("child").unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "expected NotImplemented (FK deferred to v1.1), got {err:?}"
+    let mut app = db.appender("child").unwrap();
+    app.append_row(&[Value::Int(10), Value::Null]).unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM child").unwrap()[0][0],
+        Value::BigInt(1)
     );
 }
 

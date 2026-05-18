@@ -11,7 +11,7 @@
 //! Mirrors DuckDB's Appender API and SQLite's `sqlite3_bind_*` +
 //! `sqlite3_step` pattern.
 
-use axiomdb_catalog::schema::{ColumnDef, ConstraintDef, IndexDef, TableDef};
+use axiomdb_catalog::schema::{ColumnDef, ConstraintDef, FkDef, IndexDef, TableDef};
 use axiomdb_catalog::SchemaResolver;
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
@@ -39,6 +39,11 @@ pub struct Appender<'db> {
     /// Named CHECK constraints (v1.1 Step 4). Captured at open; checked
     /// against every appended row.
     pub(crate) constraints: Vec<ConstraintDef>,
+    /// FOREIGN KEYs where THIS table is the child (v1.1 Step 5).
+    /// Captured at open; immediate FKs validated per-row in append_row;
+    /// deferred FKs queued in `session.deferred_fk_constraint_ids`
+    /// and resolved at finish() (commit triggers deferred FK check).
+    pub(crate) foreign_keys: Vec<FkDef>,
     /// Column index of the AUTO_INCREMENT column, if any (v1.1 Step 2).
     /// At most one per table; resolved once at open.
     pub(crate) auto_inc_col: Option<usize>,
@@ -100,13 +105,6 @@ impl<'db> Appender<'db> {
                 feature: "Appender on tables with triggers — use SQL INSERT".to_string(),
             });
         }
-        if !resolved.foreign_keys.is_empty() {
-            return Err(DbError::NotImplemented {
-                feature: "Appender on tables with FOREIGN KEY constraints — \
-                          use SQL INSERT (v1 limitation)"
-                    .to_string(),
-            });
-        }
         // Open the appender's transaction and stamp the session's current
         // durability override (Attack 6).
         let mut conn_txn = db.txn.begin()?;
@@ -114,6 +112,7 @@ impl<'db> Appender<'db> {
 
         let auto_inc_col = columns.iter().position(|c| c.auto_increment);
         let constraints = resolved.constraints.clone();
+        let foreign_keys = resolved.foreign_keys.clone();
 
         Ok(Self {
             db,
@@ -121,6 +120,7 @@ impl<'db> Appender<'db> {
             columns,
             indexes,
             constraints,
+            foreign_keys,
             auto_inc_col,
             conn_txn: Some(conn_txn),
             buffer: Vec::with_capacity(APPENDER_BATCH_FLUSH),
@@ -236,6 +236,33 @@ impl<'db> Appender<'db> {
                 &self.table_def.table_name,
                 &self.columns,
             )?;
+        }
+        // v1.1 Step 5: FOREIGN KEY constraints.
+        // - Immediate FKs validated against parent index using the
+        //   active snapshot (sees own writes via conn_txn).
+        // - Deferred FKs queued in session; commit machinery resolves
+        //   them at finish() (txn.commit triggers
+        //   validate_deferred_fks_on_commit in the WAL path).
+        if !self.foreign_keys.is_empty() {
+            let conn_txn = self.conn_txn.as_ref().expect("appender txn alive");
+            let (immediate, deferred) =
+                axiomdb_sql::fk_enforcement::split_child_insert_foreign_keys(
+                    &coerced,
+                    &self.foreign_keys,
+                );
+            if !immediate.is_empty() {
+                axiomdb_sql::fk_enforcement::check_fk_child_insert(
+                    &coerced,
+                    &immediate,
+                    &self.db.storage,
+                    &self.db.txn,
+                    conn_txn,
+                    &self.db.bloom,
+                )?;
+            }
+            for fk_id in deferred {
+                self.db.session.deferred_fk_constraint_ids.push(fk_id);
+            }
         }
         self.buffer.push(coerced);
         // Auto-flush keeps memory bounded — even a million-row load
