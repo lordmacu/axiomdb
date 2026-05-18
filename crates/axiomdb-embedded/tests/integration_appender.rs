@@ -724,3 +724,96 @@ fn typed_builder_append_null_and_bigint_and_bytes() {
     app.append_null().unwrap();
     assert_eq!(app.current_row_len(), 3);
 }
+
+// ── Attack 8 Step 2 — end_row ─────────────────────────────────────────────────
+
+#[test]
+fn end_row_commits_and_clears_in_progress() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (i INT, s TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(1).unwrap();
+    app.append_text("a").unwrap();
+    app.end_row().unwrap();
+    assert_eq!(app.current_row_len(), 0, "in-progress cleared");
+    assert_eq!(app.pending(), 1, "row committed to buffer");
+    app.finish().unwrap();
+    let rows = db.query("SELECT i, s FROM t").unwrap();
+    assert_eq!(rows[0][0], Value::Int(1));
+    assert_eq!(rows[0][1], Value::Text("a".into()));
+}
+
+#[test]
+fn end_row_arity_mismatch_rejects_and_clears() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (i INT, s TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(1).unwrap();
+    let err = app.end_row().unwrap_err();
+    assert!(matches!(err, DbError::TypeMismatch { .. }), "got {err:?}");
+    assert_eq!(app.current_row_len(), 0, "cleared after rejection");
+    // Retry succeeds.
+    app.append_int(2).unwrap();
+    app.append_text("b").unwrap();
+    app.end_row().unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(1)
+    );
+}
+
+#[test]
+fn end_row_check_violation_clears_and_keeps_appender_usable() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(1).unwrap();
+    app.append_int(-5).unwrap();
+    let err = app.end_row().unwrap_err();
+    assert!(matches!(err, DbError::CheckViolation { .. }), "got {err:?}");
+    assert_eq!(app.current_row_len(), 0);
+    // Retry with a valid row.
+    app.append_int(2).unwrap();
+    app.append_int(30).unwrap();
+    app.end_row().unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(1)
+    );
+}
+
+#[test]
+fn end_row_mixed_with_append_row() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (i INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(1).unwrap();
+    app.end_row().unwrap();
+    app.append_row(&[Value::Int(2)]).unwrap();
+    app.append_int(3).unwrap();
+    app.end_row().unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT i FROM t ORDER BY i").unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn end_row_typed_builder_loads_500_rows() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, s TEXT, b BOOL)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 0..500 {
+        app.append_int(i).unwrap();
+        app.append_text(&format!("row{i}")).unwrap();
+        app.append_bool(i % 2 == 0).unwrap();
+        app.end_row().unwrap();
+    }
+    let n = app.finish().unwrap();
+    assert_eq!(n, 500);
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(500)
+    );
+}

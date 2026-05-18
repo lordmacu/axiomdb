@@ -189,6 +189,20 @@ impl<'db> Appender<'db> {
         Ok(())
     }
 
+    /// Commit the in-progress row to the appender buffer. The number
+    /// of values appended since the previous `end_row()` must equal
+    /// the table's column count, else returns `TypeMismatch`.
+    ///
+    /// After `end_row()` runs (whether it succeeds OR errors), the
+    /// in-progress row buffer is cleared and the caller can start a
+    /// new row immediately via `append_<type>` calls.
+    pub fn end_row(&mut self) -> Result<(), DbError> {
+        // mem::take clears in_progress_row BEFORE validation runs, so
+        // error paths naturally leave the appender in a clean state.
+        let row = std::mem::take(&mut self.in_progress_row);
+        self.append_row_owned(row)
+    }
+
     /// Append one row.
     ///
     /// `values.len()` must equal the table's column count. NULL columns
