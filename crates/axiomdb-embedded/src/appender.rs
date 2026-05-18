@@ -91,8 +91,7 @@ impl<'db> Appender<'db> {
         }
         if !table_def.triggers.is_empty() {
             return Err(DbError::NotImplemented {
-                feature: "Appender on tables with triggers — use SQL INSERT"
-                    .to_string(),
+                feature: "Appender on tables with triggers — use SQL INSERT".to_string(),
             });
         }
         // v1 limitations — see spec "Non-goals" (revised during impl).
@@ -250,8 +249,7 @@ impl<'db> Appender<'db> {
         if !self.indexes.is_empty() {
             let n_idx = self.indexes.len();
             let empty_preds: Vec<Option<axiomdb_sql::Expr>> = vec![None; n_idx];
-            let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> =
-                vec![Vec::new(); n_idx];
+            let empty_idx_exprs: Vec<Vec<Option<axiomdb_sql::Expr>>> = vec![Vec::new(); n_idx];
             let snap = self.db.txn.active_snapshot(conn_txn);
             for (rid, values) in rids.iter().zip(batch.iter()) {
                 let updated = axiomdb_sql::index_maintenance::insert_into_indexes_with_undo(
@@ -270,17 +268,9 @@ impl<'db> Appender<'db> {
                 // subsequent reads find the new root. Mirrors
                 // insert_heap_ctx.rs:366-377.
                 for (index_id, new_root) in updated {
-                    axiomdb_catalog::CatalogWriter::new(
-                        &self.db.storage,
-                        &self.db.txn,
-                        conn_txn,
-                    )?
-                    .update_index_root(index_id, new_root)?;
-                    if let Some(idx) = self
-                        .indexes
-                        .iter_mut()
-                        .find(|i| i.index_id == index_id)
-                    {
+                    axiomdb_catalog::CatalogWriter::new(&self.db.storage, &self.db.txn, conn_txn)?
+                        .update_index_root(index_id, new_root)?;
+                    if let Some(idx) = self.indexes.iter_mut().find(|i| i.index_id == index_id) {
                         idx.root_page_id = new_root;
                     }
                     // Schema cache invalidation — the catalog version
@@ -307,10 +297,7 @@ impl<'db> Appender<'db> {
             }
             return Err(e);
         }
-        let conn_txn = self
-            .conn_txn
-            .take()
-            .expect("Appender::finish called twice");
+        let conn_txn = self.conn_txn.take().expect("Appender::finish called twice");
         // Immediate commit (we don't drive the fsync pipeline from the
         // embedded fast path). The Attack 6 durability override stamped
         // at open time controls fsync vs flush-only via WAL.

@@ -161,13 +161,33 @@ let n_inserted = app.finish()?; // flush + commit
 
 The Appender holds a single transaction; `finish()` commits, `drop`
 without `finish` rolls back. v1 supports heap tables only — clustered
-tables, triggers, and `RETURNING` go through SQL `INSERT` for now.
+tables, triggers, `CHECK`/`FOREIGN KEY`, `AUTO_INCREMENT`, and
+`GENERATED ALWAYS` columns must go through SQL `INSERT` for now. The
+Appender returns `DbError::NotImplemented` at `appender()` open time
+when any of these are detected, pointing the caller to SQL INSERT.
 
 The Appender honors `SET synchronous` ([transactions
-docs](features/transactions.md#durability--set-synchronous)).
+docs](features/transactions.md#durability--set-synchronous)) — the
+session's durability setting at open time is stamped on the Appender's
+transaction.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Throughput</span>
+On Lima virtio (5000 rows, 5 iters): <strong>204K ops/s</strong> for
+the Appender vs 4.9K for the same row inserted via
+<code>db.run("INSERT ...")</code> — a <strong>42× speedup</strong>.
+The Appender is <strong>2.2× faster</strong> than SQLite's
+single-INSERT autocommit (94K), at the same SQL-API surface. The
+remaining 7.6× gap vs SQLite's prepared-bind+step path is the next
+target. See <code>docs/perf-sqlite-gap.md</code> "Attack 7" for the
+full breakdown.
+</div>
+</div>
 
 See `specs/fase-perf-sqlite-gap/spec-embedded-appender.md` for the full
-design and `docs/perf-sqlite-gap.md` "Attack 7" for benchmark numbers.
+design.
 
 ### Error handling
 

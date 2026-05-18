@@ -26,11 +26,7 @@ fn appender_opens_on_heap_table() {
     let (_dir, mut db) = open_db();
     db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
     let app = db.appender("t").unwrap();
-    assert_eq!(
-        app.pending(),
-        0,
-        "freshly-opened appender has empty buffer"
-    );
+    assert_eq!(app.pending(), 0, "freshly-opened appender has empty buffer");
 }
 
 #[test]
@@ -220,7 +216,10 @@ fn finish_with_no_appends_commits_empty_txn() {
     let app = db.appender("t").unwrap();
     let n = app.finish().unwrap();
     assert_eq!(n, 0);
-    assert_eq!(db.query("SELECT COUNT(*) FROM t").unwrap()[0][0], Value::BigInt(0));
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(0)
+    );
 }
 
 #[test]
@@ -253,11 +252,15 @@ fn drop_after_partial_flush_rolls_back_remaining_buffer() {
         app.append_row(&[Value::Int(1)]).unwrap();
         app.flush().unwrap(); // row 1 written to heap, txn still open
         app.append_row(&[Value::Int(2)]).unwrap(); // buffered, not flushed
-        // Drop here — rollback should undo BOTH the flushed row and the
-        // buffered row (the whole txn aborts).
+                                                   // Drop here — rollback should undo BOTH the flushed row and the
+                                                   // buffered row (the whole txn aborts).
     }
     let count = db.query("SELECT COUNT(*) FROM t").unwrap()[0][0].clone();
-    assert_eq!(count, Value::BigInt(0), "ALL rows including flushed ones roll back");
+    assert_eq!(
+        count,
+        Value::BigInt(0),
+        "ALL rows including flushed ones roll back"
+    );
 }
 
 // ── Step 5 — Secondary index maintenance ──────────────────────────────────────
@@ -303,7 +306,8 @@ fn appender_unique_index_violation_rolls_back_batch() {
 #[test]
 fn appender_supports_table_with_multiple_indexes() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT, age INT, name TEXT)").unwrap();
+    db.run("CREATE TABLE t (id INT, age INT, name TEXT)")
+        .unwrap();
     db.run("CREATE INDEX idx_age ON t (age)").unwrap();
     db.run("CREATE INDEX idx_name ON t (name)").unwrap();
     let mut app = db.appender("t").unwrap();
@@ -383,10 +387,8 @@ fn appender_on_table_with_fk_returns_unsupported() {
 #[test]
 fn appender_on_table_with_generated_column_returns_unsupported() {
     let (_dir, mut db) = open_db();
-    db.run(
-        "CREATE TABLE t (id INT, v INT, doubled INT GENERATED ALWAYS AS (v * 2) STORED)",
-    )
-    .unwrap();
+    db.run("CREATE TABLE t (id INT, v INT, doubled INT GENERATED ALWAYS AS (v * 2) STORED)")
+        .unwrap();
     let err = db.appender("t").unwrap_err();
     assert!(
         matches!(err, DbError::NotImplemented { .. }),
@@ -409,9 +411,7 @@ fn appender_normalizes_text_nfc() {
     app.append_row(&[Value::Int(2), Value::Text(nfd)]).unwrap();
     app.finish().unwrap();
     // Both rows must compare equal under '='.
-    let rows = db
-        .query("SELECT COUNT(*) FROM t WHERE v = 'café'")
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM t WHERE v = 'café'").unwrap();
     assert_eq!(
         rows[0][0],
         Value::BigInt(2),

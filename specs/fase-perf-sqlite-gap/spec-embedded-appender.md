@@ -6,7 +6,7 @@ Task: Attack 7 — embedded fast-path INSERT API that skips the SQL pipeline
 directly to heap + WAL. Analog of DuckDB's Appender and SQLite's
 `sqlite3_bind_*` + `sqlite3_step` pattern.
 
-Status: approved
+Status: implemented
 
 ## Context
 

@@ -620,9 +620,7 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
             {
                 let mut stmt = db
                     .conn
-                    .prepare_cached(
-                        "INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)",
-                    )
+                    .prepare_cached("INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)")
                     .unwrap();
                 for i in 1..=n {
                     let active = if i % 2 == 0 { 1i64 } else { 0 };
@@ -630,10 +628,8 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
                     let score = 100.0 + (i % 1000) as f64 * 0.1;
                     let name = format!("user_{i:06}");
                     let email = format!("u{i}@b.local");
-                    stmt.execute(rusqlite::params![
-                        i as i64, name, age, active, score, email
-                    ])
-                    .unwrap();
+                    stmt.execute(rusqlite::params![i as i64, name, age, active, score, email])
+                        .unwrap();
                 }
             }
             db.conn.execute_batch("COMMIT").unwrap();

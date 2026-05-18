@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap
 Task: Attack 7 — `Db::appender(table)` fast-path INSERT API
 Spec: specs/fase-perf-sqlite-gap/spec-embedded-appender.md
-Status: in-progress
+Status: done
 
 ## Summary
 
