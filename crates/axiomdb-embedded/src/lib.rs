@@ -614,9 +614,8 @@ mod db {
 // needing dynamic linking).
 #[cfg(feature = "c-ffi")]
 pub use ffi::{
-    axiomdb_appender_append_bigint, axiomdb_appender_append_bool,
-    axiomdb_appender_append_bytes, axiomdb_appender_append_int,
-    axiomdb_appender_append_null, axiomdb_appender_append_real,
+    axiomdb_appender_append_bigint, axiomdb_appender_append_bool, axiomdb_appender_append_bytes,
+    axiomdb_appender_append_int, axiomdb_appender_append_null, axiomdb_appender_append_real,
     axiomdb_appender_append_text, axiomdb_appender_end_row, axiomdb_appender_finish,
     axiomdb_appender_flush, axiomdb_appender_free, axiomdb_appender_open, axiomdb_close,
     axiomdb_execute, axiomdb_last_error, axiomdb_open, AxiomDbAppender,
@@ -1116,8 +1115,7 @@ mod ffi {
             Ok(app) => {
                 // SAFETY: widen the lifetime to 'static. The caller
                 // guarantees `db` outlives the appender.
-                let app_static: crate::appender::Appender<'static> =
-                    std::mem::transmute(app);
+                let app_static: crate::appender::Appender<'static> = std::mem::transmute(app);
                 Box::into_raw(Box::new(AxiomDbAppender {
                     inner: Some(app_static),
                     db,

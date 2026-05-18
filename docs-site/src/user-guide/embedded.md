@@ -159,6 +159,51 @@ app.append_row(&[Value::Int(2), Value::Text("Bob".into())])?;
 let n_inserted = app.finish()?; // flush + commit
 ```
 
+#### Typed builder (Attack 8)
+
+For typed callers (e.g. ORM generators, code-gen pipelines) the
+Appender also exposes per-column setters analog to DuckDB's
+`Append<T>` and SQLite's `sqlite3_bind_<type>`:
+
+```rust
+let mut app = db.appender("users")?;
+app.append_int(1)?;
+app.append_text("Alice")?;
+app.end_row()?;
+app.append_int(2)?;
+app.append_text("Bob")?;
+app.end_row()?;
+app.finish()?;
+```
+
+Available setters: `append_int(i32)`, `append_bigint(i64)`,
+`append_bool(bool)`, `append_real(f64)`, `append_text(&str)`,
+`append_bytes(&[u8])`, `append_null()`. Each row needs exactly
+N values (= table column count) before `end_row()`, else
+`TypeMismatch`. On any error inside `end_row()`, the in-progress
+row is cleared and the appender remains usable.
+
+#### C FFI (Attack 8)
+
+The Appender is exposed through the C FFI for use from C / C++ /
+Python (PyO3) / Node.js (napi-rs) / Swift / Kotlin:
+
+```c
+AxiomDbAppender* app = axiomdb_appender_open(db, "users");
+if (!app) { fprintf(stderr, "%s\n", axiomdb_last_error(db)); return 1; }
+axiomdb_appender_append_int(app, 1);
+axiomdb_appender_append_text(app, "Alice");
+axiomdb_appender_end_row(app);
+int64_t n = axiomdb_appender_finish(app);   // commits + frees
+```
+
+Functions: `axiomdb_appender_open`, `axiomdb_appender_append_int`/
+`bigint`/`bool`/`real`/`text`/`bytes`/`null`,
+`axiomdb_appender_end_row`, `axiomdb_appender_flush`,
+`axiomdb_appender_finish`, `axiomdb_appender_free` (rollback).
+Errors return -1 (or NULL); the message is in
+`axiomdb_last_error(db)`.
+
 The Appender holds a single transaction; `finish()` commits, `drop`
 without `finish` rolls back. **v1.1 supports every table SQL `INSERT`
 supports except those with triggers**: clustered (PRIMARY KEY) tables,

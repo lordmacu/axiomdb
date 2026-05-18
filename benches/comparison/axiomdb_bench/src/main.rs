@@ -324,10 +324,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                         let email = CString::new(format!("u{i}@b.local")).unwrap();
                         axiomdb_embedded::axiomdb_appender_append_int(app, i as i32);
                         axiomdb_embedded::axiomdb_appender_append_text(app, name.as_ptr());
-                        axiomdb_embedded::axiomdb_appender_append_int(
-                            app,
-                            (18 + (i % 62)) as i32,
-                        );
+                        axiomdb_embedded::axiomdb_appender_append_int(app, (18 + (i % 62)) as i32);
                         axiomdb_embedded::axiomdb_appender_append_bool(
                             app,
                             if i % 2 == 0 { 1 } else { 0 },

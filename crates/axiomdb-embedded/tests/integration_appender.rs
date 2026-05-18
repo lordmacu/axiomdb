@@ -702,7 +702,8 @@ fn appender_clustered_50k_rows() {
 #[test]
 fn typed_builder_setters_accumulate_in_progress_row() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (i INT, s TEXT, b BOOL, r REAL)").unwrap();
+    db.run("CREATE TABLE t (i INT, s TEXT, b BOOL, r REAL)")
+        .unwrap();
     let mut app = db.appender("t").unwrap();
     assert_eq!(app.current_row_len(), 0);
     app.append_int(7).unwrap();
@@ -766,7 +767,8 @@ fn end_row_arity_mismatch_rejects_and_clears() {
 #[test]
 fn end_row_check_violation_clears_and_keeps_appender_usable() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))").unwrap();
+    db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))")
+        .unwrap();
     let mut app = db.appender("t").unwrap();
     app.append_int(1).unwrap();
     app.append_int(-5).unwrap();
@@ -823,7 +825,8 @@ fn end_row_typed_builder_loads_500_rows() {
 #[test]
 fn typed_builder_works_on_clustered_table() {
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     let mut app = db.appender("t").unwrap();
     for i in 1..=5 {
         app.append_int(i).unwrap();
@@ -841,7 +844,7 @@ fn typed_builder_auto_increment_via_append_null() {
     db.run("CREATE TABLE t (id INT AUTO_INCREMENT, v TEXT)")
         .unwrap();
     let mut app = db.appender("t").unwrap();
-    app.append_null().unwrap();   // AUTO_INC slot
+    app.append_null().unwrap(); // AUTO_INC slot
     app.append_text("a").unwrap();
     app.end_row().unwrap();
     app.append_null().unwrap();
@@ -861,7 +864,7 @@ fn typed_builder_generated_column_via_append_null() {
     let mut app = db.appender("t").unwrap();
     app.append_int(1).unwrap();
     app.append_int(7).unwrap();
-    app.append_null().unwrap();   // generated slot
+    app.append_null().unwrap(); // generated slot
     app.end_row().unwrap();
     app.finish().unwrap();
     let rows = db.query("SELECT v, doubled FROM t").unwrap();
@@ -874,17 +877,14 @@ fn typed_builder_too_many_values_returns_error() {
     db.run("CREATE TABLE t (i INT)").unwrap();
     let mut app = db.appender("t").unwrap();
     app.append_int(1).unwrap();
-    app.append_int(2).unwrap();   // 1 too many
+    app.append_int(2).unwrap(); // 1 too many
     let err = app.end_row().unwrap_err();
     assert!(matches!(err, DbError::TypeMismatch { .. }));
     // Retry works.
     app.append_int(3).unwrap();
     app.end_row().unwrap();
     app.finish().unwrap();
-    assert_eq!(
-        db.query("SELECT i FROM t").unwrap()[0][0],
-        Value::Int(3)
-    );
+    assert_eq!(db.query("SELECT i FROM t").unwrap()[0][0], Value::Int(3));
 }
 
 #[test]
@@ -892,6 +892,6 @@ fn typed_builder_empty_row_then_end_row_is_error() {
     let (_dir, mut db) = open_db();
     db.run("CREATE TABLE t (i INT)").unwrap();
     let mut app = db.appender("t").unwrap();
-    let err = app.end_row().unwrap_err();   // current_row_len = 0
+    let err = app.end_row().unwrap_err(); // current_row_len = 0
     assert!(matches!(err, DbError::TypeMismatch { .. }));
 }

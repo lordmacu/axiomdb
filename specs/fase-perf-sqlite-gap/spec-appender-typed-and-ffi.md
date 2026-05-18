@@ -4,7 +4,7 @@ Phase: perf-sqlite-gap — close embedded gap with SQLite
 Task: Attack 8 — per-column typed builder API on `Appender` plus C FFI
 exports so Python / Node.js / Swift / C++ embedded callers can drive
 the Appender without going through Rust
-Status: approved
+Status: implemented
 
 ## Context
 

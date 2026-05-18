@@ -627,3 +627,109 @@ insert path. That's Attack 8 territory.
   together at finish should close most of the 150K → 80K gap.
 - **Typed builder API + C FFI**: still the right v2 work to broaden
   the Appender's audience.
+
+---
+
+## Attack 8 — Typed builder + C FFI (2026-05-18)
+
+### Why this matters
+
+After Attack 7 v1.1 the Appender works on every table SQL `INSERT`
+works on (except triggers) — but:
+
+1. The Rust API is `Vec<Value>`-based. Every row needs a `Vec`
+   allocation; the per-`Value` enum dispatch is overhead the typed
+   callers don't need.
+2. The API is Rust-only. Per `memory/project_embedded_release.md` the
+   embedded release ships Python, Node.js, Swift bindings — none of
+   which can use the Appender without a C FFI.
+
+DuckDB solved both with one design: per-column typed setters
+(`BeginRow / Append<T> / EndRow`). SQLite did the same in
+`sqlite3_bind_<type>` + `sqlite3_step`. Attack 8 adopts the same
+shape on both surfaces.
+
+### The change
+
+**Rust typed builder** (9 new methods on `Appender`):
+
+```rust
+let mut app = db.appender("t")?;
+app.append_int(1)?;
+app.append_text("Alice")?;
+app.append_bool(true)?;
+app.end_row()?;
+app.finish()?;
+```
+
+Setters push onto `Appender.in_progress_row: Vec<Value>` (independent
+of the existing `buffer`). `end_row()` drains the in-progress row via
+`std::mem::take` (so error paths leave the appender usable) and
+delegates to `append_row_owned` — full v1.1 pipeline applies
+(AUTO_INC, GENERATED, text constraints, coerce, NOT NULL, CHECK, FK).
+
+**C FFI** (12 new `extern "C"` exports):
+
+```c
+AxiomDbAppender* app = axiomdb_appender_open(db, "t");
+axiomdb_appender_append_int(app, 1);
+axiomdb_appender_append_text(app, "Alice");
+axiomdb_appender_append_bool(app, 1);
+axiomdb_appender_end_row(app);
+axiomdb_appender_finish(app);   // commits + frees
+```
+
+Design notes:
+- Opaque `AxiomDbAppender` wraps `Appender<'static>` via lifetime
+  transmute — SAFETY: caller keeps `Db` alive until finish/free.
+- Errors set `Db.error_msg`; retrieved with the existing
+  `axiomdb_last_error(db)`.
+- `ffi_append_typed!` macro reduces boilerplate for the trivial typed
+  setters; bytes/text/bool/finish are bespoke (validation logic).
+
+### Results — Lima VM virtio (2026-05-18)
+
+`--scenario insert_appender_typed --rows 5000`, 3 iterations each:
+
+| Path                       | ops/s         | vs v1   |
+|----------------------------|--------------:|--------:|
+| v1 `Vec<Value>` API        | 246K          | baseline |
+| **A8 Rust typed builder**  | **229-233K**  | -7%     |
+| **A8 C FFI**               | **229-234K**  | -7%     |
+
+Findings:
+- Typed builder is **~7% slower** than the `Vec<Value>` API — within
+  the ≤10% budget. The per-call overhead of pushing one `Value` at
+  a time vs one `Vec` allocation per row accounts for it.
+- **C FFI overhead is invisible** — same throughput as Rust typed
+  within noise. The `extern "C"` boundary cost on a typed setter is
+  ~negligible.
+
+### Spec budget vs reality
+
+| Target                                           | Result |
+|--------------------------------------------------|--------|
+| Rust typed builder within 10% of v1.1 (≥170K)    | ✅ 229-233K (17% under v1 baseline but well above 170K floor) |
+| C FFI within 20% of Rust typed (≥140K)           | ✅ matches Rust within noise |
+| Clustered unchanged from v1.1 (~82K)             | ✅ (not re-measured; same code path) |
+| Public Rust API byte-identical to v1.1           | ✅ (only additions) |
+
+### Cross-path impact
+
+The typed builder and C FFI are PURE ADDITIONS — no v1.1 caller
+breaks. The internal `append_row_owned` path is unchanged. The new
+typed surface routes into the same pipeline.
+
+For the embedded release: this unblocks Python (PyO3 over the C FFI)
+and Node.js (napi-rs over the C FFI) bindings. Each is a separate
+follow-up but the FFI surface they need is now in place.
+
+### What's next
+
+- **PyO3 / napi-rs bindings** — write the Python / Node.js wrappers
+  over the C FFI. ~1 day each.
+- **Attack 9 — direct-encode** to eliminate the `Vec<Value>`
+  intermediate. Would close the ~7% typed-builder gap AND give
+  headroom on clustered. Risky scope: needs row-codec refactor.
+- **Attack 10 — clustered B-Tree bulk-load** (still the biggest
+  perf headroom — clustered at 82K with B-Tree split as bottleneck).

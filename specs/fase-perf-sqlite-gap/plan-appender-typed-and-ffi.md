@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap
 Task: Attack 8 — Appender typed builder + C FFI
 Spec: specs/fase-perf-sqlite-gap/spec-appender-typed-and-ffi.md
-Status: in-progress
+Status: done
 
 ## Summary
 

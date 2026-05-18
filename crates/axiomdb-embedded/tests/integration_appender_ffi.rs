@@ -20,8 +20,7 @@ use tempfile::TempDir;
 
 unsafe fn open_temp_db() -> (TempDir, *mut axiomdb_embedded::Db) {
     let dir = TempDir::new().unwrap();
-    let path =
-        CString::new(dir.path().join("ffi_test.db").to_str().unwrap().to_string()).unwrap();
+    let path = CString::new(dir.path().join("ffi_test.db").to_str().unwrap().to_string()).unwrap();
     let db = axiomdb_open(path.as_ptr());
     assert!(!db.is_null(), "axiomdb_open returned NULL");
     (dir, db)
@@ -122,10 +121,7 @@ fn ffi_appender_all_types_roundtrip() {
         assert!(!app.is_null());
 
         assert_eq!(axiomdb_appender_append_int(app, 1), 0);
-        assert_eq!(
-            axiomdb_appender_append_bigint(app, 1_000_000_000_000),
-            0
-        );
+        assert_eq!(axiomdb_appender_append_bigint(app, 1_000_000_000_000), 0);
         assert_eq!(axiomdb_appender_append_bool(app, 1), 0); // true
         assert_eq!(axiomdb_appender_append_real(app, 3.14), 0);
         let s = CString::new("hello").unwrap();
@@ -225,10 +221,7 @@ fn ffi_appender_bytes_empty_ok() {
         let table = CString::new("t").unwrap();
         let app = axiomdb_appender_open(db, table.as_ptr());
         // len=0 with NULL data is OK.
-        assert_eq!(
-            axiomdb_appender_append_bytes(app, std::ptr::null(), 0),
-            0
-        );
+        assert_eq!(axiomdb_appender_append_bytes(app, std::ptr::null(), 0), 0);
         assert_eq!(axiomdb_appender_end_row(app), 0);
         let n = axiomdb_appender_finish(app);
         assert_eq!(n, 1);
@@ -244,10 +237,7 @@ fn ffi_appender_bytes_null_with_len_returns_error() {
         let table = CString::new("t").unwrap();
         let app = axiomdb_appender_open(db, table.as_ptr());
         // NULL data with non-zero len → error.
-        assert_eq!(
-            axiomdb_appender_append_bytes(app, std::ptr::null(), 4),
-            -1
-        );
+        assert_eq!(axiomdb_appender_append_bytes(app, std::ptr::null(), 4), -1);
         axiomdb_appender_free(app);
         axiomdb_close(db);
     }
