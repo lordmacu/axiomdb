@@ -817,3 +817,81 @@ fn end_row_typed_builder_loads_500_rows() {
         Value::BigInt(500)
     );
 }
+
+// ── Attack 8 Step 4 — Typed builder edge cases ────────────────────────────────
+
+#[test]
+fn typed_builder_works_on_clustered_table() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    for i in 1..=5 {
+        app.append_int(i).unwrap();
+        app.append_text(&format!("row{i}")).unwrap();
+        app.end_row().unwrap();
+    }
+    app.finish().unwrap();
+    let rows = db.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 5);
+}
+
+#[test]
+fn typed_builder_auto_increment_via_append_null() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT AUTO_INCREMENT, v TEXT)")
+        .unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_null().unwrap();   // AUTO_INC slot
+    app.append_text("a").unwrap();
+    app.end_row().unwrap();
+    app.append_null().unwrap();
+    app.append_text("b").unwrap();
+    app.end_row().unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(rows[0][0], Value::Int(1));
+    assert_eq!(rows[1][0], Value::Int(2));
+}
+
+#[test]
+fn typed_builder_generated_column_via_append_null() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v INT, doubled INT GENERATED ALWAYS AS (v * 2) STORED)")
+        .unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(1).unwrap();
+    app.append_int(7).unwrap();
+    app.append_null().unwrap();   // generated slot
+    app.end_row().unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT v, doubled FROM t").unwrap();
+    assert_eq!(rows[0][1], Value::Int(14));
+}
+
+#[test]
+fn typed_builder_too_many_values_returns_error() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (i INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_int(1).unwrap();
+    app.append_int(2).unwrap();   // 1 too many
+    let err = app.end_row().unwrap_err();
+    assert!(matches!(err, DbError::TypeMismatch { .. }));
+    // Retry works.
+    app.append_int(3).unwrap();
+    app.end_row().unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT i FROM t").unwrap()[0][0],
+        Value::Int(3)
+    );
+}
+
+#[test]
+fn typed_builder_empty_row_then_end_row_is_error() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (i INT)").unwrap();
+    let mut app = db.appender("t").unwrap();
+    let err = app.end_row().unwrap_err();   // current_row_len = 0
+    assert!(matches!(err, DbError::TypeMismatch { .. }));
+}
