@@ -11,7 +11,7 @@
 //! Mirrors DuckDB's Appender API and SQLite's `sqlite3_bind_*` +
 //! `sqlite3_step` pattern.
 
-use axiomdb_catalog::schema::{ColumnDef, IndexDef, TableDef};
+use axiomdb_catalog::schema::{ColumnDef, ConstraintDef, IndexDef, TableDef};
 use axiomdb_catalog::SchemaResolver;
 use axiomdb_core::error::DbError;
 use axiomdb_types::Value;
@@ -36,6 +36,9 @@ pub struct Appender<'db> {
     /// time so we don't re-resolve per flush.
     #[allow(dead_code)] // wired in Step 5 (secondary index maintenance)
     pub(crate) indexes: Vec<IndexDef>,
+    /// Named CHECK constraints (v1.1 Step 4). Captured at open; checked
+    /// against every appended row.
+    pub(crate) constraints: Vec<ConstraintDef>,
     /// Column index of the AUTO_INCREMENT column, if any (v1.1 Step 2).
     /// At most one per table; resolved once at open.
     pub(crate) auto_inc_col: Option<usize>,
@@ -97,16 +100,6 @@ impl<'db> Appender<'db> {
                 feature: "Appender on tables with triggers — use SQL INSERT".to_string(),
             });
         }
-        // v1 limitations — see spec "Non-goals" (revised during impl).
-        // The SQL helpers for these are pub(crate) to axiomdb-sql; exposing
-        // them is a v1.1 follow-up.
-        if !resolved.constraints.is_empty() {
-            return Err(DbError::NotImplemented {
-                feature: "Appender on tables with CHECK constraints — use \
-                          SQL INSERT (v1 limitation)"
-                    .to_string(),
-            });
-        }
         if !resolved.foreign_keys.is_empty() {
             return Err(DbError::NotImplemented {
                 feature: "Appender on tables with FOREIGN KEY constraints — \
@@ -120,12 +113,14 @@ impl<'db> Appender<'db> {
         conn_txn.durability_override = Some(db.session.synchronous().to_wal_policy());
 
         let auto_inc_col = columns.iter().position(|c| c.auto_increment);
+        let constraints = resolved.constraints.clone();
 
         Ok(Self {
             db,
             table_def,
             columns,
             indexes,
+            constraints,
             auto_inc_col,
             conn_txn: Some(conn_txn),
             buffer: Vec::with_capacity(APPENDER_BATCH_FLUSH),
@@ -211,6 +206,10 @@ impl<'db> Appender<'db> {
             }
         }
         axiomdb_sql::materialize_generated_columns(&self.columns, &mut values)?;
+        // v1.1 Step 4: text constraints (CHAR(N) right-pad, VARCHAR(N)
+        // length check). Mutates values in place. SQL INSERT runs this
+        // BEFORE coercion / NOT NULL — same here.
+        axiomdb_sql::enforce_text_constraints(&self.columns, &mut values)?;
         // Coerce + emit warnings if permissive. row_num is 1-based per
         // the SQL convention so the warning text reads correctly.
         let coerced = axiomdb_sql::coerce_values_with_ctx(
@@ -227,6 +226,16 @@ impl<'db> Appender<'db> {
                     column: col.name.clone(),
                 });
             }
+        }
+        // v1.1 Step 4: CHECK constraints — `expr` must be TRUE or
+        // UNKNOWN (NULL); only FALSE rejects.
+        if !self.constraints.is_empty() {
+            axiomdb_sql::check_row_constraints_with_cols(
+                &self.constraints,
+                &coerced,
+                &self.table_def.table_name,
+                &self.columns,
+            )?;
         }
         self.buffer.push(coerced);
         // Auto-flush keeps memory bounded — even a million-row load

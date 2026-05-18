@@ -148,16 +148,58 @@ fn flush_drains_buffer_and_keeps_appender_usable() {
     assert_eq!(app.pending(), 1);
 }
 
+// ── Step 4 (v1.1) — CHECK + text constraints ──────────────────────────────────
+
 #[test]
-fn appender_on_table_with_check_returns_unsupported() {
+fn appender_check_constraint_passes_when_satisfied() {
     let (_dir, mut db) = open_db();
     db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))")
         .unwrap();
-    let err = db.appender("t").unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "expected NotImplemented, got {err:?}"
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Int(25)]).unwrap();
+    app.append_row(&[Value::Int(2), Value::Int(0)]).unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(2)
     );
+}
+
+#[test]
+fn appender_check_constraint_violation_returns_error() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, age INT CHECK (age >= 0))")
+        .unwrap();
+    let mut app = db.appender("t").unwrap();
+    let err = app.append_row(&[Value::Int(1), Value::Int(-5)]).unwrap_err();
+    assert!(
+        matches!(err, DbError::CheckViolation { .. }),
+        "expected CheckViolation, got {err:?}"
+    );
+    // Appender remains usable for a valid row.
+    app.append_row(&[Value::Int(2), Value::Int(30)]).unwrap();
+    app.finish().unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t").unwrap()[0][0],
+        Value::BigInt(1)
+    );
+}
+
+#[test]
+fn appender_char_padding_applied() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, code CHAR(5))").unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Text("ab".into())])
+        .unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT code FROM t").unwrap();
+    let stored = match &rows[0][0] {
+        Value::Text(s) => s.clone(),
+        v => panic!("expected Text, got {v:?}"),
+    };
+    // CHAR(5) right-pads with spaces.
+    assert_eq!(stored.chars().count(), 5, "got {stored:?}");
 }
 
 // ── Step 2 (v1.1) — AUTO_INCREMENT support ────────────────────────────────────
