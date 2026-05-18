@@ -237,7 +237,7 @@ pub(crate) fn validate_generated_insert_source_values(
     Ok(())
 }
 
-pub(crate) fn materialize_generated_columns(
+pub fn materialize_generated_columns(
     schema_cols: &[CatalogColumnDef],
     row_values: &mut [Value],
 ) -> Result<(), DbError> {
@@ -358,7 +358,7 @@ fn assign_auto_increment(
 /// - **CHAR(N)**: right-pads values shorter than N with spaces; rejects values
 ///   longer than N (after stripping trailing spaces, per MySQL behavior).
 /// - Columns with `type_len == 0` are unbounded (`TEXT`) and are skipped.
-pub(crate) fn enforce_text_constraints(
+pub fn enforce_text_constraints(
     schema_cols: &[CatalogColumnDef],
     row_values: &mut [Value],
 ) -> Result<(), DbError> {
@@ -418,7 +418,7 @@ pub(crate) fn enforce_text_constraints(
 ///
 /// SQL standard: CHECK passes when expr is TRUE or UNKNOWN (NULL); only
 /// explicit FALSE is a violation.
-pub(crate) fn check_row_constraints_with_cols(
+pub fn check_row_constraints_with_cols(
     constraints: &[axiomdb_catalog::schema::ConstraintDef],
     row_values: &[Value],
     table_name: &str,

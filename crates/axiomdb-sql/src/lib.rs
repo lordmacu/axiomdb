@@ -87,3 +87,12 @@ pub use result::{ColumnMeta, QueryResult, Row};
 pub use schema_cache::SchemaCache;
 pub use session::SessionContext;
 pub use table::{coerce_values_with_ctx, TableEngine};
+// Constraint helpers used by the embedded Appender (Attack 7 v1.1).
+// `materialize_generated_columns` evaluates STORED GENERATED expressions
+// in place; `enforce_text_constraints` applies CHAR(N) padding and
+// VARCHAR(N) length checks; `check_row_constraints_with_cols` runs
+// every CHECK constraint against a row. Mirror the SQL INSERT order.
+pub use executor::{
+    check_row_constraints_with_cols, enforce_text_constraints, materialize_generated_columns,
+    next_auto_increment_value,
+};
