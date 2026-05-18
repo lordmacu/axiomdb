@@ -114,14 +114,6 @@ impl<'db> Appender<'db> {
                     .to_string(),
             });
         }
-        if columns.iter().any(|c| c.generated_expr.is_some()) {
-            return Err(DbError::NotImplemented {
-                feature: "Appender on tables with GENERATED columns — \
-                          use SQL INSERT (v1 limitation)"
-                    .to_string(),
-            });
-        }
-
         // Open the appender's transaction and stamp the session's current
         // durability override (Attack 6).
         let mut conn_txn = db.txn.begin()?;
@@ -201,6 +193,24 @@ impl<'db> Appender<'db> {
                 };
             }
         }
+        // v1.1 Step 3: GENERATED ALWAYS STORED columns.
+        // SQL semantics: explicit non-NULL value for a generated column
+        // is rejected. The `materialize_generated_columns` helper
+        // unconditionally overwrites the slot — it doesn't enforce this
+        // check (the SQL pipeline does it earlier via
+        // `validate_generated_insert_source_values`, which works on
+        // col_positions). We inline the check here for the Appender.
+        for (idx, col) in self.columns.iter().enumerate() {
+            if col.generated_expr.is_some() && !matches!(values[idx], Value::Null) {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "generated column '{}.{}' cannot be assigned explicitly",
+                        self.table_def.table_name, col.name
+                    ),
+                });
+            }
+        }
+        axiomdb_sql::materialize_generated_columns(&self.columns, &mut values)?;
         // Coerce + emit warnings if permissive. row_num is 1-based per
         // the SQL convention so the warning text reads correctly.
         let coerced = axiomdb_sql::coerce_values_with_ctx(

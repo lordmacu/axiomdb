@@ -416,15 +416,38 @@ fn appender_on_table_with_fk_returns_unsupported() {
     );
 }
 
+// ── Step 3 (v1.1) — GENERATED columns support ─────────────────────────────────
+
 #[test]
-fn appender_on_table_with_generated_column_returns_unsupported() {
+fn appender_materializes_stored_generated_column_on_null() {
     let (_dir, mut db) = open_db();
     db.run("CREATE TABLE t (id INT, v INT, doubled INT GENERATED ALWAYS AS (v * 2) STORED)")
         .unwrap();
-    let err = db.appender("t").unwrap_err();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(1), Value::Int(5), Value::Null])
+        .unwrap();
+    app.append_row(&[Value::Int(2), Value::Int(7), Value::Null])
+        .unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT v, doubled FROM t ORDER BY v").unwrap();
+    assert_eq!(rows[0][1], Value::Int(10));
+    assert_eq!(rows[1][1], Value::Int(14));
+}
+
+#[test]
+fn appender_rejects_explicit_generated_always_value() {
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT, v INT, doubled INT GENERATED ALWAYS AS (v * 2) STORED)")
+        .unwrap();
+    let mut app = db.appender("t").unwrap();
+    let err = app
+        .append_row(&[Value::Int(1), Value::Int(5), Value::Int(999)])
+        .unwrap_err();
+    // Whatever the helper raises (Other / TypeMismatch / InvalidValue);
+    // semantic is "non-NULL value for GENERATED ALWAYS rejected".
     assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "expected NotImplemented (generated cols deferred to v1.1), got {err:?}"
+        !matches!(err, DbError::NotNullViolation { .. }),
+        "should not be NOT NULL — got {err:?}"
     );
 }
 
