@@ -36,6 +36,9 @@ pub struct Appender<'db> {
     /// time so we don't re-resolve per flush.
     #[allow(dead_code)] // wired in Step 5 (secondary index maintenance)
     pub(crate) indexes: Vec<IndexDef>,
+    /// Column index of the AUTO_INCREMENT column, if any (v1.1 Step 2).
+    /// At most one per table; resolved once at open.
+    pub(crate) auto_inc_col: Option<usize>,
     /// The transaction held for the Appender's lifetime. `Some` while
     /// alive, `None` after `finish()` consumes it or Drop rolls it back.
     pub(crate) conn_txn: Option<ConnectionTxn>,
@@ -111,13 +114,6 @@ impl<'db> Appender<'db> {
                     .to_string(),
             });
         }
-        if columns.iter().any(|c| c.auto_increment) {
-            return Err(DbError::NotImplemented {
-                feature: "Appender on tables with AUTO_INCREMENT/SERIAL — \
-                          use SQL INSERT (v1 limitation)"
-                    .to_string(),
-            });
-        }
         if columns.iter().any(|c| c.generated_expr.is_some()) {
             return Err(DbError::NotImplemented {
                 feature: "Appender on tables with GENERATED columns — \
@@ -131,11 +127,14 @@ impl<'db> Appender<'db> {
         let mut conn_txn = db.txn.begin()?;
         conn_txn.durability_override = Some(db.session.synchronous().to_wal_policy());
 
+        let auto_inc_col = columns.iter().position(|c| c.auto_increment);
+
         Ok(Self {
             db,
             table_def,
             columns,
             indexes,
+            auto_inc_col,
             conn_txn: Some(conn_txn),
             buffer: Vec::with_capacity(APPENDER_BATCH_FLUSH),
             rows_inserted: 0,
@@ -168,12 +167,39 @@ impl<'db> Appender<'db> {
     /// Owned variant — consumes the `Vec` to skip the per-row clone of
     /// `append_row(&[Value])`. Use this when the caller is producing
     /// `Vec<Value>` natively (e.g. building rows in a loop).
-    pub fn append_row_owned(&mut self, values: Vec<Value>) -> Result<(), DbError> {
+    pub fn append_row_owned(&mut self, mut values: Vec<Value>) -> Result<(), DbError> {
         if values.len() != self.columns.len() {
             return Err(DbError::TypeMismatch {
                 expected: format!("{} columns", self.columns.len()),
                 got: format!("{} values", values.len()),
             });
+        }
+        // v1.1 Step 2: AUTO_INCREMENT auto-assign.
+        // SQL semantics: if the AUTO_INC column is Null, assign the next
+        // value; if an explicit value is provided, respect it. The cache
+        // seeds from MAX(col) on first call so explicit values inserted
+        // earlier (or by a parallel session) are honored.
+        if let Some(col_idx) = self.auto_inc_col {
+            if matches!(values[col_idx], Value::Null) {
+                let conn_txn = self
+                    .conn_txn
+                    .as_ref()
+                    .expect("Appender has active txn while alive");
+                let next = axiomdb_sql::next_auto_increment_value(
+                    &self.db.storage,
+                    &self.db.txn,
+                    conn_txn,
+                    &self.table_def,
+                    &self.columns,
+                    col_idx,
+                )?;
+                // Match the column's declared type — Int or BigInt
+                use axiomdb_catalog::schema::ColumnType;
+                values[col_idx] = match self.columns[col_idx].col_type {
+                    ColumnType::BigInt => Value::BigInt(next as i64),
+                    _ => Value::Int(next as i32),
+                };
+            }
         }
         // Coerce + emit warnings if permissive. row_num is 1-based per
         // the SQL convention so the warning text reads correctly.

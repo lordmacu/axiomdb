@@ -160,16 +160,48 @@ fn appender_on_table_with_check_returns_unsupported() {
     );
 }
 
+// ── Step 2 (v1.1) — AUTO_INCREMENT support ────────────────────────────────────
+
 #[test]
-fn appender_on_table_with_auto_increment_returns_unsupported() {
+fn appender_assigns_auto_increment_on_null() {
     let (_dir, mut db) = open_db();
     db.run("CREATE TABLE t (id INT AUTO_INCREMENT, v TEXT)")
         .unwrap();
-    let err = db.appender("t").unwrap_err();
-    assert!(
-        matches!(err, DbError::NotImplemented { .. }),
-        "expected NotImplemented, got {err:?}"
-    );
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Null, Value::Text("a".into())])
+        .unwrap();
+    app.append_row(&[Value::Null, Value::Text("b".into())])
+        .unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT id, v FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Int(1));
+    assert_eq!(rows[1][0], Value::Int(2));
+    assert_eq!(rows[0][1], Value::Text("a".into()));
+}
+
+#[test]
+fn appender_respects_explicit_auto_increment_value() {
+    // SQL semantics: explicit non-NULL wins, but AUTO_INC cache only
+    // advances on Null-triggered assigns. So explicit 100 → keep,
+    // next Null → next cache value (which seeded from existing scan).
+    let (_dir, mut db) = open_db();
+    db.run("CREATE TABLE t (id INT AUTO_INCREMENT, v TEXT)")
+        .unwrap();
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Int(100), Value::Text("a".into())])
+        .unwrap();
+    app.finish().unwrap();
+    // Reopen + insert via Null — cache scans existing MAX (100) and
+    // continues from 101.
+    let mut app = db.appender("t").unwrap();
+    app.append_row(&[Value::Null, Value::Text("b".into())])
+        .unwrap();
+    app.finish().unwrap();
+    let rows = db.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Int(100));
+    assert_eq!(rows[1][0], Value::Int(101));
 }
 
 // (Step 3's "flush on indexed table → NotImplemented" test was removed
