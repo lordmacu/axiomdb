@@ -263,6 +263,90 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, ac_n, mean, "appender, heap (v1 baseline)");
         }
 
+        "insert_appender_typed" => {
+            // Attack 8: Rust typed builder API. Should match v1.1
+            // performance — same internal path through append_row_owned.
+            let mean = measure_timed(|| {
+                db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    &mut db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users_heap").unwrap();
+                for i in 1..=ac_n {
+                    app.append_int(i as i32).unwrap();
+                    app.append_text(&format!("user_{i:06}")).unwrap();
+                    app.append_int((18 + (i % 62)) as i32).unwrap();
+                    app.append_bool(i % 2 == 0).unwrap();
+                    app.append_real(100.0 + (i % 1000) as f64 * 0.1).unwrap();
+                    app.append_text(&format!("u{i}@b.local")).unwrap();
+                    app.end_row().unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender typed builder (Rust, A8)");
+        }
+
+        "insert_appender_c" => {
+            // Attack 8: through the C FFI surface from Rust. Measures
+            // the per-call cost of the unsafe boundary.
+            use std::ffi::CString;
+            let mean = measure_timed(|| {
+                db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    &mut db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                unsafe {
+                    let db_ptr: *mut axiomdb_embedded::Db = &mut db;
+                    let table = CString::new("bench_users_heap").unwrap();
+                    let app = axiomdb_embedded::axiomdb_appender_open(db_ptr, table.as_ptr());
+                    assert!(!app.is_null());
+                    for i in 1..=ac_n {
+                        let name = CString::new(format!("user_{i:06}")).unwrap();
+                        let email = CString::new(format!("u{i}@b.local")).unwrap();
+                        axiomdb_embedded::axiomdb_appender_append_int(app, i as i32);
+                        axiomdb_embedded::axiomdb_appender_append_text(app, name.as_ptr());
+                        axiomdb_embedded::axiomdb_appender_append_int(
+                            app,
+                            (18 + (i % 62)) as i32,
+                        );
+                        axiomdb_embedded::axiomdb_appender_append_bool(
+                            app,
+                            if i % 2 == 0 { 1 } else { 0 },
+                        );
+                        axiomdb_embedded::axiomdb_appender_append_real(
+                            app,
+                            100.0 + (i % 1000) as f64 * 0.1,
+                        );
+                        axiomdb_embedded::axiomdb_appender_append_text(app, email.as_ptr());
+                        axiomdb_embedded::axiomdb_appender_end_row(app);
+                    }
+                    let n = axiomdb_embedded::axiomdb_appender_finish(app);
+                    assert!(n >= 0);
+                }
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender C FFI (Attack 8)");
+        }
+
         _ => {
             load_batch(&mut db, &inserts);
             let step = (n_rows.max(100) / 100).max(1);
