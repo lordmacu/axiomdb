@@ -3,7 +3,7 @@
 Phase: perf-sqlite-gap
 Task: Attack 10 v1 — defer secondary + catalog batching + re-arm hint
 Spec: specs/fase-perf-sqlite-gap/spec-clustered-batch-defer.md
-Status: in-progress
+Status: done
 
 ## Summary
 

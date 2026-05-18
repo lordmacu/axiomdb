@@ -5,7 +5,7 @@ Task: Attack 10 v1 — when the embedded Appender flushes a batch of
 rows into a clustered table, accumulate ALL secondary index entries
 and root changes in memory, then commit them once at end-of-flush
 instead of per-row
-Status: approved
+Status: implemented
 
 ## Context
 

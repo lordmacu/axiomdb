@@ -224,6 +224,42 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, ac_n, mean, "appender, clustered (v1.1)");
         }
 
+        "insert_appender_indexed" => {
+            // Attack 10 validation: clustered bench_users + a secondary
+            // index. The deferred-secondary + catalog-batching wins are
+            // ONLY visible on tables WITH secondary indexes — the plain
+            // bench_users has none, so insert_appender doesn't expose
+            // the gain. Here we add `CREATE INDEX idx_email` and
+            // re-measure.
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                db_sql(&mut db, "CREATE INDEX idx_email ON bench_users (email)");
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(
+                scenario,
+                ac_n,
+                mean,
+                "appender, clustered+1 secondary index",
+            );
+        }
+
         "insert_appender_heap" => {
             // Attack 7 v1 baseline kept for comparison: Appender on a
             // parallel heap-only table (no PRIMARY KEY). Shows the

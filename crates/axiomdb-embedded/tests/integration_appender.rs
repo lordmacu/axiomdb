@@ -938,7 +938,8 @@ fn appender_clustered_unique_secondary_violation_rolls_back() {
     // A pre-existing UNIQUE secondary forces a violation mid-batch.
     // Verify the whole appender batch rolls back atomically.
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id INT PRIMARY KEY, code TEXT)").unwrap();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, code TEXT)")
+        .unwrap();
     db.run("CREATE UNIQUE INDEX idx_code ON t (code)").unwrap();
     db.run("INSERT INTO t VALUES (1, 'pre-existing')").unwrap();
     let mut app = db.appender("t").unwrap();
@@ -966,7 +967,8 @@ fn appender_clustered_many_root_splits_catalog_consistent() {
     // Verifies that after Attack 10 (deferred catalog persist), the
     // table+index roots are correctly written at end of flush.
     let (_dir, mut db) = open_db();
-    db.run("CREATE TABLE t (id TEXT PRIMARY KEY, v INT)").unwrap();
+    db.run("CREATE TABLE t (id TEXT PRIMARY KEY, v INT)")
+        .unwrap();
     let mut app = db.appender("t").unwrap();
     for i in (0..2000).rev() {
         app.append_text(&format!("key_{i:08}")).unwrap();

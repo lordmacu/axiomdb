@@ -1131,8 +1131,21 @@ mod ffi {
     /// Macro: defines a typed appender FFI fn that delegates to a
     /// method on the inner Rust `Appender`. Returns 0 on success,
     /// -1 on error (with `Db.error_msg` set).
+    ///
+    /// # Safety
+    /// All generated functions share the same safety contract: `app`
+    /// must be a valid pointer from `axiomdb_appender_open` or NULL.
+    /// The pointer must not be used after `axiomdb_appender_finish`
+    /// or `axiomdb_appender_free`.
     macro_rules! ffi_append_typed {
         ($fn_name:ident, $rust_name:ident, $($arg:ident: $ty:ty),*) => {
+            /// FFI typed appender setter — see the `ffi_append_typed!`
+            /// macro for shared safety contract.
+            ///
+            /// # Safety
+            /// `app` must be a valid pointer from `axiomdb_appender_open`,
+            /// or NULL (returns -1). Must not be used after
+            /// `axiomdb_appender_finish` / `axiomdb_appender_free`.
             #[no_mangle]
             pub unsafe extern "C" fn $fn_name(
                 app: *mut AxiomDbAppender,
@@ -1161,6 +1174,10 @@ mod ffi {
     ffi_append_typed!(axiomdb_appender_append_real, append_real, v: f64);
 
     /// Appends a BOOL value. `v == 0` is false; any non-zero is true.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`,
+    /// or NULL (returns -1).
     #[no_mangle]
     pub unsafe extern "C" fn axiomdb_appender_append_bool(
         app: *mut AxiomDbAppender,
@@ -1183,6 +1200,11 @@ mod ffi {
     }
 
     /// Appends a TEXT value from a NUL-terminated UTF-8 cstring.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`,
+    /// or NULL (returns -1). `v` must be a NUL-terminated UTF-8
+    /// string, or NULL (returns -1).
     #[no_mangle]
     pub unsafe extern "C" fn axiomdb_appender_append_text(
         app: *mut AxiomDbAppender,
@@ -1216,6 +1238,11 @@ mod ffi {
 
     /// Appends a BYTES value from a (data, len) pair. `data` may be
     /// NULL only when `len == 0`.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`,
+    /// or NULL (returns -1). `data` must point to at least `len`
+    /// readable bytes, or be NULL when `len == 0`.
     #[no_mangle]
     pub unsafe extern "C" fn axiomdb_appender_append_bytes(
         app: *mut AxiomDbAppender,

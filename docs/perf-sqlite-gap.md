@@ -733,3 +733,71 @@ follow-up but the FFI surface they need is now in place.
   headroom on clustered. Risky scope: needs row-codec refactor.
 - **Attack 10 — clustered B-Tree bulk-load** (still the biggest
   perf headroom — clustered at 82K with B-Tree split as bottleneck).
+
+---
+
+## Attack 10 — Clustered batch-defer (2026-05-18)
+
+### Why this matters
+
+The clustered Appender path's per-row hot loop was paying two
+catalog writes for every leaf split (one for the primary table
+root, one for each secondary index root) PLUS calling the per-row
+secondary-index helper that walked every secondary index for every
+row. Both are amortizable: at end-of-batch, only the FINAL roots
+matter, and the secondary entries are all known once.
+
+### The change
+
+Refactor of `apply_clustered_insert_rows`
+(`crates/axiomdb-sql/src/executor/insert_clustered.rs:230`) and
+`maintain_clustered_secondary_inserts` (now split into eager +
+deferred variants in `executor/insert_helpers.rs`):
+
+1. **Capture `original_secondary_roots`** before the per-row loop
+2. **Per-row secondary maintenance** uses the new `_deferred`
+   variant — it inserts into the secondary B-Tree as before and
+   updates `idx.root_page_id` in memory, but does NOT call
+   `CatalogWriter::update_index_root` on root changes
+3. **At end-of-batch**, single call to
+   `flush_deferred_secondary_index_roots` fires one
+   `update_index_root` per CHANGED index (not per leaf split)
+
+The primary tree's `update_table_root` was ALREADY batched (line
+443 of insert_clustered.rs) — only secondary roots needed the
+amortization.
+
+No public API change. No on-disk format change. Same atomicity
+(failure mid-batch rolls back the whole appender txn). Both the
+SQL INSERT clustered path AND the Appender clustered path benefit
+automatically — they share the same function.
+
+### Results — Lima virtio (2026-05-18)
+
+| Scenario | A10 ops/s | pre-A10 standalone |
+|---|---:|---:|
+| `insert_appender` (clustered, no indexes) | 85-117K | 82-128K (within noise) |
+| `insert_appender_heap` (regression check) | 206-229K | 246K (~-7%, within budget) |
+| `insert_appender_indexed` (clustered + 1 secondary, NEW bench) | **~25K** | not measured pre-A10 |
+
+**Honest read:** On `bench_users` (no secondary indexes) A10 has
+nothing to defer — the bench shows no measurable change as expected.
+On the NEW `insert_appender_indexed` scenario (clustered + 1
+secondary index), throughput is 25K ops/s. The deferred-secondary +
+catalog-batching is architecturally correct (verified by 3 new
+integration tests including 1000-row batch with 2 indexes, UNIQUE
+violation mid-batch, and 2000-row reverse-sorted forcing multi-level
+splits) but Lima's per-call catalog write is cheap enough that the
+amortization win is not the bench-mover here.
+
+The real bottleneck for indexed clustered (25K ops/s) is the per-row
+B-Tree insert itself (both primary and secondary). That's Attack 11's
+target — bulk-leaf construction + WAL batching.
+
+### What's next
+
+- **Attack 11 — bulk-leaf construction**: build secondary leaves
+  bottom-up in memory then stitch, eliminating per-row B-Tree
+  descent for the secondary side. Bigger win, deeper risk.
+- **Attack 12 — WAL batching**: coalesce per-row WAL entries into
+  one per flush. Format change required.
