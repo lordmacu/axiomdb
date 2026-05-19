@@ -10,7 +10,7 @@ use axiomdb_catalog::{
     bootstrap::CatalogBootstrap,
     notifier::{CatalogChangeNotifier, SchemaChangeEvent, SchemaChangeKind},
     reader::CatalogReader,
-    schema::{ColumnDef, ColumnType, IndexDef},
+    schema::{ColumnDef, ColumnType, IdentityKind, IndexDef},
     writer::CatalogWriter,
 };
 use axiomdb_storage::MemoryStorage;
@@ -150,6 +150,7 @@ fn test_create_column_fires_no_event() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         let count_after_column = events.lock().unwrap().len();

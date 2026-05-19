@@ -4,7 +4,7 @@ use axiomdb_catalog::{
     bootstrap::CatalogBootstrap,
     reader::CatalogReader,
     resolver::SchemaResolver,
-    schema::{ColumnDef, ColumnType, IndexDef, DEFAULT_DATABASE_NAME},
+    schema::{ColumnDef, ColumnType, IdentityKind, IndexDef, DEFAULT_DATABASE_NAME},
     writer::CatalogWriter,
 };
 use axiomdb_core::DbError;
@@ -122,6 +122,7 @@ fn test_resolve_table_columns_sorted_by_col_idx() {
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: IdentityKind::None,
             })
             .unwrap();
         }
@@ -278,6 +279,7 @@ fn test_resolve_column_found() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -297,6 +299,7 @@ fn test_resolve_column_found() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         tid
@@ -338,6 +341,7 @@ fn test_resolve_column_not_found_returns_column_not_found_error() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         tid

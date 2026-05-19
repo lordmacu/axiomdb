@@ -3,7 +3,7 @@
 Phase: 24 — Complete Type System
 Task: SQL-standard identity columns
 Spec: specs/fase-24/spec-24.1c-generated-identity.md
-Status: in-progress
+Status: done
 
 ## Summary
 

@@ -25,9 +25,9 @@ pub use resolver::{ResolvedTable, SchemaResolver};
 pub use schema::{
     AggregateDef, AggregateHelperKind, ColumnDef, ColumnType, ConstraintDef, ConstraintKind,
     ConstraintOperator, CronJobDef, DatabaseDef, EnumTypeDef, ExclusionElementDef, FkAction, FkDef,
-    IndexColumnDef, IndexDef, RelationKind, SchemaDef, SequenceDef, SortOrder, StatsDef,
-    TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout, TriggerDef,
-    TriggerEvent, DEFAULT_DATABASE_NAME,
+    IdentityKind, IndexColumnDef, IndexDef, RelationKind, SchemaDef, SequenceDef, SortOrder,
+    StatsDef, TableDatabaseDef, TableDef, TableId, TablePersistence, TableStorageLayout,
+    TriggerDef, TriggerEvent, DEFAULT_DATABASE_NAME,
 };
 pub use schema_composite::{CompositeField, CompositeTypeDef};
 pub use schema_exchange_rate::ExchangeRateDef;
