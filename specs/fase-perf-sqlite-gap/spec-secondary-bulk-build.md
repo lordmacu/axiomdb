@@ -5,7 +5,7 @@ Task: Attack 11 — when the embedded Appender flushes into a clustered
 table whose REGULAR B-Tree secondary indexes are EMPTY, build them
 bottom-up via the existing `BTree::bulk_load_sorted` helper instead
 of inserting row-by-row
-Status: approved
+Status: implemented
 
 ## Context
 
