@@ -2,6 +2,12 @@
 /// in-place (via `idx.root_page_id`) without writing to the catalog.
 /// Returns `(secondary_elapsed, catalog_elapsed=0)`. The caller must
 /// invoke `flush_deferred_secondary_index_roots` after the batch.
+///
+/// Attack 11: `skip_mask`, if non-empty, skips secondary indexes
+/// where `skip_mask[i] == true`. The caller is responsible for
+/// handling those indexes separately (typically: bulk-build via
+/// `BTree::bulk_load_sorted`). Pass an empty slice to maintain all
+/// indexes.
 #[expect(clippy::too_many_arguments, reason = "see maintain_clustered_secondary_inserts")]
 pub(crate) fn maintain_clustered_secondary_inserts_deferred(
     storage: &dyn StorageEngine,
@@ -14,6 +20,7 @@ pub(crate) fn maintain_clustered_secondary_inserts_deferred(
     compiled_preds: &[Option<Expr>],
     row_values: &[Value],
     debug_clustered_insert: bool,
+    skip_mask: &[bool],
 ) -> Result<std::time::Duration, DbError> {
     let (secondary_elapsed, _) = maintain_clustered_secondary_inserts_impl(
         storage,
@@ -27,6 +34,7 @@ pub(crate) fn maintain_clustered_secondary_inserts_deferred(
         row_values,
         debug_clustered_insert,
         /*defer_root_persist=*/ true,
+        skip_mask,
     )?;
     Ok(secondary_elapsed)
 }
@@ -74,17 +82,24 @@ fn maintain_clustered_secondary_inserts_impl(
     row_values: &[Value],
     debug_clustered_insert: bool,
     defer_root_persist: bool,
+    skip_mask: &[bool],
 ) -> Result<(std::time::Duration, std::time::Duration), DbError> {
     use std::time::{Duration, Instant};
 
     let mut secondary_time = Duration::ZERO;
     let mut root_persist_time = Duration::ZERO;
 
-    for ((idx, layout), compiled_pred) in secondary_indexes
+    for (i, ((idx, layout), compiled_pred)) in secondary_indexes
         .iter_mut()
         .zip(secondary_layouts.iter())
         .zip(compiled_preds.iter())
+        .enumerate()
     {
+        // Attack 11: caller-controlled skip for indexes that go
+        // through bulk_load_sorted instead of per-row insert.
+        if skip_mask.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let secondary_started = debug_clustered_insert.then(Instant::now);
         if let Some(pred) = compiled_pred {
             if !is_truthy(&eval(pred, row_values)?) {

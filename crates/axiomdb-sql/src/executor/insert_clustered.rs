@@ -257,6 +257,22 @@ pub(crate) fn apply_clustered_insert_rows(
     // update_index_root for indexes whose root actually changed.
     let original_secondary_roots: Vec<u64> =
         secondary_indexes.iter().map(|i| i.root_page_id).collect();
+
+    // Attack 11: classify each secondary index — eligible for
+    // bulk-build (regular B-Tree + empty root + no partial-index
+    // predicate) vs eager (per-row insert via Attack 10 path).
+    // For eligible indexes we collect (encoded_key) per row and call
+    // BTree::bulk_load_sorted once after the per-row loop.
+    let bulk_eligible: Vec<bool> = secondary_indexes
+        .iter()
+        .zip(compiled_preds.iter())
+        .map(|(idx, pred)| is_bulk_build_eligible(storage, idx, pred.as_ref()))
+        .collect();
+    // bulk_entries[i] is non-None only when bulk_eligible[i] == true.
+    let mut bulk_entries: Vec<Option<Vec<Vec<u8>>>> = bulk_eligible
+        .iter()
+        .map(|&e| if e { Some(Vec::with_capacity(rows.len())) } else { None })
+        .collect();
     let append_biased = rows
         .windows(2)
         .all(|pair| pair[0].primary_key_bytes < pair[1].primary_key_bytes);
@@ -338,8 +354,16 @@ pub(crate) fn apply_clustered_insert_rows(
                                 compiled_preds,
                                 &inserted_row.values,
                                 debug_clustered_insert,
+                                &bulk_eligible,
                             )?;
                         secondary_time += secondary_elapsed;
+                        // Attack 11: collect entries for bulk-eligible indexes.
+                        collect_bulk_secondary_entries(
+                            &mut bulk_entries,
+                            &bulk_eligible,
+                            secondary_layouts,
+                            &inserted_row.values,
+                        )?;
                     }
 
                     row_idx += inserted;
@@ -433,11 +457,31 @@ pub(crate) fn apply_clustered_insert_rows(
             compiled_preds,
             &row.values,
             debug_clustered_insert,
+            &bulk_eligible,
         )?;
         secondary_time += secondary_elapsed;
+        // Attack 11: collect entries for bulk-eligible indexes.
+        collect_bulk_secondary_entries(
+            &mut bulk_entries,
+            &bulk_eligible,
+            secondary_layouts,
+            &row.values,
+        )?;
 
         row_idx += 1;
     }
+
+    // Attack 11: bulk-build the eligible secondary indexes from the
+    // collected entries. Each one calls BTree::bulk_load_sorted once,
+    // updating idx.root_page_id. flush_deferred_secondary_index_roots
+    // below then emits the catalog write.
+    bulk_build_eligible_secondaries(
+        storage,
+        bloom,
+        secondary_indexes,
+        &bulk_eligible,
+        &mut bulk_entries,
+    )?;
 
     // Attack 10: flush deferred secondary-index root changes in ONE
     // catalog write per CHANGED index (not per leaf split). Mirrors
@@ -509,4 +553,117 @@ pub(crate) fn apply_clustered_insert_rows(
     }
 
     Ok(rows.len() as u64)
+}
+
+// ── Attack 11 helpers — secondary index bulk-build ───────────────────────────
+
+/// Returns `true` if a secondary index is eligible for bulk-build via
+/// `BTree::bulk_load_sorted`. Requirements:
+/// - Regular B-Tree index (idx.index_type == 0)
+/// - No partial-index predicate (we'd need to evaluate per row)
+/// - The B-Tree's root page is an empty leaf
+/// - Not BRIN / FTS / GIN / Trigram
+fn is_bulk_build_eligible(
+    storage: &dyn axiomdb_storage::StorageEngine,
+    idx: &axiomdb_catalog::schema::IndexDef,
+    compiled_pred: Option<&Expr>,
+) -> bool {
+    // index_type: 0 = regular B-Tree; 1 = BRIN; 2 = Trigram; 3 = FTS; 4 = GIN
+    if idx.index_type != 0 {
+        return false;
+    }
+    if compiled_pred.is_some() {
+        return false;
+    }
+    // Read root page and check that it's an empty leaf.
+    let Ok(page_ref) = storage.read_page(idx.root_page_id) else {
+        return false;
+    };
+    let bytes = *page_ref.as_bytes();
+    let Ok(page) = axiomdb_storage::Page::from_bytes(bytes) else {
+        return false;
+    };
+    let leaf = axiomdb_index::page_layout::cast_leaf(&page);
+    leaf.is_leaf == 1 && leaf.num_keys() == 0
+}
+
+/// Collects the encoded physical key for each `bulk_eligible[i] == true`
+/// secondary index, given the row's values.
+fn collect_bulk_secondary_entries(
+    bulk_entries: &mut [Option<Vec<Vec<u8>>>],
+    bulk_eligible: &[bool],
+    secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
+    row_values: &[Value],
+) -> Result<(), DbError> {
+    for (i, layout) in secondary_layouts.iter().enumerate() {
+        if !bulk_eligible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(entry) = layout.entry_from_row(row_values)? else {
+            continue;
+        };
+        if let Some(vec) = bulk_entries[i].as_mut() {
+            vec.push(entry.physical_key);
+        }
+    }
+    Ok(())
+}
+
+/// For each bulk-eligible secondary index with collected entries:
+/// sort, check for duplicates (UniqueViolation on UNIQUE indexes),
+/// call `BTree::bulk_load_sorted`, update `idx.root_page_id` and the
+/// bloom filter.
+fn bulk_build_eligible_secondaries(
+    storage: &dyn axiomdb_storage::StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
+    secondary_indexes: &mut [axiomdb_catalog::schema::IndexDef],
+    bulk_eligible: &[bool],
+    bulk_entries: &mut [Option<Vec<Vec<u8>>>],
+) -> Result<(), DbError> {
+    for (i, idx) in secondary_indexes.iter_mut().enumerate() {
+        if !bulk_eligible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(entries) = bulk_entries[i].take() else {
+            continue;
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        // Sort by physical_key.
+        let mut sorted = entries;
+        sorted.sort_unstable();
+        // Duplicate detection — physical_key already encodes the PK
+        // suffix for non-unique indexes, so duplicates here mean an
+        // actual UNIQUE violation OR identical PK (which can't happen
+        // since the primary tree already rejected it).
+        for window in sorted.windows(2) {
+            if window[0] == window[1] {
+                return Err(DbError::UniqueViolation {
+                    index_name: idx.name.clone(),
+                    value: None,
+                });
+            }
+        }
+        // bulk_load_sorted wants &[(&[u8], RecordId)]; build a Vec of
+        // references with the secondary's DUMMY_RID (page_id=0, slot_id=0).
+        let dummy_rid = axiomdb_core::RecordId {
+            page_id: 0,
+            slot_id: 0,
+        };
+        let pairs: Vec<(&[u8], axiomdb_core::RecordId)> =
+            sorted.iter().map(|k| (k.as_slice(), dummy_rid)).collect();
+        let new_root = axiomdb_index::BTree::bulk_load_sorted(
+            storage,
+            idx.root_page_id,
+            &pairs,
+            idx.fillfactor,
+        )?;
+        idx.root_page_id = new_root;
+        // Update bloom filter for every key.
+        for key in &sorted {
+            bloom.add(idx.index_id, key);
+        }
+    }
+    Ok(())
 }
