@@ -650,3 +650,25 @@ The benchmark `point_lookup` doesn't show a measurable win because each
 lookup is wrapped in an autocommit `SELECT ... WHERE id = N` SQL query —
 parse + analyze + plan dominate (~200µs/query) the storage cost (~5-20µs).
 Attack 20 (autocommit statement cache) addresses the real bottleneck.
+
+### Autocommit SELECT Statement Cache (Attack 20)
+
+Repeated autocommit `SELECT` queries with different literals (`SELECT ...
+WHERE id = N`, then `WHERE id = N+100`, etc.) now share one analyzed plan
+via the per-session statement cache (`statement_cache::run_cached`). The
+parser still runs (cheap), then literals are extracted to params, the
+shape is hashed, and the cache returns the prior analyzed AST. The
+analyzer's `PlanDeps` snapshot is re-validated against the catalog on each
+hit (1-3 catalog reads typically) to evict stale entries after DDL.
+
+| Scenario | Pre-A20 | Post-A20 | Speedup |
+|---|---:|---:|---:|
+| `point_lookup` 100×SELECT | 4.5K ops/s | **14.5K ops/s** | **3.2×** |
+| `count_star` SELECT COUNT(*) | 2.3K ops/s | **~5K ops/s** | 2.1× |
+| `range_scan` 1K-of-10K | 1.42M ops/s | **2.98M ops/s** | 2.1× |
+
+Cache scope: SELECT only (gated by `sql_starts_with_select_keyword`).
+INSERT/UPDATE/DELETE keep the legacy path — they have cheap analyze and
+the prior Attack 2 wiring net-regressed them. Cumulative range_scan speedup
+vs original baseline: **8.3×** (4× from A18 zero-alloc × 2.1× from A20
+cache).

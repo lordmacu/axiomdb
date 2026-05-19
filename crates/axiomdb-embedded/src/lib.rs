@@ -303,16 +303,26 @@ mod db {
                     operation: "database is in read-only degraded mode",
                 });
             }
-            // NOTE: Attack 2 (statement_cache::run_cached) was prototyped
-            // here but reverted — see specs/fase-perf-sqlite-gap/
-            // plan-statement-fingerprinting.md, "Step 2.4 outcome". The
-            // PlanDeps.is_stale catalog probe duplicates work already done
-            // by resolve_table_cached (Attack 3.A), causing a NET REGRESSION
-            // on INSERT (which has cheap analyze). The library code at
-            // axiomdb_sql::statement_cache is still useful: SELECT-heavy
-            // workloads benefit (+60% on point_lookup). A correct re-wire
-            // needs the cached plan to carry resolved table_defs so the
-            // executor can skip its own resolve_table call — deferred.
+            // Attack 20: route SELECTs through the per-session statement
+            // cache. The PlanDeps.is_stale catalog probe added net cost on
+            // INSERTs in the original Attack 2 wiring (analyze for INSERT
+            // is already cheap), so we gate the cache to SELECT only —
+            // where the analyze + plan cost dominates (~150-200µs for an
+            // autocommit query). Other statements take the legacy path.
+            //
+            // A cheap parse-prefix sniff avoids paying the lexer+parser
+            // round trip on non-SELECT branches; the real parse runs once
+            // inside whichever path we pick.
+            if sql_starts_with_select_keyword(sql) {
+                return axiomdb_sql::statement_cache::run_cached(
+                    sql,
+                    &self.storage,
+                    &self.txn,
+                    &self.bloom,
+                    &mut self.schema_cache,
+                    &mut self.session,
+                );
+            }
             let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
             let snap = if let Some(ref ct) = self.session.conn_txn {
                 self.txn.active_snapshot(ct)
@@ -584,6 +594,30 @@ mod db {
             || lower.starts_with("rollback")
             || lower.starts_with("savepoint")
             || lower.starts_with("release")
+    }
+
+    /// Attack 20: cheap prefix sniff — does the SQL start with `SELECT`
+    /// (case-insensitive, leading whitespace tolerated)?
+    ///
+    /// Used to gate the statement-cache fast path. Catches the common
+    /// `SELECT ...` form (autocommit OLTP) and bypasses the cache for
+    /// everything else (DDL, DML, transaction control) where the cache
+    /// either doesn't apply or has been shown to net-regress (Attack 2's
+    /// outcome for INSERT). Conservative: doesn't catch `(SELECT ...)`
+    /// or `WITH ... SELECT` — those fall back to the legacy path, which
+    /// is correct (the legacy path always works).
+    fn sql_starts_with_select_keyword(sql: &str) -> bool {
+        let s = sql.trim_start().as_bytes();
+        s.len() >= 6
+            && s[0].eq_ignore_ascii_case(&b'S')
+            && s[1].eq_ignore_ascii_case(&b'E')
+            && s[2].eq_ignore_ascii_case(&b'L')
+            && s[3].eq_ignore_ascii_case(&b'E')
+            && s[4].eq_ignore_ascii_case(&b'C')
+            && s[5].eq_ignore_ascii_case(&b'T')
+            // The next char must NOT be an identifier continuation (so we
+            // don't match `SELECTED` or `SELECT_VALUE`).
+            && s.get(6).is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
     }
 
     fn resolve_local_dsn_path(dsn: &str) -> Result<PathBuf, DbError> {

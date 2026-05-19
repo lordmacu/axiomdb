@@ -1214,6 +1214,66 @@ callback API.
   cache) which eliminates parse+analyze+plan for repeated query
   shapes. Shipping A19 first lays the storage groundwork.
 
+## Attack 20 — autocommit SELECT statement cache (re-wire)
+
+### Why
+
+Repeated autocommit SELECTs (`SELECT ... WHERE id = N` with different
+N's) re-parse, re-analyze, and re-plan every time — ~200µs of
+pipeline overhead per query. The library code for
+`statement_cache::run_cached` existed since Attack 2 but was
+unwired after a prior attempt regressed INSERT performance (analyze
+for INSERT is already cheap; the cache's `PlanDeps.is_stale` probe
+added net cost there).
+
+The previous fix-it-everywhere wiring saw `+60% on point_lookup`
+already (per the comment that disabled it). A SELECT-only gate
+captures the win without the INSERT regression.
+
+### Change
+
+- `Db::run_inner` now sniffs the SQL prefix with
+  `sql_starts_with_select_keyword` (cheap byte compare, tolerates
+  leading whitespace, doesn't match `SELECT_VALUE` /
+  `SELECTED`/etc.). If true: route through
+  `statement_cache::run_cached` (parse → extract literals → hash
+  shape → cache lookup with `PlanDeps.is_stale` → reuse analyzed
+  plan with new literals).
+- Non-SELECT statements (DDL, INSERT, UPDATE, DELETE, transaction
+  control) keep the legacy `parse → analyze_cached → execute_with_ctx`
+  path.
+
+### Results — macOS APFS native (2026-05-19)
+
+| Scenario | Pre-A20 | Post-A20 (median 3-5) | A20 Speedup | Cumulative vs original baseline |
+|---|---:|---:|---:|---:|
+| `point_lookup` 100×SELECT | 4.5K ops/s | **14.5K ops/s** | 3.2× | **3.2×** |
+| `count_star` SELECT COUNT(*) | 2.3K ops/s | **~5K ops/s** | 2.1× | **3.1×** (1.5× × 2.1×) |
+| `range_scan` 1K-of-10K | 1.42M ops/s | **2.98M ops/s** | 2.1× | **8.3×** (4× × 2.1×) |
+| `insert_autocommit` 300×INSERT | 8.7K → 10K ops/s | unchanged (gated off) | — | — |
+
+Range scan vs SQLite (10.4M ops/s) tightens from **30×** → **3.5×**.
+Point lookup vs SQLite (112K ops/s) tightens from **25×** → **7.7×**.
+
+### Honest read
+
+- The win comes from skipping ~150µs of analyze+plan per query —
+  this is the dominant cost in autocommit SELECT, as A17 and A19
+  diagnosed.
+- The cache is per-session (HashMap by shape_hash), capped at 256
+  entries (PostgreSQL's default), LRU-evicted. Cache hits are O(1)
+  HashMap lookup + O(1) `PlanDeps.is_stale` per dep (typically 1-3
+  tables = 1-3 catalog reads).
+- Stale detection: `PlanDeps.is_stale` compares cached
+  `schema_version` per table; DDL bumps the version so any DDL
+  evicts dependent plans on next lookup.
+- INSERT/UPDATE/DELETE not yet covered. Re-wiring those needs the
+  cached plan to carry the analyzer's `ResolvedTable` so the
+  executor can skip its own `resolve_table_cached` — the original
+  source of the INSERT regression. Deferred to a future attack.
+- Lima invisible (analyze+plan there is ~100µs already cheap due
+  to less I/O latency).
+
 ## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
 
 ### Why
