@@ -609,6 +609,150 @@ pub fn lookup_with_hint(
     }))
 }
 
+/// Attack 19: zero-alloc point lookup. Descends to the leaf,
+/// binary-searches for `key`, and if found+visible invokes `f` with
+/// the page-resident byte slice + overflow info + RowHeader. No
+/// `reconstruct_row_data` clone, no `cell.key.to_vec()`. Returns
+/// `true` if the row was visited (key matched and was visible),
+/// `false` otherwise.
+///
+/// The caller MUST consume `inline` (and read the overflow chain
+/// when present) inside the closure — once the closure returns, the
+/// page latch is released and the slice may be evicted.
+pub fn lookup_callback<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    snapshot: &TransactionSnapshot,
+    mut f: F,
+) -> Result<bool, DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>, &RowHeader) -> Result<(), DbError>,
+{
+    let Some(root_pid) = root_pid else {
+        return Ok(false);
+    };
+
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+    let pos = match leaf_search_checked(&leaf, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(false),
+    };
+
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    if !cell.row_header.is_visible(snapshot) {
+        return Ok(false);
+    }
+
+    let overflow = match (
+        cell.total_row_len.cmp(&cell.row_data.len()),
+        cell.overflow_first_page,
+    ) {
+        (std::cmp::Ordering::Greater, Some(fp)) => {
+            Some((fp, cell.total_row_len - cell.row_data.len()))
+        }
+        _ => None,
+    };
+    f(cell.row_data, overflow, &cell.row_header)?;
+    Ok(true)
+}
+
+/// Hint-aware counterpart to [`lookup_callback`]. Tries the cached
+/// leaf first; falls back to `lookup_callback` on miss/stale. The
+/// closure semantics match `lookup_callback`.
+pub fn lookup_callback_with_hint<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    table_id: u32,
+    schema_version: u64,
+    snapshot: &TransactionSnapshot,
+    hint: &mut Option<LeafCursorHint>,
+    mut f: F,
+) -> Result<bool, DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>, &RowHeader) -> Result<(), DbError>,
+{
+    let Some(root_pid) = root_pid else {
+        return Ok(false);
+    };
+
+    // Fast path: hint covers `key`.
+    if let Some(h) = hint.as_ref() {
+        if h.table_id == table_id
+            && h.root_page_id == root_pid
+            && h.schema_version == schema_version
+            && key >= h.min_key.as_slice()
+            && key <= h.max_key.as_slice()
+        {
+            if let Ok(leaf) = storage.read_page(h.leaf_page_id) {
+                if let Ok(PageType::ClusteredLeaf) = clustered_page_type(&leaf) {
+                    if let Ok(Ok(pos)) = leaf_search_checked(&leaf, key) {
+                        let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+                        if !cell.row_header.is_visible(snapshot) {
+                            return Ok(false);
+                        }
+                        let overflow = match (
+                            cell.total_row_len.cmp(&cell.row_data.len()),
+                            cell.overflow_first_page,
+                        ) {
+                            (std::cmp::Ordering::Greater, Some(fp)) => {
+                                Some((fp, cell.total_row_len - cell.row_data.len()))
+                            }
+                            _ => None,
+                        };
+                        f(cell.row_data, overflow, &cell.row_header)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    // Slow path: full descent. Update hint to point at the leaf we touched.
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+    let leaf_pid = leaf.header().page_id;
+    let pos_result = leaf_search_checked(&leaf, key)?;
+
+    // Refresh hint from the leaf we just visited (min/max from cells).
+    let nc = clustered_leaf::num_cells(&leaf);
+    if nc > 0 {
+        if let (Ok(first), Ok(last)) = (
+            clustered_leaf::read_cell(&leaf, 0),
+            clustered_leaf::read_cell(&leaf, nc - 1),
+        ) {
+            *hint = Some(LeafCursorHint {
+                table_id,
+                root_page_id: root_pid,
+                leaf_page_id: leaf_pid,
+                min_key: first.key.to_vec(),
+                max_key: last.key.to_vec(),
+                schema_version,
+            });
+        }
+    }
+
+    let pos = match pos_result {
+        Ok(pos) => pos,
+        Err(_) => return Ok(false),
+    };
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    if !cell.row_header.is_visible(snapshot) {
+        return Ok(false);
+    }
+    let overflow = match (
+        cell.total_row_len.cmp(&cell.row_data.len()),
+        cell.overflow_first_page,
+    ) {
+        (std::cmp::Ordering::Greater, Some(fp)) => {
+            Some((fp, cell.total_row_len - cell.row_data.len()))
+        }
+        _ => None,
+    };
+    f(cell.row_data, overflow, &cell.row_header)?;
+    Ok(true)
+}
+
 /// Looks up the current physical row for `key` regardless of MVCC visibility.
 pub fn lookup_physical(
     storage: &dyn StorageEngine,

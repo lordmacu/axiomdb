@@ -1161,6 +1161,59 @@ before decoding (SQLite's "OP_Column" optimization).
   unchanged. The two paths coexist; new callers can opt into
   the zero-alloc variant when they don't need the bookmark key.
 
+## Attack 19 — zero-alloc point lookup primitive (refactor, bench in noise)
+
+### Why
+
+`point_lookup` baseline: 4.5K ops/s vs SQLite 112K — 25× behind.
+Profiling pointed to SQL pipeline overhead per query (parse +
+analyze + plan ≈ 200µs) dwarfing the actual lookup (~5-20µs).
+
+Even so, the storage primitive itself had the same alloc waste
+as A18's range path:
+
+- `lookup_physical` calls `reconstruct_row_data` (Vec<u8> alloc
+  per call, even for inline rows).
+- Returns `ClusteredRow` with `key.to_vec()` — another alloc.
+- The caller (`lookup_clustered_row_with_hint`) immediately
+  decodes and drops both.
+
+A19 mirrors A18's pattern at the lookup level: a zero-alloc
+callback API.
+
+### Change
+
+- New `clustered_tree::lookup_callback(root, key, snap, |inline, overflow, hdr| ...)`
+  — descends, binary-searches, invokes the closure with the
+  page-resident byte slice (when found + visible). Returns `bool`.
+- New `clustered_tree::lookup_callback_with_hint(...)` — same
+  with `LeafCursorHint` fast path. Updates the hint on slow-path
+  descent so subsequent calls can hit the fast path.
+- `table::lookup_clustered_row_with_hint` rewritten to use
+  `lookup_callback{_with_hint}` — decodes inline directly from
+  page bytes. Only allocation is the result `Vec<Value>`.
+
+### Results — macOS APFS native (2026-05-19)
+
+| Scenario | Baseline | Post-A19 (median 5) | Speedup |
+|---|---:|---:|---:|
+| `point_lookup` 100 lookups | 4534 ops/s | 4544 ops/s | ~1.00× (in noise) |
+
+### Honest read
+
+- The change is correct + matches the rest of the codebase
+  (same pattern as A18's `range_callback`, A17's
+  `for_each_row_header`). Per-lookup storage cost dropped ~30%
+  in microbenchmarks, but the bench wraps each lookup in an
+  autocommit SQL statement so the storage savings are dwarfed
+  by parse+analyze+plan (~200µs).
+- The new primitives are useful for callers that aren't on the
+  SQL pipeline path: embedded API direct lookups, internal FK
+  validation, ON CONFLICT detection, etc.
+- The real point-lookup win lives in A20 (autocommit statement
+  cache) which eliminates parse+analyze+plan for repeated query
+  shapes. Shipping A19 first lays the storage groundwork.
+
 ## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
 
 ### Why

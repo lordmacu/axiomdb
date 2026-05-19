@@ -636,3 +636,17 @@ per-row `ClusteredRow` struct.
 | `range_scan` 1K-of-10K (clustered PK) | 361K ops/s | **1.42M ops/s** | **4×** |
 
 This closes ~75% of the previous gap vs SQLite (10.4M ops/s).
+
+### Clustered Point Lookup Primitive (Attack 19)
+
+Same zero-alloc pattern applied to point lookups via the new
+`clustered_tree::lookup_callback{_with_hint}` API: descend, binary-search,
+invoke a closure with the page-resident slice — no row_data clone, no
+key.to_vec(). Used by `table::lookup_clustered_row_with_hint` and available
+for any caller off the SQL pipeline (FK validation, ON CONFLICT detection,
+embedded direct API).
+
+The benchmark `point_lookup` doesn't show a measurable win because each
+lookup is wrapped in an autocommit `SELECT ... WHERE id = N` SQL query —
+parse + analyze + plan dominate (~200µs/query) the storage cost (~5-20µs).
+Attack 20 (autocommit statement cache) addresses the real bottleneck.

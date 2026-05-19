@@ -414,6 +414,12 @@ pub fn lookup_clustered_row(
 /// Point lookup variant that consults / updates a per-session leaf
 /// hint (Attack 5 — `LeafCursorHint`). When the hint covers `pk_key`,
 /// skips the full B-tree descent and reads the cached leaf directly.
+///
+/// Attack 19: uses the zero-alloc `lookup_callback{_with_hint}` paths
+/// — decodes the row directly from the page slice. No
+/// `reconstruct_row_data` clone, no `cell.key.to_vec()` allocation
+/// per lookup. For inline rows (the common case on bench-sized rows)
+/// the only allocation is the result `Vec<Value>`.
 pub fn lookup_clustered_row_with_hint(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
@@ -423,29 +429,56 @@ pub fn lookup_clustered_row_with_hint(
     hint: Option<&mut Option<axiomdb_storage::clustered_tree::LeafCursorHint>>,
 ) -> Result<Option<(RecordId, Vec<Value>)>, DbError> {
     let col_types = column_data_types(columns);
-    let row_opt = match hint {
-        Some(slot) => axiomdb_storage::clustered_tree::lookup_with_hint(
+    let mut decoded: Option<Vec<Value>> = None;
+    let visited = match hint {
+        Some(slot) => axiomdb_storage::clustered_tree::lookup_callback_with_hint(
             storage,
             Some(table_def.root_page_id),
             pk_key,
             table_def.id,
             table_def.schema_version,
+            &snap,
             slot,
-        )?
-        .filter(|r| r.row_header.is_visible(&snap)),
-        None => axiomdb_storage::clustered_tree::lookup(
+            |inline, overflow, _hdr| {
+                decoded = Some(decode_with_overflow(storage, inline, overflow, &col_types)?);
+                Ok(())
+            },
+        )?,
+        None => axiomdb_storage::clustered_tree::lookup_callback(
             storage,
             Some(table_def.root_page_id),
             pk_key,
             &snap,
+            |inline, overflow, _hdr| {
+                decoded = Some(decode_with_overflow(storage, inline, overflow, &col_types)?);
+                Ok(())
+            },
         )?,
     };
-    match row_opt {
-        Some(row) => {
-            let values = decode_row(&row.row_data, &col_types)?;
-            Ok(Some((CLUSTERED_DUMMY_RID, values)))
+    if visited {
+        Ok(decoded.map(|v| (CLUSTERED_DUMMY_RID, v)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[inline]
+fn decode_with_overflow(
+    storage: &dyn StorageEngine,
+    inline: &[u8],
+    overflow: Option<(u64, usize)>,
+    col_types: &[axiomdb_types::DataType],
+) -> Result<Vec<Value>, DbError> {
+    match overflow {
+        None => decode_row(inline, col_types),
+        Some((first_page, tail_len)) => {
+            let mut buf = Vec::with_capacity(inline.len() + tail_len);
+            buf.extend_from_slice(inline);
+            buf.extend_from_slice(&axiomdb_storage::clustered_overflow::read_chain(
+                storage, first_page, tail_len,
+            )?);
+            decode_row(&buf, col_types)
         }
-        None => Ok(None),
     }
 }
 
