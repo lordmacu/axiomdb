@@ -347,19 +347,36 @@ pub(crate) fn apply_clustered_insert_rows(
                 }
                 if inserted > 0 {
                     fast_path_hits += inserted as u64;
-                    for inserted_row in &rows[row_idx..row_idx + inserted] {
-                        let new_image = axiomdb_wal::ClusteredRowImage::new(
-                            current_root,
-                            new_header,
-                            &inserted_row.encoded_row,
-                        );
-                        txn.record_clustered_insert(
-                            conn_txn,
-                            table_def.id,
-                            &inserted_row.primary_key_bytes,
-                            &new_image,
-                        )?;
+                    // Attack 15: build all ClusteredRowImage's first, then
+                    // emit a single batched WAL write. The previous per-row
+                    // record_clustered_insert loop did N separate
+                    // wal.append_with_buf calls — wasteful in the
+                    // rightmost-leaf fast path where every row already
+                    // shares the leaf and current_root.
+                    let images: Vec<axiomdb_wal::ClusteredRowImage> =
+                        rows[row_idx..row_idx + inserted]
+                            .iter()
+                            .map(|inserted_row| {
+                                axiomdb_wal::ClusteredRowImage::new(
+                                    current_root,
+                                    new_header,
+                                    &inserted_row.encoded_row,
+                                )
+                            })
+                            .collect();
+                    let wal_started = debug_clustered_insert.then(Instant::now);
+                    let entries: Vec<(&[u8], &axiomdb_wal::ClusteredRowImage)> = rows
+                        [row_idx..row_idx + inserted]
+                        .iter()
+                        .zip(images.iter())
+                        .map(|(row, image)| (row.primary_key_bytes.as_slice(), image))
+                        .collect();
+                    txn.record_clustered_insert_batch(conn_txn, table_def.id, &entries)?;
+                    if let Some(started) = wal_started {
+                        tree_insert_time += started.elapsed();
+                    }
 
+                    for inserted_row in &rows[row_idx..row_idx + inserted] {
                         let secondary_elapsed =
                             maintain_clustered_secondary_inserts_deferred(
                                 storage,

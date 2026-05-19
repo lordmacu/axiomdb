@@ -991,3 +991,65 @@ SQLite prepared-bind+step territory.
 - Lima virtio invisible to A14 too — the per-flush descent
   there is so cheap (~50µs fsync) that even 10× slower paths
   look fast.
+
+## Attack 15 — WAL batching for clustered inserts
+
+### Why
+
+Post-A14 macOS profile (5000 rows / 5 flushes, 24.7ms total):
+instrumented `lookup + tree + secondary + root_persist` =
+~4.4ms accounted; **20ms unaccounted** outside the per-flush
+timer. A big chunk lives in the fast-path's `for inserted_row`
+loop after `try_insert_rightmost_leaf_batch` succeeds:
+
+- Per-row `txn.record_clustered_insert` → per-row
+  `wal.append_with_buf` → header serialize + payload alloc + CRC.
+- Per-row `conn_txn.clustered_roots.insert` (HashMap, but redundant
+  N times for the same key in a flush).
+- Per-row `conn_txn.undo_ops.push` (Vec alloc per entry).
+
+The WAL crate already had this pattern solved for updates
+(`record_clustered_update_batch`) and field patches: reserve N
+LSNs once, serialize all entries into `wal_scratch`, single
+`wal.write_batch()`. The insert path just never adopted it.
+
+### Change
+
+New `TxnManager::record_clustered_insert_batch(conn_txn, table_id, inserts: &[(key, image)])`:
+
+- Reserves N LSNs once via `wal.reserve_lsns(n)`.
+- Serializes all N entries into `conn_txn.wal_scratch`.
+- Single `wal.write_batch()`.
+- Mirrors the existing batch APIs byte-for-byte; crash recovery
+  is unchanged (decoder walks entries by LSN).
+
+`apply_clustered_insert_rows` fast-path block: build all
+`ClusteredRowImage`s for the batch, collect `(key, &image)`
+pairs, call the new batch API once. Per-row loop only retained
+for secondary index maintenance (which is already deferred via
+Attack 10/11).
+
+### Results — macOS APFS native (2026-05-19, stacked on A13+A14)
+
+| Scenario | Pre-A13 | Post-A14 | Post-A15 (median 3) | A15 vs A14 | Cumulative |
+|---|---:|---:|---:|---:|---:|
+| `insert_appender_large` 5K | 43.8K ops/s | 192K ops/s | **244K ops/s** | 1.27× | **5.6×** |
+| `insert_appender_large` 50K | 49.1K ops/s | 457K ops/s | ~448K ops/s | noise | **9.1×** |
+
+Win shrinks at 50K because the dominant remaining cost is the
+B-tree descent for non-fast-path edge rows (~10ms once per
+~1024-row run, amortized across larger batches).
+
+### Honest read
+
+- A15 is correct + consistent with the rest of the codebase
+  (same pattern as `record_clustered_update_batch`,
+  `record_clustered_field_patch_batch`) but the perf win is
+  smaller than expected — ~20% at 5K, in noise at 50K.
+- The bulk of the residual unaccounted time is in
+  `prepare_row_with_ctx` (value coercion + encoding) and the
+  Appender's own append_row buffering. Those are next
+  candidates if we want to squeeze more.
+- Lima invisible (per-row WAL append is ~5µs there, so
+  batching wins ~3-4µs/row which is below the bench's
+  resolution).

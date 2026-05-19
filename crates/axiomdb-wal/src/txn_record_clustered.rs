@@ -25,6 +25,54 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Batch version of `record_clustered_insert` — accumulates N entries
+    /// into a single `write_batch()` call. WAL entries are byte-identical
+    /// to N individual calls; crash recovery is unchanged.
+    ///
+    /// Each element: `(key, image)`. All entries share `table_id`.
+    ///
+    /// Attack 15: collapses per-row WAL append overhead in the Appender
+    /// and bulk INSERT paths.
+    pub fn record_clustered_insert_batch(
+        &self,
+        conn_txn: &mut ConnectionTxn,
+        table_id: u32,
+        inserts: &[(&[u8], &ClusteredRowImage)],
+    ) -> Result<(), DbError> {
+        let n = inserts.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let txn_id = conn_txn.txn_id;
+        let lsn_base = self.wal.reserve_lsns(n);
+        conn_txn.wal_scratch.clear();
+
+        for (i, (key, new_row)) in inserts.iter().enumerate() {
+            let entry = WalEntry::new(
+                lsn_base + i as u64,
+                txn_id,
+                EntryType::ClusteredInsert,
+                table_id,
+                key.to_vec(),
+                vec![],
+                new_row.to_bytes()?,
+            );
+            entry.serialize_into(&mut conn_txn.wal_scratch);
+        }
+
+        self.wal.write_batch(lsn_base, &conn_txn.wal_scratch)?;
+
+        for (key, new_row) in inserts {
+            conn_txn.clustered_roots.insert(table_id, new_row.root_pid);
+            conn_txn.undo_ops.push(UndoOp::UndoClusteredInsert {
+                table_id,
+                key: key.to_vec(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn record_clustered_delete_mark(
         &self,
         conn_txn: &mut ConnectionTxn,
