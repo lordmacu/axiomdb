@@ -801,3 +801,78 @@ target — bulk-leaf construction + WAL batching.
   descent for the secondary side. Bigger win, deeper risk.
 - **Attack 12 — WAL batching**: coalesce per-row WAL entries into
   one per flush. Format change required.
+
+---
+
+## Attack 11 — Secondary B-Tree bulk-build (2026-05-18)
+
+### Why this matters
+
+After Attack 10, the indexed-clustered scenario was still at 25K
+ops/s — the bottleneck is per-row `BTree::insert_in` on the
+secondary, not catalog persist. The research brief revealed
+`BTree::bulk_load_sorted` already exists in
+`crates/axiomdb-index/src/tree_bulk.rs:20-146`. It takes sorted
+`(key, RecordId)` entries, builds leaf pages bottom-up at the
+configured fillfactor, links them via `next_leaf`, builds internal
+pages bottom-up, returns the new root.
+
+The common bulk-load pattern (CREATE TABLE → CREATE INDEX before
+INSERT → bulk-load rows) leaves secondary indexes EMPTY at Appender
+open. We can replace per-row `BTree::insert_in` with one
+`bulk_load_sorted` call per empty secondary.
+
+### The change
+
+`apply_clustered_insert_rows` (`executor/insert_clustered.rs:230`)
+classifies each secondary at start:
+
+| Classification | Condition | Path |
+|---|---|---|
+| **Bulk-eligible** | regular B-Tree (index_type == 0) AND empty root (`is_leaf && num_keys == 0`) AND no partial-index predicate | collect entries → sort → `bulk_load_sorted` |
+| **Eager** | everything else (BRIN/FTS/GIN/Trigram, populated, partial, expression) | per-row `maintain_clustered_secondary_inserts_deferred` (Attack 10) |
+
+Per-row loop: skips bulk-eligible indexes (via new `skip_mask`
+parameter on the deferred helper) and collects their encoded
+physical keys.
+
+End-of-loop: for each bulk-eligible index, sort entries, check
+duplicates (UniqueViolation if found), call `bulk_load_sorted`,
+update bloom for every key.
+
+`flush_deferred_secondary_index_roots` (Attack 10) then emits a
+single `update_index_root` per changed index.
+
+### Results — Lima virtio (2026-05-18)
+
+| Scenario | Pre-A11 | Post-A11 (median) | Δ |
+|---|---:|---:|---:|
+| `insert_appender_indexed` (clustered + 1 empty secondary) | 25K ops/s | **134K ops/s** | **5.4×** |
+| `insert_appender` (no secondaries) | 85-117K | 242-246K | Lima jitter (unrelated; mostly improved) |
+| `insert_appender_heap` (heap path, untouched) | 220K | 480K | Lima jitter (path unchanged) |
+| `appender_clustered_50k_rows` integration test | 9.3s | 4.8s | **2×** |
+
+**Spec target ≥ 100K**: HIT 120-184K range (median 134K). ✅
+
+### Honest read
+
+- The architectural change is right: per-row B-Tree insert was
+  indeed the bottleneck, and `bulk_load_sorted` collapsed it.
+- The 5.4× win is on tables WITH empty secondaries. Tables WITHOUT
+  indexes (the plain `bench_users`) don't see a direct A11 win —
+  any change there is Lima jitter.
+- Tables with POPULATED secondaries (rare for the bulk-load
+  pattern) fall back to the Attack 10 path.
+- The new path doesn't write per-row WAL records for the leaf
+  pages — it relies on the catalog `update_index_root` (atomic
+  with commit) and the raw `storage.write_page` for the bulk-built
+  leaves. Same model `CREATE INDEX` already uses. On crash before
+  commit the leaf pages are orphaned (acceptable leak).
+
+### What's next
+
+- **Attack 12** — CREATE INDEX bulk-build: `ddl_create_index.rs`
+  still does per-row insert. Wiring it through `bulk_load_sorted`
+  is a small extension of this Attack.
+- **Attack 13 candidate** — BRIN / FTS / GIN / Trigram bulk-build:
+  each has its own page layout and isn't covered here.

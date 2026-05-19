@@ -560,6 +560,14 @@ pub(crate) fn apply_clustered_insert_rows(
 /// Returns `true` if a secondary index is eligible for bulk-build via
 /// `BTree::bulk_load_sorted`. Requirements:
 /// - Regular B-Tree index (idx.index_type == 0)
+/// - NOT UNIQUE — UNIQUE indexes require logical-key dedup against the
+///   existing tree (which is empty here, fine) AND against each other
+///   within the batch. Our duplicate check on physical_key MISSES the
+///   intra-batch case because physical_key = logical_key + PK_suffix
+///   (so two rows with the same indexed value but different PKs have
+///   different physical keys). Falling back to the per-row path uses
+///   `ensure_unique_logical_key_absent` which checks logical keys
+///   correctly.
 /// - No partial-index predicate (we'd need to evaluate per row)
 /// - The B-Tree's root page is an empty leaf
 /// - Not BRIN / FTS / GIN / Trigram
@@ -570,6 +578,9 @@ fn is_bulk_build_eligible(
 ) -> bool {
     // index_type: 0 = regular B-Tree; 1 = BRIN; 2 = Trigram; 3 = FTS; 4 = GIN
     if idx.index_type != 0 {
+        return false;
+    }
+    if idx.is_unique {
         return false;
     }
     if compiled_pred.is_some() {
@@ -633,18 +644,17 @@ fn bulk_build_eligible_secondaries(
         // Sort by physical_key.
         let mut sorted = entries;
         sorted.sort_unstable();
-        // Duplicate detection — physical_key already encodes the PK
-        // suffix for non-unique indexes, so duplicates here mean an
-        // actual UNIQUE violation OR identical PK (which can't happen
-        // since the primary tree already rejected it).
-        for window in sorted.windows(2) {
-            if window[0] == window[1] {
-                return Err(DbError::UniqueViolation {
-                    index_name: idx.name.clone(),
-                    value: None,
-                });
-            }
-        }
+        // Duplicate detection — physical_key includes the PK suffix
+        // so duplicates can only happen if the SAME row was processed
+        // twice (a bug above us) or if the PK was re-used (the primary
+        // tree would have rejected it first). UNIQUE indexes are
+        // excluded from this path (see is_bulk_build_eligible), so
+        // logical-key dedup isn't our responsibility here. If a
+        // duplicate slips through it's a real corruption signal.
+        debug_assert!(
+            sorted.windows(2).all(|w| w[0] != w[1]),
+            "non-unique index has duplicate physical_key after sort — corruption?"
+        );
         // bulk_load_sorted wants &[(&[u8], RecordId)]; build a Vec of
         // references with the secondary's DUMMY_RID (page_id=0, slot_id=0).
         let dummy_rid = axiomdb_core::RecordId {
