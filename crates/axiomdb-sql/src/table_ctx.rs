@@ -180,7 +180,10 @@ impl TableEngine {
         indexes: &[axiomdb_catalog::IndexDef],
         ctx: &mut SessionContext,
         conn_txn: &mut axiomdb_wal::ConnectionTxn,
-        batch: &[Vec<Value>],
+        // Attack 16: take ownership so prepare_row_with_ctx can move
+        // the inner Vec<Value> instead of cloning it. The sole caller
+        // (Appender::flush) already owns the batch via mem::take.
+        batch: Vec<Vec<Value>>,
     ) -> Result<u64, DbError> {
         if batch.is_empty() {
             return Ok(0);
@@ -199,17 +202,18 @@ impl TableEngine {
         let compiled_preds =
             crate::partial_index::compile_index_predicates(&secondary_indexes, columns)?;
 
-        // Prepare each row: encode + extract primary key.
+        // Prepare each row: encode + extract primary key. Owned Vec<Value>
+        // moves into the prepared row (A16) and we skip re-coercion since
+        // the Appender already ran `coerce_values_with_ctx` in
+        // `append_row_owned` (A16b — eliminates the double-coerce).
         let mut prepared: Vec<crate::clustered_table::PreparedClusteredInsertRow> =
             Vec::with_capacity(batch.len());
-        for (i, values) in batch.iter().enumerate() {
-            let p = crate::clustered_table::prepare_row_with_ctx(
-                values.clone(),
+        for values in batch.into_iter() {
+            let p = crate::clustered_table::prepare_row_already_coerced(
+                values,
                 columns,
                 primary_idx,
                 &table_def.table_name,
-                ctx,
-                i + 1,
             )?;
             prepared.push(p);
         }

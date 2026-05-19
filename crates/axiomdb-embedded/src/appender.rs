@@ -400,7 +400,7 @@ impl<'db> Appender<'db> {
                 &all_indexes,
                 &mut self.db.session,
                 conn_txn,
-                &batch,
+                batch,
             )?;
             self.rows_inserted += count;
             // `all_indexes` is dropped — the helper updated its own

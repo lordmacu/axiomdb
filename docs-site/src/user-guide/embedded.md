@@ -249,13 +249,15 @@ breakdown.
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Deferred catalog persist + cross-flush fast-path + WAL batching (A13–A15)</span>
+<span class="callout-label">Deferred catalog persist + cross-flush fast-path + WAL batching + no double-coerce (A13–A16)</span>
 On the clustered path, the Appender (a) defers the per-flush
 <code>update_table_root</code> catalog write to <code>finish()</code>
 (A13), (b) preserves the rightmost-leaf hint across flushes
-via the per-connection root map (A14), and (c) collapses
+via the per-connection root map (A14), (c) collapses
 per-row WAL appends into a single <code>write_batch()</code> in the
-fast path (A15). Combined effect on macOS APFS native:
+fast path (A15), and (d) skips re-coercing rows that the
+Appender already coerced at <code>append_row</code> time (A16, refactor).
+Combined effect on macOS APFS native:
 <strong>5.6× speedup at 5K rows (244K ops/s)</strong> and
 <strong>9.1× at 50K rows (~448K ops/s)</strong> — in SQLite
 prepared-bind+step territory. Crash safety unchanged (WAL

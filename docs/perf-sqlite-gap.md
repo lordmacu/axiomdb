@@ -1053,3 +1053,49 @@ B-tree descent for non-fast-path edge rows (~10ms once per
 - Lima invisible (per-row WAL append is ~5µs there, so
   batching wins ~3-4µs/row which is below the bench's
   resolution).
+
+## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
+
+### Why
+
+Two wasted work items in the Appender batch path, both correct
+to remove but not cleanly measurable in the current macOS bench
+(variance is now ~30-40% run-to-run; thermal+disk state):
+
+1. `insert_clustered_rows_batch_with_ctx` took `&[Vec<Value>]`
+   and called `values.clone()` per row. The sole caller
+   (`Appender::flush`) already does `std::mem::take(&mut self.buffer)`,
+   so it owns the Vec — the clone was pure waste (deep-copying
+   inner Strings/Vecs per row).
+2. The same path then called `prepare_row_with_ctx(values, ...)`
+   which invoked `coerce_values_with_ctx` AGAIN, even though
+   `Appender::append_row_owned` had already coerced the row at
+   buffer time. Double-coerce per row.
+
+### Change
+
+- A16: `insert_clustered_rows_batch_with_ctx` takes
+  `batch: Vec<Vec<Value>>` (owned); the loop uses `into_iter()`.
+- A16b: New helper `prepare_row_already_coerced` calls
+  `encode_prepared_row` directly without re-coercing.
+  The Appender path uses this; SQL INSERT path still uses the
+  full `prepare_row_with_ctx`.
+
+### Results
+
+| Bench | Result |
+|---|---|
+| Tests | 85/85 axiomdb-embedded, no regressions |
+| Clippy | clean |
+| 5K rows | Within ~5% of A15 baseline (bench too noisy to call) |
+| 50K rows | Within ±15% (bench too noisy to call) |
+
+### Honest read
+
+- The change is unequivocally less work per row (one less Vec
+  deep-clone, one less coerce-loop pass). Whether the bench
+  CAN measure it depends on whether the SSD/thermal state is
+  stable.
+- Shipping as a refactor + correctness improvement; not
+  claiming a perf number until we can re-bench from a clean
+  cold state.
