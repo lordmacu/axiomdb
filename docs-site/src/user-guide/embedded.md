@@ -493,6 +493,41 @@ lib.axiomdb_rows_free(rows)
 lib.axiomdb_close(db)
 ```
 
+#### Python — high-level wrapper (`bindings/python/axiomdb.py`)
+
+The repo ships a ready-to-use ctypes wrapper that exposes both `AxiomDB`
+(SQL + queries) and `Appender` (fast-path INSERT):
+
+```python
+from axiomdb import AxiomDB
+
+with AxiomDB("./app.db") as db:
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    # SQL INSERT (slow path):
+    db.execute("INSERT INTO users VALUES (1, 'Alice')")
+
+    # Appender fast-path (~5-50× faster for bulk loads):
+    with db.appender("users") as app:
+        for i in range(2, 10_002):
+            app.append_row(i, f"user_{i:06}")
+        # finish() called automatically on __exit__
+
+    for row in db.query("SELECT COUNT(*) FROM users"):
+        print(row)
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Python speedup</span>
+<code>bindings/python/example_appender.py</code> on Lima virtio
+shows the Appender at <strong>~53K rows/s</strong> vs ~4-6K for
+SQL <code>INSERT</code> autocommit — a <strong>~10-13× speedup</strong>
+from Python. The C FFI overhead between Python and the Rust engine
+is minimal; the win comes from skipping the SQL pipeline entirely.
+</div>
+</div>
+
 ---
 
 ## Build the shared library
