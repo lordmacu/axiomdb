@@ -1105,6 +1105,62 @@ The per-cell visibility check is no longer the dominant cost.
 - The heap path (`HeapChain::count_visible`) was already inlined
   with `bytemuck::from_bytes`; no change needed there.
 
+## Attack 18 — zero-alloc clustered range scan (`range_callback`)
+
+### Why
+
+`range_scan` baseline (`SELECT * FROM bench_users WHERE id >= X AND
+id < Y`, 1K matching rows out of 10K): **361K ops/s** vs SQLite
+**10.4M ops/s** — 30× behind. Profile pointed to per-row allocations
+in the `ClusteredRangeIter` path:
+
+- `reconstruct_row_data` allocates `Vec<u8>` per row even for inline
+  rows (clones page bytes into a fresh Vec).
+- `cell.key.to_vec()` clones the primary key bytes the caller
+  immediately throws away.
+- `ClusteredRow { ... }` per-row struct construction.
+- Iterator state machine (loop with explicit `IterResult`) adds
+  per-row overhead.
+
+`scan_all_callback` already solved this for full scans — yields
+inline page slice + overflow info via a closure. Just no
+range-bounded variant existed.
+
+### Change
+
+- New `clustered_tree::range_callback(from, to, snap, |inline, overflow| ...)`
+  — descends via `find_start_position` to the leaf containing `from`,
+  walks leaves until `to` is exceeded, yields cell bytes via the
+  closure. Same prefetch + page-lock pattern as `scan_all_callback`.
+- `table::range_clustered_table` rewritten to use it: decode inline
+  rows directly from the page slice (no per-row alloc), only allocate
+  for overflow tail (rare on bench-sized rows).
+
+### Results — macOS APFS native (2026-05-19)
+
+| Scenario | Baseline | Post-A18 (median 3) | Speedup |
+|---|---:|---:|---:|
+| `range_scan` 1K-of-10K | 361K ops/s | **1.42M ops/s** | **4×** |
+
+Gap vs SQLite (10.4M ops/s) tightens from **30×** to **7×**.
+The remaining cost is per-row `decode_row` (column-by-column
+parse + Value::Int/Text alloc) — a future attack could fuse
+WHERE evaluation into the byte parse to skip non-matching rows
+before decoding (SQLite's "OP_Column" optimization).
+
+### Honest read
+
+- This is the largest read-path win since A11 inserts (5.4×).
+  The architecture was correct (`scan_all_callback` already had
+  the pattern) — just a missing range-bounded twin.
+- The 4× holds across iteration variance (1.36M-1.45M ops/s in
+  3 runs). Less noisy than the count_star bench because the
+  range scan is doing meaningful work per call (1000 row decodes).
+- `update_in_place`, range-scan via `range()` iterator, and the
+  rest of the codebase that relied on `ClusteredRow` keys are
+  unchanged. The two paths coexist; new callers can opt into
+  the zero-alloc variant when they don't need the bookmark key.
+
 ## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
 
 ### Why

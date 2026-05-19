@@ -450,6 +450,14 @@ pub fn lookup_clustered_row_with_hint(
 }
 
 /// Range scan on a clustered B-tree by primary key bounds.
+///
+/// Attack 18: uses the zero-alloc `range_callback` path. For rows
+/// without overflow tails (the common case), the page slice is
+/// decoded in place — no `reconstruct_row_data` clone, no
+/// `key.to_vec()`, no `ClusteredRangeIter` allocation. Saves
+/// ~2 heap allocations per returned row vs the previous iterator
+/// path. Overflow tails (rare on small rows) still allocate once
+/// to splice inline + overflow into a contiguous buffer.
 pub fn range_clustered_table(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
@@ -468,19 +476,33 @@ pub fn range_clustered_table(
         Some(k) => Bound::Included(k.to_vec()),
         None => Bound::Unbounded,
     };
-    let iter = axiomdb_storage::clustered_tree::range(
+    let mut result: Vec<(RecordId, Vec<Value>)> = Vec::new();
+    let mut overflow_scratch: Vec<u8> = Vec::new();
+    axiomdb_storage::clustered_tree::range_callback(
         storage,
         Some(table_def.root_page_id),
         from,
         to,
         &snap,
+        |inline, overflow| {
+            let values = match overflow {
+                None => decode_row(inline, &col_types)?,
+                Some((first_page, tail_len)) => {
+                    overflow_scratch.clear();
+                    overflow_scratch.reserve(inline.len() + tail_len);
+                    overflow_scratch.extend_from_slice(inline);
+                    overflow_scratch.extend_from_slice(
+                        &axiomdb_storage::clustered_overflow::read_chain(
+                            storage, first_page, tail_len,
+                        )?,
+                    );
+                    decode_row(&overflow_scratch, &col_types)?
+                }
+            };
+            result.push((CLUSTERED_DUMMY_RID, values));
+            Ok(())
+        },
     )?;
-    let mut result = Vec::new();
-    for row_result in iter {
-        let row = row_result?;
-        let values = decode_row(&row.row_data, &col_types)?;
-        result.push((CLUSTERED_DUMMY_RID, values));
-    }
     Ok(result)
 }
 

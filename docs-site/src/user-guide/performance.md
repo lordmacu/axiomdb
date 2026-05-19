@@ -621,3 +621,18 @@ no `CellRef` construction — just the visibility check inlined per cell.
 
 The remaining ~60× gap vs SQLite lives in the SQL pipeline overhead (parse +
 analyze + plan per autocommit query), not in the count itself.
+
+### Clustered Range Scan (Attack 18)
+
+`SELECT * FROM t WHERE id BETWEEN X AND Y` on a clustered (PRIMARY KEY) table
+now uses `clustered_tree::range_callback` — a zero-alloc range iterator that
+yields page-resident byte slices via a closure. For rows without overflow
+tails (the common case on bench-sized rows), `decode_row` runs directly on
+the page slice — no `reconstruct_row_data` clone, no `key.to_vec()`, no
+per-row `ClusteredRow` struct.
+
+| Scenario | Pre-A18 | Post-A18 | Speedup |
+|---|---:|---:|---:|
+| `range_scan` 1K-of-10K (clustered PK) | 361K ops/s | **1.42M ops/s** | **4×** |
+
+This closes ~75% of the previous gap vs SQLite (10.4M ops/s).

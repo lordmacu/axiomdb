@@ -786,6 +786,139 @@ where
     Ok(())
 }
 
+/// Attack 18: range-bounded counterpart to [`scan_all_callback`].
+///
+/// Descends to the leaf containing `from` (via `find_start_position`),
+/// then yields inline row data + overflow tail (when present) for every
+/// visible cell with key in `[from, to]`. Stops as soon as the upper
+/// bound is exceeded. Inline-only rows (the common case) require zero
+/// heap allocations per row — callers decode directly from the
+/// `&[u8]` slice into the page.
+///
+/// Use this when the result needs only the row payload (no key bookmark
+/// for downstream lookups). Mirrors PostgreSQL's `index_getnext_slot`
+/// path which streams tuples without intermediate key copies.
+pub fn range_callback<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    from: Bound<Vec<u8>>,
+    to: Bound<Vec<u8>>,
+    snapshot: &TransactionSnapshot,
+    mut f: F,
+) -> Result<(), DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>) -> Result<(), DbError>,
+{
+    if bounds_empty(&from, &to) {
+        return Ok(());
+    }
+    let Some(root_pid) = root_pid else {
+        return Ok(());
+    };
+
+    let (start_pid, start_slot) = find_start_position(storage, root_pid, &from)?;
+    let mut current_pid = start_pid;
+    let mut slot_idx = start_slot;
+    let mut current_latch = None;
+    let mut next_leaf_cache = clustered_leaf::NULL_PAGE;
+
+    let above_lower = |key: &[u8]| -> bool {
+        match &from {
+            Bound::Included(k) => key >= k.as_slice(),
+            Bound::Excluded(k) => key > k.as_slice(),
+            Bound::Unbounded => true,
+        }
+    };
+    let below_upper = |key: &[u8]| -> bool {
+        match &to {
+            Bound::Included(k) => key <= k.as_slice(),
+            Bound::Excluded(k) => key < k.as_slice(),
+            Bound::Unbounded => true,
+        }
+    };
+
+    while current_pid != clustered_leaf::NULL_PAGE {
+        if current_latch.is_none() {
+            current_latch = Some(storage.page_lock_table().read(current_pid));
+        }
+
+        let page = storage.read_page(current_pid)?;
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => {}
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "range_callback expected leaf at page {current_pid}, found {other:?}"
+                    ),
+                });
+            }
+        }
+
+        if next_leaf_cache == clustered_leaf::NULL_PAGE {
+            next_leaf_cache = clustered_leaf::next_leaf(&page);
+        }
+
+        let num_cells = clustered_leaf::num_cells(&page) as usize;
+        let mut reached_upper = false;
+        while slot_idx < num_cells {
+            let cell = clustered_leaf::read_cell(&page, slot_idx as u16)?;
+            slot_idx += 1;
+
+            if !above_lower(cell.key) {
+                continue;
+            }
+            if !below_upper(cell.key) {
+                reached_upper = true;
+                break;
+            }
+            if !cell.row_header.is_visible(snapshot) {
+                continue;
+            }
+
+            let overflow = match (
+                cell.total_row_len.cmp(&cell.row_data.len()),
+                cell.overflow_first_page,
+            ) {
+                (std::cmp::Ordering::Greater, Some(fp)) => {
+                    Some((fp, cell.total_row_len - cell.row_data.len()))
+                }
+                _ => None,
+            };
+            f(cell.row_data, overflow)?;
+        }
+
+        if reached_upper {
+            return Ok(());
+        }
+
+        let next_pid = next_leaf_cache;
+        if next_pid != clustered_leaf::NULL_PAGE {
+            storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+            let next_guard = match storage.page_lock_table().try_read(next_pid) {
+                Some(guard) => {
+                    let old_guard = current_latch.replace(guard);
+                    drop(old_guard);
+                    None
+                }
+                None => {
+                    current_latch = None;
+                    Some(storage.page_lock_table().read(next_pid))
+                }
+            };
+            if let Some(guard) = next_guard {
+                current_latch = Some(guard);
+            }
+        } else {
+            current_latch = None;
+        }
+        current_pid = next_pid;
+        next_leaf_cache = clustered_leaf::NULL_PAGE;
+        slot_idx = 0;
+    }
+
+    Ok(())
+}
+
 /// Rewrites the current inline version of one clustered row in the owning leaf
 /// page without changing the primary key or tree structure.
 pub fn update_in_place(
