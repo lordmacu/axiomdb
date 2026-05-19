@@ -1054,6 +1054,57 @@ B-tree descent for non-fast-path edge rows (~10ms once per
   batching wins ~3-4µs/row which is below the bench's
   resolution).
 
+## Attack 17 — COUNT(*) header-only scan via `for_each_row_header`
+
+### Why
+
+Baseline `count_star` on a 10K-row clustered `bench_users`:
+**1.6K ops/s** vs SQLite **155K ops/s** = 97× slower. The old
+`count_clustered_visible` called `read_cell` per cell, which
+parses the cell-meta (key_len + total_row_len), builds a `CellRef`
+borrow, and copies the RowHeader. For 10K cells that's a lot of
+work to throw away the parsed key/payload immediately.
+
+### Change
+
+- New `clustered_leaf::for_each_row_header(page, |hdr| ...)` —
+  walks the cell-pointer array and yields only the 8-byte
+  RowHeader for each cell. Skips key+payload slicing, skips
+  `CellRef` construction, skips length-encoded payload parse.
+- `table::count_clustered_visible` rewritten to call this helper
+  with the visibility predicate inlined inside the closure.
+  Branch hierarchy (created_by_self → created_committed → not_deleted
+  → not_overwritten) hits the common cases (no active_ids, txn_id_deleted
+  == 0) in 2–3 branches per cell.
+
+### Results — macOS APFS native (2026-05-19)
+
+| Scenario | Baseline | Post-A17 | Speedup |
+|---|---:|---:|---:|
+| `count_star` 10K rows | 1.6K ops/s | **2.3K ops/s** | **1.5×** |
+
+The gain is honest but modest. Profiling reveals the remaining
+~400µs/query is split between:
+
+- ~150µs SQL pipeline (parse + analyze + plan)
+- ~100µs storage `read_page` × 13 leaves (mmap fault + checksum)
+- ~150µs misc executor overhead (result row builder, ctx invalidation)
+
+The per-cell visibility check is no longer the dominant cost.
+
+### Honest read
+
+- 1.5× is real but small relative to A11 / A14 wins. The
+  architectural change is right (header-only iteration is
+  fundamentally cheaper than full cell parse).
+- Closing the remaining ~60× gap vs SQLite requires either
+  (a) caching the count at the executor level (A17b) — invalidate
+  on INSERT/DELETE/UPDATE — would give O(1) for repeat queries
+  in the same session, or (b) per-leaf count summary in internal
+  nodes (page format change) for O(log N).
+- The heap path (`HeapChain::count_visible`) was already inlined
+  with `bytemuck::from_bytes`; no change needed there.
+
 ## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
 
 ### Why

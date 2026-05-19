@@ -607,3 +607,17 @@ and MySQL 8.0 (98K r/s) by 14×. The combination of <code>WalEntry::Truncate</co
 eliminates the two main costs in full-table deletion.
 </div>
 </div>
+
+### `SELECT COUNT(*)` Fast Path (Attack 17)
+
+The clustered-table `COUNT(*)` path bypasses the regular row-decode pipeline:
+it walks the leaf chain and visits only each cell's 8-byte `RowHeader`
+via `clustered_leaf::for_each_row_header`. No key slicing, no payload parse,
+no `CellRef` construction — just the visibility check inlined per cell.
+
+| Scenario | Pre-A17 | Post-A17 | Speedup |
+|---|---:|---:|---:|
+| `SELECT COUNT(*) FROM t` (10K rows, clustered) | 1.6K ops/s | **2.3K ops/s** | 1.5× |
+
+The remaining ~60× gap vs SQLite lives in the SQL pipeline overhead (parse +
+analyze + plan per autocommit query), not in the count itself.
