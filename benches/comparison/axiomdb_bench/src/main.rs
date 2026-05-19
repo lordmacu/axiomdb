@@ -224,6 +224,23 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, ac_n, mean, "appender, clustered (v1.1)");
         }
 
+        "create_index" => {
+            // Attack 12: CREATE INDEX timing on the canonical 5000-row
+            // bench_users table. Uses non-unique idx_email (the
+            // bulk-eligible case). UNIQUE indexes fall back to the
+            // per-row path.
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let inserts = gen_inserts(n_rows);
+                insert_batch_pure(&mut db, &inserts);
+                db_sql(&mut db, "DROP INDEX IF EXISTS idx_email");
+                let t0 = Instant::now();
+                db_sql(&mut db, "CREATE INDEX idx_email ON bench_users (email)");
+                t0.elapsed()
+            });
+            out(scenario, n_rows, mean, "CREATE INDEX on n_rows-row table");
+        }
+
         "insert_appender_indexed" => {
             // Attack 10 validation: clustered bench_users + a secondary
             // index. The deferred-secondary + catalog-batching wins are
