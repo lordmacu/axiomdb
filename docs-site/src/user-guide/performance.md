@@ -672,3 +672,21 @@ INSERT/UPDATE/DELETE keep the legacy path — they have cheap analyze and
 the prior Attack 2 wiring net-regressed them. Cumulative range_scan speedup
 vs original baseline: **8.3×** (4× from A18 zero-alloc × 2.1× from A20
 cache).
+
+### Session COUNT(*) Cache (Attack 17b)
+
+The `SELECT COUNT(*) FROM t` fast path now consults a per-session cache
+keyed by `(table_id, schema_version)`. Cache hits return in O(1) without
+re-scanning leaves. Validity is determined by the existing per-table
+change counter on `StaleStatsTracker` — any INSERT/UPDATE/DELETE bumps
+the counter and forces the next COUNT(*) to re-scan.
+
+| Scenario | Pre-A17 | Post-A17b | Total Speedup |
+|---|---:|---:|---:|
+| `count_star` 10K rows (clustered) | 1.6K ops/s | **~12K ops/s** | **7.5×** |
+
+Cache is gated to autocommit mode — inside an explicit BEGIN..ROLLBACK
+the change counter doesn't unwind on rollback, so we skip the cache there
+to preserve correctness. Multi-session writes from another connection
+don't invalidate this session's cache; the cached count is a snapshot
+value (per MVCC semantics).

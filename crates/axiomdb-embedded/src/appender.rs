@@ -421,6 +421,15 @@ impl<'db> Appender<'db> {
                 &batch,
             )?;
             self.rows_inserted += rids.len() as u64;
+            // Attack 17b: bump the per-table change counter so the
+            // session-level COUNT(*) cache invalidates on next read.
+            // The clustered branch above already routes through
+            // insert_clustered_rows_batch_with_ctx → table_ctx.rs which
+            // calls on_rows_changed; the heap path doesn't.
+            self.db
+                .session
+                .stats
+                .on_rows_changed(self.table_def.id, rids.len() as u64);
 
             // Step 5: secondary index maintenance. v1 supports regular B-Tree,
             // BRIN, FTS, GIN, and Trigram indexes — partial-index predicates

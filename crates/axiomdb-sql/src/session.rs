@@ -531,6 +531,14 @@ impl StaleStatsTracker {
         self.check_stale(table_id);
     }
 
+    /// Attack 17b: read the accumulated change counter for `table_id`.
+    /// Used by the COUNT(*) session cache as a cheap dirty-bit substitute
+    /// — the cache stores the change count seen at cache time and
+    /// compares against this on lookup; any mismatch is a miss.
+    pub fn changes_for(&self, table_id: u32) -> u64 {
+        self.changes.get(&table_id).copied().unwrap_or(0)
+    }
+
     /// Records multiple row changes at once (e.g. after batch DELETE).
     pub fn on_rows_changed(&mut self, table_id: u32, count: u64) {
         *self.changes.entry(table_id).or_insert(0) += count;
@@ -771,6 +779,16 @@ pub struct SessionContext {
     /// `invalidate_all` and `invalidate_table`. Mirrors SQLite's
     /// `BtCursor` cached metadata (BTCF_ValidNKey).
     clustered_leaf_hint: Option<axiomdb_storage::clustered_tree::LeafCursorHint>,
+    /// Attack 17b: per-table COUNT(*) cache. Stores
+    /// `(count, changes_count_at_cache_time, schema_version_at_cache_time)`
+    /// per table. The change counter doubles as a dirty bit: any
+    /// INSERT/UPDATE/DELETE through this session bumps
+    /// `stats.changes_for(table_id)`, which then mismatches the
+    /// cached value and forces a re-scan. DDL bumps `schema_version`
+    /// which also forces a miss. No invalidation hook needed —
+    /// callers don't have to touch this cache; correctness falls
+    /// out of the comparison on lookup.
+    count_star_cache: HashMap<u32, (u64, u64, u64)>,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -937,6 +955,7 @@ impl SessionContext {
             statement_cache: HashMap::new(),
             statement_lru_seq: 0,
             clustered_leaf_hint: None,
+            count_star_cache: HashMap::new(),
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,
@@ -1232,6 +1251,10 @@ impl SessionContext {
         // sees a mismatch (see `get_insert_col_positions`).
         if let Some(resolved) = self.cache.get(&Self::key(database, schema, table)) {
             self.heap_tail.remove(&resolved.def.id);
+            // Attack 17b: drop the cached COUNT(*) too — the schema_version
+            // tag would catch it on next lookup anyway, but evicting now
+            // keeps the HashMap small after a DDL on an unrelated session.
+            self.count_star_cache.remove(&resolved.def.id);
         }
         self.cache.remove(&Self::key(database, schema, table));
         // Attack 5: clear the leaf hint conservatively. Could be more
@@ -1243,6 +1266,10 @@ impl SessionContext {
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
         self.heap_tail.clear();
+        // Attack 17b: COUNT(*) cache is per-table, but `invalidate_all`
+        // is the DDL-fence path — schema_version may have bumped across
+        // many tables. Drop the lot.
+        self.count_star_cache.clear();
         // `insert_col_positions` is intentionally NOT cleared. Its entries
         // carry a schema_version stamp and get lazy-evicted on the next
         // lookup with a mismatching version (see get_insert_col_positions).
@@ -1471,6 +1498,30 @@ impl SessionContext {
     /// Clears the heap tail hint for a specific `table_id`.
     pub fn invalidate_heap_tail(&mut self, table_id: u32) {
         self.heap_tail.remove(&table_id);
+    }
+
+    /// Attack 17b: COUNT(*) cache lookup. Returns `Some(count)` when
+    /// `table_id` has a cached count AND the cached state still
+    /// matches: same change counter (no writes since cache time)
+    /// AND same schema version (no DDL since cache time).
+    pub fn get_count_star(&self, table_id: u32, schema_version: u64) -> Option<u64> {
+        let (count, cached_changes, cached_schema_ver) =
+            self.count_star_cache.get(&table_id).copied()?;
+        if cached_changes != self.stats.changes_for(table_id) {
+            return None;
+        }
+        if cached_schema_ver != schema_version {
+            return None;
+        }
+        Some(count)
+    }
+
+    /// Stores the freshly-computed COUNT(*) for `table_id`, capturing
+    /// the current change-count + schema_version as the validity tags.
+    pub fn cache_count_star(&mut self, table_id: u32, schema_version: u64, count: u64) {
+        let changes = self.stats.changes_for(table_id);
+        self.count_star_cache
+            .insert(table_id, (count, changes, schema_version));
     }
 
     pub fn cached_count(&self) -> usize {
