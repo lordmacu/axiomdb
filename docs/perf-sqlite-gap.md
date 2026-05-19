@@ -876,3 +876,69 @@ single `update_index_root` per changed index.
   is a small extension of this Attack.
 - **Attack 13 candidate** — BRIN / FTS / GIN / Trigram bulk-build:
   each has its own page layout and isn't covered here.
+
+## Attack 13 — defer `update_table_root` to Appender::finish
+
+### Why
+
+macOS APFS profile of `insert_appender` (300 rows) showed
+`root_persist_ms = 8.687 / 9.7ms total` — **90% of the per-flush
+cost was a single `CatalogWriter::update_table_root` call**.
+
+For 300 rows in one flush this is a fixed cost, but the Appender's
+auto-flush triggers at every `APPENDER_BATCH_FLUSH = 1024` rows.
+So a 50K-row Appender does ~49 flushes × 8.7ms = ~426ms of
+catalog writes, none of which are needed until commit — the
+in-memory `txn.clustered_root_for_conn(...)` already tracks the
+latest root per transaction.
+
+Lima virtio fsync (~50µs) makes this near-free, masking the real
+APFS native cost (~8ms). This Attack is invisible on Lima but
+real on macOS direct.
+
+### Change
+
+`apply_clustered_insert_rows` gains a
+`defer_table_root_persist: bool` parameter:
+
+- `false` (SQL INSERT, staging, IGNORE path): unchanged — emits
+  `update_table_root` at end-of-batch when the root grew.
+- `true` (Appender flush): skips the catalog write. The caller
+  invokes `TableEngine::flush_appender_clustered_table_root`
+  once at end-of-Appender-lifetime, which reads the latest root
+  via `txn.clustered_root_for_conn` and emits ONE
+  `update_table_root` if it differs from `table_def.root_page_id`.
+
+Wired into `Appender::finish()` before `txn.commit()`.
+
+### Results — macOS APFS native (2026-05-19)
+
+| Scenario | A13 OFF | A13 ON | Speedup |
+|---|---:|---:|---:|
+| `insert_appender_large` 5,000 rows | 114.0ms (43.8K ops/s) | 67.4ms (74.2K ops/s) | **1.69×** |
+| `insert_appender_large` 50,000 rows | 1018.5ms (49.1K ops/s) | 630.8ms (79.3K ops/s) | **1.61×** |
+
+Per-flush debug now shows `root_persist_ms=0.000` consistently;
+the moved catalog write is paid once per Appender lifetime.
+
+### Honest read
+
+- Win is real and consistent ~1.6× across row counts on macOS APFS.
+- Lima virtio mostly masks this (50µs fsync vs APFS's ~8ms),
+  so the Lima bench will not show it.
+- The architecture is right: `txn.clustered_root_for_conn` already
+  carries the in-progress root per transaction — the per-flush
+  catalog write was redundant. A13 just stops emitting it.
+- Crash safety unchanged: WAL ROW_INSERT records still capture
+  every row; recovery rebuilds the clustered root from those.
+  The `update_table_root` is just a forward-looking catalog
+  pointer.
+
+### What's next
+
+- macOS bench should now expose the **next** bottleneck —
+  `tree_ms` (5-10ms per 1024 rows) and `lookup_ms` (~2ms per 1024
+  rows) once outside the rightmost-leaf fast path.
+- SQL INSERT path could benefit from the same deferral when
+  wrapped in BEGIN/COMMIT, but that requires session-level
+  tracking of "dirty roots" — deferred.

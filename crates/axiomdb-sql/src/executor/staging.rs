@@ -281,6 +281,7 @@ pub(super) fn flush_clustered_insert_batch(
             // it anyway. The local rightmost_leaf_hint inside the
             // function already handles the batched-flush case.
             None,
+            /*defer_table_root_persist=*/ false,
         )?
     };
 

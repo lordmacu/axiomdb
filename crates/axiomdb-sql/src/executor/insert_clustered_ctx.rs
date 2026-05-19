@@ -268,6 +268,7 @@ fn execute_clustered_insert_ctx(
                 &compiled_preds,
                 &prepared_rows[i..i + 1],
                 Some(ctx.clustered_leaf_hint_slot()),
+                /*defer_table_root_persist=*/ false,
             ) {
                 Ok(n) => total += n,
                 Err(e) if is_ignorable_insert_error(&e) => {}
@@ -291,6 +292,7 @@ fn execute_clustered_insert_ctx(
             &compiled_preds,
             &prepared_rows,
             Some(ctx.clustered_leaf_hint_slot()),
+            /*defer_table_root_persist=*/ false,
         )?
     };
     ctx.stats.on_rows_changed(resolved.def.id, count);

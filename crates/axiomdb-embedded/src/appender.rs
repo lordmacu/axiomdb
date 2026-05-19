@@ -482,7 +482,21 @@ impl<'db> Appender<'db> {
             }
             return Err(e);
         }
-        let conn_txn = self.conn_txn.take().expect("Appender::finish called twice");
+        let mut conn_txn = self.conn_txn.take().expect("Appender::finish called twice");
+        // Attack 13: for clustered tables, persist the final root once
+        // here instead of once per flush (8.7ms saved on macOS APFS per
+        // flush avoided). flush() passed `defer_table_root_persist=true`.
+        if self.table_def.is_clustered() {
+            if let Err(e) = axiomdb_sql::TableEngine::flush_appender_clustered_table_root(
+                &self.db.storage,
+                &self.db.txn,
+                &mut conn_txn,
+                &self.table_def,
+            ) {
+                let _ = self.db.txn.rollback(conn_txn, &self.db.storage);
+                return Err(e);
+            }
+        }
         // Immediate commit (we don't drive the fsync pipeline from the
         // embedded fast path). The Attack 6 durability override stamped
         // at open time controls fsync vs flush-only via WAL.

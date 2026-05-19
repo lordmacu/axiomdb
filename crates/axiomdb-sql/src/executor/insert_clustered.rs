@@ -192,6 +192,7 @@ fn execute_clustered_insert(
                 &compiled_preds,
                 &prepared_rows[i..i + 1],
                 None, // legacy non-ctx path — no session hint available
+                /*defer_table_root_persist=*/ false,
             ) {
                 Ok(n) => total += n,
                 Err(e) if is_ignorable_insert_error(&e) => {} // skip row
@@ -212,6 +213,7 @@ fn execute_clustered_insert(
             &compiled_preds,
             &prepared_rows,
             None, // legacy non-ctx path — no session hint available
+            /*defer_table_root_persist=*/ false,
         )?
     };
 
@@ -226,6 +228,14 @@ fn execute_clustered_insert(
     })
 }
 
+/// Attack 13: when `defer_table_root_persist == true`, the function
+/// does NOT call `CatalogWriter::update_table_root` even if the
+/// clustered root grew. The caller is responsible for calling
+/// `flush_deferred_table_root` once at end-of-Appender-lifetime to
+/// persist the final root in a single catalog write. This avoids
+/// paying the catalog write cost (8.7ms on macOS APFS) per flush
+/// — for an Appender doing N auto-flushes the saving is (N-1)
+/// catalog writes per session.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_clustered_insert_rows(
     storage: &dyn StorageEngine,
@@ -239,6 +249,7 @@ pub(crate) fn apply_clustered_insert_rows(
     compiled_preds: &[Option<Expr>],
     rows: &[crate::clustered_table::PreparedClusteredInsertRow],
     session_hint: Option<&mut Option<axiomdb_storage::clustered_tree::LeafCursorHint>>,
+    defer_table_root_persist: bool,
 ) -> Result<u64, DbError> {
     use std::time::{Duration, Instant};
 
@@ -498,13 +509,16 @@ pub(crate) fn apply_clustered_insert_rows(
         root_persist_time += started.elapsed();
     }
 
-    if current_root != table_def.root_page_id {
+    if current_root != table_def.root_page_id && !defer_table_root_persist {
         let persist_started = debug_clustered_insert.then(Instant::now);
         CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_def.id, current_root)?;
         if let Some(started) = persist_started {
             root_persist_time += started.elapsed();
         }
     }
+    // When `defer_table_root_persist == true`, the caller will read
+    // the latest root via `txn.clustered_root(table_def.id)` and emit
+    // a single `update_table_root` at end-of-Appender-lifetime.
 
     if debug_clustered_insert {
         eprintln!(

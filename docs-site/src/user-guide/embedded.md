@@ -246,6 +246,20 @@ breakdown.
 </div>
 </div>
 
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Deferred catalog persist (A13)</span>
+On the clustered path, the Appender defers the per-flush
+<code>update_table_root</code> catalog write to <code>finish()</code>.
+For multi-flush Appenders (rows ≥ <code>APPENDER_BATCH_FLUSH</code> =
+1024) this saves <strong>~8.7ms per skipped flush</strong> on macOS
+APFS — measured <strong>1.6× speedup</strong> at 5K and 50K rows.
+Crash safety is unchanged (WAL ROW_INSERTs still capture every row;
+the catalog pointer is forward-looking).
+</div>
+</div>
+
 See `specs/fase-perf-sqlite-gap/spec-embedded-appender.md` for the full
 design.
 

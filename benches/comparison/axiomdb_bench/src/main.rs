@@ -224,6 +224,39 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, ac_n, mean, "appender, clustered (v1.1)");
         }
 
+        "insert_appender_large" => {
+            // Attack 13 validation: uncapped rows to exercise multiple
+            // auto-flushes (APPENDER_BATCH_FLUSH = 1024). The deferred
+            // `update_table_root` saves one catalog write per flush
+            // avoided (8.7ms on macOS APFS).
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=n_rows {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(
+                scenario,
+                n_rows,
+                mean,
+                "appender clustered, n_rows uncapped (A13)",
+            );
+        }
+
         "create_index" => {
             // Attack 12: CREATE INDEX timing on the canonical 5000-row
             // bench_users table. Uses non-unique idx_email (the
