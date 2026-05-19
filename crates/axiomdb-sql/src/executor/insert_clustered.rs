@@ -259,8 +259,15 @@ pub(crate) fn apply_clustered_insert_rows(
 
     let txn_id = conn_txn.txn_id;
     let snapshot = txn.active_snapshot(conn_txn);
+    // Attack 14: use the per-conn root (which tracks the in-progress
+    // txn's writes) instead of the global `last_clustered_roots` map
+    // (only updated at commit). For multi-flush Appenders this is the
+    // difference between hitting and missing the rightmost-leaf fast
+    // path on every flush after the first — the hint stored at the
+    // end of flush N carries the NEW root, and flush N+1 would
+    // otherwise compare it against the pre-txn (OLD) root.
     let mut current_root = txn
-        .clustered_root(table_def.id)
+        .clustered_root_for_conn(conn_txn, table_def.id)
         .unwrap_or(table_def.root_page_id);
 
     // Attack 10: snapshot the secondary index roots BEFORE the batch

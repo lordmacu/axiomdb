@@ -249,14 +249,16 @@ breakdown.
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">
-<span class="callout-label">Deferred catalog persist (A13)</span>
-On the clustered path, the Appender defers the per-flush
-<code>update_table_root</code> catalog write to <code>finish()</code>.
-For multi-flush Appenders (rows ≥ <code>APPENDER_BATCH_FLUSH</code> =
-1024) this saves <strong>~8.7ms per skipped flush</strong> on macOS
-APFS — measured <strong>1.6× speedup</strong> at 5K and 50K rows.
-Crash safety is unchanged (WAL ROW_INSERTs still capture every row;
-the catalog pointer is forward-looking).
+<span class="callout-label">Deferred catalog persist + cross-flush fast-path (A13 + A14)</span>
+On the clustered path, the Appender (a) defers the per-flush
+<code>update_table_root</code> catalog write to <code>finish()</code>
+(A13) and (b) preserves the rightmost-leaf hint across flushes
+via the per-connection root map (A14). Combined effect on macOS
+APFS native: <strong>4.4× speedup at 5K rows (192K ops/s)</strong> and
+<strong>9.3× at 50K rows (457K ops/s)</strong> — in SQLite
+prepared-bind+step territory. Crash safety unchanged (WAL
+ROW_INSERTs capture every row; catalog root is a forward-looking
+pointer).
 </div>
 </div>
 

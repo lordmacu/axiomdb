@@ -942,3 +942,52 @@ the moved catalog write is paid once per Appender lifetime.
 - SQL INSERT path could benefit from the same deferral when
   wrapped in BEGIN/COMMIT, but that requires session-level
   tracking of "dirty roots" — deferred.
+
+## Attack 14 — clustered_root_for_conn fixes cross-flush fast-path
+
+### Why
+
+Post-A13 macOS profile showed: only the FIRST flush of an
+Appender hits the rightmost-leaf fast path (`fast_path_hits=1014/1024`).
+Every subsequent flush has `fast_path_hits=0` and pays the full
+B-Tree descent (`tree_ms ~10ms`, `lookup_ms ~2.4ms` vs `~1ms` /
+`~0.04ms` on the fast path).
+
+Root cause: at the start of every batch, `apply_clustered_insert_rows`
+read `txn.clustered_root(table_id)` which returns from the GLOBAL
+`last_clustered_roots` map — only updated at commit. So during
+the Appender's lifetime, `current_root` was the OLD pre-txn root,
+while the hint stored by the previous flush carries the NEW root.
+The hint filter (`h.root_page_id == current_root`) failed, the
+hint was discarded, and the fast path missed.
+
+### Change
+
+Switch to `clustered_root_for_conn(conn_txn, table_id)` — the
+per-conn map carries the in-progress writes immediately. One line
+change.
+
+### Results — macOS APFS native (2026-05-19, stacked on A13)
+
+| Scenario | Pre-A13 | Post-A13 | Post-A14 | A14 vs A13 | Cumulative |
+|---|---:|---:|---:|---:|---:|
+| `insert_appender_large` 5K | 43.8K ops/s | 74.2K ops/s | **192K ops/s** | 2.6× | **4.4×** |
+| `insert_appender_large` 50K | 49.1K ops/s | 79.3K ops/s | **457K ops/s** | 5.8× | **9.3×** |
+
+Per-flush debug post-A14: every flush hits `fast_path_hits=1013-1014/1024`
+with `tree_ms ~1ms` and `lookup_ms ~0.04ms`. The bench is in
+SQLite prepared-bind+step territory.
+
+### Honest read
+
+- One-line fix; the architecture was already right. We had
+  TWO copies of the same API confusion (the other was A13's
+  helper which also read `clustered_root` initially — fixed
+  during testing). Same bug, two places.
+- The hint persistence had been working for SQL autocommit
+  (single-statement single-batch) since Attack 5, but the
+  multi-flush Appender exposed the gap. The cross-flush case
+  hadn't been benched until now.
+- Lima virtio invisible to A14 too — the per-flush descent
+  there is so cheap (~50µs fsync) that even 10× slower paths
+  look fast.
