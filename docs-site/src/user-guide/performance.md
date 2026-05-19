@@ -690,3 +690,19 @@ the change counter doesn't unwind on rollback, so we skip the cache there
 to preserve correctness. Multi-session writes from another connection
 don't invalidate this session's cache; the cached count is a snapshot
 value (per MVCC semantics).
+
+### Why autocommit INSERT isn't on the statement cache yet
+
+Attack 22 attempted to extend the statement cache (A20) to
+INSERT/UPDATE/DELETE. Both repair paths regressed `insert_autocommit`
+versus the cache-disabled baseline — keeping the existing per-dep
+`PlanDeps.is_stale` check cost ~17%, and clearing the cache eagerly
+from `invalidate_all` cost ~35% (the cache was wiped on every DML
+because `invalidate_all` is overloaded for index-root changes).
+
+For now the autocommit DML path keeps the legacy parse → analyze →
+execute pipeline. Workloads that need the win can switch to the
+embedded `Appender` API (a fast-path INSERT builder that bypasses the
+SQL pipeline entirely) — see the
+[embedded guide](embedded.md). The full investigation lives in
+`docs/perf-sqlite-gap.md` "Attack 22 — deferred".

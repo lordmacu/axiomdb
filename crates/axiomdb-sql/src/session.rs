@@ -1270,6 +1270,14 @@ impl SessionContext {
         // is the DDL-fence path — schema_version may have bumped across
         // many tables. Drop the lot.
         self.count_star_cache.clear();
+        // NOTE: `statement_cache` is intentionally NOT cleared here.
+        // invalidate_all is called from DDL endpoints AND from
+        // DML-with-index-changes (dml_join.rs, appender.rs). Clearing
+        // the statement cache on every DML would defeat the cache for
+        // the autocommit INSERT workload (each INSERT would re-compile).
+        // Staleness for the cache is handled lazily on lookup via
+        // PlanDeps.is_stale. The Attack 22 redesign to make this faster
+        // is deferred — see docs/perf-sqlite-gap.md.
         // `insert_col_positions` is intentionally NOT cleared. Its entries
         // carry a schema_version stamp and get lazy-evicted on the next
         // lookup with a mismatching version (see get_insert_col_positions).

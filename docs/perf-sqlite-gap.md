@@ -1345,6 +1345,86 @@ not the count itself.
   `appender.finish()`. Added the bump alongside the heap
   insert in `appender.rs` for parity with the clustered path.
 
+## Attack 22 — DML statement cache (DEFERRED)
+
+### Why
+
+`insert_autocommit` sits at ~6.9K ops/s vs SQLite's ~74K = 11×
+behind. Same SQL-pipeline cost as autocommit SELECT (parse +
+analyze + plan per query), but A20's cache is gated SELECT-only
+because the original Attack 2 wiring regressed INSERT.
+
+### Investigation summary
+
+Two repair paths attempted; neither shipped:
+
+**v1 — gate flipped to include DML (`is_cacheable` already
+covers SELECT/INSERT/UPDATE/DELETE)**
+
+`PlanDeps.is_stale` runs a per-dep catalog probe
+(`reader.get_table_schema_version`) on every cache lookup,
+costing ~25µs per dep. For INSERT this cost outweighs the
+saved analyze (INSERT analyze uses `resolve_table_cached` which
+is already cheap), netting a **17% slowdown** on
+`insert_autocommit` (6.6K → 5.5K ops/s).
+
+**v2 — drop `is_stale` + clear cache eagerly from `invalidate_all`**
+
+`invalidate_all` is called from every DDL endpoint AND from
+every DML path that may have changed an index root
+(`dml_join.rs:198`, `appender.rs:412/471`, `insert_clustered_ctx.rs:299`,
+`insert_heap_ctx.rs:395`). For autocommit INSERT, every call
+triggers `invalidate_all`, dropping the cache before the next
+INSERT can hit it. Net result: pay cache infrastructure
+(extract_literals + hash + store) on every miss with no
+benefit. **35% slower** than baseline (4.4K ops/s).
+
+### Why a quick fix doesn't work
+
+- `is_stale` is correct but slow (catalog probe).
+- Eager clear is fast but defeats the cache because
+  `invalidate_all` is overloaded between "DDL changed
+  something" and "DML changed an index root."
+- Splitting into two methods touches ~20 call sites and risks
+  silent staleness if anything routes through the wrong one.
+
+### Right path (deferred)
+
+Three viable redesigns:
+
+1. **Cheap is_stale via schema_cache.** `SchemaCache` already
+   holds `TableDef` (with `schema_version`) in memory. Add a
+   `get_schema_version(table_id) -> Option<u64>` that doesn't
+   touch the catalog heap. `PlanDeps.is_stale` becomes O(1)
+   per dep instead of catalog-bound.
+
+2. **Per-session DDL epoch counter.** Bump on every actual DDL
+   (separate from DML's `invalidate_all`). `CachedPlan` stores
+   the epoch at cache time; lookup compares with `==`. Skip
+   `is_stale` when epoch matches.
+
+3. **Split `invalidate_all` into `invalidate_after_ddl` and
+   `invalidate_after_dml`.** Statement cache only cleared by
+   the DDL variant. Touches all the DML call sites but
+   semantically the cleanest.
+
+Path 1 is the smallest change and likely sufficient. Tracked
+in `specs/fase-perf-sqlite-gap/spec-statement-cache-dml.md`
+(to be written when prioritized).
+
+### Honest read
+
+- The 17% / 35% regressions are real; this attack ships as a
+  documented deferral, not as code. The SELECT-side win from
+  A20 + A17b (`point_lookup` 3.2×, `count_star` 7.5×,
+  `range_scan` 8.3× cumulative) is the lion's share of the
+  embedded SQL pipeline opportunity.
+- For INSERT-heavy workloads the embedded Appender API
+  already bypasses the SQL pipeline entirely (A7+) and is
+  competitive with SQLite (244K ops/s at 5K rows). Users
+  who hit the autocommit INSERT gap have a documented
+  upgrade path.
+
 ## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
 
 ### Why

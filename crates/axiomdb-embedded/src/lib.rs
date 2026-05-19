@@ -304,15 +304,22 @@ mod db {
                 });
             }
             // Attack 20: route SELECTs through the per-session statement
-            // cache. The PlanDeps.is_stale catalog probe added net cost on
-            // INSERTs in the original Attack 2 wiring (analyze for INSERT
-            // is already cheap), so we gate the cache to SELECT only —
-            // where the analyze + plan cost dominates (~150-200µs for an
-            // autocommit query). Other statements take the legacy path.
-            //
-            // A cheap parse-prefix sniff avoids paying the lexer+parser
-            // round trip on non-SELECT branches; the real parse runs once
-            // inside whichever path we pick.
+            // cache. INSERT/UPDATE/DELETE are gated off — Attack 22
+            // tried to extend the cache to them and reproduced the
+            // original Attack 2 regression (~17% on insert_autocommit).
+            // Two repair paths investigated and rejected:
+            //   (a) Drop PlanDeps.is_stale + clear the cache from
+            //       invalidate_all → defeats the cache because every DML
+            //       calls invalidate_all (35% slower than the baseline).
+            //   (b) Keep PlanDeps.is_stale → 17% slower on INSERT due to
+            //       the per-dep catalog probe (analyze for INSERT is
+            //       already cheap, so the probe is net-negative).
+            // The real fix needs (c) a per-table version sourced from
+            // the in-memory schema_cache, not the catalog heap; OR (d)
+            // a dedicated `invalidate_all_after_ddl` that bumps an
+            // epoch counter the statement cache reads cheaply. Deferred
+            // until a focused brainstorm — see docs/perf-sqlite-gap.md
+            // "Attack 22 — deferred".
             if sql_starts_with_select_keyword(sql) {
                 return axiomdb_sql::statement_cache::run_cached(
                     sql,
