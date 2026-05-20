@@ -848,6 +848,9 @@ pub(crate) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering,
         (Value::Bytes(a), Value::Bytes(b)) => Ok(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
+        (Value::TimestampTz(a), Value::TimestampTz(b)) => Ok(a.cmp(b)),
+        // Cross-type comparison: strip tz annotation, compare µs values
+        (Value::Timestamp(a), Value::TimestampTz(b)) | (Value::TimestampTz(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
         // MySQL compatibility: allow comparing DECIMAL with numeric text.
         // Common ORM pattern: `WHERE dec_col = '123.45'`.
@@ -863,6 +866,10 @@ pub(crate) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering,
         // what we want. For (Text, Timestamp) we need the reverse.
         (Value::Timestamp(micros), Value::Text(s)) => text_vs_ts_cmp(s, *micros),
         (Value::Text(s), Value::Timestamp(micros)) => {
+            text_vs_ts_cmp(s, *micros).map(|o| o.reverse())
+        }
+        (Value::TimestampTz(micros), Value::Text(s)) => text_vs_ts_cmp(s, *micros),
+        (Value::Text(s), Value::TimestampTz(micros)) => {
             text_vs_ts_cmp(s, *micros).map(|o| o.reverse())
         }
         (Value::Date(days), Value::Text(s)) => text_vs_date_cmp(s, *days),

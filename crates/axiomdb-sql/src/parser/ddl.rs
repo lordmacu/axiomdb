@@ -1244,7 +1244,23 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
         }
         Token::TyTimestamp | Token::TyDatetime => {
             p.advance();
-            (DataType::Timestamp, 0, false)
+            // TIMESTAMP WITH TIME ZONE → TimestampTz
+            if p.eat(&Token::With) {
+                if p.eat_ident_ci("TIME") && p.eat_ident_ci("ZONE") {
+                    (DataType::TimestampTz, 0, false)
+                } else {
+                    return Err(DbError::ParseError {
+                        message: "expected TIME ZONE after TIMESTAMP WITH".into(),
+                        position: Some(pos),
+                    });
+                }
+            } else {
+                (DataType::Timestamp, 0, false)
+            }
+        }
+        Token::Ident(s) if s.eq_ignore_ascii_case("TIMESTAMPTZ") => {
+            p.advance();
+            (DataType::TimestampTz, 0, false)
         }
         Token::TyUuid => {
             p.advance();
