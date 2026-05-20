@@ -691,30 +691,18 @@ to preserve correctness. Multi-session writes from another connection
 don't invalidate this session's cache; the cached count is a snapshot
 value (per MVCC semantics).
 
-### Statement cache for DML inside explicit txns (Attack 22 real)
+### Why autocommit INSERT isn't on the statement cache yet
 
-The statement cache (A20) now covers `INSERT`/`UPDATE`/`DELETE` when
-they run inside an explicit `BEGIN..COMMIT`. The original Attack 22
-attempt regressed autocommit DML because every statement clears the
-schema cache via the index-root maintenance path; gating the DML cache
-to explicit transactions side-steps the issue and turns the cache
-unambiguously positive on bulk loaders.
+Attack 22 attempted to extend the statement cache (A20) to
+INSERT/UPDATE/DELETE. Both repair paths regressed `insert_autocommit`
+versus the cache-disabled baseline — keeping the existing per-dep
+`PlanDeps.is_stale` check cost ~17%, and clearing the cache eagerly
+from `invalidate_all` cost ~35% (the cache was wiped on every DML
+because `invalidate_all` is overloaded for index-root changes).
 
-| Scenario | Pre-A22 | Post-A22 real | Speedup |
-|---|---:|---:|---:|
-| `insert_batch` 10K (one explicit txn) | 5.5K ops/s | **~7.5K ops/s** | **1.36×** |
-| `insert_autocommit` 300×INSERT | 6.9K | ~6.4K | within noise |
-
-What changed under the hood:
-
-- `SchemaCache` now indexes `(table_id → schema_version)`. A new
-  `PlanDeps::is_stale_via_cache` consults this map first (O(1)) and
-  only falls back to a catalog probe when the table isn't cached.
-- `Db::run_inner` routes a statement through the cache when:
-  - the SQL starts with `SELECT` (always; analyze is the hot path), OR
-  - the SQL starts with `INSERT`/`UPDATE`/`DELETE` AND a `BEGIN` is
-    in progress (`session.in_explicit_txn == true`).
-
-For autocommit INSERT workloads, the embedded `Appender` API (244K+
-ops/s on clustered tables) remains the recommended path — it
-bypasses the SQL pipeline entirely.
+For now the autocommit DML path keeps the legacy parse → analyze →
+execute pipeline. Workloads that need the win can switch to the
+embedded `Appender` API (a fast-path INSERT builder that bypasses the
+SQL pipeline entirely) — see the
+[embedded guide](embedded.md). The full investigation lives in
+`docs/perf-sqlite-gap.md` "Attack 22 — deferred".

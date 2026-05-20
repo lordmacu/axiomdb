@@ -42,13 +42,6 @@ pub struct SchemaCache {
     tables: HashMap<TableKey, TableDef>,
     /// `table_id` → ordered `Vec<ColumnDef>`
     columns: HashMap<TableId, Vec<ColumnDef>>,
-    /// Attack 22 (real): `table_id` → `schema_version`. Updated on every
-    /// `insert`, cleared by `invalidate`. Used by
-    /// `PlanDeps::is_stale_via_cache` to skip the catalog-heap probe for
-    /// every dep on a cache lookup — the cache holds the same
-    /// `schema_version` the catalog would return, and DDL invalidates
-    /// the cache before the next query runs.
-    id_to_version: HashMap<TableId, u64>,
 }
 
 impl SchemaCache {
@@ -78,31 +71,17 @@ impl SchemaCache {
         columns: Vec<ColumnDef>,
     ) {
         let id = table_def.id;
-        let version = table_def.schema_version;
         self.tables.insert(
             (database.to_string(), schema.to_string(), name.to_string()),
             table_def,
         );
         self.columns.insert(id, columns);
-        self.id_to_version.insert(id, version);
     }
 
     /// Drop all cached entries. Call after any DDL statement.
     pub fn invalidate(&mut self) {
         self.tables.clear();
         self.columns.clear();
-        self.id_to_version.clear();
-    }
-
-    /// Attack 22 (real): O(1) lookup of a table's `schema_version`
-    /// from the in-memory cache. Used by `PlanDeps::is_stale_via_cache`
-    /// to skip the catalog-heap probe for every cached-plan lookup.
-    ///
-    /// Returns `None` when the table is not in the cache — caller must
-    /// fall back to a `CatalogReader::get_table_schema_version` probe
-    /// for correctness (the table may exist but just not be cached yet).
-    pub fn get_schema_version(&self, table_id: TableId) -> Option<u64> {
-        self.id_to_version.get(&table_id).copied()
     }
 
     /// Number of cached tables (for diagnostics / tests).

@@ -444,12 +444,9 @@ pub fn run_cached(
     let hash = shape_hash(&stmt);
 
     // Cache lookup with PlanDeps validation.
-    // Attack 22 (real): try the schema-cache fast path first — O(1) per
-    // dep instead of a catalog-heap probe. Falls back to the catalog
-    // automatically for any dep not yet in the schema cache.
     let analyzed = {
         let mut reader = CatalogReader::new(storage, snap.clone())?;
-        match session.get_cached_plan_via_schema_cache(hash, schema_cache, &mut reader)? {
+        match session.get_cached_plan(hash, &mut reader)? {
             Some(plan) => {
                 if extracted.len() != plan.param_count {
                     return Err(DbError::Internal {

@@ -1409,31 +1409,6 @@ impl SessionContext {
         Ok(self.statement_cache.get(&shape_hash).map(|(p, _)| p))
     }
 
-    /// Attack 22 (real): fast-path `get_cached_plan` that consults the
-    /// in-memory `SchemaCache` before falling back to a catalog probe
-    /// for staleness detection. Cuts ~25µs/dep off the per-lookup cost,
-    /// turning DML cache hits net-positive vs the legacy path.
-    pub fn get_cached_plan_via_schema_cache(
-        &mut self,
-        shape_hash: u64,
-        schema_cache: &crate::schema_cache::SchemaCache,
-        reader: &mut axiomdb_catalog::CatalogReader<'_>,
-    ) -> Result<Option<&crate::statement_cache::CachedPlan>, DbError> {
-        let stale = match self.statement_cache.get(&shape_hash) {
-            None => return Ok(None),
-            Some((plan, _)) => plan.deps.is_stale_via_cache(schema_cache, reader)?,
-        };
-        if stale {
-            self.statement_cache.remove(&shape_hash);
-            return Ok(None);
-        }
-        self.statement_lru_seq += 1;
-        if let Some((_, seq)) = self.statement_cache.get_mut(&shape_hash) {
-            *seq = self.statement_lru_seq;
-        }
-        Ok(self.statement_cache.get(&shape_hash).map(|(p, _)| p))
-    }
-
     /// Inserts a compiled plan into the cache, evicting the oldest entry
     /// (by LRU sequence) if at capacity. Capacity is
     /// `STATEMENT_CACHE_MAX_ENTRIES` (see `statement_cache` module).
