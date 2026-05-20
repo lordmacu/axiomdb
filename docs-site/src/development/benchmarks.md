@@ -638,17 +638,22 @@ Attack 23 applied the statement-cache epoch fast path only to the embedded
 Attack 23b routes wire SELECT queries through `run_cached`, giving them the
 same O(1) cache-hit path as embedded queries.
 
-> **Honest correction (2026-05-20):** an earlier draft of this section
-> claimed a ~2× wire speedup. A careful before/after on the macOS-native
-> wire benchmark (`tools/bench-vs-pg-mariadb.py`, pre-23b vs post-23b binary)
-> is **dominated by noise** — the same binary swings ±60% run-to-run. The
-> honest read is **performance-neutral** on the wire path: the
-> `analyze_cached` it replaces was already cheap (resolve-table epoch
-> shortcut), so the cache's extra AST walks roughly cancel the savings. The
-> clearer win is the embedded path (Attack 23, 2.11× on Lima) and
-> `count_star`. The wire change's real value is *correctness-neutral
-> caching*, not a speedup. See `docs/perf-sqlite-gap.md` for the full
-> post-merge regression hunt (12 regressions found and fixed).
+Measured with `tools/bench-wire-ab.py` on the **Lima VM** (Linux), 3
+interleaved rounds of 12 timed runs (the macOS-native wire bench is too noisy
+— ±60% run-to-run — to show this signal):
+
+| Scenario | Pre-23b (no wire cache) | Post-23b (wire cache) | Speedup |
+|---|---:|---:|---:|
+| point_lookup (100 same-shape) | ~2,554 ops/s | ~4,531 ops/s | **~1.78×** |
+| count_star | ~1,901 ops/s | ~3,022 ops/s | **~1.6×** |
+| range_scan / select_where | — | — | ~1.0× (neutral) |
+
+The cache wins on **small-result, high-frequency** queries (point lookup,
+`COUNT(*)`), where the per-call `analyze` is a meaningful fraction of query
+cost. On large scans it's neutral — row encoding dominates. The first cut of
+23b also introduced 12 wire-test regressions (shape-hash collisions, dropped
+`SKIP LOCKED` locks, a read-your-own-commit snapshot race), all fixed; see
+`docs/perf-sqlite-gap.md` for the full post-merge regression hunt.
 
 **Correctness work**: the shape hash (`hash_stmt`) and literal extraction
 (`walk_stmt_extract`) were extended to cover all expression positions that

@@ -703,11 +703,15 @@ Two changes close this (Attack 23 — embedded path):
 
 **Attack 23b** extends the same fast path to the **MySQL wire server path**:
 wire SELECTs route through `run_cached` instead of re-analyzing per call.
-On the wire path this is **performance-neutral** in practice (the analyze it
-replaces is already cheap via the resolve-table epoch shortcut, and the macOS
-wire benchmark is too noisy to show a clean signal); the real value is shared,
-correctness-checked caching across the embedded and wire paths. The clearer
-measured speedup is on the embedded path (above) and `count_star`.
+Measured on the Lima VM (the macOS wire bench is too noisy to show it),
+this is a real **~1.78× on wire point lookups** and **~1.6× on `COUNT(*)`** —
+the high-frequency OLTP path. It's neutral on large scans, where row encoding
+dominates and the saved analyze is negligible.
+
+| Wire scenario | Pre-23b | Post-23b | Speedup |
+|---|---:|---:|---:|
+| point_lookup | ~2.6K ops/s | ~4.5K ops/s | **~1.78×** |
+| count_star | ~1.9K ops/s | ~3.0K ops/s | **~1.6×** |
 
 <div class="callout-design">
 Routing wire SELECTs through the statement cache required three correctness

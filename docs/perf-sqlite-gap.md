@@ -1691,26 +1691,39 @@ pre-23b baseline** (the 13 are genuinely pre-existing: JSON_TABLE NESTED,
 JSON `#>`/`#-`, view column type metadata, TABLESAMPLE(0), business-calendar,
 currency conversion). Stable across 5 consecutive runs.
 
-### Results — honest read
+### Results — measure on the right host
 
-The "~2×" speedup originally claimed here did **not** reproduce. A careful
-before/after on the macOS-native wire benchmark (`bench-vs-pg-mariadb.py
---skip-pg --skip-maria`, pre-23b binary vs post-23b binary) is **dominated by
-measurement noise** — the same binary swings ±60% run-to-run (point_lookup
-3.2K–5.4K ops/s). Averaged, post-23b is roughly **performance-neutral** to
-slightly positive on the wire path, not 2×.
+The headline number depends entirely on measurement quality:
 
-Why the cache barely helps the wire path: `analyze_cached_with_defaults`
-already resolves tables through the `resolve_table` epoch shortcut, so the
-analyze it replaces was *already cheap*. The statement cache adds three AST
-walks (eligibility, extract, substitute) plus a plan clone, which roughly
-cancels the saved analyze. The clearer win is on the embedded path (Attack
-23, where the Lima measurement showed 2.11×) and on `count_star` (session
-COUNT cache). For SELECT-heavy wire workloads the value is correctness-neutral
-caching, not a dramatic speedup.
+- **macOS native (APFS): unusable for this signal.** A before/after with
+  `bench-vs-pg-mariadb.py --skip-pg --skip-maria` swings ±60% run-to-run on
+  the *same* binary (point_lookup 3.2K–5.4K ops/s). Averaged it looks
+  "neutral" — but that's noise swamping the signal, not the real result.
+
+- **Lima VM (Linux, clean): a real, consistent win.** A focused A/B
+  (`tools/bench-wire-ab.py <binary> <label>`, 3 interleaved rounds of 12
+  timed runs each) gave tight, repeatable numbers:
+
+  | Scenario | Pre-23b (no wire cache) | Post-23b (wire cache) | Speedup |
+  |---|---:|---:|---:|
+  | point_lookup (100 same-shape) | ~2,554 ops/s | ~4,531 ops/s | **~1.78×** |
+  | count_star | ~1,901 ops/s | ~3,022 ops/s | **~1.6×** |
+  | range_scan (500 rows) | ~139.9K rows/s | ~132.9K rows/s | ~1.0× |
+  | select_where (~2.5K rows) | ~134.7K rows/s | ~141.7K rows/s | ~1.05× |
+
+Where the cache helps and why: for a **small-result, high-frequency** query
+(point lookup, `COUNT(*)`), the per-call `analyze` is a meaningful fraction of
+total query cost, so the cached-plan fast path (epoch check + substitute) is a
+clear ~1.6–1.8× win. For **large-result scans**, row encoding and the wire
+write dominate, the saved analyze is negligible, and the cache is neutral (no
+harm). So the original "~2×" was directionally right for the OLTP point-lookup
+path; the macOS bench just couldn't show it.
 
 - DML (INSERT/UPDATE/DELETE) and DDL on the wire path still go through the
   legacy pipeline — zero regression risk for writes.
-- **Lesson:** never label new failures "pre-existing" without diffing against
-  the prior binary. Build the old commit in a worktree and run the identical
-  test harness via `AXIOMDB_SERVER_BIN`.
+- **Lesson 1:** never label new failures "pre-existing" without diffing
+  against the prior binary — build the old commit in a worktree and run the
+  identical harness via `AXIOMDB_SERVER_BIN`.
+- **Lesson 2:** don't conclude "neutral" from a noisy host. The macOS-native
+  wire bench (±60%) hid a real 1.78×; the Lima VM showed it cleanly. Match the
+  benchmark host to the signal size.
