@@ -123,19 +123,50 @@ fn run_statement_triggers_for_result(
     let QueryResult::Affected { count, .. } = &result else {
         return Ok(result);
     };
-    let conn = ctx.conn_txn.take().expect("conn_txn set during DML");
-    let resolved = resolve_table_cached(
-        exec_ctx.storage(),
-        exec_ctx.coord(),
-        ctx,
-        Some(&conn),
-        table,
-    )?;
-    ctx.conn_txn = Some(conn);
-    let table_name = resolved.def.table_name.clone();
-    let matching: Vec<_> = resolved
-        .def
-        .triggers
+
+    // Fast path: read triggers from the session cache — no catalog HeapChain
+    // scan needed. Trigger definitions only change via DDL, which always
+    // invalidates the session cache (SchemaCache::invalidate). The table was
+    // just resolved in execute_insert_ctx so the cache entry is current.
+    let database: String = table
+        .database
+        .as_deref()
+        .unwrap_or_else(|| ctx.effective_database())
+        .to_string();
+    let pick = |rt: &ResolvedTable| (rt.def.table_name.clone(), rt.def.triggers.clone());
+    let cached_info: Option<(String, Vec<axiomdb_catalog::TriggerDef>)> =
+        if let Some(schema) = table.schema.as_deref() {
+            ctx.get_table(&database, schema, &table.name).map(pick)
+        } else {
+            let n = ctx.search_path.len();
+            let mut found = None;
+            for i in 0..n {
+                let schema = ctx.search_path[i].clone();
+                if let Some(rt) = ctx.get_table(&database, &schema, &table.name) {
+                    found = Some(pick(rt));
+                    break;
+                }
+            }
+            found
+        };
+
+    let (table_name, all_triggers) = if let Some(info) = cached_info {
+        info
+    } else {
+        // Cache miss — fall back to full catalog probe.
+        let conn = ctx.conn_txn.take().expect("conn_txn set during DML");
+        let resolved = resolve_table_cached(
+            exec_ctx.storage(),
+            exec_ctx.coord(),
+            ctx,
+            Some(&conn),
+            table,
+        )?;
+        ctx.conn_txn = Some(conn);
+        (resolved.def.table_name, resolved.def.triggers)
+    };
+
+    let matching: Vec<_> = all_triggers
         .into_iter()
         .filter(|t| {
             matches!(

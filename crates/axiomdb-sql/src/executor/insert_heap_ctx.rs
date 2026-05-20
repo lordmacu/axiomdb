@@ -19,7 +19,49 @@ fn execute_insert_ctx(
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
     let bloom = exec_ctx.bloom();
-    let resolved = resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?;
+
+    // Fast path: for repeated INSERTs into the same clustered table inside an
+    // explicit transaction, the session cache is always fresh. The batch's
+    // table_id confirms we are targeting the same table, and since all B-tree
+    // writes are deferred to COMMIT in this path, the catalog entry (including
+    // root_page_id) is unchanged since the batch was created.
+    let resolved: ResolvedTable = 'resolve: {
+        if ctx.in_explicit_txn
+            && stmt.returning.is_empty()
+            && matches!(stmt.source, InsertSource::Values(_))
+        {
+            if let Some(bid) = ctx.clustered_insert_batch.as_ref().map(|b| b.table_id) {
+                let database = stmt
+                    .table
+                    .database
+                    .as_deref()
+                    .unwrap_or_else(|| ctx.effective_database())
+                    .to_string();
+                let cached = if let Some(schema) = stmt.table.schema.as_deref() {
+                    ctx.get_table(&database, schema, &stmt.table.name)
+                        .filter(|rt| rt.def.id == bid)
+                        .cloned()
+                } else {
+                    let n = ctx.search_path.len();
+                    let mut found = None;
+                    for i in 0..n {
+                        let schema = ctx.search_path[i].clone();
+                        if let Some(rt) = ctx.get_table(&database, &schema, &stmt.table.name) {
+                            if rt.def.id == bid {
+                                found = Some(rt.clone());
+                                break;
+                            }
+                        }
+                    }
+                    found
+                };
+                if let Some(rt) = cached {
+                    break 'resolve rt;
+                }
+            }
+        }
+        resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?
+    };
 
     // Phase 40.11: IX(table) — once per statement, before any row write.
     // Idempotent: InnoDB `lock_table_has()` pattern — returns immediately if
