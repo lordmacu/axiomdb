@@ -145,7 +145,11 @@ fn create_table_with_mysql_locale_collation_compiles_and_runs() {
         &mut bloom,
         &mut ctx,
     );
-    assert_eq!(r.len(), 1, "case + diacritic-insensitive match should succeed");
+    assert_eq!(
+        r.len(),
+        1,
+        "case + diacritic-insensitive match should succeed"
+    );
 }
 
 // ── Feature-gated locale-specific behaviour ──────────────────────────────

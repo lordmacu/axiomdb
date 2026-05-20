@@ -11,10 +11,7 @@ fn open_db() -> (TempDir, Db) {
 }
 
 fn count_rows(db: &mut Db, table: &str) -> i64 {
-    match &db
-        .query(&format!("SELECT COUNT(*) FROM {table}"))
-        .unwrap()[0][0]
-    {
+    match &db.query(&format!("SELECT COUNT(*) FROM {table}")).unwrap()[0][0] {
         Value::BigInt(n) => *n,
         Value::Int(n) => *n as i64,
         other => panic!("expected integer COUNT, got {other:?}"),
@@ -30,8 +27,7 @@ fn autovacuum_default_is_on() {
     db.run("SET autovacuum_vacuum_threshold = 10").unwrap();
     db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
     for i in 1..=50 {
-        db.run(&format!("INSERT INTO t VALUES ({i}, 'x')"))
-            .unwrap();
+        db.run(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
     }
     // Bulk DELETE -> creates 50 dead tuples in one autocommit txn.
     db.run("DELETE FROM t").unwrap();

@@ -229,14 +229,18 @@ without locale tailoring.
 
 ## Binary Type
 
-| SQL Type | Aliases       | Max length       | Rust type  | Notes                   |
-|----------|---------------|------------------|------------|-------------------------|
-| `BYTEA`  | `BLOB`, `BYTES` | 16,777,215 bytes | `Vec<u8>` | Raw bytes, hex display  |
+| SQL Type | Aliases                                    | Max length       | Rust type  | Notes                  |
+|----------|--------------------------------------------|------------------|------------|------------------------|
+| `BYTEA`  | `BLOB`, `BYTES`, `BINARY(n)`, `VARBINARY(n)` | 16,777,215 bytes | `Vec<u8>` | Raw bytes, hex display |
 
 AxiomDB stores oversized `TEXT`, `JSON`, and `BYTEA` values out-of-line with
 TOAST. Inserts keep a fixed inline pointer in the row and place the large value
 in overflow pages. Deletes release the referenced overflow chain through the
 refcount-aware BLOB path introduced in Phase 11.2d.
+
+The MySQL aliases `BINARY(n)` and `VARBINARY(n)` are accepted as synonyms for
+`BYTEA` (the length is parsed but not enforced — payloads are bounded only by
+the row/TOAST limit). This lets `mysqldump` output load without rewrites.
 
 <div class="callout callout-tip">
 <span class="callout-icon">💡</span>
@@ -258,6 +262,36 @@ INSERT INTO attachments (name, content) VALUES ('icon.png', X'89504e47');
 
 -- Display as hex
 SELECT name, encode(content, 'hex') FROM attachments;
+```
+
+### Bytea expressions (Phase 24.5)
+
+The full PostgreSQL bytea expression surface is available alongside the
+existing `encode`/`decode`/`from_base64`/`to_base64`/`mime_type` set:
+
+| Form                                | Returns | Notes                                       |
+|-------------------------------------|---------|---------------------------------------------|
+| `bytea \|\| bytea`                  | `BYTEA` | Concat — same operator that joins TEXT.     |
+| `substring(b, start[, length])`     | `BYTEA` | 1-based byte indexing; MySQL negative-from-end accepted. |
+| `position(needle, haystack)`        | `INT`   | 1-based byte position; 0 if absent.         |
+| `instr(haystack, needle)`           | `INT`   | Same as `position`, reversed argument order. |
+| `get_byte(b, idx)`                  | `INT`   | 0-based byte read; out-of-range raises.     |
+| `set_byte(b, idx, value)`           | `BYTEA` | Copy with byte at `idx` replaced.           |
+| `get_bit(b, idx)`                   | `INT`   | MSB-first bit indexing within each byte.    |
+| `set_bit(b, idx, 0\|1)`             | `BYTEA` | Copy with single bit flipped.               |
+| `bit_count(bytea \| int)`           | `BIGINT`| popcount over all bits.                     |
+| `md5(text \| bytea)`                | `TEXT`  | 32-char lowercase hex digest.               |
+| `sha1`/`sha224`/`sha256`/`sha384`/`sha512(text \| bytea)` | `TEXT` | Lowercase hex digest. Pure-Rust `sha2` crate. |
+| `CAST('\xDEADBEEF' AS BYTEA)`       | `BYTEA` | PostgreSQL hex literal — even hex digit count required. |
+| `CAST('hello' AS BYTEA)`            | `BYTEA` | Plain text → raw UTF-8 bytes (MySQL-compat). |
+| `CAST(b AS TEXT)`                   | `TEXT`  | Lossy UTF-8 — use `encode(b,'hex')` for lossless. |
+
+```sql
+SELECT md5('hello');                     -- '5d41402abc4b2a76b9719d911017c592'
+SELECT sha256(CAST('hello' AS BYTEA));   -- '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'
+SELECT CAST('\xDEADBEEF' AS BYTEA);      -- BYTEA <4 bytes>
+SELECT bit_count(CAST('\xFF000F' AS BYTEA)); -- 12
+SELECT substring(CAST('\x01020304' AS BYTEA), 2, 2); -- BYTEA <0x02 0x03>
 ```
 
 ---

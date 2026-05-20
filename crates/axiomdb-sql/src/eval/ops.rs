@@ -954,8 +954,12 @@ fn text_vs_decimal_cmp(s: &str, mantissa: i128, scale: u8) -> Result<std::cmp::O
 fn eval_concat(l: Value, r: Value) -> Result<Value, DbError> {
     match (l, r) {
         (Value::Text(a), Value::Text(b)) => Ok(Value::Text(a + &b)),
+        (Value::Bytes(mut a), Value::Bytes(b)) => {
+            a.extend_from_slice(&b);
+            Ok(Value::Bytes(a))
+        }
         (l, r) => Err(DbError::TypeMismatch {
-            expected: "Text || Text".into(),
+            expected: "Text || Text or Bytes || Bytes".into(),
             got: format!("{} || {}", l.variant_name(), r.variant_name()),
         }),
     }

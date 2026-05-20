@@ -83,7 +83,10 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
             datetime::eval(lower.as_str(), args, row)
         }
 
-        "from_base64" | "to_base64" | "encode" | "decode" | "mime_type" => {
+        "from_base64" | "to_base64" | "encode" | "decode" | "mime_type"
+        // Phase 24.5 — PostgreSQL byte/bit accessors + hashing
+        | "get_byte" | "set_byte" | "get_bit" | "set_bit" | "bit_count"
+        | "md5" | "sha1" | "sha224" | "sha256" | "sha384" | "sha512" => {
             binary::eval(lower.as_str(), args, row)
         }
 

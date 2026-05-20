@@ -1332,6 +1332,13 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             p.advance();
             (DataType::Bytes, 0, false)
         }
+        Token::TyBinary | Token::TyVarbinary => {
+            // MySQL BINARY(n) / VARBINARY(n) — alias for BYTEA (Phase 24.5).
+            // Optional (N) length specifier accepted but not enforced.
+            p.advance();
+            let _ = eat_optional_length(p)?;
+            (DataType::Bytes, 0, false)
+        }
         Token::TyDate => {
             p.advance();
             (DataType::Date, 0, false)

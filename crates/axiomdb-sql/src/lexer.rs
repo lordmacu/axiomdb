@@ -398,6 +398,13 @@ pub enum Token<'src> {
     TyBlob,
     #[token("BYTEA", ignore(ascii_case))]
     TyBytea,
+    /// MySQL fixed-length binary (`BINARY(n)`). Treated as BYTEA for storage.
+    /// Phase 24.5.
+    #[token("BINARY", ignore(ascii_case))]
+    TyBinary,
+    /// MySQL variable-length binary (`VARBINARY(n)`). Treated as BYTEA. Phase 24.5.
+    #[token("VARBINARY", ignore(ascii_case))]
+    TyVarbinary,
     #[token("DATE", ignore(ascii_case))]
     TyDate,
     #[token("TIMESTAMP", ignore(ascii_case))]

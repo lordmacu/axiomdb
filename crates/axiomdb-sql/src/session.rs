@@ -257,7 +257,9 @@ pub fn parse_session_collation_setting(raw: &str) -> Result<Option<SessionCollat
             Ok(Some(SessionCollation::Icu(locale)))
         }
         _ => Err(DbError::InvalidValue {
-            reason: format!("invalid collation value '{raw}'; expected binary | es | utf8mb4_*_ai_ci | DEFAULT"),
+            reason: format!(
+                "invalid collation value '{raw}'; expected binary | es | utf8mb4_*_ai_ci | DEFAULT"
+            ),
         }),
     }
 }
