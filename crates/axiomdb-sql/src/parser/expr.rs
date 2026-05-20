@@ -653,6 +653,23 @@ fn parse_postfix(p: &mut Parser) -> Result<Expr, DbError> {
         }
     }
 
+    // Handle AT TIME ZONE: `expr AT TIME ZONE tz_expr`
+    // Lowered to __at_time_zone(expr, tz_expr) to avoid a new AST node.
+    if p.eat_ident_ci("AT") {
+        if p.eat_ident_ci("TIME") && p.eat_ident_ci("ZONE") {
+            let tz_expr = parse_expr(p)?;
+            expr = Expr::Function {
+                name: "__at_time_zone".to_string(),
+                args: vec![expr, tz_expr],
+            };
+        } else {
+            return Err(DbError::ParseError {
+                message: "expected TIME ZONE after AT".into(),
+                position: Some(p.current_pos()),
+            });
+        }
+    }
+
     // Handle PostgreSQL-style type cast: `expr::type[]`
     // This must appear AFTER subscript handling (which consumes LBracket/RBracket).
     // We check for :: specifically to avoid interfering with slice [lo:hi] syntax.

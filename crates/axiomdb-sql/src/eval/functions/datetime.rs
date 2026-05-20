@@ -616,6 +616,58 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             Ok(Value::Int(find_in_set_inner(&needle, &list)))
         }
 
+        // ── AT TIME ZONE stub (Phase 24.7) ──────────────────────────────────
+        // expr AT TIME ZONE 'UTC' — parsed as __at_time_zone(expr, tz_name).
+        // Phase 24.7: only 'UTC' / '+00:00' / 'Z' are supported; any other tz
+        // is rejected. Full tz database support deferred to a later phase.
+        "__at_time_zone" => {
+            if args.len() != 2 {
+                return Err(DbError::InvalidValue {
+                    reason: "__at_time_zone requires exactly 2 arguments".into(),
+                });
+            }
+            let ts_val = crate::eval::eval(&args[0], row)?;
+            let tz_val = crate::eval::eval(&args[1], row)?;
+            if matches!(ts_val, Value::Null) || matches!(tz_val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            // Verify the timezone is UTC-compatible.
+            let tz_name = match &tz_val {
+                Value::Text(s) => s.clone(),
+                _ => {
+                    return Err(DbError::InvalidValue {
+                        reason: "AT TIME ZONE: timezone must be a text value".into(),
+                    })
+                }
+            };
+            let normalized = tz_name.trim();
+            let is_utc = normalized.eq_ignore_ascii_case("UTC")
+                || normalized == "+00:00"
+                || normalized == "+00"
+                || normalized.eq_ignore_ascii_case("Z")
+                || normalized == "0"
+                || normalized == "+0:00"
+                || normalized == "00:00";
+            if !is_utc {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "AT TIME ZONE: only UTC is supported in Phase 24.7, got '{normalized}'"
+                    ),
+                });
+            }
+            // Convert Timestamp → TimestampTz (same µs, just a type annotation).
+            match ts_val {
+                Value::Timestamp(t) => Ok(Value::TimestampTz(t)),
+                Value::TimestampTz(t) => Ok(Value::TimestampTz(t)),
+                _ => Err(DbError::InvalidValue {
+                    reason: format!(
+                        "AT TIME ZONE: left side must be TIMESTAMP or TIMESTAMPTZ, got {}",
+                        ts_val.variant_name()
+                    ),
+                }),
+            }
+        }
+
         _ => unreachable!("dispatcher routed unsupported datetime function"),
     }
 }

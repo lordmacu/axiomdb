@@ -79,7 +79,9 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "utc_timestamp" | "utc_date" | "utc_time" | "from_unixtime" | "convert_tz"
         | "adddate" | "date_add" | "subdate" | "date_sub" | "timestampdiff" | "makedate"
         | "dayofweek" | "day_of_month" | "dayofmonth" | "dayofyear" | "weekday" | "quarter"
-        | "week" | "weekofyear" | "yearweek" | "last_day" | "date" | "time" | "timediff" => {
+        | "week" | "weekofyear" | "yearweek" | "last_day" | "date" | "time" | "timediff"
+        // Phase 24.7 — AT TIME ZONE lowered to internal function
+        | "__at_time_zone" => {
             datetime::eval(lower.as_str(), args, row)
         }
 
