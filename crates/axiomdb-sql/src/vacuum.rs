@@ -442,6 +442,142 @@ fn persist_index_root_if_changed(
     Ok(())
 }
 
+// ── Auto-vacuum (Phase 19.1) ─────────────────────────────────────────────────
+
+/// Phase 19.1: inline-at-commit auto-vacuum entry point.
+///
+/// Called by `Db::run_inner` after every successful autocommit query.
+/// Iterates the session's per-table change counter and vacuums every
+/// table whose count meets or exceeds `auto_vacuum_threshold`. On
+/// success, resets the table's counter so the next batch of writes
+/// has to cross the threshold again.
+///
+/// Returns the number of tables actually vacuumed. Errors from a
+/// per-table vacuum are logged via `eprintln!` and do NOT propagate —
+/// the caller (the autocommit hook) shouldn't fail the user's
+/// already-successful query just because background maintenance hit a
+/// snag. Logging is acceptable for v1; structured logging arrives in
+/// Phase 19.5.
+///
+/// Skipped entirely when:
+/// - `ctx.auto_vacuum_enabled == false`
+/// - `ctx.in_explicit_txn == true` (would cross txn boundaries)
+/// - `ctx.conn_txn.is_some()` (a txn is still open — caller forgot to
+///   commit; refuse rather than corrupt MVCC visibility)
+///
+/// System catalog tables (id < `USER_TABLE_ID_BASE`) are excluded —
+/// they're updated by DDL fences and don't accumulate dead tuples
+/// the same way user tables do.
+pub fn auto_vacuum_if_needed(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> usize {
+    if !ctx.auto_vacuum_enabled || ctx.in_explicit_txn {
+        return 0;
+    }
+    if ctx.conn_txn.is_some() {
+        // A txn is still open — the autocommit wrapper hasn't fired.
+        // Skip rather than risk consuming the user's snapshot.
+        return 0;
+    }
+    let threshold = ctx.auto_vacuum_threshold;
+    if threshold == u64::MAX {
+        return 0;
+    }
+    // Collect candidates first so we don't hold the session borrow
+    // across the vacuum (which mutably borrows ctx).
+    const USER_TABLE_ID_BASE: u32 = 100; // mirrors axiomdb-catalog convention.
+    let candidates: Vec<u32> = ctx
+        .stats
+        .changes_iter()
+        .filter(|&(id, count)| id >= USER_TABLE_ID_BASE && count >= threshold)
+        .map(|(id, _)| id)
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let mut vacuumed = 0usize;
+    for table_id in candidates {
+        match run_auto_vacuum_for(table_id, storage, txn, bloom, ctx) {
+            Ok(true) => {
+                ctx.stats.reset_changes_for(table_id);
+                vacuumed += 1;
+            }
+            Ok(false) => {
+                // Table was dropped between the change bump and now —
+                // clear the counter so we don't keep looking for it.
+                ctx.stats.reset_changes_for(table_id);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[auto-vacuum] table_id={table_id} failed: {e:?} (will retry on next commit)"
+                );
+                // Leave the counter alone so the next commit tries again.
+            }
+        }
+    }
+    vacuumed
+}
+
+/// Internal: open a fresh txn, resolve the table, run vacuum_one_table,
+/// commit. Returns `Ok(true)` on a successful vacuum, `Ok(false)` if
+/// the table is missing from the catalog, or `Err` for any storage /
+/// vacuum failure.
+fn run_auto_vacuum_for(
+    table_id: u32,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &crate::bloom::BloomRegistry,
+    ctx: &mut SessionContext,
+) -> Result<bool, DbError> {
+    // Open a short-lived txn. The session's conn_txn is None at this
+    // point (autocommit just committed).
+    let mut conn_txn = txn.begin()?;
+    conn_txn.durability_override = Some(ctx.synchronous().to_wal_policy());
+    let snap = txn.active_snapshot(&conn_txn);
+    let oldest_safe_txn = txn.max_committed() + 1;
+
+    let (table_def, indexes) = {
+        let mut reader = CatalogReader::new(storage, snap.clone())?;
+        let Some(td) = reader.get_table_by_id(table_id)? else {
+            // Table no longer exists.
+            let _ = txn.rollback(conn_txn, storage);
+            return Ok(false);
+        };
+        let idxs = reader.list_indexes(table_id)?;
+        (td, idxs)
+    };
+
+    let result = vacuum_one_table(
+        &table_def,
+        &indexes,
+        storage,
+        txn,
+        &mut conn_txn,
+        snap,
+        oldest_safe_txn,
+        bloom,
+    );
+    match result {
+        Ok(_) => {
+            txn.commit(conn_txn)?;
+            // Drain post-commit page-batch state (mirrors the autocommit
+            // wrapper). Without this, freed pages stay pinned until the
+            // next user-driven commit.
+            txn.drain_committed_page_batches(storage)?;
+            ctx.invalidate_all();
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = txn.rollback(conn_txn, storage);
+            Err(e)
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

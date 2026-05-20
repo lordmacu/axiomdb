@@ -490,6 +490,269 @@ pub fn lookup(
     Ok(Some(row))
 }
 
+/// A per-session cached pointer to the most-recently-touched clustered
+/// leaf page. Mirrors SQLite's `BtCursor` cached metadata (BTCF_ValidNKey
+/// at `research/sqlite/src/btree.c:9482`).
+///
+/// Used by [`lookup_with_hint`] (and Attack 7's `try_append_with_hint`)
+/// to skip the B-tree descent when the next key falls in the cached
+/// leaf's range. The SQL layer owns the `Option<LeafCursorHint>` slot
+/// inside its `SessionContext`; storage-side functions take a
+/// `&mut Option<LeafCursorHint>` and update it in place.
+#[derive(Debug, Clone)]
+pub struct LeafCursorHint {
+    /// Owner table. Different tables don't share the hint.
+    pub table_id: u32,
+    /// `TableDef.root_page_id` when the hint was recorded — detects
+    /// root rotation (bulk DELETE, REBUILD, etc.).
+    pub root_page_id: u64,
+    /// The leaf page itself.
+    pub leaf_page_id: u64,
+    /// Lowest key stored in the leaf (cell 0) at hint time.
+    pub min_key: Vec<u8>,
+    /// Highest key stored in the leaf (cell N-1) at hint time.
+    pub max_key: Vec<u8>,
+    /// `TableDef.schema_version` — invalidated on DDL bump.
+    pub schema_version: u64,
+}
+
+/// Hint-aware variant of [`lookup_physical`]. Skips the B-tree descent
+/// when `hint` points at a leaf whose key range covers `key`.
+///
+/// Behavior:
+/// - Fast path: hint matches `(table_id, root_pid, schema_version)`
+///   AND `key ∈ [min_key, max_key]` → re-read the cached leaf page,
+///   binary-search for `key`, return the row (or `None`).
+/// - Stale leaf (page type changed / leaf merged away / search returns
+///   out-of-range due to concurrent split) → fall back to full descent.
+/// - Miss (any field mismatch) → full descent via [`descend_to_leaf`].
+///
+/// In all paths, `hint` is updated to point at the leaf the lookup
+/// actually consulted, so the NEXT call can hit the fast path.
+///
+/// MVCC visibility is NOT checked; callers should filter by
+/// `row_header.is_visible(&snapshot)` afterwards (the existing
+/// [`lookup`] wrapper does this).
+pub fn lookup_with_hint(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    table_id: u32,
+    schema_version: u64,
+    hint: &mut Option<LeafCursorHint>,
+) -> Result<Option<ClusteredRow>, DbError> {
+    let Some(root_pid) = root_pid else {
+        return Ok(None);
+    };
+
+    // ── Fast path: hint may serve ──
+    if let Some(h) = hint.as_ref() {
+        if h.table_id == table_id
+            && h.root_page_id == root_pid
+            && h.schema_version == schema_version
+            && key >= h.min_key.as_slice()
+            && key <= h.max_key.as_slice()
+        {
+            let leaf = storage.read_page(h.leaf_page_id)?;
+            if clustered_page_type(&leaf)? == PageType::ClusteredLeaf
+                && clustered_leaf::num_cells(&leaf) > 0
+            {
+                if let Ok(search_result) = leaf_search_checked(&leaf, key) {
+                    return match search_result {
+                        Ok(pos) => {
+                            let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+                            let row_data = reconstruct_row_data(storage, &cell)?;
+                            Ok(Some(ClusteredRow {
+                                key: cell.key.to_vec(),
+                                row_header: cell.row_header,
+                                row_data,
+                            }))
+                        }
+                        Err(_) => Ok(None),
+                    };
+                }
+                // search_checked failed → fall through to descent
+            }
+            // Page no longer a valid leaf → fall through to descent
+        }
+    }
+
+    // ── Slow path: descend from root ──
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+
+    // Update the hint with the leaf we just landed on (if it has any
+    // cells — empty leaf can't bound a key range usefully).
+    let nc = clustered_leaf::num_cells(&leaf);
+    if nc > 0 {
+        let first = clustered_leaf::read_cell(&leaf, 0)?;
+        let last = clustered_leaf::read_cell(&leaf, nc - 1)?;
+        *hint = Some(LeafCursorHint {
+            table_id,
+            root_page_id: root_pid,
+            leaf_page_id: leaf.header().page_id,
+            min_key: first.key.to_vec(),
+            max_key: last.key.to_vec(),
+            schema_version,
+        });
+    }
+
+    let pos = match leaf_search_checked(&leaf, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(None),
+    };
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    let row_data = reconstruct_row_data(storage, &cell)?;
+    Ok(Some(ClusteredRow {
+        key: cell.key.to_vec(),
+        row_header: cell.row_header,
+        row_data,
+    }))
+}
+
+/// Attack 19: zero-alloc point lookup. Descends to the leaf,
+/// binary-searches for `key`, and if found+visible invokes `f` with
+/// the page-resident byte slice + overflow info + RowHeader. No
+/// `reconstruct_row_data` clone, no `cell.key.to_vec()`. Returns
+/// `true` if the row was visited (key matched and was visible),
+/// `false` otherwise.
+///
+/// The caller MUST consume `inline` (and read the overflow chain
+/// when present) inside the closure — once the closure returns, the
+/// page latch is released and the slice may be evicted.
+pub fn lookup_callback<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    snapshot: &TransactionSnapshot,
+    mut f: F,
+) -> Result<bool, DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>, &RowHeader) -> Result<(), DbError>,
+{
+    let Some(root_pid) = root_pid else {
+        return Ok(false);
+    };
+
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+    let pos = match leaf_search_checked(&leaf, key)? {
+        Ok(pos) => pos,
+        Err(_) => return Ok(false),
+    };
+
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    if !cell.row_header.is_visible(snapshot) {
+        return Ok(false);
+    }
+
+    let overflow = match (
+        cell.total_row_len.cmp(&cell.row_data.len()),
+        cell.overflow_first_page,
+    ) {
+        (std::cmp::Ordering::Greater, Some(fp)) => {
+            Some((fp, cell.total_row_len - cell.row_data.len()))
+        }
+        _ => None,
+    };
+    f(cell.row_data, overflow, &cell.row_header)?;
+    Ok(true)
+}
+
+/// Hint-aware counterpart to [`lookup_callback`]. Tries the cached
+/// leaf first; falls back to `lookup_callback` on miss/stale. The
+/// closure semantics match `lookup_callback`.
+pub fn lookup_callback_with_hint<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    key: &[u8],
+    table_id: u32,
+    schema_version: u64,
+    snapshot: &TransactionSnapshot,
+    hint: &mut Option<LeafCursorHint>,
+    mut f: F,
+) -> Result<bool, DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>, &RowHeader) -> Result<(), DbError>,
+{
+    let Some(root_pid) = root_pid else {
+        return Ok(false);
+    };
+
+    // Fast path: hint covers `key`.
+    if let Some(h) = hint.as_ref() {
+        if h.table_id == table_id
+            && h.root_page_id == root_pid
+            && h.schema_version == schema_version
+            && key >= h.min_key.as_slice()
+            && key <= h.max_key.as_slice()
+        {
+            if let Ok(leaf) = storage.read_page(h.leaf_page_id) {
+                if let Ok(PageType::ClusteredLeaf) = clustered_page_type(&leaf) {
+                    if let Ok(Ok(pos)) = leaf_search_checked(&leaf, key) {
+                        let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+                        if !cell.row_header.is_visible(snapshot) {
+                            return Ok(false);
+                        }
+                        let overflow = match (
+                            cell.total_row_len.cmp(&cell.row_data.len()),
+                            cell.overflow_first_page,
+                        ) {
+                            (std::cmp::Ordering::Greater, Some(fp)) => {
+                                Some((fp, cell.total_row_len - cell.row_data.len()))
+                            }
+                            _ => None,
+                        };
+                        f(cell.row_data, overflow, &cell.row_header)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    // Slow path: full descent. Update hint to point at the leaf we touched.
+    let leaf = descend_to_leaf(storage, root_pid, key)?;
+    let leaf_pid = leaf.header().page_id;
+    let pos_result = leaf_search_checked(&leaf, key)?;
+
+    // Refresh hint from the leaf we just visited (min/max from cells).
+    let nc = clustered_leaf::num_cells(&leaf);
+    if nc > 0 {
+        if let (Ok(first), Ok(last)) = (
+            clustered_leaf::read_cell(&leaf, 0),
+            clustered_leaf::read_cell(&leaf, nc - 1),
+        ) {
+            *hint = Some(LeafCursorHint {
+                table_id,
+                root_page_id: root_pid,
+                leaf_page_id: leaf_pid,
+                min_key: first.key.to_vec(),
+                max_key: last.key.to_vec(),
+                schema_version,
+            });
+        }
+    }
+
+    let pos = match pos_result {
+        Ok(pos) => pos,
+        Err(_) => return Ok(false),
+    };
+    let cell = clustered_leaf::read_cell(&leaf, pos as u16)?;
+    if !cell.row_header.is_visible(snapshot) {
+        return Ok(false);
+    }
+    let overflow = match (
+        cell.total_row_len.cmp(&cell.row_data.len()),
+        cell.overflow_first_page,
+    ) {
+        (std::cmp::Ordering::Greater, Some(fp)) => {
+            Some((fp, cell.total_row_len - cell.row_data.len()))
+        }
+        _ => None,
+    };
+    f(cell.row_data, overflow, &cell.row_header)?;
+    Ok(true)
+}
+
 /// Looks up the current physical row for `key` regardless of MVCC visibility.
 pub fn lookup_physical(
     storage: &dyn StorageEngine,
@@ -662,6 +925,139 @@ where
         }
         current_pid = next_pid;
         next_leaf_cache = clustered_leaf::NULL_PAGE;
+    }
+
+    Ok(())
+}
+
+/// Attack 18: range-bounded counterpart to [`scan_all_callback`].
+///
+/// Descends to the leaf containing `from` (via `find_start_position`),
+/// then yields inline row data + overflow tail (when present) for every
+/// visible cell with key in `[from, to]`. Stops as soon as the upper
+/// bound is exceeded. Inline-only rows (the common case) require zero
+/// heap allocations per row — callers decode directly from the
+/// `&[u8]` slice into the page.
+///
+/// Use this when the result needs only the row payload (no key bookmark
+/// for downstream lookups). Mirrors PostgreSQL's `index_getnext_slot`
+/// path which streams tuples without intermediate key copies.
+pub fn range_callback<F>(
+    storage: &dyn StorageEngine,
+    root_pid: Option<u64>,
+    from: Bound<Vec<u8>>,
+    to: Bound<Vec<u8>>,
+    snapshot: &TransactionSnapshot,
+    mut f: F,
+) -> Result<(), DbError>
+where
+    F: FnMut(&[u8], Option<(u64, usize)>) -> Result<(), DbError>,
+{
+    if bounds_empty(&from, &to) {
+        return Ok(());
+    }
+    let Some(root_pid) = root_pid else {
+        return Ok(());
+    };
+
+    let (start_pid, start_slot) = find_start_position(storage, root_pid, &from)?;
+    let mut current_pid = start_pid;
+    let mut slot_idx = start_slot;
+    let mut current_latch = None;
+    let mut next_leaf_cache = clustered_leaf::NULL_PAGE;
+
+    let above_lower = |key: &[u8]| -> bool {
+        match &from {
+            Bound::Included(k) => key >= k.as_slice(),
+            Bound::Excluded(k) => key > k.as_slice(),
+            Bound::Unbounded => true,
+        }
+    };
+    let below_upper = |key: &[u8]| -> bool {
+        match &to {
+            Bound::Included(k) => key <= k.as_slice(),
+            Bound::Excluded(k) => key < k.as_slice(),
+            Bound::Unbounded => true,
+        }
+    };
+
+    while current_pid != clustered_leaf::NULL_PAGE {
+        if current_latch.is_none() {
+            current_latch = Some(storage.page_lock_table().read(current_pid));
+        }
+
+        let page = storage.read_page(current_pid)?;
+        match clustered_page_type(&page)? {
+            PageType::ClusteredLeaf => {}
+            other => {
+                return Err(DbError::BTreeCorrupted {
+                    msg: format!(
+                        "range_callback expected leaf at page {current_pid}, found {other:?}"
+                    ),
+                });
+            }
+        }
+
+        if next_leaf_cache == clustered_leaf::NULL_PAGE {
+            next_leaf_cache = clustered_leaf::next_leaf(&page);
+        }
+
+        let num_cells = clustered_leaf::num_cells(&page) as usize;
+        let mut reached_upper = false;
+        while slot_idx < num_cells {
+            let cell = clustered_leaf::read_cell(&page, slot_idx as u16)?;
+            slot_idx += 1;
+
+            if !above_lower(cell.key) {
+                continue;
+            }
+            if !below_upper(cell.key) {
+                reached_upper = true;
+                break;
+            }
+            if !cell.row_header.is_visible(snapshot) {
+                continue;
+            }
+
+            let overflow = match (
+                cell.total_row_len.cmp(&cell.row_data.len()),
+                cell.overflow_first_page,
+            ) {
+                (std::cmp::Ordering::Greater, Some(fp)) => {
+                    Some((fp, cell.total_row_len - cell.row_data.len()))
+                }
+                _ => None,
+            };
+            f(cell.row_data, overflow)?;
+        }
+
+        if reached_upper {
+            return Ok(());
+        }
+
+        let next_pid = next_leaf_cache;
+        if next_pid != clustered_leaf::NULL_PAGE {
+            storage.prefetch_hint(next_pid, PREFETCH_DEPTH);
+            let next_guard = match storage.page_lock_table().try_read(next_pid) {
+                Some(guard) => {
+                    let old_guard = current_latch.replace(guard);
+                    drop(old_guard);
+                    None
+                }
+                None => {
+                    current_latch = None;
+                    Some(storage.page_lock_table().read(next_pid))
+                }
+            };
+            if let Some(guard) = next_guard {
+                current_latch = Some(guard);
+            }
+        } else {
+            current_latch = None;
+        }
+        current_pid = next_pid;
+        next_leaf_cache = clustered_leaf::NULL_PAGE;
+        slot_idx = 0;
     }
 
     Ok(())

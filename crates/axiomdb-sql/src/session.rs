@@ -13,12 +13,78 @@ use axiomdb_catalog::{
     IndexDef, ResolvedTable,
 };
 use axiomdb_core::error::DbError;
+use axiomdb_storage::WalDurabilityPolicy;
 use axiomdb_types::Value;
 use axiomdb_wal::ConnectionTxn;
 
 use crate::clustered_secondary::ClusteredSecondaryLayout;
 use crate::expr::Expr;
 use crate::result::{ColumnMeta, Row};
+
+// ── SessionDurability ─────────────────────────────────────────────────────────
+
+/// Session-level durability mode. Maps to [`axiomdb_wal::WalDurabilityPolicy`]
+/// at commit time via the per-transaction `ConnectionTxn.durability_override`
+/// slot (Attack 6).
+///
+/// Mirrors SQLite's `PRAGMA synchronous`
+/// ([`research/sqlite/src/pager.c:3590-3611`](research/sqlite/src/pager.c)),
+/// collapsed from SQLite's 5 levels (OFF/ON/NORMAL/FULL/EXTRA) to our 3.
+///
+/// Set via `SET synchronous = '<value>'`. The default is `Strict` — no
+/// durability regression for users who don't opt in. Users explicitly
+/// trade fsync-per-commit for throughput by issuing the SET.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionDurability {
+    /// **Default.** fsync per commit. Equivalent to SQLite
+    /// `synchronous=FULL`. Durable on commit ACK.
+    #[default]
+    Strict,
+    /// Flush to OS page cache only; no fsync per commit. Equivalent to
+    /// SQLite `synchronous=NORMAL` in WAL mode. Durable in COMMIT
+    /// ORDERING — recent commits may be lost on crash but the DB
+    /// remains internally consistent.
+    Normal,
+    /// No flush, no fsync. Equivalent to SQLite `synchronous=OFF`.
+    /// Data loss possible on crash. Intended for ephemeral / test DBs.
+    Off,
+}
+
+impl SessionDurability {
+    /// Maps this session-level enum to the WAL crate's policy enum.
+    pub fn to_wal_policy(self) -> WalDurabilityPolicy {
+        match self {
+            Self::Strict => WalDurabilityPolicy::Strict,
+            Self::Normal => WalDurabilityPolicy::Normal,
+            Self::Off => WalDurabilityPolicy::Off,
+        }
+    }
+}
+
+/// Parses `SET synchronous = '<value>'`.
+///
+/// Accepts canonical names (STRICT/NORMAL/OFF), case-insensitive,
+/// quoted or unquoted, plus SQLite aliases (FULL → Strict, EXTRA → Strict,
+/// ON → Normal) and numeric forms (0=Off, 1/2=Normal, 3/4=Strict).
+/// See SQLite's `getSafetyLevel` for the source numbering.
+pub fn parse_synchronous_setting(raw: &str) -> Result<SessionDurability, DbError> {
+    let s = raw
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "off" | "0" => Ok(SessionDurability::Off),
+        "normal" | "on" | "1" | "2" => Ok(SessionDurability::Normal),
+        "strict" | "full" | "extra" | "3" | "4" => Ok(SessionDurability::Strict),
+        _ => Err(DbError::InvalidValue {
+            reason: format!(
+                "invalid synchronous value '{raw}'; expected \
+                 STRICT | NORMAL | OFF | FULL | EXTRA | ON | 0..4 | DEFAULT"
+            ),
+        }),
+    }
+}
 
 // ── CompatMode ────────────────────────────────────────────────────────────────
 
@@ -88,6 +154,65 @@ pub enum SessionCollation {
     /// CI+AI fold: NFC + lowercase + strip combining marks.
     /// `Jose`, `JOSE`, `José` compare equal.
     Es,
+    /// Phase 24.4b: ICU4X locale-aware collation. Selects from a small
+    /// curated set of locales that the embedded library bakes in. Cost:
+    /// ~500 KB-1 MB of UCD data added to the binary; only present when
+    /// the `icu-collations` Cargo feature is enabled (the variant exists
+    /// regardless so the `SessionCollation` size stays stable across
+    /// feature combinations, but `text_eq`/`compare_text` fall back to
+    /// the `Es` algorithm when the feature is off).
+    Icu(IcuLocale),
+}
+
+/// Phase 24.4b: small enum of locales the ICU-backed collator path
+/// supports. Each variant maps to a BCP-47 locale tag at runtime in
+/// `text_semantics.rs`. The set is curated rather than open-ended so
+/// that the binary doesn't have to bake every CLDR locale — adding a
+/// new one is a one-line change + a data-cost decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcuLocale {
+    /// Turkish — handles dotless `i` ↔ `I`, dotted `İ` ↔ `i`.
+    /// MySQL alias: `utf8mb4_tr_0900_ai_ci`.
+    Turkish,
+    /// German — handles `ß` ↔ `SS` per DIN 5007-1.
+    /// MySQL alias: `utf8mb4_de_0900_ai_ci`.
+    German,
+    /// Spanish — `ñ` between `n` and `o` in sort order.
+    /// MySQL alias: `utf8mb4_es_0900_ai_ci`.
+    Spanish,
+    /// Swedish — `å`, `ä`, `ö` sort at the end of the alphabet.
+    /// MySQL alias: `utf8mb4_sv_0900_ai_ci`.
+    Swedish,
+    /// French — accent-sensitive comparison from the end of the word.
+    /// MySQL alias: `utf8mb4_fr_0900_ai_ci`.
+    French,
+    /// Czech — `č`, `š`, `ž` etc. sort as separate letters.
+    /// MySQL alias: `utf8mb4_cs_0900_ai_ci`.
+    Czech,
+    /// Polish — Polish letters `ą`, `ć`, etc. sort distinctly.
+    /// MySQL alias: `utf8mb4_pl_0900_ai_ci`.
+    Polish,
+    /// Generic Unicode CI+AI (Primary strength, no locale tailoring).
+    /// MySQL alias: `utf8mb4_0900_ai_ci`. Used when the user wants
+    /// locale-aware behaviour but doesn't specify a language.
+    UnicodeCi,
+}
+
+impl IcuLocale {
+    /// Returns the BCP-47 locale tag the ICU4X collator constructs from.
+    /// Empty string for `UnicodeCi` (root locale).
+    pub fn bcp47(self) -> &'static str {
+        match self {
+            Self::Turkish => "tr",
+            Self::German => "de",
+            Self::Spanish => "es",
+            Self::Swedish => "sv",
+            Self::French => "fr",
+            Self::Czech => "cs",
+            Self::Polish => "pl",
+            Self::UnicodeCi => "und",
+        }
+    }
 }
 
 /// Parses a `SET collation = ...` value.
@@ -98,12 +223,43 @@ pub fn parse_session_collation_setting(raw: &str) -> Result<Option<SessionCollat
     if s.eq_ignore_ascii_case("default") {
         return Ok(None);
     }
-    match normalize_collation_name(s)?.as_str() {
+    let normalized = normalize_collation_name(s)?;
+    match normalized.as_str() {
         "binary" => Ok(Some(SessionCollation::Binary)),
         "es" => Ok(Some(SessionCollation::Es)),
         "default" => Ok(None),
+        // Phase 24.4b: ICU locale-aware collations. The normalizer maps
+        // both MySQL aliases (`utf8mb4_tr_0900_ai_ci`) and BCP-47-style
+        // names (`tr-icu`) to the canonical `icu_tr` / `icu_de` / etc.
+        // form. Parsing succeeds whether or not the `icu-collations`
+        // feature is compiled in — the runtime `text_eq`/`compare_text`
+        // implementations decide whether to use ICU or fall back to the
+        // `Es` algorithm.
+        other if other.starts_with("icu_") => {
+            let tag = &other[4..];
+            let locale = match tag {
+                "tr" => IcuLocale::Turkish,
+                "de" => IcuLocale::German,
+                "es" => IcuLocale::Spanish,
+                "sv" => IcuLocale::Swedish,
+                "fr" => IcuLocale::French,
+                "cs" => IcuLocale::Czech,
+                "pl" => IcuLocale::Polish,
+                "und" => IcuLocale::UnicodeCi,
+                _ => {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "unsupported ICU locale '{tag}'; expected tr | de | es | sv | fr | cs | pl | und"
+                        ),
+                    });
+                }
+            };
+            Ok(Some(SessionCollation::Icu(locale)))
+        }
         _ => Err(DbError::InvalidValue {
-            reason: format!("invalid collation value '{raw}'; expected binary | es | DEFAULT"),
+            reason: format!(
+                "invalid collation value '{raw}'; expected binary | es | utf8mb4_*_ai_ci | DEFAULT"
+            ),
         }),
     }
 }
@@ -128,9 +284,24 @@ pub fn normalize_collation_name(raw: &str) -> Result<String, DbError> {
         "es" | "utf8mb4_0900_ai_ci" | "utf8mb4_general_ci" | "utf8mb4_unicode_ci" => {
             Ok("es".into())
         }
+        // Phase 24.4b: ICU locale aliases. The MySQL form is
+        // `utf8mb4_<lang>_0900_ai_ci` (libmysqlclient adds the
+        // language-specific tailoring on top of the 0900 collation
+        // root); we accept both the MySQL form and the BCP-47 shorthand
+        // (`tr-icu`, `de-icu`, etc.) for portability. The canonical
+        // form `icu_<lang>` is also accepted as input so round-tripping
+        // works (read collation from catalog → re-parse).
+        "utf8mb4_tr_0900_ai_ci" | "tr-icu" | "icu_tr" => Ok("icu_tr".into()),
+        "utf8mb4_de_0900_ai_ci" | "de-icu" | "icu_de" => Ok("icu_de".into()),
+        "utf8mb4_es_0900_ai_ci" | "es-icu" | "icu_es" => Ok("icu_es".into()),
+        "utf8mb4_sv_0900_ai_ci" | "sv-icu" | "icu_sv" => Ok("icu_sv".into()),
+        "utf8mb4_fr_0900_ai_ci" | "fr-icu" | "icu_fr" => Ok("icu_fr".into()),
+        "utf8mb4_cs_0900_ai_ci" | "cs-icu" | "icu_cs" => Ok("icu_cs".into()),
+        "utf8mb4_pl_0900_ai_ci" | "pl-icu" | "icu_pl" => Ok("icu_pl".into()),
+        "utf8mb4_und_0900_ai_ci" | "und-icu" | "icu_und" => Ok("icu_und".into()),
         _ => Err(DbError::InvalidValue {
             reason: format!(
-                "invalid collation value '{raw}'; expected binary | es or a supported alias"
+                "invalid collation value '{raw}'; expected binary | es | utf8mb4_<lang>_0900_ai_ci | <lang>-icu"
             ),
         }),
     }
@@ -140,6 +311,13 @@ pub fn session_collation_from_name(raw: &str) -> Result<SessionCollation, DbErro
     match normalize_collation_name(raw)?.as_str() {
         "binary" => Ok(SessionCollation::Binary),
         "es" => Ok(SessionCollation::Es),
+        // Phase 24.4b: forward ICU canonical names to the locale parser.
+        other if other.starts_with("icu_") => {
+            // Reuse parse_session_collation_setting's locale match.
+            parse_session_collation_setting(other)?.ok_or_else(|| DbError::InvalidValue {
+                reason: format!("invalid ICU collation '{raw}'"),
+            })
+        }
         _ => Err(DbError::InvalidValue {
             reason: format!("invalid collation value '{raw}'"),
         }),
@@ -151,6 +329,14 @@ pub fn session_collation_name(c: SessionCollation) -> &'static str {
     match c {
         SessionCollation::Binary => "binary",
         SessionCollation::Es => "es",
+        SessionCollation::Icu(IcuLocale::Turkish) => "icu_tr",
+        SessionCollation::Icu(IcuLocale::German) => "icu_de",
+        SessionCollation::Icu(IcuLocale::Spanish) => "icu_es",
+        SessionCollation::Icu(IcuLocale::Swedish) => "icu_sv",
+        SessionCollation::Icu(IcuLocale::French) => "icu_fr",
+        SessionCollation::Icu(IcuLocale::Czech) => "icu_cs",
+        SessionCollation::Icu(IcuLocale::Polish) => "icu_pl",
+        SessionCollation::Icu(IcuLocale::UnicodeCi) => "icu_und",
     }
 }
 
@@ -465,6 +651,28 @@ impl StaleStatsTracker {
         self.check_stale(table_id);
     }
 
+    /// Attack 17b: read the accumulated change counter for `table_id`.
+    /// Used by the COUNT(*) session cache as a cheap dirty-bit substitute
+    /// — the cache stores the change count seen at cache time and
+    /// compares against this on lookup; any mismatch is a miss.
+    pub fn changes_for(&self, table_id: u32) -> u64 {
+        self.changes.get(&table_id).copied().unwrap_or(0)
+    }
+
+    /// Phase 19.1: after a successful auto-vacuum the change counter
+    /// for that table is reset so the next 1000 (configurable)
+    /// changes trigger the next vacuum.
+    pub fn reset_changes_for(&mut self, table_id: u32) {
+        self.changes.remove(&table_id);
+        self.stale.remove(&table_id);
+    }
+
+    /// Phase 19.1: enumerate every (table_id, change_count) pair so the
+    /// auto-vacuum hook can decide which tables to vacuum.
+    pub fn changes_iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.changes.iter().map(|(&id, &n)| (id, n))
+    }
+
     /// Records multiple row changes at once (e.g. after batch DELETE).
     pub fn on_rows_changed(&mut self, table_id: u32, count: u64) {
         *self.changes.entry(table_id).or_insert(0) += count;
@@ -650,7 +858,10 @@ pub struct ClusteredInsertBatch {
     pub table_id: u32,
     pub table_def: TableDef,
     pub columns: Vec<ColumnDef>,
-    pub primary_idx: IndexDef,
+    /// Wrapped in `Arc` so per-statement reuse is an atomic increment
+    /// instead of a full `IndexDef` clone (which allocates its inner
+    /// `Vec<IndexColumnDef>` and predicate string). See Attack 3.B Step 2.
+    pub primary_idx: std::sync::Arc<IndexDef>,
     pub secondary_indexes: Vec<IndexDef>,
     pub secondary_layouts: Vec<ClusteredSecondaryLayout>,
     pub compiled_preds: Vec<Option<Expr>>,
@@ -673,6 +884,63 @@ pub struct SessionContext {
     /// Key: `table_id`. Value: `(root_page_id, tail_page_id)`.
     /// Cleared whenever the schema cache is invalidated or a root rotation is detected.
     heap_tail: HashMap<u32, (u64, u64)>,
+    /// Attack 3.B Step 3: cached `build_insert_column_positions` results
+    /// keyed by `(table_id, columns_signature)`. Skips ~1-3 µs per INSERT
+    /// call by avoiding the per-column name lookup + Vec allocation.
+    ///
+    /// The value is `(schema_version, positions)`. On lookup, callers pass
+    /// the current schema_version; a mismatch causes lazy eviction +
+    /// recompute. This keeps the cache correct across DDL without coupling
+    /// it to specific invalidation paths (which are scattered across
+    /// invalidate_all, invalidate_table, root rotations, etc.).
+    ///
+    /// `columns_signature = 0` is the "all columns in declaration order"
+    /// shape (when the INSERT has no column list). Other shapes hash the
+    /// column-name list with `DefaultHasher`.
+    insert_col_positions: HashMap<(u32, u64), (u64, Vec<usize>)>,
+    /// Attack 2 (statement-fingerprinting): cached `CachedPlan` keyed by
+    /// `shape_hash`. Value is `(plan, lru_seq)`. Capacity capped at
+    /// `STATEMENT_CACHE_MAX_ENTRIES`; eviction picks min seq on insert
+    /// over capacity. Staleness handled lazily on lookup via
+    /// `PlanDeps::is_stale`.
+    statement_cache: HashMap<u64, (crate::statement_cache::CachedPlan, u64)>,
+    /// Monotonically increasing sequence counter for `statement_cache` LRU.
+    statement_lru_seq: u64,
+    /// Attack 5 (cursor-reuse-cross-statement): cached pointer to the
+    /// most-recently-touched clustered leaf in this session. Used by
+    /// `clustered_tree::lookup_with_hint` to skip the B-tree descent
+    /// when the next key falls in this leaf's range. Cleared by
+    /// `invalidate_all` and `invalidate_table`. Mirrors SQLite's
+    /// `BtCursor` cached metadata (BTCF_ValidNKey).
+    clustered_leaf_hint: Option<axiomdb_storage::clustered_tree::LeafCursorHint>,
+    /// Attack 17b: per-table COUNT(*) cache. Stores
+    /// `(count, changes_count_at_cache_time, schema_version_at_cache_time)`
+    /// per table. The change counter doubles as a dirty bit: any
+    /// INSERT/UPDATE/DELETE through this session bumps
+    /// `stats.changes_for(table_id)`, which then mismatches the
+    /// cached value and forces a re-scan. DDL bumps `schema_version`
+    /// which also forces a miss. No invalidation hook needed —
+    /// callers don't have to touch this cache; correctness falls
+    /// out of the comparison on lookup.
+    count_star_cache: HashMap<u32, (u64, u64, u64)>,
+    /// Phase 19.1: auto-vacuum config. When `auto_vacuum_enabled` is
+    /// `true` (default), every successful autocommit query that
+    /// touches any table is followed by an auto-vacuum check —
+    /// tables whose accumulated `stats.changes_for` count exceeds
+    /// `auto_vacuum_threshold` get inline-vacuumed before the next
+    /// query.
+    ///
+    /// Configurable via:
+    /// - `SET autovacuum = ON|OFF`
+    /// - `SET autovacuum_vacuum_threshold = N`
+    ///
+    /// Skipped inside explicit BEGIN..ROLLBACK/COMMIT — would cross
+    /// transaction boundaries. Skipped in degraded (read-only) mode.
+    pub auto_vacuum_enabled: bool,
+    /// Phase 19.1: per-session threshold (default 1000 changes).
+    /// PostgreSQL uses 50 + 0.2 * row_count; we keep it simple and
+    /// global until we have ALTER TABLE SET (per-table) in 19.x.
+    pub auto_vacuum_threshold: u64,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -697,6 +965,14 @@ pub struct SessionContext {
     ///
     /// Derived from `SET sql_mode = ...`.
     pub ansi_quotes: bool,
+    /// Attack 6 (perf-sqlite-gap deferred-fsync): per-session durability
+    /// override. Default = `Strict` (fsync per commit). Set via
+    /// `SET synchronous = '<value>'`; see `parse_synchronous_setting`.
+    /// Read via `SessionContext::synchronous()`. Applied to every
+    /// implicit/autocommit `txn.begin()` in the executor — see
+    /// `exec_with_ctx.rs`. Analog of SQLite's PRAGMA synchronous
+    /// (`research/sqlite/src/pager.c:3590-3611`).
+    synchronous: SessionDurability,
     /// How statement errors affect the current transaction (default: `RollbackStatement`).
     ///
     /// Set via `SET on_error = 'rollback_statement' | 'rollback_transaction' |
@@ -827,9 +1103,17 @@ impl SessionContext {
             session_id: NOTIFICATION_SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             cache: HashMap::new(),
             heap_tail: HashMap::new(),
+            insert_col_positions: HashMap::new(),
+            statement_cache: HashMap::new(),
+            statement_lru_seq: 0,
+            clustered_leaf_hint: None,
+            count_star_cache: HashMap::new(),
+            auto_vacuum_enabled: true,
+            auto_vacuum_threshold: 1000,
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,
+            synchronous: SessionDurability::default(),
             on_error: OnErrorMode::RollbackStatement,
             compat_mode: CompatMode::Standard,
             explicit_collation: None,
@@ -859,6 +1143,22 @@ impl SessionContext {
     /// Clears all accumulated warnings. Called before each statement.
     pub fn clear_warnings(&mut self) {
         self.warnings.clear();
+    }
+
+    /// Returns the current session-level durability mode.
+    ///
+    /// Attack 6 (perf-sqlite-gap deferred-fsync): consumed by every
+    /// implicit/autocommit `txn.begin()` to set `ConnectionTxn.durability_override`.
+    pub fn synchronous(&self) -> SessionDurability {
+        self.synchronous
+    }
+
+    /// Sets the session-level durability mode. Takes effect on the next
+    /// `txn.begin()`. Mirrors SQLite's PRAGMA synchronous semantics — must
+    /// be rejected inside an open transaction by the caller (the SET
+    /// dispatcher in `exec_dispatch.rs`).
+    pub fn set_synchronous(&mut self, mode: SessionDurability) {
+        self.synchronous = mode;
     }
 
     /// Discards any staged INSERT rows without writing to heap or WAL.
@@ -1060,6 +1360,31 @@ impl SessionContext {
         self.cache.get(&Self::key(database, schema, table))
     }
 
+    /// Returns the cached `ResolvedTable` for `(database, schema, table)` only
+    /// if its `def.schema_version` equals `expected_version`.
+    ///
+    /// Returns `None` on cache miss OR on version mismatch. Does NOT auto-evict
+    /// on mismatch — the caller is expected to re-resolve and overwrite via
+    /// [`Self::cache_table`].
+    ///
+    /// This is the cache-hit fast path for `resolve_table_cached` inside
+    /// explicit transactions, mirroring SQLite's schema-cookie check
+    /// (`research/sqlite/src/prepare.c:518-526`).
+    pub fn get_table_if_version(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        expected_version: u64,
+    ) -> Option<&ResolvedTable> {
+        let cached = self.cache.get(&Self::key(database, schema, table))?;
+        if cached.def.schema_version == expected_version {
+            Some(cached)
+        } else {
+            None
+        }
+    }
+
     pub fn cache_table(
         &mut self,
         database: &str,
@@ -1074,17 +1399,235 @@ impl SessionContext {
     pub fn invalidate_table(&mut self, database: &str, schema: &str, table: &str) {
         // Also clear any heap-tail hint for this table so a stale tail is not
         // reused after a DDL change or root rotation.
+        //
+        // `insert_col_positions` is NOT cleared here — its entries carry a
+        // schema_version stamp and get lazy-evicted on the next lookup that
+        // sees a mismatch (see `get_insert_col_positions`).
         if let Some(resolved) = self.cache.get(&Self::key(database, schema, table)) {
             self.heap_tail.remove(&resolved.def.id);
+            // Attack 17b: drop the cached COUNT(*) too — the schema_version
+            // tag would catch it on next lookup anyway, but evicting now
+            // keeps the HashMap small after a DDL on an unrelated session.
+            self.count_star_cache.remove(&resolved.def.id);
         }
         self.cache.remove(&Self::key(database, schema, table));
+        // Attack 5: clear the leaf hint conservatively. Could be more
+        // precise (only clear when invalidated table matches the hint's
+        // table_id), but the hint is a single slot so the cost is small.
+        self.clustered_leaf_hint = None;
     }
 
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
         self.heap_tail.clear();
+        // Attack 17b: COUNT(*) cache is per-table, but `invalidate_all`
+        // is the DDL-fence path — schema_version may have bumped across
+        // many tables. Drop the lot.
+        self.count_star_cache.clear();
+        // NOTE: `statement_cache` is intentionally NOT cleared here.
+        // invalidate_all is called from DDL endpoints AND from
+        // DML-with-index-changes (dml_join.rs, appender.rs). Clearing
+        // the statement cache on every DML would defeat the cache for
+        // the autocommit INSERT workload (each INSERT would re-compile).
+        // Staleness for the cache is handled lazily on lookup via
+        // PlanDeps.is_stale. The Attack 22 redesign to make this faster
+        // is deferred — see docs/perf-sqlite-gap.md.
+        // `insert_col_positions` is intentionally NOT cleared. Its entries
+        // carry a schema_version stamp and get lazy-evicted on the next
+        // lookup with a mismatching version (see get_insert_col_positions).
+        // Avoids clearing on every commit (staging.rs flush) which would
+        // defeat the cache's purpose.
         self.holiday_cache.clear();
         self.exchange_rate_cache.clear();
+        // `clustered_leaf_hint` is also intentionally NOT cleared here.
+        // The hint is STRUCTURAL (leaf page id + key range stamped by
+        // schema_version), not data-content-dependent. Committed writes
+        // don't move the leaf; only DDL / root rotation / leaf split
+        // can, and those paths invalidate via schema_version bump or
+        // are caught by the lazy validation in lookup_with_hint
+        // (page type check + range re-check). Clearing on every commit
+        // would defeat Attack 5's autocommit-INSERT win.
+    }
+
+    // ── Insert col_positions cache (Attack 3.B Step 3) ────────────────────────
+
+    /// Returns the cached column-position vector for `table_id` and the
+    /// statement's `columns_signature`, but only if its stored
+    /// `schema_version` matches `expected_schema_version`.
+    ///
+    /// On stale entries the cache lazily evicts and returns `None`, so the
+    /// caller recomputes and re-caches under the new version. This keeps
+    /// the cache correct across DDL without coupling it to specific
+    /// invalidation paths.
+    pub fn get_insert_col_positions(
+        &mut self,
+        table_id: u32,
+        expected_schema_version: u64,
+        columns_signature: u64,
+    ) -> Option<&Vec<usize>> {
+        let key = (table_id, columns_signature);
+        let stale = self
+            .insert_col_positions
+            .get(&key)
+            .map(|(ver, _)| *ver != expected_schema_version)
+            .unwrap_or(false);
+        if stale {
+            self.insert_col_positions.remove(&key);
+            return None;
+        }
+        self.insert_col_positions.get(&key).map(|(_, pos)| pos)
+    }
+
+    /// Caches a `build_insert_column_positions` result tagged with the
+    /// current schema_version (so future lookups can lazy-evict on stale).
+    pub fn cache_insert_col_positions(
+        &mut self,
+        table_id: u32,
+        schema_version: u64,
+        columns_signature: u64,
+        col_positions: Vec<usize>,
+    ) {
+        self.insert_col_positions.insert(
+            (table_id, columns_signature),
+            (schema_version, col_positions),
+        );
+    }
+
+    /// Diagnostic / test accessor for the cache size.
+    pub fn insert_col_positions_count(&self) -> usize {
+        self.insert_col_positions.len()
+    }
+
+    // ── Statement cache (Attack 2 — auto-prepared statements) ─────────────────
+
+    /// Returns the cached plan for `shape_hash` only if its `PlanDeps`
+    /// are still valid against the live catalog.
+    ///
+    /// Stale entries are lazy-evicted on lookup (removed from the cache
+    /// and returned as `None`), reusing the existing version-check pattern.
+    ///
+    /// On hit, the entry's LRU sequence is bumped so it survives longer.
+    pub fn get_cached_plan(
+        &mut self,
+        shape_hash: u64,
+        reader: &mut axiomdb_catalog::CatalogReader<'_>,
+    ) -> Result<Option<&crate::statement_cache::CachedPlan>, DbError> {
+        // Step 1: validate deps (immutable borrow on the entry, no LRU bump yet).
+        let stale = match self.statement_cache.get(&shape_hash) {
+            None => return Ok(None),
+            Some((plan, _)) => plan.deps.is_stale(reader)?,
+        };
+        if stale {
+            self.statement_cache.remove(&shape_hash);
+            return Ok(None);
+        }
+        // Step 2: bump LRU + return.
+        self.statement_lru_seq += 1;
+        if let Some((_, seq)) = self.statement_cache.get_mut(&shape_hash) {
+            *seq = self.statement_lru_seq;
+        }
+        Ok(self.statement_cache.get(&shape_hash).map(|(p, _)| p))
+    }
+
+    /// Inserts a compiled plan into the cache, evicting the oldest entry
+    /// (by LRU sequence) if at capacity. Capacity is
+    /// `STATEMENT_CACHE_MAX_ENTRIES` (see `statement_cache` module).
+    pub fn cache_plan(&mut self, shape_hash: u64, plan: crate::statement_cache::CachedPlan) {
+        if self.statement_cache.len() >= crate::statement_cache::STATEMENT_CACHE_MAX_ENTRIES
+            && !self.statement_cache.contains_key(&shape_hash)
+        {
+            // Linear scan for min seq. At cap = 256 this is sub-µs and avoids
+            // the complexity of a LinkedHashMap or LRU crate. Profile-driven
+            // upgrade later if it ever shows up.
+            if let Some(&oldest_key) = self
+                .statement_cache
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(k, _)| k)
+            {
+                self.statement_cache.remove(&oldest_key);
+            }
+        }
+        self.statement_lru_seq += 1;
+        self.statement_cache
+            .insert(shape_hash, (plan, self.statement_lru_seq));
+    }
+
+    /// Diagnostic / test accessor for the statement cache size.
+    pub fn statement_cache_count(&self) -> usize {
+        self.statement_cache.len()
+    }
+
+    /// Clears the statement cache. Used by tests and by any DDL path
+    /// that wants to force a cold start.
+    pub fn invalidate_statement_cache(&mut self) {
+        self.statement_cache.clear();
+    }
+
+    // ── Clustered leaf hint (Attack 5 — cursor reuse cross-statement) ─────────
+
+    /// Returns the cached clustered-leaf hint only if it can serve `key`.
+    ///
+    /// "Can serve" means:
+    /// - `table_id` matches,
+    /// - `root_page_id` matches the caller's current root,
+    /// - `schema_version` matches the caller's current version,
+    /// - `key` falls in `[min_key, max_key]`.
+    ///
+    /// Returns `None` on any mismatch — the caller must descend from
+    /// root via `clustered_tree::descend_to_leaf` (which `lookup_with_hint`
+    /// does automatically when this returns `None`).
+    pub fn get_clustered_leaf_hint(
+        &self,
+        table_id: u32,
+        root_page_id: u64,
+        schema_version: u64,
+        key: &[u8],
+    ) -> Option<&axiomdb_storage::clustered_tree::LeafCursorHint> {
+        let h = self.clustered_leaf_hint.as_ref()?;
+        if h.table_id == table_id
+            && h.root_page_id == root_page_id
+            && h.schema_version == schema_version
+            && key >= h.min_key.as_slice()
+            && key <= h.max_key.as_slice()
+        {
+            Some(h)
+        } else {
+            None
+        }
+    }
+
+    /// Stores a fresh hint. Called after a successful descent or
+    /// `try_append_with_hint`.
+    pub fn set_clustered_leaf_hint(
+        &mut self,
+        hint: axiomdb_storage::clustered_tree::LeafCursorHint,
+    ) {
+        self.clustered_leaf_hint = Some(hint);
+    }
+
+    /// Explicitly clears the hint. Used by callers that mutate the
+    /// underlying leaf in ways the hint can't track (e.g., page split,
+    /// merge, root rotation outside the catalog DDL path).
+    pub fn invalidate_clustered_leaf_hint(&mut self) {
+        self.clustered_leaf_hint = None;
+    }
+
+    /// Diagnostic / test accessor — reports whether a hint is currently
+    /// stored. Says nothing about whether the hint matches any particular
+    /// `(table_id, root, version, key)` tuple — use `get_clustered_leaf_hint`
+    /// for that.
+    pub fn clustered_leaf_hint_present(&self) -> bool {
+        self.clustered_leaf_hint.is_some()
+    }
+
+    /// Returns a mutable reference to the underlying slot so that
+    /// storage-layer helpers (`clustered_tree::lookup_with_hint` etc.)
+    /// can read + update it in place.
+    pub fn clustered_leaf_hint_slot(
+        &mut self,
+    ) -> &mut Option<axiomdb_storage::clustered_tree::LeafCursorHint> {
+        &mut self.clustered_leaf_hint
     }
 
     // ── Heap tail hint cache (Phase 5.18) ─────────────────────────────────────
@@ -1117,6 +1660,30 @@ impl SessionContext {
     /// Clears the heap tail hint for a specific `table_id`.
     pub fn invalidate_heap_tail(&mut self, table_id: u32) {
         self.heap_tail.remove(&table_id);
+    }
+
+    /// Attack 17b: COUNT(*) cache lookup. Returns `Some(count)` when
+    /// `table_id` has a cached count AND the cached state still
+    /// matches: same change counter (no writes since cache time)
+    /// AND same schema version (no DDL since cache time).
+    pub fn get_count_star(&self, table_id: u32, schema_version: u64) -> Option<u64> {
+        let (count, cached_changes, cached_schema_ver) =
+            self.count_star_cache.get(&table_id).copied()?;
+        if cached_changes != self.stats.changes_for(table_id) {
+            return None;
+        }
+        if cached_schema_ver != schema_version {
+            return None;
+        }
+        Some(count)
+    }
+
+    /// Stores the freshly-computed COUNT(*) for `table_id`, capturing
+    /// the current change-count + schema_version as the validity tags.
+    pub fn cache_count_star(&mut self, table_id: u32, schema_version: u64, count: u64) {
+        let changes = self.stats.changes_for(table_id);
+        self.count_star_cache
+            .insert(table_id, (count, changes, schema_version));
     }
 
     pub fn cached_count(&self) -> usize {

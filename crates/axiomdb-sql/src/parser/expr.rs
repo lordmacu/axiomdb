@@ -1432,6 +1432,16 @@ fn parse_window_order_item(p: &mut Parser) -> Result<OrderByItem, DbError> {
 /// that are not standard SQL data types (SIGNED, UNSIGNED, BINARY, JSON…).
 fn parse_convert_type(p: &mut Parser) -> Result<DataType, DbError> {
     // Handle MySQL-specific CONVERT type keywords that aren't standard SQL types.
+    // Phase 24.5: BINARY/VARBINARY were promoted to real keyword tokens so we
+    // also handle them here directly (the old `Ident("binary")` path is dead).
+    if let Token::TyBinary | Token::TyVarbinary = p.peek() {
+        p.advance();
+        if p.eat(&Token::LParen) {
+            p.advance();
+            p.expect(&Token::RParen)?;
+        }
+        return Ok(DataType::Bytes);
+    }
     match p.peek().clone() {
         Token::Ident(s) => {
             let lower = s.to_ascii_lowercase();

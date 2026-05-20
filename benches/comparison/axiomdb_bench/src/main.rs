@@ -20,7 +20,15 @@ const RUNS: usize = 5;
 // ── Engine helpers ────────────────────────────────────────────────────────────
 
 fn db_open(dir: &Path) -> Db {
-    Db::open(dir.join("bench.db")).expect("open db")
+    let mut db = Db::open(dir.join("bench.db")).expect("open db");
+    // Attack 6: match SQLite's PRAGMA synchronous=NORMAL for an
+    // apples-to-apples comparison on the insert_autocommit scenario.
+    // SqliteDb::open_file above sets the same level (line 464).
+    // Without this, AxiomDB pays fsync-per-commit while SQLite does not,
+    // and the bench is fundamentally unfair on durability cost.
+    db.run("SET synchronous = 'NORMAL'")
+        .expect("set synchronous=NORMAL");
+    db
 }
 
 fn db_sql(db: &mut Db, q: &str) -> QueryResult {
@@ -188,6 +196,240 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, ac_n, mean, "reset outside timing");
         }
 
+        "insert_appender" => {
+            // Attack 7 v1.1: Appender on the canonical clustered
+            // bench_users table (PRIMARY KEY id). Goes through the
+            // clustered B-Tree + all secondary indexes — same write
+            // path SQL INSERT uses for this schema.
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender, clustered (v1.1)");
+        }
+
+        "insert_appender_large" => {
+            // Attack 13 validation: uncapped rows to exercise multiple
+            // auto-flushes (APPENDER_BATCH_FLUSH = 1024). The deferred
+            // `update_table_root` saves one catalog write per flush
+            // avoided (8.7ms on macOS APFS).
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=n_rows {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(
+                scenario,
+                n_rows,
+                mean,
+                "appender clustered, n_rows uncapped (A13)",
+            );
+        }
+
+        "create_index" => {
+            // Attack 12: CREATE INDEX timing on the canonical 5000-row
+            // bench_users table. Uses non-unique idx_email (the
+            // bulk-eligible case). UNIQUE indexes fall back to the
+            // per-row path.
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                let inserts = gen_inserts(n_rows);
+                insert_batch_pure(&mut db, &inserts);
+                db_sql(&mut db, "DROP INDEX IF EXISTS idx_email");
+                let t0 = Instant::now();
+                db_sql(&mut db, "CREATE INDEX idx_email ON bench_users (email)");
+                t0.elapsed()
+            });
+            out(scenario, n_rows, mean, "CREATE INDEX on n_rows-row table");
+        }
+
+        "insert_appender_indexed" => {
+            // Attack 10 validation: clustered bench_users + a secondary
+            // index. The deferred-secondary + catalog-batching wins are
+            // ONLY visible on tables WITH secondary indexes — the plain
+            // bench_users has none, so insert_appender doesn't expose
+            // the gain. Here we add `CREATE INDEX idx_email` and
+            // re-measure.
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                reset(&mut db);
+                db_sql(&mut db, "CREATE INDEX idx_email ON bench_users (email)");
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(
+                scenario,
+                ac_n,
+                mean,
+                "appender, clustered+1 secondary index",
+            );
+        }
+
+        "insert_appender_heap" => {
+            // Attack 7 v1 baseline kept for comparison: Appender on a
+            // parallel heap-only table (no PRIMARY KEY). Shows the
+            // ceiling of the Appender when the clustered B-Tree split
+            // overhead is removed.
+            use axiomdb_types::Value;
+            let mean = measure_timed(|| {
+                db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    &mut db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users_heap").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender, heap (v1 baseline)");
+        }
+
+        "insert_appender_typed" => {
+            // Attack 8: Rust typed builder API. Should match v1.1
+            // performance — same internal path through append_row_owned.
+            let mean = measure_timed(|| {
+                db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    &mut db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users_heap").unwrap();
+                for i in 1..=ac_n {
+                    app.append_int(i as i32).unwrap();
+                    app.append_text(&format!("user_{i:06}")).unwrap();
+                    app.append_int((18 + (i % 62)) as i32).unwrap();
+                    app.append_bool(i % 2 == 0).unwrap();
+                    app.append_real(100.0 + (i % 1000) as f64 * 0.1).unwrap();
+                    app.append_text(&format!("u{i}@b.local")).unwrap();
+                    app.end_row().unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender typed builder (Rust, A8)");
+        }
+
+        "insert_appender_c" => {
+            // Attack 8: through the C FFI surface from Rust. Measures
+            // the per-call cost of the unsafe boundary.
+            use std::ffi::CString;
+            let mean = measure_timed(|| {
+                db_sql(&mut db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    &mut db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                unsafe {
+                    let db_ptr: *mut axiomdb_embedded::Db = &mut db;
+                    let table = CString::new("bench_users_heap").unwrap();
+                    let app = axiomdb_embedded::axiomdb_appender_open(db_ptr, table.as_ptr());
+                    assert!(!app.is_null());
+                    for i in 1..=ac_n {
+                        let name = CString::new(format!("user_{i:06}")).unwrap();
+                        let email = CString::new(format!("u{i}@b.local")).unwrap();
+                        axiomdb_embedded::axiomdb_appender_append_int(app, i as i32);
+                        axiomdb_embedded::axiomdb_appender_append_text(app, name.as_ptr());
+                        axiomdb_embedded::axiomdb_appender_append_int(app, (18 + (i % 62)) as i32);
+                        axiomdb_embedded::axiomdb_appender_append_bool(
+                            app,
+                            if i % 2 == 0 { 1 } else { 0 },
+                        );
+                        axiomdb_embedded::axiomdb_appender_append_real(
+                            app,
+                            100.0 + (i % 1000) as f64 * 0.1,
+                        );
+                        axiomdb_embedded::axiomdb_appender_append_text(app, email.as_ptr());
+                        axiomdb_embedded::axiomdb_appender_end_row(app);
+                    }
+                    let n = axiomdb_embedded::axiomdb_appender_finish(app);
+                    assert!(n >= 0);
+                }
+                t0.elapsed()
+            });
+            out(scenario, ac_n, mean, "appender C FFI (Attack 8)");
+        }
+
         _ => {
             load_batch(&mut db, &inserts);
             let step = (n_rows.max(100) / 100).max(1);
@@ -259,6 +501,197 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             out(scenario, n_ops, mean, note);
         }
     }
+}
+
+// ── Diagnostic: INSERT timing breakdown (parse / analyze / execute) ──────────
+//
+// Recreates the embedded Db components manually so we can wrap each phase
+// with its own timer. No production code changes.
+//
+// Layout of one INSERT call inside `Db::run_inner` (from axiomdb-embedded
+// lib.rs:294) is:
+//     1. parse_with_sql_mode(...)        ← AST construction
+//     2. txn.snapshot()                  ← MVCC snapshot allocation
+//     3. analyze_cached(...)             ← name resolution (schema cache hit)
+//     4. execute_with_ctx(...)           ← all the real work
+//
+// All four are timed separately below. The fourth bucket (execute) lumps
+// together the row codec, heap insert, WAL append, MVCC bookkeeping, PK
+// index update, and autocommit. A follow-up diagnostic can break execute
+// down further once we know it dominates.
+fn diagnose_insert(data_dir: &Path, n_rows: usize) {
+    use axiomdb_catalog::bootstrap::CatalogBootstrap;
+    use axiomdb_sql::{
+        analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode, SchemaCache,
+        SessionContext,
+    };
+    use axiomdb_storage::MmapStorage;
+    use axiomdb_wal::TxnManager;
+
+    // Always start from a clean DB so the bench is reproducible.
+    let _ = std::fs::remove_dir_all(data_dir);
+    std::fs::create_dir_all(data_dir).unwrap();
+    let db_path = data_dir.join("diag_insert.db");
+    let wal_path = data_dir.join("diag_insert.wal");
+
+    let storage = MmapStorage::create(&db_path).expect("create storage");
+    CatalogBootstrap::init(&storage).expect("bootstrap catalog");
+    let txn = TxnManager::create(&wal_path).expect("create txn");
+    let bloom = BloomRegistry::new();
+    let mut schema_cache = SchemaCache::new();
+    let mut session = SessionContext::default();
+    let sql_mode = session.sql_mode_flags();
+
+    // ── CREATE TABLE (not part of the measurement) ────────────────────────────
+    let create_sql = "CREATE TABLE bench_users (\
+        id INT NOT NULL, name TEXT NOT NULL, age INT NOT NULL, \
+        active BOOL NOT NULL, score REAL NOT NULL, email TEXT NOT NULL, \
+        PRIMARY KEY (id))";
+    let create_stmt = parse_with_sql_mode(create_sql, None, sql_mode).expect("parse create");
+    let create_analyzed = analyze_cached(create_stmt, &storage, txn.snapshot(), &mut schema_cache)
+        .expect("analyze create");
+    execute_with_ctx(create_analyzed, &storage, &txn, &bloom, &mut session).expect("create");
+
+    // ── BEGIN (one explicit transaction wrapping all inserts) ─────────────────
+    let begin_stmt = parse_with_sql_mode("BEGIN", None, sql_mode).unwrap();
+    let begin_analyzed =
+        analyze_cached(begin_stmt, &storage, txn.snapshot(), &mut schema_cache).unwrap();
+    execute_with_ctx(begin_analyzed, &storage, &txn, &bloom, &mut session).unwrap();
+
+    let sqls = gen_inserts(n_rows);
+
+    // ── Warmup so caches are hot for the first measured row ───────────────────
+    let first = parse_with_sql_mode(&sqls[0], None, sql_mode).unwrap();
+    let first = analyze_cached(first, &storage, txn.snapshot(), &mut schema_cache).unwrap();
+    execute_with_ctx(first, &storage, &txn, &bloom, &mut session).unwrap();
+
+    // ── Timed loop — separate timers around each phase ────────────────────────
+    let mut t_parse_ns: u128 = 0;
+    let mut t_snap_ns: u128 = 0;
+    let mut t_analyze_ns: u128 = 0;
+    let mut t_execute_ns: u128 = 0;
+
+    let measured_start = 1; // we already executed row 0 above as warmup
+    for sql in &sqls[measured_start..] {
+        // Phase 1: parse
+        let t0 = Instant::now();
+        let stmt = parse_with_sql_mode(sql, None, sql_mode).expect("parse insert");
+        t_parse_ns += t0.elapsed().as_nanos();
+
+        // Phase 2: snapshot acquisition
+        let t0 = Instant::now();
+        let snap = if let Some(ref ct) = session.conn_txn {
+            txn.active_snapshot(ct)
+        } else {
+            txn.snapshot()
+        };
+        t_snap_ns += t0.elapsed().as_nanos();
+
+        // Phase 3: analyze (schema cache hit after the first row)
+        let t0 = Instant::now();
+        let analyzed = analyze_cached(stmt, &storage, snap, &mut schema_cache).expect("analyze");
+        t_analyze_ns += t0.elapsed().as_nanos();
+
+        // Phase 4: execute (everything else — codec, heap, WAL, MVCC, index)
+        let t0 = Instant::now();
+        execute_with_ctx(analyzed, &storage, &txn, &bloom, &mut session).expect("execute");
+        t_execute_ns += t0.elapsed().as_nanos();
+    }
+
+    // ── COMMIT (timed separately — captures group fsync) ──────────────────────
+    let commit_stmt = parse_with_sql_mode("COMMIT", None, sql_mode).unwrap();
+    let commit_analyzed =
+        analyze_cached(commit_stmt, &storage, txn.snapshot(), &mut schema_cache).unwrap();
+    let t0 = Instant::now();
+    execute_with_ctx(commit_analyzed, &storage, &txn, &bloom, &mut session).unwrap();
+    let commit_ns = t0.elapsed().as_nanos();
+
+    // ── Report ────────────────────────────────────────────────────────────────
+    let measured = (n_rows - measured_start) as u128;
+    let per = |total: u128| total / measured;
+    let total_per_row = per(t_parse_ns) + per(t_snap_ns) + per(t_analyze_ns) + per(t_execute_ns);
+
+    fn fmt_us(ns: u128) -> String {
+        format!("{:.2} µs", ns as f64 / 1000.0)
+    }
+    fn pct(part: u128, total: u128) -> String {
+        if total == 0 {
+            "  —".into()
+        } else {
+            format!("{:5.1}%", part as f64 / total as f64 * 100.0)
+        }
+    }
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════╗");
+    eprintln!(
+        "║  AxiomDB INSERT Phase Breakdown — {} rows (warmup discarded)   ",
+        n_rows
+    );
+    eprintln!("║  Configuration: explicit BEGIN/COMMIT, single connection         ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Phase                       µs/row    % of per-row total       ║");
+    eprintln!("║  ────────────────────────────────────────────────────────────    ║");
+    eprintln!(
+        "║  parse_with_sql_mode      {:>10}     {}                  ║",
+        fmt_us(per(t_parse_ns)),
+        pct(per(t_parse_ns), total_per_row)
+    );
+    eprintln!(
+        "║  txn.snapshot()           {:>10}     {}                  ║",
+        fmt_us(per(t_snap_ns)),
+        pct(per(t_snap_ns), total_per_row)
+    );
+    eprintln!(
+        "║  analyze_cached           {:>10}     {}                  ║",
+        fmt_us(per(t_analyze_ns)),
+        pct(per(t_analyze_ns), total_per_row)
+    );
+    eprintln!(
+        "║  execute_with_ctx         {:>10}     {}                  ║",
+        fmt_us(per(t_execute_ns)),
+        pct(per(t_execute_ns), total_per_row)
+    );
+    eprintln!("║  ────────────────────────────────────────────────────────────    ║");
+    eprintln!(
+        "║  TOTAL per row            {:>10}                            ║",
+        fmt_us(total_per_row)
+    );
+    eprintln!("║                                                                  ║");
+    eprintln!(
+        "║  COMMIT (group fsync)     {:>10}  (amortized over {} rows)  ",
+        fmt_us(commit_ns),
+        n_rows
+    );
+    eprintln!("║                                                                  ║");
+    eprintln!(
+        "║  Effective throughput:    {:.0} rows/s                            ",
+        1e9 / total_per_row as f64
+    );
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+
+    // Verdict
+    let dominant = [
+        ("parse", per(t_parse_ns)),
+        ("snapshot", per(t_snap_ns)),
+        ("analyze", per(t_analyze_ns)),
+        ("execute", per(t_execute_ns)),
+    ]
+    .iter()
+    .max_by_key(|(_, v)| *v)
+    .copied()
+    .unwrap();
+    eprintln!(
+        "║  Dominant phase: {} ({:.1}% of per-row time)",
+        dominant.0,
+        dominant.1 as f64 / total_per_row as f64 * 100.0,
+    );
+    if dominant.0 == "execute" {
+        eprintln!("║  Next step: instrument inside execute_with_ctx to break          ║");
+        eprintln!("║  execute down into: row codec, heap insert, WAL, index update.   ║");
+    }
+    eprintln!("╚══════════════════════════════════════════════════════════════════╝");
+    eprintln!();
 }
 
 // ── SQLite wrapper ────────────────────────────────────────────────────────────
@@ -363,6 +796,36 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
             for sql in &ac_inserts {
                 db.sql(&format!("BEGIN; {sql}; COMMIT"));
             }
+            t0.elapsed()
+        }),
+
+        // Attack 7 comparison: SQLite analog of AxiomDB Appender.
+        // Uses prepare_cached + execute with bind params (no parsing
+        // per row, no fsync per row in NORMAL mode) — the canonical
+        // "fast bind" pattern SQLite users actually use for bulk loads.
+        "insert_appender" | "insert_appender_heap" => measure_timed(|| {
+            // Same SQLite fast-bind path for both — SQLite doesn't
+            // distinguish heap vs clustered (every table is a B-Tree).
+            db.reset();
+            let n = ac_inserts.len();
+            let t0 = Instant::now();
+            db.conn.execute_batch("BEGIN").unwrap();
+            {
+                let mut stmt = db
+                    .conn
+                    .prepare_cached("INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)")
+                    .unwrap();
+                for i in 1..=n {
+                    let active = if i % 2 == 0 { 1i64 } else { 0 };
+                    let age = (18 + (i % 62)) as i64;
+                    let score = 100.0 + (i % 1000) as f64 * 0.1;
+                    let name = format!("user_{i:06}");
+                    let email = format!("u{i}@b.local");
+                    stmt.execute(rusqlite::params![i as i64, name, age, active, score, email])
+                        .unwrap();
+                }
+            }
+            db.conn.execute_batch("COMMIT").unwrap();
             t0.elapsed()
         }),
 
@@ -477,6 +940,8 @@ fn run_compare(n_rows: usize, sqlite_memory: bool) {
     let scenarios: &[(&str, usize)] = &[
         ("insert_batch", n_rows),
         ("insert_autocommit", n_rows.min(300)),
+        ("insert_appender", n_rows.min(300)),
+        ("insert_appender_heap", n_rows.min(300)),
         ("crud_flow/insert", n_rows),
         ("crud_flow/select", n_rows),
         ("crud_flow/delete", n_rows),
@@ -562,6 +1027,65 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
             }
             t0.elapsed()
         }),
+
+        "insert_appender" => {
+            // v1.1: clustered bench_users (PRIMARY KEY id).
+            use axiomdb_types::Value;
+            measure_timed(|| {
+                reset(db);
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            })
+        }
+
+        "insert_appender_heap" => {
+            // v1 baseline retained: heap-only bench_users_heap.
+            use axiomdb_types::Value;
+            measure_timed(|| {
+                db_sql(db, "DROP TABLE IF EXISTS bench_users_heap");
+                db_sql(
+                    db,
+                    "CREATE TABLE bench_users_heap (
+                        id     INT  NOT NULL,
+                        name   TEXT NOT NULL,
+                        age    INT  NOT NULL,
+                        active BOOL NOT NULL,
+                        score  REAL NOT NULL,
+                        email  TEXT NOT NULL
+                    )",
+                );
+                let t0 = Instant::now();
+                let mut app = db.appender("bench_users_heap").unwrap();
+                for i in 1..=ac_n {
+                    let active = i % 2 == 0;
+                    app.append_row_owned(vec![
+                        Value::Int(i as i32),
+                        Value::Text(format!("user_{i:06}")),
+                        Value::Int((18 + (i % 62)) as i32),
+                        Value::Bool(active),
+                        Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                        Value::Text(format!("u{i}@b.local")),
+                    ])
+                    .unwrap();
+                }
+                app.finish().unwrap();
+                t0.elapsed()
+            })
+        }
 
         "crud_flow/insert" | "crud_flow/select" | "crud_flow/delete" => {
             let mut ins_t = Vec::with_capacity(RUNS);
@@ -699,11 +1223,191 @@ fn main() {
     };
     std::fs::create_dir_all(&data_dir).unwrap();
 
+    // The bench harness runs one scenario per `--scenario` invocation.
+    // Each process exits at the end of `main`; with `SET synchronous =
+    // NORMAL` (matching SQLite's bench config) the WAL may not be fully
+    // flushed when the process terminates, leaving the .db in a state
+    // recovery cannot reconcile cleanly on the next invocation
+    // (ChecksumMismatch on `Db::open`). Each scenario already calls
+    // `reset(&db)` to DROP+CREATE its table, so persisting state
+    // between scenarios has no value — wipe the data dir before opening
+    // to guarantee a clean baseline.
+    for entry in std::fs::read_dir(&data_dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            if name.starts_with("bench.") || name.starts_with("diag_") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
     if args.contains(&"--diagnose".to_string()) {
         diagnose(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-insert".to_string()) {
+        diagnose_insert(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-insert-deep".to_string()) {
+        diagnose_insert_deep(&data_dir, n_rows);
     } else {
         run_scenario(&scenario, n_rows, &data_dir);
     }
+}
+
+// ── Deep INSERT diagnostic (requires --features axiomdb-sql/bench-timings) ────
+#[cfg(feature = "bench-timings")]
+fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
+    use axiomdb_catalog::bootstrap::CatalogBootstrap;
+    use axiomdb_sql::{
+        analyze_cached, bench_timings, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode,
+        SchemaCache, SessionContext,
+    };
+    use axiomdb_storage::MmapStorage;
+    use axiomdb_wal::TxnManager;
+
+    let _ = std::fs::remove_dir_all(data_dir);
+    std::fs::create_dir_all(data_dir).unwrap();
+    let db_path = data_dir.join("diag_insert_deep.db");
+    let wal_path = data_dir.join("diag_insert_deep.wal");
+
+    let storage = MmapStorage::create(&db_path).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
+    let txn = TxnManager::create(&wal_path).unwrap();
+    let bloom = BloomRegistry::new();
+    let mut schema_cache = SchemaCache::new();
+    let mut session = SessionContext::default();
+    let sql_mode = session.sql_mode_flags();
+
+    let run = |sql: &str,
+               storage: &MmapStorage,
+               txn: &TxnManager,
+               bloom: &BloomRegistry,
+               cache: &mut SchemaCache,
+               session: &mut SessionContext| {
+        let stmt = parse_with_sql_mode(sql, None, sql_mode).unwrap();
+        let analyzed = analyze_cached(stmt, storage, txn.snapshot(), cache).unwrap();
+        execute_with_ctx(analyzed, storage, txn, bloom, session).unwrap();
+    };
+
+    run(
+        "CREATE TABLE bench_users (id INT NOT NULL, name TEXT NOT NULL, \
+         age INT NOT NULL, active BOOL NOT NULL, score REAL NOT NULL, \
+         email TEXT NOT NULL, PRIMARY KEY (id))",
+        &storage,
+        &txn,
+        &bloom,
+        &mut schema_cache,
+        &mut session,
+    );
+    run(
+        "BEGIN",
+        &storage,
+        &txn,
+        &bloom,
+        &mut schema_cache,
+        &mut session,
+    );
+
+    let sqls = gen_inserts(n_rows);
+
+    // Warmup row (1 row) before resetting timers.
+    let warm = parse_with_sql_mode(&sqls[0], None, sql_mode).unwrap();
+    let warm = analyze_cached(warm, &storage, txn.snapshot(), &mut schema_cache).unwrap();
+    execute_with_ctx(warm, &storage, &txn, &bloom, &mut session).unwrap();
+
+    bench_timings::reset_insert_timings();
+
+    for sql in &sqls[1..] {
+        let stmt = parse_with_sql_mode(sql, None, sql_mode).unwrap();
+        let snap = if let Some(ref ct) = session.conn_txn {
+            txn.active_snapshot(ct)
+        } else {
+            txn.snapshot()
+        };
+        let analyzed = analyze_cached(stmt, &storage, snap, &mut schema_cache).unwrap();
+        execute_with_ctx(analyzed, &storage, &txn, &bloom, &mut session).unwrap();
+    }
+
+    let t = bench_timings::snapshot_insert_timings();
+    let rows = t.rows.max(1) as u128;
+    let per = |ns: u128| ns / rows;
+
+    let measured = [
+        ("eval (expr → Value)", per(t.eval_ns)),
+        ("validate exprs+defaults", per(t.validate_ns)),
+        ("assign_auto_increment", per(t.auto_inc_ns)),
+        ("materialize_generated", per(t.generated_cols_ns)),
+        ("text+row constraints", per(t.constraints_ns)),
+        ("fk_check_child_insert", per(t.fk_check_ns)),
+        ("prepare_row (codec+PK)", per(t.prepare_row_ns)),
+        ("validate_enum", per(t.enum_validate_ns)),
+        ("pk_dup HashSet check", per(t.pk_dup_ns)),
+        ("batch push (Vec+HashSet)", per(t.batch_push_ns)),
+    ];
+    let total: u128 = measured.iter().map(|(_, ns)| *ns).sum();
+
+    fn fmt_us(ns: u128) -> String {
+        format!("{:>8.2} µs", ns as f64 / 1000.0)
+    }
+    fn pct(part: u128, total: u128) -> String {
+        if total == 0 {
+            "  —".into()
+        } else {
+            format!("{:>6.1}%", part as f64 / total as f64 * 100.0)
+        }
+    }
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════╗");
+    eprintln!(
+        "║  AxiomDB INSERT Deep Phase Breakdown — {} rows (warmup discarded)",
+        t.rows
+    );
+    eprintln!("║  Path: enqueue_clustered_insert_ctx per-row loop                 ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Phase                              µs/row      % of measured    ║");
+    eprintln!("║  ──────────────────────────────────────────────────────────      ║");
+    for (name, ns) in &measured {
+        eprintln!(
+            "║  {:<32} {}    {}        ║",
+            name,
+            fmt_us(*ns),
+            pct(*ns, total)
+        );
+    }
+    eprintln!("║  ──────────────────────────────────────────────────────────      ║");
+    eprintln!(
+        "║  measured subtotal              {}                       ║",
+        fmt_us(total)
+    );
+    eprintln!("║                                                                  ║");
+
+    let mut sorted: Vec<_> = measured.iter().copied().collect();
+    sorted.sort_by_key(|(_, ns)| std::cmp::Reverse(*ns));
+    eprintln!("║  Top 3 phases:                                                   ║");
+    for (i, (name, ns)) in sorted.iter().take(3).enumerate() {
+        eprintln!(
+            "║   {}. {:<28}  {}  ({})                  ║",
+            i + 1,
+            name,
+            fmt_us(*ns),
+            pct(*ns, total),
+        );
+    }
+    eprintln!("╚══════════════════════════════════════════════════════════════════╝");
+    eprintln!();
+}
+
+#[cfg(not(feature = "bench-timings"))]
+fn diagnose_insert_deep(_data_dir: &Path, _n_rows: usize) {
+    eprintln!();
+    eprintln!("──────────────────────────────────────────────────────────────────");
+    eprintln!("  --diagnose-insert-deep requires the bench-timings feature.");
+    eprintln!("  Rebuild with:");
+    eprintln!();
+    eprintln!("      cargo run -p axiomdb-bench-comparison --release \\");
+    eprintln!("          --features axiomdb-sql/bench-timings -- \\");
+    eprintln!("          --scenario insert_batch --rows 10000 --diagnose-insert-deep");
+    eprintln!("──────────────────────────────────────────────────────────────────");
+    eprintln!();
 }
 
 // ── Diagnostic: timing breakdown per phase ────────────────────────────────────

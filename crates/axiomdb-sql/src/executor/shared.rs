@@ -20,39 +20,41 @@ fn resolve_table_cached(
         }
     }
 
-    // Inside an explicit transaction, catalog metadata can change mid-transaction
-    // (bulk DELETE, TRUNCATE, DDL, savepoint rollback). Skip the cache so every
-    // statement always reads the current catalog state via the active snapshot.
-    let in_txn = conn_txn.is_some();
+    // Cache lookup is valid both inside and outside an explicit transaction.
+    // We validate cached entries against TableDef.schema_version, which DDL
+    // bumps via CatalogWriter::bump_table_schema_version. Mirrors SQLite's
+    // schema-cookie check in research/sqlite/src/prepare.c:518-526.
 
     // If the user specified an explicit schema, resolve directly.
     if let Some(schema) = tref.schema.as_deref() {
-        if !in_txn {
-            if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
-                return Ok(cached.clone());
-            }
+        if let Some(hit) = try_cached_with_version(
+            storage, txn, ctx, conn_txn, &database, schema, &tref.name,
+        )? {
+            return Ok(hit);
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
-        if !in_txn {
-            ctx.cache_table(&database, schema, &tref.name, resolved.clone());
-        }
+        ctx.cache_table(&database, schema, &tref.name, resolved.clone());
         return Ok(resolved);
     }
 
     // Unqualified name: scan search_path in order until a match is found.
-    let search_path: Vec<String> = ctx.search_path.clone();
-    for schema in &search_path {
-        if !in_txn {
-            if let Some(cached) = ctx.get_table(&database, schema, &tref.name) {
-                return Ok(cached.clone());
-            }
+    // Iterate by index to avoid cloning the whole search_path Vec on every
+    // call — only clone the one schema string per iteration that the
+    // borrow checker forces (try_cached_with_version takes &mut ctx).
+    // search_path is typically 1 entry ("public") so this is at most one
+    // String alloc per call instead of an outer Vec + per-entry String.
+    let n_schemas = ctx.search_path.len();
+    for schema_idx in 0..n_schemas {
+        let schema = ctx.search_path[schema_idx].clone();
+        if let Some(hit) = try_cached_with_version(
+            storage, txn, ctx, conn_txn, &database, &schema, &tref.name,
+        )? {
+            return Ok(hit);
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
-        if let Ok(resolved) = resolver.resolve_table(Some(schema), &tref.name) {
-            if !in_txn {
-                ctx.cache_table(&database, schema, &tref.name, resolved.clone());
-            }
+        if let Ok(resolved) = resolver.resolve_table(Some(&schema), &tref.name) {
+            ctx.cache_table(&database, &schema, &tref.name, resolved.clone());
             return Ok(resolved);
         }
 
@@ -61,7 +63,7 @@ fn resolve_table_cached(
             .map(|c| txn.active_snapshot(c))
             .unwrap_or_else(|| txn.snapshot());
         let mut reader = CatalogReader::new(storage, snap)?;
-        if let Some(ftable) = reader.get_foreign_table(schema, &tref.name)? {
+        if let Some(ftable) = reader.get_foreign_table(&schema, &tref.name)? {
             return Ok(fdw_resolved_table(ftable));
         }
     }
@@ -69,6 +71,53 @@ fn resolve_table_cached(
     Err(DbError::TableNotFound {
         name: tref.name.clone(),
     })
+}
+
+/// Returns a cached `ResolvedTable` clone iff the cache entry's
+/// `schema_version` matches the current catalog version. Returns `None`
+/// on miss, on stale entry (evicts it), or on table not found.
+///
+/// **A.2 deferred:** an earlier attempt skipped this probe when the
+/// current `ConnectionTxn.catalog_dirty == false`. That works for the
+/// in-txn case but breaks when a previous autocommit (e.g. VACUUM) in
+/// the same session bumped a table's `schema_version` — the new txn
+/// starts with `catalog_dirty = false` and the fast path would serve a
+/// stale entry. The correct A.2 design needs session-level dirty
+/// tracking with proper clear-on-revalidate semantics; tracked as a
+/// follow-up to this spec.
+fn try_cached_with_version(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    ctx: &mut SessionContext,
+    conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
+    database: &str,
+    schema: &str,
+    name: &str,
+) -> Result<Option<ResolvedTable>, DbError> {
+    // Read the cached (table_id, schema_version) — release the borrow before
+    // touching `ctx` again for invalidation.
+    let (cached_id, cached_version) = match ctx.get_table(database, schema, name) {
+        Some(r) => (r.def.id, r.def.schema_version),
+        None => return Ok(None),
+    };
+
+    // Cheap probe: 1 catalog row read to learn the current schema_version.
+    let snap = conn_txn
+        .map(|c| txn.active_snapshot(c))
+        .unwrap_or_else(|| txn.snapshot());
+    let mut reader = CatalogReader::new(storage, snap)?;
+    let current_version = reader.get_table_schema_version(cached_id)?;
+
+    match current_version {
+        Some(v) if v == cached_version => Ok(ctx
+            .get_table_if_version(database, schema, name, cached_version)
+            .cloned()),
+        _ => {
+            // Stale entry OR table dropped — evict so the caller re-resolves.
+            ctx.invalidate_table(database, schema, name);
+            Ok(None)
+        }
+    }
 }
 
 /// Builds a synthetic `ResolvedTable` for a foreign table.
@@ -102,6 +151,7 @@ fn fdw_resolved_table(ftable: ForeignTableDef) -> ResolvedTable {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: axiomdb_catalog::IdentityKind::None,
         })
         .collect();
     let def = TableDef {

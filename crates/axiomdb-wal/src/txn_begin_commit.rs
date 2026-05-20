@@ -75,6 +75,7 @@ impl TxnManager {
             deferred_commit_mode: self.deferred_commit_mode,
             pending_deferred_txn_id: None,
             local_page_batch: LocalPageBatch::new(),
+            durability_override: None,
         })
     }
 
@@ -108,7 +109,13 @@ impl TxnManager {
             self.wal.flush_no_sync()?;
             (true, None)
         } else {
-            match self.durability_policy {
+            // Attack 6: per-txn `durability_override` wins over the
+            // instance default when set. Lets the SQL layer honor
+            // session-level `SET synchronous = '<value>'`.
+            let effective_policy = conn_txn
+                .durability_override
+                .unwrap_or(self.durability_policy);
+            match effective_policy {
                 WalDurabilityPolicy::Strict => {
                     if conn_txn.deferred_commit_mode {
                         // Pipeline mode: Commit entry buffered but not fsynced yet.

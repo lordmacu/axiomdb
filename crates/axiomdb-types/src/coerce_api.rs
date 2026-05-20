@@ -284,6 +284,35 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
         // Ltree identity.
         (v @ Value::Ltree(_), DataType::Ltree) => Ok(v),
 
+        // ── Bytea coercions (Phase 24.5) ──────────────────────────────────────
+        // Text → Bytes:
+        //   - `'\x68656c6c6f'` or `'\\x68656c6c6f'` → hex-decoded bytes
+        //   - anything else → raw UTF-8 bytes (MySQL-compatible)
+        // This mirrors PostgreSQL's bytea hex input format while also
+        // accepting MySQL's permissive Text-as-bytes pattern.
+        (Value::Text(s), DataType::Bytes) => {
+            if let Some(rest) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
+                match decode_hex_for_bytea(rest) {
+                    Some(b) => Ok(Value::Bytes(b)),
+                    None => Err(DbError::InvalidCoercion {
+                        from: "Text".into(),
+                        to: "BYTEA".into(),
+                        value: format!("'{s}'"),
+                        reason: "invalid hex digits in '\\x...' bytea literal".into(),
+                    }),
+                }
+            } else {
+                Ok(Value::Bytes(s.into_bytes()))
+            }
+        }
+        // Bytes → Text: lossy UTF-8 decode (replaces invalid sequences with
+        // U+FFFD). For lossless round-trip use `ENCODE(b, 'hex')` instead.
+        (Value::Bytes(b), DataType::Text) => {
+            Ok(Value::Text(String::from_utf8_lossy(&b).into_owned()))
+        }
+        // Bytea identity.
+        (v @ Value::Bytes(_), DataType::Bytes) => Ok(v),
+
         // ── Xml coercions (Phase 20.20) ───────────────────────────────────────
         // Text → Xml: parse with roxmltree to validate well-formedness.
         (Value::Text(s), DataType::Xml) => {
@@ -427,4 +456,24 @@ pub fn coerce_for_op(l: Value, r: Value) -> Result<(Value, Value), DbError> {
             reason: "no implicit numeric promotion between these types; use explicit CAST".into(),
         }),
     }
+}
+
+/// Decodes the hex tail of a PostgreSQL bytea literal `\x...` / `\X...` into
+/// raw bytes. Returns `None` if any non-hex digit is encountered or the length
+/// is odd. Whitespace inside the hex run is silently ignored (PG accepts it).
+fn decode_hex_for_bytea(hex_tail: &str) -> Option<Vec<u8>> {
+    let clean: Vec<u8> = hex_tail
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .collect();
+    if !clean.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(clean.len() / 2);
+    for pair in clean.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)? as u8;
+        let lo = (pair[1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
 }

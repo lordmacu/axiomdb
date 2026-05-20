@@ -538,6 +538,7 @@ fn bound_from_clause(
                         enum_type_name: None,
                         array_element_type: None,
                         array_ndims: None,
+                        identity_kind: axiomdb_catalog::IdentityKind::None,
                     }
                 })
                 .collect();
@@ -648,6 +649,7 @@ fn parquet_schema_to_column_defs(
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: axiomdb_catalog::IdentityKind::None,
         });
     }
     Ok(cols)
@@ -877,6 +879,7 @@ fn fdw_columns_to_column_defs(ft: &ForeignTableDef) -> Vec<ColumnDef> {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: axiomdb_catalog::IdentityKind::None,
         })
         .collect()
 }
@@ -934,6 +937,7 @@ fn make_virtual_col(col_idx: u16, name: String) -> axiomdb_catalog::schema::Colu
         enum_type_name: None,
         array_element_type: None,
         array_ndims: None,
+        identity_kind: axiomdb_catalog::IdentityKind::None,
     }
 }
 

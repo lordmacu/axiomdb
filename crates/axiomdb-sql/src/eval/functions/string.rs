@@ -257,23 +257,15 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
         "substr" | "substring" | "mid" => {
-            // SUBSTR(str, start[, length]) — 1-based indexing (SQL standard)
+            // SUBSTR(str|bytea, start[, length]) — 1-based indexing (SQL standard).
+            // Phase 24.5: bytea operands return bytea sliced by byte position.
             if args.is_empty() {
                 return Err(DbError::TypeMismatch {
                     expected: "2-3 args".into(),
                     got: "0".into(),
                 });
             }
-            let s = match crate::eval::eval(&args[0], row)? {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s,
-                other => {
-                    return Err(DbError::TypeMismatch {
-                        expected: "Text".into(),
-                        got: other.variant_name().into(),
-                    })
-                }
-            };
+            let first = crate::eval::eval(&args[0], row)?;
             let start_raw: i64 = if args.len() > 1 {
                 match crate::eval::eval(&args[1], row)? {
                     Value::Int(n) => n as i64,
@@ -289,6 +281,52 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             } else {
                 1
             };
+            let len_arg: Option<Value> = if args.len() > 2 {
+                Some(crate::eval::eval(&args[2], row)?)
+            } else {
+                None
+            };
+            // Bytea path — slice by byte position (Phase 24.5).
+            if let Value::Bytes(b) = first {
+                let start_idx = if start_raw < 0 {
+                    b.len().saturating_sub(start_raw.unsigned_abs() as usize)
+                } else if start_raw == 0 {
+                    0
+                } else {
+                    ((start_raw as usize) - 1).min(b.len())
+                };
+                let result: Vec<u8> = match len_arg {
+                    Some(Value::Null) => return Ok(Value::Null),
+                    Some(Value::Int(n)) => b[start_idx..]
+                        .iter()
+                        .take(n.max(0) as usize)
+                        .copied()
+                        .collect(),
+                    Some(Value::BigInt(n)) => b[start_idx..]
+                        .iter()
+                        .take(n.max(0) as usize)
+                        .copied()
+                        .collect(),
+                    Some(other) => {
+                        return Err(DbError::TypeMismatch {
+                            expected: "Int".into(),
+                            got: other.variant_name().into(),
+                        })
+                    }
+                    None => b[start_idx..].to_vec(),
+                };
+                return Ok(Value::Bytes(result));
+            }
+            let s = match first {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Text or Bytes".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
             let chars: Vec<char> = s.chars().collect();
             let start_idx = if start_raw < 0 {
                 // MySQL: negative index counts from end; -1 = last char
@@ -300,26 +338,23 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             } else {
                 ((start_raw as usize) - 1).min(chars.len())
             };
-            let result = if args.len() > 2 {
-                match crate::eval::eval(&args[2], row)? {
-                    Value::Int(n) => chars[start_idx..]
-                        .iter()
-                        .take(n.max(0) as usize)
-                        .collect::<String>(),
-                    Value::BigInt(n) => chars[start_idx..]
-                        .iter()
-                        .take(n.max(0) as usize)
-                        .collect::<String>(),
-                    Value::Null => return Ok(Value::Null),
-                    other => {
-                        return Err(DbError::TypeMismatch {
-                            expected: "Int".into(),
-                            got: other.variant_name().into(),
-                        })
-                    }
+            let result = match len_arg {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Int(n)) => chars[start_idx..]
+                    .iter()
+                    .take(n.max(0) as usize)
+                    .collect::<String>(),
+                Some(Value::BigInt(n)) => chars[start_idx..]
+                    .iter()
+                    .take(n.max(0) as usize)
+                    .collect::<String>(),
+                Some(other) => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
                 }
-            } else {
-                chars[start_idx..].iter().collect::<String>()
+                None => chars[start_idx..].iter().collect::<String>(),
             };
             Ok(Value::Text(result))
         }
@@ -544,15 +579,27 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             Ok(Value::Text(chars.iter().chain(pad_chars.iter()).collect()))
         }
         "locate" | "position" => {
-            // LOCATE(needle, haystack) / POSITION(needle IN haystack) — same runtime form
+            // LOCATE(needle, haystack) / POSITION(needle IN haystack) — same runtime form.
+            // Phase 24.5: bytea operands return 1-based byte position.
             if args.len() < 2 {
                 return Ok(Value::Int(0));
             }
-            let needle = match crate::eval::eval(&args[0], row)? {
+            let needle = crate::eval::eval(&args[0], row)?;
+            let haystack = crate::eval::eval(&args[1], row)?;
+            if matches!(needle, Value::Null) || matches!(haystack, Value::Null) {
+                return Ok(Value::Null);
+            }
+            if let (Value::Bytes(n), Value::Bytes(h)) = (&needle, &haystack) {
+                return Ok(match find_subslice(h, n) {
+                    None => Value::Int(0),
+                    Some(i) => Value::Int(i as i32 + 1),
+                });
+            }
+            let needle = match needle {
                 Value::Text(s) => s,
                 _ => return Ok(Value::Int(0)),
             };
-            let haystack = match crate::eval::eval(&args[1], row)? {
+            let haystack = match haystack {
                 Value::Text(s) => s,
                 _ => return Ok(Value::Int(0)),
             };
@@ -562,15 +609,27 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             })
         }
         "instr" => {
-            // INSTR(haystack, needle) — argument order reversed vs LOCATE
+            // INSTR(haystack, needle) — argument order reversed vs LOCATE.
+            // Phase 24.5: bytea operands return 1-based byte position.
             if args.len() < 2 {
                 return Ok(Value::Int(0));
             }
-            let haystack = match crate::eval::eval(&args[0], row)? {
+            let haystack = crate::eval::eval(&args[0], row)?;
+            let needle = crate::eval::eval(&args[1], row)?;
+            if matches!(needle, Value::Null) || matches!(haystack, Value::Null) {
+                return Ok(Value::Null);
+            }
+            if let (Value::Bytes(h), Value::Bytes(n)) = (&haystack, &needle) {
+                return Ok(match find_subslice(h, n) {
+                    None => Value::Int(0),
+                    Some(i) => Value::Int(i as i32 + 1),
+                });
+            }
+            let haystack = match haystack {
                 Value::Text(s) => s,
                 _ => return Ok(Value::Int(0)),
             };
-            let needle = match crate::eval::eval(&args[1], row)? {
+            let needle = match needle {
                 Value::Text(s) => s,
                 _ => return Ok(Value::Int(0)),
             };
@@ -990,4 +1049,25 @@ fn soundex_encode(s: &str) -> String {
         result.push('0');
     }
     result
+}
+
+/// Returns the byte index of `needle` inside `haystack`, or `None` if absent.
+///
+/// Naive O(n·m) search — adequate for typical BYTEA needles (a few bytes inside
+/// rows up to TOAST_THRESHOLD). `b""` always returns `Some(0)` (every position
+/// contains the empty needle), matching PostgreSQL's `position(bytea, bytea)`.
+pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let last = haystack.len() - needle.len();
+    for i in 0..=last {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+    }
+    None
 }

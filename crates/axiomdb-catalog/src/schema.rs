@@ -358,6 +358,7 @@ mod tests {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -384,6 +385,7 @@ mod tests {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         };
         let bytes = def.to_bytes();
         let (back, _) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -410,6 +412,7 @@ mod tests {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         };
         let bytes = def.to_bytes();
         assert!(ColumnDef::from_bytes(&bytes[..5]).is_err());
@@ -434,6 +437,7 @@ mod tests {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -460,6 +464,7 @@ mod tests {
             enum_type_name: Some("public.mood".into()),
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         };
         let bytes = def.to_bytes();
         let (back, consumed) = ColumnDef::from_bytes(&bytes).unwrap();
@@ -486,6 +491,7 @@ mod tests {
             enum_type_name: None,
             array_element_type: Some(ColumnType::Text),
             array_ndims: Some(1),
+            identity_kind: IdentityKind::None,
         };
         let bytes = def.to_bytes();
         eprintln!("Array column serialized {} bytes: {:?}", bytes.len(), bytes);

@@ -230,6 +230,39 @@ struct OwnedCell {
     overflow_first_page: Option<u64>,
 }
 
+/// Attack 17: fast iteration that yields only the `RowHeader` for every
+/// cell, skipping key/payload slicing and `CellRef` construction.
+///
+/// Used by COUNT(*) and other header-only fast paths. The closure
+/// receives a reference to a stack-resident `RowHeader` for each cell
+/// in logical order. Returns early on bounds errors so callers can
+/// surface them via `?`.
+#[inline]
+pub fn for_each_row_header<F: FnMut(&RowHeader)>(
+    page: &Page,
+    mut f: F,
+) -> Result<(), DbError> {
+    let n = num_cells(page);
+    let b = page.as_bytes();
+    for i in 0..n {
+        let ptr_abs = HEADER_SIZE + CELL_PTR_START + i as usize * CELL_PTR_SIZE;
+        let body_off = u16::from_le_bytes([b[ptr_abs], b[ptr_abs + 1]]) as usize;
+        let hdr_abs = HEADER_SIZE + body_off + CELL_META_SIZE;
+        if hdr_abs + ROW_HEADER_SIZE > PAGE_SIZE {
+            return Err(DbError::Other(
+                "clustered_leaf: row header truncated".into(),
+            ));
+        }
+        // RowHeader is repr(C, packed?) — but cells aren't guaranteed
+        // 8-byte aligned, so copy into a stack buffer (cheap, ~8 bytes).
+        let mut buf = [0u8; ROW_HEADER_SIZE];
+        buf.copy_from_slice(&b[hdr_abs..hdr_abs + ROW_HEADER_SIZE]);
+        let hdr: RowHeader = bytemuck::pod_read_unaligned(&buf);
+        f(&hdr);
+    }
+    Ok(())
+}
+
 /// Read cell at logical index `idx` (0-based, sorted by key).
 pub fn read_cell(page: &Page, idx: u16) -> Result<CellRef<'_>, DbError> {
     let n = num_cells(page);

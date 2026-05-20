@@ -23,44 +23,28 @@ fn decimal_column_params_stored_and_shown() {
 #[test]
 fn decimal_params_invalid_precision_zero_rejected() {
     let (mut storage, mut txn) = common::setup();
-    let r = common::run_result(
-        "CREATE TABLE t (x DECIMAL(0,0))",
-        &mut storage,
-        &mut txn,
-    );
+    let r = common::run_result("CREATE TABLE t (x DECIMAL(0,0))", &mut storage, &mut txn);
     assert!(r.is_err(), "precision 0 should be rejected");
 }
 
 #[test]
 fn decimal_params_invalid_precision_too_large_rejected() {
     let (mut storage, mut txn) = common::setup();
-    let r = common::run_result(
-        "CREATE TABLE t (x DECIMAL(39,0))",
-        &mut storage,
-        &mut txn,
-    );
+    let r = common::run_result("CREATE TABLE t (x DECIMAL(39,0))", &mut storage, &mut txn);
     assert!(r.is_err(), "precision > 38 should be rejected");
 }
 
 #[test]
 fn decimal_params_scale_exceeds_precision_rejected() {
     let (mut storage, mut txn) = common::setup();
-    let r = common::run_result(
-        "CREATE TABLE t (x DECIMAL(5,6))",
-        &mut storage,
-        &mut txn,
-    );
+    let r = common::run_result("CREATE TABLE t (x DECIMAL(5,6))", &mut storage, &mut txn);
     assert!(r.is_err(), "scale > precision should be rejected");
 }
 
 #[test]
 fn numeric_alias_same_as_decimal() {
     let (mut storage, mut txn) = common::setup();
-    common::run(
-        "CREATE TABLE t (x NUMERIC(8,3))",
-        &mut storage,
-        &mut txn,
-    );
+    common::run("CREATE TABLE t (x NUMERIC(8,3))", &mut storage, &mut txn);
     let cols = common::rows(common::run("SHOW COLUMNS FROM t", &mut storage, &mut txn));
     let type_str = cols[0][1].to_string();
     assert_eq!(type_str, "decimal(8,3)");
@@ -139,7 +123,11 @@ fn decimal_division_produces_fractional_digits() {
         &mut storage,
         &mut txn,
     );
-    common::run("INSERT INTO t VALUES ('10.00', '3.00')", &mut storage, &mut txn);
+    common::run(
+        "INSERT INTO t VALUES ('10.00', '3.00')",
+        &mut storage,
+        &mut txn,
+    );
     let out = common::rows(common::run("SELECT a / b FROM t", &mut storage, &mut txn));
     match &out[0][0] {
         Value::Decimal(m, s) => {
@@ -171,9 +159,9 @@ fn decimal_round_half_up_function() {
         &mut storage,
         &mut txn,
     ));
-    assert_eq!(out[0][0], Value::Decimal(123, 2));  // 1.23
-    assert_eq!(out[0][1], Value::Decimal(124, 2));  // 1.24 (HALF_UP)
-    assert_eq!(out[0][2], Value::Decimal(123, 2));  // 1.23
+    assert_eq!(out[0][0], Value::Decimal(123, 2)); // 1.23
+    assert_eq!(out[0][1], Value::Decimal(124, 2)); // 1.24 (HALF_UP)
+    assert_eq!(out[0][2], Value::Decimal(123, 2)); // 1.23
 }
 
 #[test]
@@ -184,7 +172,11 @@ fn decimal_round_no_scale_arg() {
         &mut storage,
         &mut txn,
     );
-    common::run("INSERT INTO t VALUES ('1.6', '1.4', '1.5')", &mut storage, &mut txn);
+    common::run(
+        "INSERT INTO t VALUES ('1.6', '1.4', '1.5')",
+        &mut storage,
+        &mut txn,
+    );
     let out = common::rows(common::run(
         "SELECT ROUND(a), ROUND(b), ROUND(c) FROM t",
         &mut storage,
@@ -203,15 +195,19 @@ fn decimal_trunc_function() {
         &mut storage,
         &mut txn,
     );
-    common::run("INSERT INTO t VALUES ('1.999', '-1.999')", &mut storage, &mut txn);
+    common::run(
+        "INSERT INTO t VALUES ('1.999', '-1.999')",
+        &mut storage,
+        &mut txn,
+    );
     let out = common::rows(common::run(
         "SELECT TRUNC(a, 1), TRUNC(a, 2), TRUNC(b, 1) FROM t",
         &mut storage,
         &mut txn,
     ));
-    assert_eq!(out[0][0], Value::Decimal(19, 1));   // 1.9
-    assert_eq!(out[0][1], Value::Decimal(199, 2));  // 1.99
-    assert_eq!(out[0][2], Value::Decimal(-19, 1));  // -1.9
+    assert_eq!(out[0][0], Value::Decimal(19, 1)); // 1.9
+    assert_eq!(out[0][1], Value::Decimal(199, 2)); // 1.99
+    assert_eq!(out[0][2], Value::Decimal(-19, 1)); // -1.9
 }
 
 #[test]
@@ -230,10 +226,6 @@ fn decimal_truncate_alias() {
 #[test]
 fn decimal_round_null_returns_null() {
     let (mut storage, mut txn) = common::setup();
-    let out = common::rows(common::run(
-        "SELECT ROUND(NULL, 2)",
-        &mut storage,
-        &mut txn,
-    ));
+    let out = common::rows(common::run("SELECT ROUND(NULL, 2)", &mut storage, &mut txn));
     assert_eq!(out[0][0], Value::Null);
 }

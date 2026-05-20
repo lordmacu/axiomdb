@@ -186,7 +186,9 @@ conn = pymysql.connect(
 )
 
 with conn.cursor() as cursor:
-    # CREATE TABLE with AUTO_INCREMENT
+    # CREATE TABLE with AUTO_INCREMENT (MySQL syntax) or
+    # GENERATED ALWAYS|BY DEFAULT AS IDENTITY (SQL:2003 / PostgreSQL syntax — Phase 24.1c).
+    # Both are supported and interoperable.
     cursor.execute("""
         CREATE TABLE users (
             id    BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -194,6 +196,14 @@ with conn.cursor() as cursor:
             email TEXT   NOT NULL
         )
     """)
+
+    # Same table via SQL-standard identity syntax:
+    # CREATE TABLE users_iso (
+    #     id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    #     name  TEXT NOT NULL,
+    #     email TEXT NOT NULL
+    # )
+    # ALWAYS rejects explicit values; BY DEFAULT accepts them.
 
     # INSERT — last_insert_id is returned in the OK packet
     cursor.execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")

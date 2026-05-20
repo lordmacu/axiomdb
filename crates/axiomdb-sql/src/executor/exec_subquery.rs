@@ -29,6 +29,49 @@ pub(crate) fn last_insert_id_value() -> u64 {
     THREAD_LAST_INSERT_ID.with(|v| v.get())
 }
 
+/// Returns the next AUTO_INCREMENT value for `col_idx` in `table_def`
+/// and bumps the per-table cache. On first call (cache miss), scans the
+/// table to seed from `MAX(col) + 1`. Mirrors `next_auto_inc_ctx` in
+/// `insert_heap_ctx.rs:94-123` but exposed as a public helper so the
+/// embedded `Appender` (Attack 7 v1.1) can use the same machinery
+/// without going through the SQL pipeline.
+///
+/// `col_idx` must be the column index of an `AUTO_INCREMENT` column in
+/// `table_def`. Caller is responsible for asserting that.
+///
+/// Returns a `u64` so the caller can map it into either `Value::Int`
+/// or `Value::BigInt` based on the column's declared type.
+pub fn next_auto_increment_value(
+    storage: &dyn axiomdb_storage::StorageEngine,
+    txn: &axiomdb_wal::TxnManager,
+    conn_txn: &ConnectionTxn,
+    table_def: &axiomdb_catalog::schema::TableDef,
+    schema_cols: &[axiomdb_catalog::schema::ColumnDef],
+    col_idx: usize,
+) -> Result<u64, axiomdb_core::error::DbError> {
+    let table_id = table_def.id;
+    let cached = AUTO_INC_SEQ.with(|seq| seq.borrow().get(&table_id).copied());
+    if let Some(next) = cached {
+        AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+        return Ok(next);
+    }
+    let snap = txn.active_snapshot(conn_txn);
+    let rows = crate::table::TableEngine::scan_table(storage, table_def, schema_cols, snap, None)?;
+    let max_existing: u64 = rows
+        .iter()
+        .filter_map(|(_, vals)| vals.get(col_idx))
+        .filter_map(|v| match v {
+            axiomdb_types::Value::Int(n) => Some(*n as u64),
+            axiomdb_types::Value::BigInt(n) => Some(*n as u64),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let next = max_existing + 1;
+    AUTO_INC_SEQ.with(|seq| seq.borrow_mut().insert(table_id, next + 1));
+    Ok(next)
+}
+
 /// Sets the value of `LAST_INSERT_ID()` for the current thread.
 /// Called by `LAST_INSERT_ID(expr)` 1-arg form (4.14b).
 pub(crate) fn set_last_insert_id(id: u64) {

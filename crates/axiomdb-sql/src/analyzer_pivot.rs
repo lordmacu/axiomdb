@@ -100,6 +100,7 @@ fn build_pivot_virtual_columns(
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
         });
     }
 

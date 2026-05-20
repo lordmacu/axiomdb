@@ -116,6 +116,46 @@ _lib.axiomdb_rows_free.restype = None
 _lib.axiomdb_last_error.argtypes = [ctypes.c_void_p]
 _lib.axiomdb_last_error.restype = ctypes.c_char_p
 
+# ── Appender FFI (Attack 8) ──────────────────────────────────────────────────
+
+_lib.axiomdb_appender_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+_lib.axiomdb_appender_open.restype = ctypes.c_void_p
+
+_lib.axiomdb_appender_append_int.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+_lib.axiomdb_appender_append_int.restype = ctypes.c_int
+
+_lib.axiomdb_appender_append_bigint.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+_lib.axiomdb_appender_append_bigint.restype = ctypes.c_int
+
+_lib.axiomdb_appender_append_bool.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_lib.axiomdb_appender_append_bool.restype = ctypes.c_int
+
+_lib.axiomdb_appender_append_real.argtypes = [ctypes.c_void_p, ctypes.c_double]
+_lib.axiomdb_appender_append_real.restype = ctypes.c_int
+
+_lib.axiomdb_appender_append_text.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+_lib.axiomdb_appender_append_text.restype = ctypes.c_int
+
+_lib.axiomdb_appender_append_bytes.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t
+]
+_lib.axiomdb_appender_append_bytes.restype = ctypes.c_int
+
+_lib.axiomdb_appender_append_null.argtypes = [ctypes.c_void_p]
+_lib.axiomdb_appender_append_null.restype = ctypes.c_int
+
+_lib.axiomdb_appender_end_row.argtypes = [ctypes.c_void_p]
+_lib.axiomdb_appender_end_row.restype = ctypes.c_int
+
+_lib.axiomdb_appender_flush.argtypes = [ctypes.c_void_p]
+_lib.axiomdb_appender_flush.restype = ctypes.c_int
+
+_lib.axiomdb_appender_finish.argtypes = [ctypes.c_void_p]
+_lib.axiomdb_appender_finish.restype = ctypes.c_int64
+
+_lib.axiomdb_appender_free.argtypes = [ctypes.c_void_p]
+_lib.axiomdb_appender_free.restype = None
+
 # ── Python API ───────────────────────────────────────────────────────────────
 
 
@@ -227,8 +267,199 @@ class AxiomDB:
             return err.decode("utf-8")
         return None
 
+    def appender(self, table: str) -> "Appender":
+        """Open a fast-path Appender for high-throughput INSERT.
+
+        Skips the SQL parser/analyzer/dispatcher — typed values are
+        written directly to the heap. ~5-50× faster than `INSERT`
+        statements for bulk loads.
+
+        Use as a context manager OR call `finish()` explicitly.
+        Dropping without `finish()` rolls back the appender's txn.
+
+        Example:
+            with db.appender("users") as app:
+                for i in range(10000):
+                    app.append_int(i)
+                    app.append_text(f"user_{i}")
+                    app.end_row()
+                # finish() called automatically on __exit__
+        """
+        self._check_open()
+        ptr = _lib.axiomdb_appender_open(self._ptr, table.encode("utf-8"))
+        if not ptr:
+            raise AxiomDBError(
+                self._last_error() or f"appender_open('{table}') failed"
+            )
+        return Appender(self, ptr)
+
     def __del__(self):
         self.close()
+
+
+class Appender:
+    """Fast-path INSERT builder. Created via `Db.appender(table)`.
+
+    Per-column setters (`append_int`, `append_text`, ...) followed by
+    `end_row()` to commit each row. `finish()` flushes + commits +
+    consumes the appender; dropping without `finish()` rolls back.
+
+    Mirrors DuckDB's Appender + SQLite's `sqlite3_bind_*` patterns.
+
+    v1 limitations: heap and clustered tables OK; tables with triggers
+    are rejected at open. CHECK/FK/AUTO_INCREMENT/GENERATED ALWAYS
+    work. UNIQUE indexes work (per-row path); empty NON-UNIQUE
+    secondary indexes get a bulk-build fast path (~5× speedup).
+    """
+
+    def __init__(self, db: "AxiomDB", ptr: int):
+        # Keep a reference to db so it outlives the appender (caller
+        # responsibility per the C FFI safety contract).
+        self._db = db
+        self._ptr = ptr
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._ptr:
+            if exc_type is None:
+                # Normal exit — commit.
+                self.finish()
+            else:
+                # Exception in the with-block — rollback.
+                _lib.axiomdb_appender_free(self._ptr)
+                self._ptr = None
+
+    def _check_open(self):
+        if not self._ptr:
+            raise AxiomDBError("Appender is closed")
+
+    def _check_rc(self, rc: int, op: str):
+        if rc != 0:
+            err = self._db._last_error() or f"{op} failed"
+            raise AxiomDBError(err)
+
+    def append_int(self, v: int):
+        """Append an INT (i32) value."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_append_int(self._ptr, v), "append_int"
+        )
+
+    def append_bigint(self, v: int):
+        """Append a BIGINT (i64) value."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_append_bigint(self._ptr, v), "append_bigint"
+        )
+
+    def append_bool(self, v: bool):
+        """Append a BOOL value."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_append_bool(self._ptr, 1 if v else 0),
+            "append_bool",
+        )
+
+    def append_real(self, v: float):
+        """Append a REAL/DOUBLE value."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_append_real(self._ptr, v), "append_real"
+        )
+
+    def append_text(self, v: str):
+        """Append a TEXT value (UTF-8)."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_append_text(self._ptr, v.encode("utf-8")),
+            "append_text",
+        )
+
+    def append_bytes(self, v: bytes):
+        """Append a BLOB/BYTES value."""
+        self._check_open()
+        n = len(v)
+        if n == 0:
+            ptr = None
+            rc = _lib.axiomdb_appender_append_bytes(self._ptr, None, 0)
+        else:
+            buf = (ctypes.c_uint8 * n)(*v)
+            rc = _lib.axiomdb_appender_append_bytes(self._ptr, buf, n)
+        self._check_rc(rc, "append_bytes")
+
+    def append_null(self):
+        """Append a NULL value."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_append_null(self._ptr), "append_null"
+        )
+
+    def append_row(self, *values):
+        """Append a full row from positional arguments.
+
+        Inferred types per Python value: None → NULL, bool → BOOL,
+        int → INT (or BIGINT if outside i32), float → REAL,
+        str → TEXT, bytes → BLOB. Calls `end_row()` automatically.
+
+        Example:
+            app.append_row(1, "Alice", True, 3.14)
+        """
+        for v in values:
+            if v is None:
+                self.append_null()
+            elif isinstance(v, bool):
+                self.append_bool(v)
+            elif isinstance(v, int):
+                # i32 range fits append_int; else BIGINT.
+                if -(2**31) <= v < 2**31:
+                    self.append_int(v)
+                else:
+                    self.append_bigint(v)
+            elif isinstance(v, float):
+                self.append_real(v)
+            elif isinstance(v, str):
+                self.append_text(v)
+            elif isinstance(v, (bytes, bytearray)):
+                self.append_bytes(bytes(v))
+            else:
+                raise AxiomDBError(
+                    f"append_row: unsupported Python type {type(v).__name__}"
+                )
+        self.end_row()
+
+    def end_row(self):
+        """Commit the in-progress row to the appender buffer."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_end_row(self._ptr), "end_row"
+        )
+
+    def flush(self):
+        """Write buffered rows to heap+WAL; transaction stays open."""
+        self._check_open()
+        self._check_rc(
+            _lib.axiomdb_appender_flush(self._ptr), "flush"
+        )
+
+    def finish(self) -> int:
+        """Flush + commit + close. Returns total rows inserted.
+
+        The Appender is invalid after this call.
+        """
+        self._check_open()
+        n = _lib.axiomdb_appender_finish(self._ptr)
+        self._ptr = None
+        if n < 0:
+            err = self._db._last_error() or "finish failed"
+            raise AxiomDBError(err)
+        return n
+
+    def __del__(self):
+        if self._ptr:
+            _lib.axiomdb_appender_free(self._ptr)
+            self._ptr = None
 
 
 # ── Demo ─────────────────────────────────────────────────────────────────────

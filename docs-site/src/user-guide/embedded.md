@@ -142,6 +142,133 @@ db.begin()?;
 db.rollback()?;
 ```
 
+### Fast-path INSERT — `Appender`
+
+For bulk loads, `Db::appender(table)` opens an
+[`Appender`](https://docs.rs/axiomdb-embedded) that skips the SQL parser,
+analyzer, and dispatcher and writes typed [`Value`]s directly to the
+heap. Analog of DuckDB's Appender and SQLite's `sqlite3_bind_*` +
+`sqlite3_step`.
+
+```rust
+use axiomdb_types::Value;
+
+let mut app = db.appender("users")?;
+app.append_row(&[Value::Int(1), Value::Text("Alice".into())])?;
+app.append_row(&[Value::Int(2), Value::Text("Bob".into())])?;
+let n_inserted = app.finish()?; // flush + commit
+```
+
+#### Typed builder (Attack 8)
+
+For typed callers (e.g. ORM generators, code-gen pipelines) the
+Appender also exposes per-column setters analog to DuckDB's
+`Append<T>` and SQLite's `sqlite3_bind_<type>`:
+
+```rust
+let mut app = db.appender("users")?;
+app.append_int(1)?;
+app.append_text("Alice")?;
+app.end_row()?;
+app.append_int(2)?;
+app.append_text("Bob")?;
+app.end_row()?;
+app.finish()?;
+```
+
+Available setters: `append_int(i32)`, `append_bigint(i64)`,
+`append_bool(bool)`, `append_real(f64)`, `append_text(&str)`,
+`append_bytes(&[u8])`, `append_null()`. Each row needs exactly
+N values (= table column count) before `end_row()`, else
+`TypeMismatch`. On any error inside `end_row()`, the in-progress
+row is cleared and the appender remains usable.
+
+#### C FFI (Attack 8)
+
+The Appender is exposed through the C FFI for use from C / C++ /
+Python (PyO3) / Node.js (napi-rs) / Swift / Kotlin:
+
+```c
+AxiomDbAppender* app = axiomdb_appender_open(db, "users");
+if (!app) { fprintf(stderr, "%s\n", axiomdb_last_error(db)); return 1; }
+axiomdb_appender_append_int(app, 1);
+axiomdb_appender_append_text(app, "Alice");
+axiomdb_appender_end_row(app);
+int64_t n = axiomdb_appender_finish(app);   // commits + frees
+```
+
+Functions: `axiomdb_appender_open`, `axiomdb_appender_append_int`/
+`bigint`/`bool`/`real`/`text`/`bytes`/`null`,
+`axiomdb_appender_end_row`, `axiomdb_appender_flush`,
+`axiomdb_appender_finish`, `axiomdb_appender_free` (rollback).
+Errors return -1 (or NULL); the message is in
+`axiomdb_last_error(db)`.
+
+The Appender holds a single transaction; `finish()` commits, `drop`
+without `finish` rolls back. **v1.1 supports every table SQL `INSERT`
+supports except those with triggers**: clustered (PRIMARY KEY) tables,
+`CHECK` constraints, `FOREIGN KEY` constraints, `AUTO_INCREMENT` /
+`SERIAL` columns, and `GENERATED ALWAYS` columns all work. The
+Appender returns `DbError::NotImplemented` at `appender()` open time
+only when the table has a trigger.
+
+For tables with constraints the per-row pipeline is:
+
+1. Arity check (n columns = n values)
+2. AUTO_INCREMENT assignment (if column is `AUTO_INCREMENT` and value
+   is `Value::Null`)
+3. STORED `GENERATED ALWAYS` column materialization
+4. Text constraints (CHAR padding, VARCHAR length)
+5. Type coercion (respects session `strict_mode`)
+6. NOT NULL check
+7. CHECK constraints
+8. FOREIGN KEY validation (immediate FKs per row, deferred FKs
+   queued and resolved at `finish()`/commit)
+
+The Appender honors `SET synchronous` ([transactions
+docs](features/transactions.md#durability--set-synchronous)) — the
+session's durability setting at open time is stamped on the Appender's
+transaction.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Throughput</span>
+On Lima virtio (5000 rows, 5 iters): <strong>82K ops/s</strong> for
+the v1.1 Appender on clustered tables (PRIMARY KEY) and
+<strong>191K ops/s</strong> for heap-only tables, vs ~4.6K for the
+same row inserted via <code>db.run("INSERT ...")</code> — a
+<strong>~18-42× speedup</strong>. The remaining gap vs SQLite's
+prepared-bind+step (1.7M) is dominated by B-Tree split overhead on
+clustered tables, the next optimization target. See
+<code>docs/perf-sqlite-gap.md</code> "Attack 7 v1.1" for the full
+breakdown.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Deferred catalog persist + cross-flush fast-path + WAL batching + no double-coerce (A13–A16)</span>
+On the clustered path, the Appender (a) defers the per-flush
+<code>update_table_root</code> catalog write to <code>finish()</code>
+(A13), (b) preserves the rightmost-leaf hint across flushes
+via the per-connection root map (A14), (c) collapses
+per-row WAL appends into a single <code>write_batch()</code> in the
+fast path (A15), and (d) skips re-coercing rows that the
+Appender already coerced at <code>append_row</code> time (A16, refactor).
+Combined effect on macOS APFS native:
+<strong>5.6× speedup at 5K rows (244K ops/s)</strong> and
+<strong>9.1× at 50K rows (~448K ops/s)</strong> — in SQLite
+prepared-bind+step territory. Crash safety unchanged (WAL
+ROW_INSERTs capture every row; catalog root is a forward-looking
+pointer).
+</div>
+</div>
+
+See `specs/fase-perf-sqlite-gap/spec-embedded-appender.md` for the full
+design.
+
 ### Error handling
 
 ```rust
@@ -385,6 +512,41 @@ for r in range(lib.axiomdb_rows_count(rows)):
 lib.axiomdb_rows_free(rows)
 lib.axiomdb_close(db)
 ```
+
+#### Python — high-level wrapper (`bindings/python/axiomdb.py`)
+
+The repo ships a ready-to-use ctypes wrapper that exposes both `AxiomDB`
+(SQL + queries) and `Appender` (fast-path INSERT):
+
+```python
+from axiomdb import AxiomDB
+
+with AxiomDB("./app.db") as db:
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    # SQL INSERT (slow path):
+    db.execute("INSERT INTO users VALUES (1, 'Alice')")
+
+    # Appender fast-path (~5-50× faster for bulk loads):
+    with db.appender("users") as app:
+        for i in range(2, 10_002):
+            app.append_row(i, f"user_{i:06}")
+        # finish() called automatically on __exit__
+
+    for row in db.query("SELECT COUNT(*) FROM users"):
+        print(row)
+```
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Python speedup</span>
+<code>bindings/python/example_appender.py</code> on Lima virtio
+shows the Appender at <strong>~53K rows/s</strong> vs ~4-6K for
+SQL <code>INSERT</code> autocommit — a <strong>~10-13× speedup</strong>
+from Python. The C FFI overhead between Python and the Rust engine
+is minimal; the win comes from skipping the SQL pipeline entirely.
+</div>
+</div>
 
 ---
 

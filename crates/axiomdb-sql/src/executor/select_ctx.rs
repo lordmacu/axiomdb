@@ -166,14 +166,45 @@ fn execute_select_ctx(
             }) = stmt.columns.first()
             {
                 if name.eq_ignore_ascii_case("count") && args.is_empty() {
-                    let count = if resolved.def.is_clustered() {
-                        crate::table::count_clustered_visible(
-                            storage,
-                            resolved.def.root_page_id,
-                            snap,
-                        )?
-                    } else {
-                        HeapChain::count_visible(storage, resolved.def.root_page_id, snap)?
+                    // Attack 17b: per-session COUNT(*) cache. Hits when no
+                    // writes have hit this table since cache time AND no
+                    // DDL has bumped its schema_version. Only used in
+                    // autocommit mode — inside an explicit BEGIN..ROLLBACK,
+                    // `stats.changes_for` doesn't unwind on rollback so
+                    // caching there would risk returning a stale count
+                    // (post-rollback). Autocommit queries each commit
+                    // immediately, so the counter always reflects
+                    // committed state.
+                    let cacheable =
+                        ctx.autocommit && !ctx.in_explicit_txn;
+                    let count = match cacheable
+                        .then(|| ctx.get_count_star(resolved.def.id, resolved.def.schema_version))
+                        .flatten()
+                    {
+                        Some(c) => c,
+                        None => {
+                            let c = if resolved.def.is_clustered() {
+                                crate::table::count_clustered_visible(
+                                    storage,
+                                    resolved.def.root_page_id,
+                                    snap,
+                                )?
+                            } else {
+                                HeapChain::count_visible(
+                                    storage,
+                                    resolved.def.root_page_id,
+                                    snap,
+                                )?
+                            };
+                            if cacheable {
+                                ctx.cache_count_star(
+                                    resolved.def.id,
+                                    resolved.def.schema_version,
+                                    c,
+                                );
+                            }
+                            c
+                        }
                     };
                     let columns = vec![ColumnMeta::computed("count(*)", DataType::BigInt)];
                     let rows = vec![vec![Value::BigInt(count as i64)]];
@@ -589,12 +620,15 @@ fn execute_select_ctx(
             {
                 // ── Clustered PK point lookup (Phase 39.15) ──────────────────
                 // Direct B-tree search returns full row inline — no heap fetch.
-                match crate::table::lookup_clustered_row(
+                // Attack 5: pass the session's leaf hint so consecutive PK
+                // lookups in the same leaf skip the descent.
+                match crate::table::lookup_clustered_row_with_hint(
                     storage,
                     &resolved.def,
                     &resolved.columns,
                     key,
                     snap,
+                    Some(ctx.clustered_leaf_hint_slot()),
                 )? {
                     Some(pair) => vec![pair],
                     None => vec![],

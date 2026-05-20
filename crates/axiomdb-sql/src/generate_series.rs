@@ -69,6 +69,7 @@ pub fn column_defs_for_generate_series(gs: &GenerateSeriesClause) -> Vec<ColumnD
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: axiomdb_catalog::IdentityKind::None,
         })
         .collect()
 }

@@ -153,6 +153,24 @@ When no transaction is active, `execute` wraps the statement in an implicit
 All reads use `txn.active_snapshot()?` — a snapshot fixed at `BEGIN` — so that
 writes made earlier in the same transaction are visible (read-your-own-writes).
 
+### Per-session durability override
+
+Every `txn.begin()` site in `executor/exec_with_ctx.rs` is routed through
+two small helpers:
+
+```rust
+fn begin_session_txn(txn, ctx) -> ConnectionTxn       // sets durability_override
+fn begin_session_txn_with_isolation(txn, level, ctx)  // same, with isolation
+```
+
+The helpers read `ctx.synchronous()` (a `SessionDurability` set by
+`SET synchronous = '<value>'`) and stamp the resulting
+`WalDurabilityPolicy` onto `ConnectionTxn.durability_override` immediately
+after `begin`. The WAL `commit()` reads that field and chooses between
+`commit_data_sync()` (Strict), `flush_no_sync()` (Normal), and a no-op
+(Off). See [internals/wal.md](wal.md#per-transaction-durability-override)
+and [user-guide/features/transactions.md](../user-guide/features/transactions.md#durability--set-synchronous).
+
 ## Generated columns (Phase 21.5f)
 
 Stored generated columns are materialized by one shared helper:

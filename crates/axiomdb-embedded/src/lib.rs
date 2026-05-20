@@ -59,10 +59,16 @@
 // ── Sync Rust API ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sync-api")]
+pub use appender::Appender;
+
+#[cfg(feature = "sync-api")]
 pub use db::Db;
 
 #[cfg(feature = "sync-api")]
 pub use db::Row;
+
+#[cfg(feature = "sync-api")]
+mod appender;
 
 #[cfg(feature = "sync-api")]
 mod db {
@@ -98,11 +104,11 @@ mod db {
     /// Every `execute()` and `query()` call is wrapped in an implicit BEGIN/COMMIT
     /// unless an explicit `begin()` is active.
     pub struct Db {
-        storage: MmapStorage,
-        txn: TxnManager,
-        bloom: BloomRegistry,
-        schema_cache: SchemaCache,
-        session: SessionContext,
+        pub(super) storage: MmapStorage,
+        pub(super) txn: TxnManager,
+        pub(super) bloom: BloomRegistry,
+        pub(super) schema_cache: SchemaCache,
+        pub(super) session: SessionContext,
         /// Set to `true` after the first `DiskFull` error. When degraded,
         /// all mutating operations are rejected immediately without touching
         /// WAL or storage again.
@@ -297,20 +303,65 @@ mod db {
                     operation: "database is in read-only degraded mode",
                 });
             }
-            let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
-            let snap = if let Some(ref ct) = self.session.conn_txn {
-                self.txn.active_snapshot(ct)
+            // Attack 20: route SELECTs through the per-session statement
+            // cache. INSERT/UPDATE/DELETE are gated off — Attack 22
+            // tried to extend the cache to them and reproduced the
+            // original Attack 2 regression (~17% on insert_autocommit).
+            // Two repair paths investigated and rejected:
+            //   (a) Drop PlanDeps.is_stale + clear the cache from
+            //       invalidate_all → defeats the cache because every DML
+            //       calls invalidate_all (35% slower than the baseline).
+            //   (b) Keep PlanDeps.is_stale → 17% slower on INSERT due to
+            //       the per-dep catalog probe (analyze for INSERT is
+            //       already cheap, so the probe is net-negative).
+            // The real fix needs (c) a per-table version sourced from
+            // the in-memory schema_cache, not the catalog heap; OR (d)
+            // a dedicated `invalidate_all_after_ddl` that bumps an
+            // epoch counter the statement cache reads cheaply. Deferred
+            // until a focused brainstorm — see docs/perf-sqlite-gap.md
+            // "Attack 22 — deferred".
+            let result = if sql_starts_with_select_keyword(sql) {
+                axiomdb_sql::statement_cache::run_cached(
+                    sql,
+                    &self.storage,
+                    &self.txn,
+                    &self.bloom,
+                    &mut self.schema_cache,
+                    &mut self.session,
+                )
             } else {
-                self.txn.snapshot()
+                let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
+                let snap = if let Some(ref ct) = self.session.conn_txn {
+                    self.txn.active_snapshot(ct)
+                } else {
+                    self.txn.snapshot()
+                };
+                let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
+                execute_with_ctx(
+                    analyzed,
+                    &self.storage,
+                    &self.txn,
+                    &self.bloom,
+                    &mut self.session,
+                )
             };
-            let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
-            execute_with_ctx(
-                analyzed,
-                &self.storage,
-                &self.txn,
-                &self.bloom,
-                &mut self.session,
-            )
+
+            // Phase 19.1: inline auto-vacuum after a successful autocommit
+            // query. Skipped inside explicit txns and in degraded mode
+            // (the helper guards both). Errors are logged inside the
+            // helper, never propagated — the user's already-successful
+            // query result must not be turned into a failure by background
+            // maintenance.
+            if result.is_ok() && !self.degraded {
+                axiomdb_sql::vacuum::auto_vacuum_if_needed(
+                    &self.storage,
+                    &self.txn,
+                    &self.bloom,
+                    &mut self.session,
+                );
+            }
+
+            result
         }
 
         /// Returns the last error message, or `None` if the last operation succeeded.
@@ -369,6 +420,37 @@ mod db {
     pub struct PreparedStatement {
         analyzed: Stmt,
         param_count: usize,
+    }
+
+    impl Db {
+        /// Opens an [`Appender`](crate::Appender) for high-throughput INSERT
+        /// into `table_name`.
+        ///
+        /// The Appender skips the SQL parser/analyzer/dispatcher and writes
+        /// typed [`Value`]s directly to the heap + WAL. Analogous to DuckDB's
+        /// Appender and SQLite's `sqlite3_bind_*` + `sqlite3_step` pattern.
+        ///
+        /// Holds an active transaction for its whole lifetime;
+        /// `Appender::finish()` commits, `Drop` rolls back.
+        ///
+        /// # Errors
+        /// - [`DbError::TableNotFound`] if `table_name` doesn't exist.
+        /// - [`DbError::NotImplemented`] if the table is clustered or has
+        ///   triggers (deferred to a future Attack).
+        /// - [`DbError::TransactionAlreadyActive`] if a SQL `BEGIN` is open.
+        /// - I/O errors from `txn.begin()`.
+        ///
+        /// ```rust,no_run
+        /// # let mut db = axiomdb_embedded::Db::open("./test.db").unwrap();
+        /// # db.run("CREATE TABLE t (id INT, v TEXT)").unwrap();
+        /// use axiomdb_types::Value;
+        /// let mut app = db.appender("t").unwrap();
+        /// app.append_row(&[Value::Int(1), Value::Text("a".into())]).unwrap();
+        /// app.finish().unwrap();
+        /// ```
+        pub fn appender(&mut self, table_name: &str) -> Result<crate::Appender<'_>, DbError> {
+            crate::appender::Appender::open(self, table_name)
+        }
     }
 
     impl Db {
@@ -539,6 +621,30 @@ mod db {
             || lower.starts_with("release")
     }
 
+    /// Attack 20: cheap prefix sniff — does the SQL start with `SELECT`
+    /// (case-insensitive, leading whitespace tolerated)?
+    ///
+    /// Used to gate the statement-cache fast path. Catches the common
+    /// `SELECT ...` form (autocommit OLTP) and bypasses the cache for
+    /// everything else (DDL, DML, transaction control) where the cache
+    /// either doesn't apply or has been shown to net-regress (Attack 2's
+    /// outcome for INSERT). Conservative: doesn't catch `(SELECT ...)`
+    /// or `WITH ... SELECT` — those fall back to the legacy path, which
+    /// is correct (the legacy path always works).
+    fn sql_starts_with_select_keyword(sql: &str) -> bool {
+        let s = sql.trim_start().as_bytes();
+        s.len() >= 6
+            && s[0].eq_ignore_ascii_case(&b'S')
+            && s[1].eq_ignore_ascii_case(&b'E')
+            && s[2].eq_ignore_ascii_case(&b'L')
+            && s[3].eq_ignore_ascii_case(&b'E')
+            && s[4].eq_ignore_ascii_case(&b'C')
+            && s[5].eq_ignore_ascii_case(&b'T')
+            // The next char must NOT be an identifier continuation (so we
+            // don't match `SELECTED` or `SELECT_VALUE`).
+            && s.get(6).is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+    }
+
     fn resolve_local_dsn_path(dsn: &str) -> Result<PathBuf, DbError> {
         let parsed = parse_dsn(dsn)?;
         match parsed {
@@ -561,6 +667,18 @@ mod db {
 }
 
 // ── C FFI ─────────────────────────────────────────────────────────────────────
+
+// Re-export the FFI surface so integration tests can drive the
+// `#[no_mangle] extern "C"` functions through Rust paths (without
+// needing dynamic linking).
+#[cfg(feature = "c-ffi")]
+pub use ffi::{
+    axiomdb_appender_append_bigint, axiomdb_appender_append_bool, axiomdb_appender_append_bytes,
+    axiomdb_appender_append_int, axiomdb_appender_append_null, axiomdb_appender_append_real,
+    axiomdb_appender_append_text, axiomdb_appender_end_row, axiomdb_appender_finish,
+    axiomdb_appender_flush, axiomdb_appender_free, axiomdb_appender_open, axiomdb_close,
+    axiomdb_execute, axiomdb_last_error, axiomdb_open, AxiomDbAppender,
+};
 
 #[cfg(feature = "c-ffi")]
 mod ffi {
@@ -989,6 +1107,275 @@ mod ffi {
         match &(*db).error_msg {
             Some(s) => s.as_ptr(),
             None => std::ptr::null(),
+        }
+    }
+
+    // ── Appender C FFI (Attack 8) ────────────────────────────────────────────
+    //
+    // Opaque heap-allocated wrapper around the Rust `Appender<'_>`.
+    // The Appender's lifetime is widened to `'static` via transmute —
+    // SAFETY: the caller is responsible for keeping the `Db` pointer
+    // alive (no `axiomdb_close` calls) until the appender is finished
+    // or freed.
+    //
+    // Routing:
+    //   axiomdb_appender_open                → Db::appender(name)
+    //   axiomdb_appender_append_<type>       → Appender::append_<type>
+    //   axiomdb_appender_end_row             → Appender::end_row
+    //   axiomdb_appender_flush               → Appender::flush
+    //   axiomdb_appender_finish              → Appender::finish (consumes)
+    //   axiomdb_appender_free                → Drop (rollback)
+    //
+    // Errors set Db.error_msg so `axiomdb_last_error(db)` retrieves them.
+
+    /// Opaque appender handle. Internally owns an `Appender<'static>`
+    /// plus a back-pointer to the `Db` for error message routing.
+    pub struct AxiomDbAppender {
+        // Box<Appender<'static>> — but stored as a raw pointer so we
+        // can move out of it in `axiomdb_appender_finish`.
+        inner: Option<crate::appender::Appender<'static>>,
+        db: *mut Db,
+    }
+
+    /// Sets `Db.error_msg` from a `DbError`. Called by every FFI fn
+    /// before returning an error code.
+    unsafe fn set_db_error(db: *mut Db, e: &axiomdb_core::error::DbError) {
+        if db.is_null() {
+            return;
+        }
+        (*db).error_msg = CString::new(e.to_string()).ok();
+    }
+
+    /// Opens an Appender for `table_name`. Returns NULL on error;
+    /// the error message is in `axiomdb_last_error(db)`.
+    ///
+    /// The returned pointer must be freed with either
+    /// [`axiomdb_appender_finish`] (commits + frees) or
+    /// [`axiomdb_appender_free`] (rolls back + frees).
+    ///
+    /// # Safety
+    /// - `db` must be a valid pointer from `axiomdb_open` and remain
+    ///   alive until the appender is consumed.
+    /// - `table_name` must be a valid non-NULL UTF-8 NUL-terminated
+    ///   string.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_open(
+        db: *mut Db,
+        table_name: *const c_char,
+    ) -> *mut AxiomDbAppender {
+        if db.is_null() || table_name.is_null() {
+            return std::ptr::null_mut();
+        }
+        let name = match CStr::from_ptr(table_name).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let db_ref: &mut Db = &mut *db;
+        match db_ref.appender(name) {
+            Ok(app) => {
+                // SAFETY: widen the lifetime to 'static. The caller
+                // guarantees `db` outlives the appender.
+                let app_static: crate::appender::Appender<'static> = std::mem::transmute(app);
+                Box::into_raw(Box::new(AxiomDbAppender {
+                    inner: Some(app_static),
+                    db,
+                }))
+            }
+            Err(e) => {
+                set_db_error(db, &e);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    /// Macro: defines a typed appender FFI fn that delegates to a
+    /// method on the inner Rust `Appender`. Returns 0 on success,
+    /// -1 on error (with `Db.error_msg` set).
+    ///
+    /// # Safety
+    /// All generated functions share the same safety contract: `app`
+    /// must be a valid pointer from `axiomdb_appender_open` or NULL.
+    /// The pointer must not be used after `axiomdb_appender_finish`
+    /// or `axiomdb_appender_free`.
+    macro_rules! ffi_append_typed {
+        ($fn_name:ident, $rust_name:ident, $($arg:ident: $ty:ty),*) => {
+            /// FFI typed appender setter — see the `ffi_append_typed!`
+            /// macro for shared safety contract.
+            ///
+            /// # Safety
+            /// `app` must be a valid pointer from `axiomdb_appender_open`,
+            /// or NULL (returns -1). Must not be used after
+            /// `axiomdb_appender_finish` / `axiomdb_appender_free`.
+            #[no_mangle]
+            pub unsafe extern "C" fn $fn_name(
+                app: *mut AxiomDbAppender,
+                $($arg: $ty,)*
+            ) -> c_int {
+                if app.is_null() {
+                    return -1;
+                }
+                let wrapper = &mut *app;
+                let Some(ref mut inner) = wrapper.inner else {
+                    return -1;
+                };
+                match inner.$rust_name($($arg),*) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        set_db_error(wrapper.db, &e);
+                        -1
+                    }
+                }
+            }
+        };
+    }
+
+    ffi_append_typed!(axiomdb_appender_append_int, append_int, v: i32);
+    ffi_append_typed!(axiomdb_appender_append_bigint, append_bigint, v: i64);
+    ffi_append_typed!(axiomdb_appender_append_real, append_real, v: f64);
+
+    /// Appends a BOOL value. `v == 0` is false; any non-zero is true.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`,
+    /// or NULL (returns -1).
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_append_bool(
+        app: *mut AxiomDbAppender,
+        v: c_int,
+    ) -> c_int {
+        if app.is_null() {
+            return -1;
+        }
+        let wrapper = &mut *app;
+        let Some(ref mut inner) = wrapper.inner else {
+            return -1;
+        };
+        match inner.append_bool(v != 0) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    /// Appends a TEXT value from a NUL-terminated UTF-8 cstring.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`,
+    /// or NULL (returns -1). `v` must be a NUL-terminated UTF-8
+    /// string, or NULL (returns -1).
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_append_text(
+        app: *mut AxiomDbAppender,
+        v: *const c_char,
+    ) -> c_int {
+        if app.is_null() || v.is_null() {
+            return -1;
+        }
+        let wrapper = &mut *app;
+        let s = match CStr::from_ptr(v).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                let e = axiomdb_core::error::DbError::InvalidValue {
+                    reason: "axiomdb_appender_append_text: invalid UTF-8".into(),
+                };
+                set_db_error(wrapper.db, &e);
+                return -1;
+            }
+        };
+        let Some(ref mut inner) = wrapper.inner else {
+            return -1;
+        };
+        match inner.append_text(s) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    /// Appends a BYTES value from a (data, len) pair. `data` may be
+    /// NULL only when `len == 0`.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`,
+    /// or NULL (returns -1). `data` must point to at least `len`
+    /// readable bytes, or be NULL when `len == 0`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_append_bytes(
+        app: *mut AxiomDbAppender,
+        data: *const u8,
+        len: usize,
+    ) -> c_int {
+        if app.is_null() {
+            return -1;
+        }
+        let wrapper = &mut *app;
+        if data.is_null() && len > 0 {
+            let e = axiomdb_core::error::DbError::InvalidValue {
+                reason: "axiomdb_appender_append_bytes: NULL data with len > 0".into(),
+            };
+            set_db_error(wrapper.db, &e);
+            return -1;
+        }
+        let slice = if len == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(data, len)
+        };
+        let Some(ref mut inner) = wrapper.inner else {
+            return -1;
+        };
+        match inner.append_bytes(slice) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    ffi_append_typed!(axiomdb_appender_append_null, append_null,);
+    ffi_append_typed!(axiomdb_appender_end_row, end_row,);
+    ffi_append_typed!(axiomdb_appender_flush, flush,);
+
+    /// Flushes remaining rows, commits the transaction, and frees the
+    /// appender. Returns the total rows-inserted count, or -1 on
+    /// error. The appender pointer is invalid after this call.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_finish(app: *mut AxiomDbAppender) -> i64 {
+        if app.is_null() {
+            return -1;
+        }
+        let mut wrapper = Box::from_raw(app);
+        let inner = match wrapper.inner.take() {
+            Some(a) => a,
+            None => return -1,
+        };
+        match inner.finish() {
+            Ok(n) => n as i64,
+            Err(e) => {
+                set_db_error(wrapper.db, &e);
+                -1
+            }
+        }
+    }
+
+    /// Rolls back the appender's transaction and frees the appender.
+    /// The pointer is invalid after this call. NULL is a no-op.
+    ///
+    /// # Safety
+    /// `app` must be a valid pointer from `axiomdb_appender_open`, or NULL.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_appender_free(app: *mut AxiomDbAppender) {
+        if !app.is_null() {
+            // Drop the Box → Drops the Appender → Drop impl rolls back.
+            drop(Box::from_raw(app));
         }
     }
 

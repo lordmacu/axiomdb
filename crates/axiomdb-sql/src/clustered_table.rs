@@ -53,6 +53,19 @@ pub(crate) fn prepare_row_with_ctx(
     encode_prepared_row(coerced, columns, primary_idx, table_name)
 }
 
+/// Attack 16b: skip coercion for callers (e.g. the embedded Appender
+/// at flush time) that have already coerced their values via
+/// `coerce_values_with_ctx`. Eliminates the double-coerce that was
+/// happening for every Appender row at flush time.
+pub(crate) fn prepare_row_already_coerced(
+    coerced: Vec<Value>,
+    columns: &[ColumnDef],
+    primary_idx: &IndexDef,
+    table_name: &str,
+) -> Result<PreparedClusteredInsertRow, DbError> {
+    encode_prepared_row(coerced, columns, primary_idx, table_name)
+}
+
 pub(crate) fn scan_max_numeric_column(
     storage: &dyn StorageEngine,
     root_pid: Option<u64>,

@@ -11,7 +11,7 @@
 use axiomdb_catalog::{
     bootstrap::CatalogBootstrap,
     reader::CatalogReader,
-    schema::{ColumnDef, ColumnType, EnumTypeDef, IndexDef, TableStorageLayout},
+    schema::{ColumnDef, ColumnType, EnumTypeDef, IdentityKind, IndexDef, TableStorageLayout},
     schema_composite::{CompositeField, CompositeTypeDef},
     writer::CatalogWriter,
 };
@@ -163,6 +163,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -182,6 +183,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         w.create_column(ColumnDef {
@@ -201,6 +203,7 @@ fn test_create_columns_list_ordered_by_col_idx() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         tid
@@ -398,6 +401,7 @@ fn test_delete_table_cascades_columns_and_indexes() {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: IdentityKind::None,
         })
         .unwrap();
         w.create_index(IndexDef {

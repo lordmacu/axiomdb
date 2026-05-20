@@ -193,6 +193,25 @@ fn execute_insert_ctx(
                     materialize_insert_row(&col_positions, &provided, &resolved.columns);
 
                 if let Some(ai_col) = auto_inc_col {
+                    // Phase 24.1c: GENERATED ALWAYS AS IDENTITY rejects
+                    // explicit non-trigger values (NULL / 0 still auto-generate).
+                    if schema_cols[ai_col].identity_kind
+                        == axiomdb_catalog::IdentityKind::Always
+                    {
+                        match full_values.get(ai_col) {
+                            Some(Value::Null) | Some(Value::Int(0)) | Some(Value::BigInt(0))
+                            | None => {}
+                            Some(_) => {
+                                return Err(DbError::InvalidValue {
+                                    reason: format!(
+                                        "cannot insert explicit value into column '{}': \
+                                         column is GENERATED ALWAYS AS IDENTITY",
+                                        schema_cols[ai_col].name
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     // MySQL: explicit 0 on AUTO_INCREMENT column is treated same as NULL.
                     let is_auto_trigger = matches!(
                         full_values.get(ai_col),

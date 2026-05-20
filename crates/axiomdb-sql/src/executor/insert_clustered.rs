@@ -191,6 +191,8 @@ fn execute_clustered_insert(
                 &secondary_layouts,
                 &compiled_preds,
                 &prepared_rows[i..i + 1],
+                None, // legacy non-ctx path — no session hint available
+                /*defer_table_root_persist=*/ false,
             ) {
                 Ok(n) => total += n,
                 Err(e) if is_ignorable_insert_error(&e) => {} // skip row
@@ -210,6 +212,8 @@ fn execute_clustered_insert(
             &secondary_layouts,
             &compiled_preds,
             &prepared_rows,
+            None, // legacy non-ctx path — no session hint available
+            /*defer_table_root_persist=*/ false,
         )?
     };
 
@@ -224,8 +228,16 @@ fn execute_clustered_insert(
     })
 }
 
+/// Attack 13: when `defer_table_root_persist == true`, the function
+/// does NOT call `CatalogWriter::update_table_root` even if the
+/// clustered root grew. The caller is responsible for calling
+/// `flush_deferred_table_root` once at end-of-Appender-lifetime to
+/// persist the final root in a single catalog write. This avoids
+/// paying the catalog write cost (8.7ms on macOS APFS) per flush
+/// — for an Appender doing N auto-flushes the saving is (N-1)
+/// catalog writes per session.
 #[allow(clippy::too_many_arguments)]
-fn apply_clustered_insert_rows(
+pub(crate) fn apply_clustered_insert_rows(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
@@ -236,6 +248,8 @@ fn apply_clustered_insert_rows(
     secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
     compiled_preds: &[Option<Expr>],
     rows: &[crate::clustered_table::PreparedClusteredInsertRow],
+    session_hint: Option<&mut Option<axiomdb_storage::clustered_tree::LeafCursorHint>>,
+    defer_table_root_persist: bool,
 ) -> Result<u64, DbError> {
     use std::time::{Duration, Instant};
 
@@ -245,13 +259,54 @@ fn apply_clustered_insert_rows(
 
     let txn_id = conn_txn.txn_id;
     let snapshot = txn.active_snapshot(conn_txn);
+    // Attack 14: use the per-conn root (which tracks the in-progress
+    // txn's writes) instead of the global `last_clustered_roots` map
+    // (only updated at commit). For multi-flush Appenders this is the
+    // difference between hitting and missing the rightmost-leaf fast
+    // path on every flush after the first — the hint stored at the
+    // end of flush N carries the NEW root, and flush N+1 would
+    // otherwise compare it against the pre-txn (OLD) root.
     let mut current_root = txn
-        .clustered_root(table_def.id)
+        .clustered_root_for_conn(conn_txn, table_def.id)
         .unwrap_or(table_def.root_page_id);
+
+    // Attack 10: snapshot the secondary index roots BEFORE the batch
+    // so flush_deferred_secondary_index_roots only fires
+    // update_index_root for indexes whose root actually changed.
+    let original_secondary_roots: Vec<u64> =
+        secondary_indexes.iter().map(|i| i.root_page_id).collect();
+
+    // Attack 11: classify each secondary index — eligible for
+    // bulk-build (regular B-Tree + empty root + no partial-index
+    // predicate) vs eager (per-row insert via Attack 10 path).
+    // For eligible indexes we collect (encoded_key) per row and call
+    // BTree::bulk_load_sorted once after the per-row loop.
+    let bulk_eligible: Vec<bool> = secondary_indexes
+        .iter()
+        .zip(compiled_preds.iter())
+        .map(|(idx, pred)| is_bulk_build_eligible(storage, idx, pred.as_ref()))
+        .collect();
+    // bulk_entries[i] is non-None only when bulk_eligible[i] == true.
+    let mut bulk_entries: Vec<Option<Vec<Vec<u8>>>> = bulk_eligible
+        .iter()
+        .map(|&e| if e { Some(Vec::with_capacity(rows.len())) } else { None })
+        .collect();
     let append_biased = rows
         .windows(2)
         .all(|pair| pair[0].primary_key_bytes < pair[1].primary_key_bytes);
-    let mut rightmost_leaf_hint = None;
+    // Attack 5 step 5.4: prime the rightmost_leaf_hint from the session
+    // when it matches THIS table — that's how the autocommit per-row
+    // INSERT path can reuse the previous statement's leaf and trigger
+    // the try_insert_rightmost_leaf_batch fast path on the very first row.
+    let mut rightmost_leaf_hint: Option<u64> = session_hint
+        .as_ref()
+        .and_then(|slot| slot.as_ref())
+        .filter(|h| {
+            h.table_id == table_def.id
+                && h.root_page_id == current_root
+                && h.schema_version == table_def.schema_version
+        })
+        .map(|h| h.leaf_page_id);
     let debug_clustered_insert = std::env::var_os("AXIOMDB_DEBUG_CLUSTERED_INSERT").is_some();
     let mut fast_path_hits = 0u64;
     let mut physical_lookup_time = Duration::ZERO;
@@ -292,21 +347,38 @@ fn apply_clustered_insert_rows(
                 }
                 if inserted > 0 {
                     fast_path_hits += inserted as u64;
-                    for inserted_row in &rows[row_idx..row_idx + inserted] {
-                        let new_image = axiomdb_wal::ClusteredRowImage::new(
-                            current_root,
-                            new_header,
-                            &inserted_row.encoded_row,
-                        );
-                        txn.record_clustered_insert(
-                            conn_txn,
-                            table_def.id,
-                            &inserted_row.primary_key_bytes,
-                            &new_image,
-                        )?;
+                    // Attack 15: build all ClusteredRowImage's first, then
+                    // emit a single batched WAL write. The previous per-row
+                    // record_clustered_insert loop did N separate
+                    // wal.append_with_buf calls — wasteful in the
+                    // rightmost-leaf fast path where every row already
+                    // shares the leaf and current_root.
+                    let images: Vec<axiomdb_wal::ClusteredRowImage> =
+                        rows[row_idx..row_idx + inserted]
+                            .iter()
+                            .map(|inserted_row| {
+                                axiomdb_wal::ClusteredRowImage::new(
+                                    current_root,
+                                    new_header,
+                                    &inserted_row.encoded_row,
+                                )
+                            })
+                            .collect();
+                    let wal_started = debug_clustered_insert.then(Instant::now);
+                    let entries: Vec<(&[u8], &axiomdb_wal::ClusteredRowImage)> = rows
+                        [row_idx..row_idx + inserted]
+                        .iter()
+                        .zip(images.iter())
+                        .map(|(row, image)| (row.primary_key_bytes.as_slice(), image))
+                        .collect();
+                    txn.record_clustered_insert_batch(conn_txn, table_def.id, &entries)?;
+                    if let Some(started) = wal_started {
+                        tree_insert_time += started.elapsed();
+                    }
 
-                        let (secondary_elapsed, root_persist_elapsed) =
-                            maintain_clustered_secondary_inserts(
+                    for inserted_row in &rows[row_idx..row_idx + inserted] {
+                        let secondary_elapsed =
+                            maintain_clustered_secondary_inserts_deferred(
                                 storage,
                                 txn,
                                 conn_txn,
@@ -317,9 +389,16 @@ fn apply_clustered_insert_rows(
                                 compiled_preds,
                                 &inserted_row.values,
                                 debug_clustered_insert,
+                                &bulk_eligible,
                             )?;
                         secondary_time += secondary_elapsed;
-                        root_persist_time += root_persist_elapsed;
+                        // Attack 11: collect entries for bulk-eligible indexes.
+                        collect_bulk_secondary_entries(
+                            &mut bulk_entries,
+                            &bulk_eligible,
+                            secondary_layouts,
+                            &inserted_row.values,
+                        )?;
                     }
 
                     row_idx += inserted;
@@ -402,7 +481,7 @@ fn apply_clustered_insert_rows(
             );
         }
 
-        let (secondary_elapsed, root_persist_elapsed) = maintain_clustered_secondary_inserts(
+        let secondary_elapsed = maintain_clustered_secondary_inserts_deferred(
             storage,
             txn,
             conn_txn,
@@ -413,20 +492,57 @@ fn apply_clustered_insert_rows(
             compiled_preds,
             &row.values,
             debug_clustered_insert,
+            &bulk_eligible,
         )?;
         secondary_time += secondary_elapsed;
-        root_persist_time += root_persist_elapsed;
+        // Attack 11: collect entries for bulk-eligible indexes.
+        collect_bulk_secondary_entries(
+            &mut bulk_entries,
+            &bulk_eligible,
+            secondary_layouts,
+            &row.values,
+        )?;
 
         row_idx += 1;
     }
 
-    if current_root != table_def.root_page_id {
+    // Attack 11: bulk-build the eligible secondary indexes from the
+    // collected entries. Each one calls BTree::bulk_load_sorted once,
+    // updating idx.root_page_id. flush_deferred_secondary_index_roots
+    // below then emits the catalog write.
+    bulk_build_eligible_secondaries(
+        storage,
+        bloom,
+        secondary_indexes,
+        &bulk_eligible,
+        &mut bulk_entries,
+    )?;
+
+    // Attack 10: flush deferred secondary-index root changes in ONE
+    // catalog write per CHANGED index (not per leaf split). Mirrors
+    // the existing update_table_root call below.
+    let persist_started = debug_clustered_insert.then(Instant::now);
+    flush_deferred_secondary_index_roots(
+        storage,
+        txn,
+        conn_txn,
+        secondary_indexes,
+        &original_secondary_roots,
+    )?;
+    if let Some(started) = persist_started {
+        root_persist_time += started.elapsed();
+    }
+
+    if current_root != table_def.root_page_id && !defer_table_root_persist {
         let persist_started = debug_clustered_insert.then(Instant::now);
         CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_def.id, current_root)?;
         if let Some(started) = persist_started {
             root_persist_time += started.elapsed();
         }
     }
+    // When `defer_table_root_persist == true`, the caller will read
+    // the latest root via `txn.clustered_root(table_def.id)` and emit
+    // a single `update_table_root` at end-of-Appender-lifetime.
 
     if debug_clustered_insert {
         eprintln!(
@@ -441,5 +557,161 @@ fn apply_clustered_insert_rows(
         );
     }
 
+    // Attack 5 step 5.4: persist the rightmost leaf as a session hint so
+    // the NEXT autocommit INSERT statement can prime its fast path and
+    // skip the descent entirely (the bench's insert_autocommit pattern).
+    if let (Some(slot), Some(leaf_pid), Some(last_row)) = (
+        session_hint,
+        rightmost_leaf_hint,
+        rows.last(),
+    ) {
+        // The leaf may have just been split inside try_insert_rightmost_leaf
+        // — read the current max key directly from the page rather than
+        // relying on the in-memory row data.
+        if let Ok(leaf) = storage.read_page(leaf_pid) {
+            use axiomdb_storage::clustered_leaf;
+            if clustered_leaf::num_cells(&leaf) > 0 {
+                let nc = clustered_leaf::num_cells(&leaf);
+                if let (Ok(first), Ok(last)) = (
+                    clustered_leaf::read_cell(&leaf, 0),
+                    clustered_leaf::read_cell(&leaf, nc - 1),
+                ) {
+                    *slot = Some(axiomdb_storage::clustered_tree::LeafCursorHint {
+                        table_id: table_def.id,
+                        root_page_id: current_root,
+                        leaf_page_id: leaf_pid,
+                        min_key: first.key.to_vec(),
+                        max_key: last.key.to_vec(),
+                        schema_version: table_def.schema_version,
+                    });
+                }
+            }
+        }
+        let _ = last_row; // suppress unused warning when assertion not used
+    }
+
     Ok(rows.len() as u64)
+}
+
+// ── Attack 11 helpers — secondary index bulk-build ───────────────────────────
+
+/// Returns `true` if a secondary index is eligible for bulk-build via
+/// `BTree::bulk_load_sorted`. Requirements:
+/// - Regular B-Tree index (idx.index_type == 0)
+/// - NOT UNIQUE — UNIQUE indexes require logical-key dedup against the
+///   existing tree (which is empty here, fine) AND against each other
+///   within the batch. Our duplicate check on physical_key MISSES the
+///   intra-batch case because physical_key = logical_key + PK_suffix
+///   (so two rows with the same indexed value but different PKs have
+///   different physical keys). Falling back to the per-row path uses
+///   `ensure_unique_logical_key_absent` which checks logical keys
+///   correctly.
+/// - No partial-index predicate (we'd need to evaluate per row)
+/// - The B-Tree's root page is an empty leaf
+/// - Not BRIN / FTS / GIN / Trigram
+fn is_bulk_build_eligible(
+    storage: &dyn axiomdb_storage::StorageEngine,
+    idx: &axiomdb_catalog::schema::IndexDef,
+    compiled_pred: Option<&Expr>,
+) -> bool {
+    // index_type: 0 = regular B-Tree; 1 = BRIN; 2 = Trigram; 3 = FTS; 4 = GIN
+    if idx.index_type != 0 {
+        return false;
+    }
+    if idx.is_unique {
+        return false;
+    }
+    if compiled_pred.is_some() {
+        return false;
+    }
+    // Read root page and check that it's an empty leaf.
+    let Ok(page_ref) = storage.read_page(idx.root_page_id) else {
+        return false;
+    };
+    let bytes = *page_ref.as_bytes();
+    let Ok(page) = axiomdb_storage::Page::from_bytes(bytes) else {
+        return false;
+    };
+    let leaf = axiomdb_index::page_layout::cast_leaf(&page);
+    leaf.is_leaf == 1 && leaf.num_keys() == 0
+}
+
+/// Collects the encoded physical key for each `bulk_eligible[i] == true`
+/// secondary index, given the row's values.
+fn collect_bulk_secondary_entries(
+    bulk_entries: &mut [Option<Vec<Vec<u8>>>],
+    bulk_eligible: &[bool],
+    secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
+    row_values: &[Value],
+) -> Result<(), DbError> {
+    for (i, layout) in secondary_layouts.iter().enumerate() {
+        if !bulk_eligible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(entry) = layout.entry_from_row(row_values)? else {
+            continue;
+        };
+        if let Some(vec) = bulk_entries[i].as_mut() {
+            vec.push(entry.physical_key);
+        }
+    }
+    Ok(())
+}
+
+/// For each bulk-eligible secondary index with collected entries:
+/// sort, check for duplicates (UniqueViolation on UNIQUE indexes),
+/// call `BTree::bulk_load_sorted`, update `idx.root_page_id` and the
+/// bloom filter.
+fn bulk_build_eligible_secondaries(
+    storage: &dyn axiomdb_storage::StorageEngine,
+    bloom: &crate::bloom::BloomRegistry,
+    secondary_indexes: &mut [axiomdb_catalog::schema::IndexDef],
+    bulk_eligible: &[bool],
+    bulk_entries: &mut [Option<Vec<Vec<u8>>>],
+) -> Result<(), DbError> {
+    for (i, idx) in secondary_indexes.iter_mut().enumerate() {
+        if !bulk_eligible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(entries) = bulk_entries[i].take() else {
+            continue;
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        // Sort by physical_key.
+        let mut sorted = entries;
+        sorted.sort_unstable();
+        // Duplicate detection — physical_key includes the PK suffix
+        // so duplicates can only happen if the SAME row was processed
+        // twice (a bug above us) or if the PK was re-used (the primary
+        // tree would have rejected it first). UNIQUE indexes are
+        // excluded from this path (see is_bulk_build_eligible), so
+        // logical-key dedup isn't our responsibility here. If a
+        // duplicate slips through it's a real corruption signal.
+        debug_assert!(
+            sorted.windows(2).all(|w| w[0] != w[1]),
+            "non-unique index has duplicate physical_key after sort — corruption?"
+        );
+        // bulk_load_sorted wants &[(&[u8], RecordId)]; build a Vec of
+        // references with the secondary's DUMMY_RID (page_id=0, slot_id=0).
+        let dummy_rid = axiomdb_core::RecordId {
+            page_id: 0,
+            slot_id: 0,
+        };
+        let pairs: Vec<(&[u8], axiomdb_core::RecordId)> =
+            sorted.iter().map(|k| (k.as_slice(), dummy_rid)).collect();
+        let new_root = axiomdb_index::BTree::bulk_load_sorted(
+            storage,
+            idx.root_page_id,
+            &pairs,
+            idx.fillfactor,
+        )?;
+        idx.root_page_id = new_root;
+        // Update bloom filter for every key.
+        for key in &sorted {
+            bloom.add(idx.index_id, key);
+        }
+    }
+    Ok(())
 }

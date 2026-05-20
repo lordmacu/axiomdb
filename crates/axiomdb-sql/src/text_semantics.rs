@@ -30,7 +30,14 @@ use crate::session::SessionCollation;
 pub fn canonical_text<'a>(c: SessionCollation, s: &'a str) -> Cow<'a, str> {
     match c {
         SessionCollation::Binary => Cow::Borrowed(s),
-        SessionCollation::Es => {
+        // For both `Es` and `Icu` we use the same canonicalization path
+        // (NFC + Unicode lowercase + strip combining marks). The Icu
+        // variant adds locale-aware tailoring on top via the collator's
+        // `compare()` method, but the canonical form (used for hashing /
+        // GROUP BY / DISTINCT / LIKE) is the same. Strictly locale-
+        // sensitive grouping would need per-locale weights, which would
+        // ~double the data footprint and is deferred.
+        SessionCollation::Es | SessionCollation::Icu(_) => {
             // Step 1: NFC normalize.
             let nfc: String = s.nfc().collect();
             // Step 2: Unicode-aware lowercase.
@@ -72,7 +79,99 @@ pub fn compare_text(c: SessionCollation, a: &str, b: &str) -> std::cmp::Ordering
                 a.cmp(b)
             }
         }
+        // Phase 24.4b: ICU4X locale-aware ordering. With the
+        // `icu-collations` feature, we look up a per-locale Collator
+        // (cached process-wide; constructed lazily on first use) and
+        // use its Primary-strength comparison. Without the feature the
+        // variant falls back to `Es` semantics — the SQL parses, but
+        // locale-specific tailoring is silently absent.
+        SessionCollation::Icu(locale) => icu_compare(locale, a, b),
     }
+}
+
+#[cfg(feature = "icu-collations")]
+fn icu_compare(locale: crate::session::IcuLocale, a: &str, b: &str) -> std::cmp::Ordering {
+    let coll = get_cached_icu_collator(locale);
+    coll.compare(a, b)
+}
+
+#[cfg(not(feature = "icu-collations"))]
+fn icu_compare(_: crate::session::IcuLocale, a: &str, b: &str) -> std::cmp::Ordering {
+    // Feature off: fall back to the canonical comparison so the
+    // semantics are at least case-insensitive. Locale tailoring (Turkish
+    // i/İ, German ß/SS, etc.) is silently ignored. We skip the raw-text
+    // tie-break here because the Icu variant's contract is "case-equal
+    // strings compare equal" — sort determinism in absence of a real
+    // collator isn't worth violating that contract.
+    let ca = canonical_text(SessionCollation::Es, a);
+    let cb = canonical_text(SessionCollation::Es, b);
+    ca.as_ref().cmp(cb.as_ref())
+}
+
+#[cfg(feature = "icu-collations")]
+fn icu_eq(locale: crate::session::IcuLocale, a: &str, b: &str) -> bool {
+    let coll = get_cached_icu_collator(locale);
+    coll.compare(a, b) == std::cmp::Ordering::Equal
+}
+
+#[cfg(not(feature = "icu-collations"))]
+fn icu_eq(_: crate::session::IcuLocale, a: &str, b: &str) -> bool {
+    canonical_text(SessionCollation::Es, a) == canonical_text(SessionCollation::Es, b)
+}
+
+#[cfg(feature = "icu-collations")]
+fn get_cached_icu_collator(
+    locale: crate::session::IcuLocale,
+) -> &'static icu_collator::CollatorBorrowed<'static> {
+    use icu_collator::options::{CollatorOptions, Strength};
+    use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences};
+    use std::sync::OnceLock;
+
+    // 8 slots — one per IcuLocale variant. Lazy-init on first use via
+    // OnceLock. The CollatorBorrowed is 'static because `compiled_data`
+    // gives us a baked data slice with `'static` lifetime.
+    static SLOTS: [OnceLock<CollatorBorrowed<'static>>; 8] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+
+    let idx = match locale {
+        crate::session::IcuLocale::Turkish => 0,
+        crate::session::IcuLocale::German => 1,
+        crate::session::IcuLocale::Spanish => 2,
+        crate::session::IcuLocale::Swedish => 3,
+        crate::session::IcuLocale::French => 4,
+        crate::session::IcuLocale::Czech => 5,
+        crate::session::IcuLocale::Polish => 6,
+        crate::session::IcuLocale::UnicodeCi => 7,
+    };
+
+    SLOTS[idx].get_or_init(|| {
+        // Build CollatorPreferences from the BCP-47 tag. For
+        // `IcuLocale::UnicodeCi` (tag "und") we skip the parse and use
+        // the default (root locale).
+        let tag = locale.bcp47();
+        let prefs: CollatorPreferences = if tag == "und" {
+            CollatorPreferences::default()
+        } else {
+            match tag.parse::<icu_locale::Locale>() {
+                Ok(loc) => (&loc).into(),
+                Err(_) => CollatorPreferences::default(),
+            }
+        };
+        let mut options = CollatorOptions::default();
+        // Primary = case-insensitive + accent-insensitive — matches the
+        // MySQL `_ai_ci` semantics.
+        options.strength = Some(Strength::Primary);
+        Collator::try_new(prefs, options)
+            .expect("ICU collator initialization for compiled_data should never fail")
+    })
 }
 
 /// Returns `true` if `a` and `b` are equal under the given collation.
@@ -83,6 +182,7 @@ pub fn text_eq(c: SessionCollation, a: &str, b: &str) -> bool {
     match c {
         SessionCollation::Binary => a == b,
         SessionCollation::Es => canonical_text(c, a) == canonical_text(c, b),
+        SessionCollation::Icu(locale) => icu_eq(locale, a, b),
     }
 }
 
@@ -98,7 +198,13 @@ pub fn text_eq(c: SessionCollation, a: &str, b: &str) -> bool {
 pub fn like_match_collated(c: SessionCollation, text: &str, pattern: &str) -> bool {
     match c {
         SessionCollation::Binary => crate::eval::like_match(text, pattern),
-        SessionCollation::Es => {
+        SessionCollation::Es | SessionCollation::Icu(_) => {
+            // Phase 24.4b: ICU LIKE uses the same canonical form as Es —
+            // locale-specific tailoring is applied to ordering and
+            // equality (text_eq / compare_text), but LIKE patterns fold
+            // both sides through the generic CI+AI normalization. This
+            // keeps `LIKE 'jos%'` matching `José`/`JOSE`/`jose` under any
+            // locale without per-locale pattern engines.
             let t = canonical_text(c, text);
             let p = canonical_text(c, pattern);
             crate::eval::like_match(&t, &p)

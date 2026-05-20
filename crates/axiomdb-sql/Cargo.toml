@@ -5,6 +5,19 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables thread-local timing accumulators in the INSERT path for the
+# `axiomdb_bench --diagnose-insert-deep` diagnostic. ZERO cost when disabled.
+bench-timings = []
+# Phase 24.4b: ICU4X-backed locale-aware collations
+# (Turkish-i, German-ß, language-aware sort, accent-sensitive
+# variants, etc.). Adds ~500 KB-1 MB to the binary depending on
+# locale data baked in. Disabled by default to keep the embedded
+# library lightweight — users that need locale-specific behaviour
+# opt in.
+icu-collations = ["dep:icu_collator", "dep:icu_locale"]
+
 [dependencies]
 axiomdb-core    = { workspace = true }
 axiomdb-types   = { workspace = true }
@@ -28,10 +41,19 @@ url             = { workspace = true }
 tempfile        = { workspace = true }
 chrono                = { version = "0.4", default-features = false, features = ["std"] }
 unicode-normalization = "0.1"
+# Phase 24.4b: optional ICU4X collator (compiled_data = bundled
+# pre-built Unicode tables). Gated by the `icu-collations` feature
+# so default builds stay lean.
+icu_collator         = { version = "2.2", optional = true, default-features = false, features = ["compiled_data"] }
+icu_locale           = { version = "2.0", optional = true }
 regex                 = { workspace = true }
 parquet               = { version = "54", default-features = false, features = ["snap"] }
 roxmltree             = { workspace = true }
 rust_decimal          = { version = "1", default-features = false, features = ["maths"] }
+# Phase 24.5: cryptographic hashes for MD5/SHA-1/SHA-2 SQL functions.
+md-5                  = { version = "0.10", default-features = false }
+sha1                  = { version = "0.10", default-features = false }
+sha2                  = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 criterion    = { workspace = true }

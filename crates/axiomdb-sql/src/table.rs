@@ -291,17 +291,41 @@ pub fn count_clustered_visible(
     }
 
     // Walk leaf chain, count visible cells.
+    //
+    // Attack 17: a single-pass per-leaf scan inspects each cell's
+    // RowHeader directly via `for_each_row_header` — no CellRef
+    // allocation, no key/payload slicing, just the 16 bytes that
+    // visibility needs. The `is_visible` call is inlined so common
+    // cases (no active_ids, txn_id_deleted == 0, txn_id_created <
+    // snapshot_id) short-circuit in 2–3 branches. Typical 10K-row
+    // table drops from ~625µs to ~10µs on macOS APFS.
     let mut count = 0u64;
     let mut current = pid;
+    let current_txn = snap.current_txn_id;
+    let snap_id = snap.snapshot_id;
+    let has_active = !snap.active_ids.is_empty();
     while current != clustered_leaf::NULL_PAGE {
         let page = storage.read_page(current)?;
-        let n = clustered_leaf::num_cells(&page);
-        for idx in 0..n {
-            let cell = clustered_leaf::read_cell(&page, idx)?;
-            if cell.row_header.is_visible(&snap) {
+        clustered_leaf::for_each_row_header(&page, |hdr| {
+            let created_by_self = current_txn != 0 && hdr.txn_id_created == current_txn;
+            let created_committed = hdr.txn_id_created < snap_id
+                && (!has_active || !snap.active_ids.contains(&hdr.txn_id_created));
+            if !created_by_self && !created_committed {
+                return;
+            }
+            if hdr.txn_id_deleted == 0 {
+                count += 1;
+                return;
+            }
+            if current_txn != 0 && hdr.txn_id_deleted == current_txn {
+                return;
+            }
+            if hdr.txn_id_deleted >= snap_id
+                || (has_active && snap.active_ids.contains(&hdr.txn_id_deleted))
+            {
                 count += 1;
             }
-        }
+        })?;
         current = clustered_leaf::next_leaf(&page);
     }
 
@@ -373,6 +397,12 @@ pub fn scan_clustered_table_masked(
 }
 
 /// Point lookup on a clustered B-tree by primary key bytes.
+///
+/// Wrapper that forwards to [`lookup_clustered_row_with_hint`] with no
+/// session hint — pays a full B-tree descent on every call. Hot-path
+/// callers (the SELECT executors) should pass their session hint slot
+/// via the `_with_hint` variant instead to skip the descent when the
+/// previous lookup landed on the same leaf.
 pub fn lookup_clustered_row(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
@@ -380,22 +410,89 @@ pub fn lookup_clustered_row(
     pk_key: &[u8],
     snap: TransactionSnapshot,
 ) -> Result<Option<(RecordId, Vec<Value>)>, DbError> {
+    lookup_clustered_row_with_hint(storage, table_def, columns, pk_key, snap, None)
+}
+
+/// Point lookup variant that consults / updates a per-session leaf
+/// hint (Attack 5 — `LeafCursorHint`). When the hint covers `pk_key`,
+/// skips the full B-tree descent and reads the cached leaf directly.
+///
+/// Attack 19: uses the zero-alloc `lookup_callback{_with_hint}` paths
+/// — decodes the row directly from the page slice. No
+/// `reconstruct_row_data` clone, no `cell.key.to_vec()` allocation
+/// per lookup. For inline rows (the common case on bench-sized rows)
+/// the only allocation is the result `Vec<Value>`.
+pub fn lookup_clustered_row_with_hint(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    pk_key: &[u8],
+    snap: TransactionSnapshot,
+    hint: Option<&mut Option<axiomdb_storage::clustered_tree::LeafCursorHint>>,
+) -> Result<Option<(RecordId, Vec<Value>)>, DbError> {
     let col_types = column_data_types(columns);
-    match axiomdb_storage::clustered_tree::lookup(
-        storage,
-        Some(table_def.root_page_id),
-        pk_key,
-        &snap,
-    )? {
-        Some(row) => {
-            let values = decode_row(&row.row_data, &col_types)?;
-            Ok(Some((CLUSTERED_DUMMY_RID, values)))
+    let mut decoded: Option<Vec<Value>> = None;
+    let visited = match hint {
+        Some(slot) => axiomdb_storage::clustered_tree::lookup_callback_with_hint(
+            storage,
+            Some(table_def.root_page_id),
+            pk_key,
+            table_def.id,
+            table_def.schema_version,
+            &snap,
+            slot,
+            |inline, overflow, _hdr| {
+                decoded = Some(decode_with_overflow(storage, inline, overflow, &col_types)?);
+                Ok(())
+            },
+        )?,
+        None => axiomdb_storage::clustered_tree::lookup_callback(
+            storage,
+            Some(table_def.root_page_id),
+            pk_key,
+            &snap,
+            |inline, overflow, _hdr| {
+                decoded = Some(decode_with_overflow(storage, inline, overflow, &col_types)?);
+                Ok(())
+            },
+        )?,
+    };
+    if visited {
+        Ok(decoded.map(|v| (CLUSTERED_DUMMY_RID, v)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[inline]
+fn decode_with_overflow(
+    storage: &dyn StorageEngine,
+    inline: &[u8],
+    overflow: Option<(u64, usize)>,
+    col_types: &[axiomdb_types::DataType],
+) -> Result<Vec<Value>, DbError> {
+    match overflow {
+        None => decode_row(inline, col_types),
+        Some((first_page, tail_len)) => {
+            let mut buf = Vec::with_capacity(inline.len() + tail_len);
+            buf.extend_from_slice(inline);
+            buf.extend_from_slice(&axiomdb_storage::clustered_overflow::read_chain(
+                storage, first_page, tail_len,
+            )?);
+            decode_row(&buf, col_types)
         }
-        None => Ok(None),
     }
 }
 
 /// Range scan on a clustered B-tree by primary key bounds.
+///
+/// Attack 18: uses the zero-alloc `range_callback` path. For rows
+/// without overflow tails (the common case), the page slice is
+/// decoded in place — no `reconstruct_row_data` clone, no
+/// `key.to_vec()`, no `ClusteredRangeIter` allocation. Saves
+/// ~2 heap allocations per returned row vs the previous iterator
+/// path. Overflow tails (rare on small rows) still allocate once
+/// to splice inline + overflow into a contiguous buffer.
 pub fn range_clustered_table(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
@@ -414,19 +511,33 @@ pub fn range_clustered_table(
         Some(k) => Bound::Included(k.to_vec()),
         None => Bound::Unbounded,
     };
-    let iter = axiomdb_storage::clustered_tree::range(
+    let mut result: Vec<(RecordId, Vec<Value>)> = Vec::new();
+    let mut overflow_scratch: Vec<u8> = Vec::new();
+    axiomdb_storage::clustered_tree::range_callback(
         storage,
         Some(table_def.root_page_id),
         from,
         to,
         &snap,
+        |inline, overflow| {
+            let values = match overflow {
+                None => decode_row(inline, &col_types)?,
+                Some((first_page, tail_len)) => {
+                    overflow_scratch.clear();
+                    overflow_scratch.reserve(inline.len() + tail_len);
+                    overflow_scratch.extend_from_slice(inline);
+                    overflow_scratch.extend_from_slice(
+                        &axiomdb_storage::clustered_overflow::read_chain(
+                            storage, first_page, tail_len,
+                        )?,
+                    );
+                    decode_row(&overflow_scratch, &col_types)?
+                }
+            };
+            result.push((CLUSTERED_DUMMY_RID, values));
+            Ok(())
+        },
     )?;
-    let mut result = Vec::new();
-    for row_result in iter {
-        let row = row_result?;
-        let values = decode_row(&row.row_data, &col_types)?;
-        result.push((CLUSTERED_DUMMY_RID, values));
-    }
     Ok(result)
 }
 
@@ -841,7 +952,7 @@ fn decimal_precision_scale(col: &ColumnDef) -> (u8, u8) {
 /// - If permissive also fails, returns the permissive error (no warning emitted).
 ///
 /// `row_num` is 1-based and statement-local (used in the warning message).
-pub(crate) fn coerce_values_with_ctx(
+pub fn coerce_values_with_ctx(
     values: Vec<Value>,
     columns: &[ColumnDef],
     ctx: &mut SessionContext,
@@ -963,6 +1074,7 @@ mod tests {
             enum_type_name: None,
             array_element_type: None,
             array_ndims: None,
+            identity_kind: axiomdb_catalog::IdentityKind::None,
         }
     }
 
@@ -1036,6 +1148,7 @@ mod tests {
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
             },
             ColumnDef {
                 table_id: 1,
@@ -1054,6 +1167,7 @@ mod tests {
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
             },
         ];
 
@@ -1114,6 +1228,7 @@ mod tests {
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
             },
             ColumnDef {
                 table_id: 1,
@@ -1132,6 +1247,7 @@ mod tests {
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
             },
         ];
 

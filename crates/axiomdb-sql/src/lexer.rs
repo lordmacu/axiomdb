@@ -384,6 +384,12 @@ pub enum Token<'src> {
     TyBoolean,
     #[token("TEXT", ignore(ascii_case))]
     TyText,
+    /// Phase 24.4: PostgreSQL `CITEXT` — case-insensitive text. Parsed
+    /// as `TEXT` with an implicit `utf8mb4_unicode_ci` collation, so
+    /// the existing collation-aware equality (post-`text_eq` fix)
+    /// makes `WHERE col = 'value'` case-insensitive transparently.
+    #[token("CITEXT", ignore(ascii_case))]
+    TyCitext,
     #[token("VARCHAR", ignore(ascii_case))]
     TyVarchar,
     #[token("CHAR", ignore(ascii_case))]
@@ -392,6 +398,13 @@ pub enum Token<'src> {
     TyBlob,
     #[token("BYTEA", ignore(ascii_case))]
     TyBytea,
+    /// MySQL fixed-length binary (`BINARY(n)`). Treated as BYTEA for storage.
+    /// Phase 24.5.
+    #[token("BINARY", ignore(ascii_case))]
+    TyBinary,
+    /// MySQL variable-length binary (`VARBINARY(n)`). Treated as BYTEA. Phase 24.5.
+    #[token("VARBINARY", ignore(ascii_case))]
+    TyVarbinary,
     #[token("DATE", ignore(ascii_case))]
     TyDate,
     #[token("TIMESTAMP", ignore(ascii_case))]

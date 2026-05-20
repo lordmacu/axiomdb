@@ -475,10 +475,31 @@ fn execute_create_table(
             .iter()
             .any(|c| matches!(c, ColumnConstraint::NotNull))
             && !primary_key_cols.contains(&(i as u16));
-        let auto_increment = col_def
+        // Phase 24.1c: GENERATED ALWAYS|BY DEFAULT AS IDENTITY also sets
+        // auto_increment (the value-generation path is shared with MySQL
+        // AUTO_INCREMENT). The new identity_kind field distinguishes the
+        // SQL-standard form for enforcement + display purposes.
+        let auto_increment = col_def.constraints.iter().any(|c| {
+            matches!(
+                c,
+                ColumnConstraint::AutoIncrement | ColumnConstraint::GeneratedIdentity { .. }
+            )
+        });
+        let identity_kind = col_def
             .constraints
             .iter()
-            .any(|c| matches!(c, ColumnConstraint::AutoIncrement));
+            .find_map(|c| {
+                if let ColumnConstraint::GeneratedIdentity { by_default } = c {
+                    Some(if *by_default {
+                        axiomdb_catalog::IdentityKind::ByDefault
+                    } else {
+                        axiomdb_catalog::IdentityKind::Always
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(axiomdb_catalog::IdentityKind::None);
         if let Some(refs) = col_def.constraints.iter().find_map(|c| {
             if let ColumnConstraint::References {
                 table,
@@ -549,6 +570,7 @@ fn execute_create_table(
             enum_type_name: user_type_name,
             array_element_type,
             array_ndims,
+            identity_kind,
         })?;
     }
 
@@ -1623,6 +1645,7 @@ fn execute_create_table_like(
             enum_type_name: col.enum_type_name.clone(),
             array_element_type: col.array_element_type,
             array_ndims: col.array_ndims,
+            identity_kind: axiomdb_catalog::IdentityKind::None,
         })?;
     }
 
@@ -1821,6 +1844,7 @@ fn create_relation_as_select(
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
         })?;
     }
 
@@ -1846,6 +1870,7 @@ fn create_relation_as_select(
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
         })
         .collect();
 

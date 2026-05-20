@@ -100,10 +100,8 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
                     use rust_decimal::prelude::ToPrimitive;
                     use rust_decimal::{Decimal as RustDecimal, RoundingStrategy};
                     let rd = RustDecimal::from_i128_with_scale(m, s as u32);
-                    let rounded = rd.round_dp_with_strategy(
-                        decimals,
-                        RoundingStrategy::MidpointAwayFromZero,
-                    );
+                    let rounded =
+                        rd.round_dp_with_strategy(decimals, RoundingStrategy::MidpointAwayFromZero);
                     let new_scale = decimals as u8;
                     let factor = RustDecimal::from(10i64.pow(decimals));
                     let scaled = rounded * factor;

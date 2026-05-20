@@ -607,3 +607,102 @@ and MySQL 8.0 (98K r/s) by 14×. The combination of <code>WalEntry::Truncate</co
 eliminates the two main costs in full-table deletion.
 </div>
 </div>
+
+### `SELECT COUNT(*)` Fast Path (Attack 17)
+
+The clustered-table `COUNT(*)` path bypasses the regular row-decode pipeline:
+it walks the leaf chain and visits only each cell's 8-byte `RowHeader`
+via `clustered_leaf::for_each_row_header`. No key slicing, no payload parse,
+no `CellRef` construction — just the visibility check inlined per cell.
+
+| Scenario | Pre-A17 | Post-A17 | Speedup |
+|---|---:|---:|---:|
+| `SELECT COUNT(*) FROM t` (10K rows, clustered) | 1.6K ops/s | **2.3K ops/s** | 1.5× |
+
+The remaining ~60× gap vs SQLite lives in the SQL pipeline overhead (parse +
+analyze + plan per autocommit query), not in the count itself.
+
+### Clustered Range Scan (Attack 18)
+
+`SELECT * FROM t WHERE id BETWEEN X AND Y` on a clustered (PRIMARY KEY) table
+now uses `clustered_tree::range_callback` — a zero-alloc range iterator that
+yields page-resident byte slices via a closure. For rows without overflow
+tails (the common case on bench-sized rows), `decode_row` runs directly on
+the page slice — no `reconstruct_row_data` clone, no `key.to_vec()`, no
+per-row `ClusteredRow` struct.
+
+| Scenario | Pre-A18 | Post-A18 | Speedup |
+|---|---:|---:|---:|
+| `range_scan` 1K-of-10K (clustered PK) | 361K ops/s | **1.42M ops/s** | **4×** |
+
+This closes ~75% of the previous gap vs SQLite (10.4M ops/s).
+
+### Clustered Point Lookup Primitive (Attack 19)
+
+Same zero-alloc pattern applied to point lookups via the new
+`clustered_tree::lookup_callback{_with_hint}` API: descend, binary-search,
+invoke a closure with the page-resident slice — no row_data clone, no
+key.to_vec(). Used by `table::lookup_clustered_row_with_hint` and available
+for any caller off the SQL pipeline (FK validation, ON CONFLICT detection,
+embedded direct API).
+
+The benchmark `point_lookup` doesn't show a measurable win because each
+lookup is wrapped in an autocommit `SELECT ... WHERE id = N` SQL query —
+parse + analyze + plan dominate (~200µs/query) the storage cost (~5-20µs).
+Attack 20 (autocommit statement cache) addresses the real bottleneck.
+
+### Autocommit SELECT Statement Cache (Attack 20)
+
+Repeated autocommit `SELECT` queries with different literals (`SELECT ...
+WHERE id = N`, then `WHERE id = N+100`, etc.) now share one analyzed plan
+via the per-session statement cache (`statement_cache::run_cached`). The
+parser still runs (cheap), then literals are extracted to params, the
+shape is hashed, and the cache returns the prior analyzed AST. The
+analyzer's `PlanDeps` snapshot is re-validated against the catalog on each
+hit (1-3 catalog reads typically) to evict stale entries after DDL.
+
+| Scenario | Pre-A20 | Post-A20 | Speedup |
+|---|---:|---:|---:|
+| `point_lookup` 100×SELECT | 4.5K ops/s | **14.5K ops/s** | **3.2×** |
+| `count_star` SELECT COUNT(*) | 2.3K ops/s | **~5K ops/s** | 2.1× |
+| `range_scan` 1K-of-10K | 1.42M ops/s | **2.98M ops/s** | 2.1× |
+
+Cache scope: SELECT only (gated by `sql_starts_with_select_keyword`).
+INSERT/UPDATE/DELETE keep the legacy path — they have cheap analyze and
+the prior Attack 2 wiring net-regressed them. Cumulative range_scan speedup
+vs original baseline: **8.3×** (4× from A18 zero-alloc × 2.1× from A20
+cache).
+
+### Session COUNT(*) Cache (Attack 17b)
+
+The `SELECT COUNT(*) FROM t` fast path now consults a per-session cache
+keyed by `(table_id, schema_version)`. Cache hits return in O(1) without
+re-scanning leaves. Validity is determined by the existing per-table
+change counter on `StaleStatsTracker` — any INSERT/UPDATE/DELETE bumps
+the counter and forces the next COUNT(*) to re-scan.
+
+| Scenario | Pre-A17 | Post-A17b | Total Speedup |
+|---|---:|---:|---:|
+| `count_star` 10K rows (clustered) | 1.6K ops/s | **~12K ops/s** | **7.5×** |
+
+Cache is gated to autocommit mode — inside an explicit BEGIN..ROLLBACK
+the change counter doesn't unwind on rollback, so we skip the cache there
+to preserve correctness. Multi-session writes from another connection
+don't invalidate this session's cache; the cached count is a snapshot
+value (per MVCC semantics).
+
+### Why autocommit INSERT isn't on the statement cache yet
+
+Attack 22 attempted to extend the statement cache (A20) to
+INSERT/UPDATE/DELETE. Both repair paths regressed `insert_autocommit`
+versus the cache-disabled baseline — keeping the existing per-dep
+`PlanDeps.is_stale` check cost ~17%, and clearing the cache eagerly
+from `invalidate_all` cost ~35% (the cache was wiped on every DML
+because `invalidate_all` is overloaded for index-root changes).
+
+For now the autocommit DML path keeps the legacy parse → analyze →
+execute pipeline. Workloads that need the win can switch to the
+embedded `Appender` API (a fast-path INSERT builder that bypasses the
+SQL pipeline entirely) — see the
+[embedded guide](embedded.md). The full investigation lives in
+`docs/perf-sqlite-gap.md` "Attack 22 — deferred".

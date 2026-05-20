@@ -153,6 +153,127 @@ impl TableEngine {
             .collect())
     }
 
+    /// Clustered-table analog of [`Self::insert_rows_batch_with_ctx`]
+    /// (Attack 7 v1.1).
+    ///
+    /// Accepts pre-validated `Vec<Value>` rows (caller is responsible for
+    /// constraint/FK/auto_inc/generated — the embedded Appender does
+    /// this in its `append_row` pipeline) and writes them to the
+    /// clustered B-Tree via the same `apply_clustered_insert_rows`
+    /// helper the SQL `INSERT` path uses. Maintains both the primary
+    /// clustered index AND any secondary indexes (including BRIN/FTS/GIN/
+    /// trigram), via the existing dispatcher.
+    ///
+    /// Returns the rows-inserted count. Note that — unlike the heap
+    /// variant — clustered inserts don't expose stable `RecordId`s to
+    /// callers (the PK is the identifier), so the return type is `u64`,
+    /// not `Vec<RecordId>`.
+    ///
+    /// Partial-index predicates and expression indexes are honored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_clustered_rows_batch_with_ctx(
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
+        bloom: &crate::bloom::BloomRegistry,
+        table_def: &TableDef,
+        columns: &[ColumnDef],
+        indexes: &[axiomdb_catalog::IndexDef],
+        ctx: &mut SessionContext,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
+        // Attack 16: take ownership so prepare_row_with_ctx can move
+        // the inner Vec<Value> instead of cloning it. The sole caller
+        // (Appender::flush) already owns the batch via mem::take.
+        batch: Vec<Vec<Value>>,
+    ) -> Result<u64, DbError> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let primary_idx = crate::clustered_table::primary_index(indexes, &table_def.table_name)?;
+        let mut secondary_indexes: Vec<axiomdb_catalog::IndexDef> = indexes
+            .iter()
+            .filter(|i| !i.is_primary && !i.columns.is_empty())
+            .cloned()
+            .collect();
+        let secondary_layouts = secondary_indexes
+            .iter()
+            .map(|idx| crate::clustered_secondary::ClusteredSecondaryLayout::derive(idx, primary_idx))
+            .collect::<Result<Vec<_>, _>>()?;
+        let compiled_preds =
+            crate::partial_index::compile_index_predicates(&secondary_indexes, columns)?;
+
+        // Prepare each row: encode + extract primary key. Owned Vec<Value>
+        // moves into the prepared row (A16) and we skip re-coercion since
+        // the Appender already ran `coerce_values_with_ctx` in
+        // `append_row_owned` (A16b — eliminates the double-coerce).
+        let mut prepared: Vec<crate::clustered_table::PreparedClusteredInsertRow> =
+            Vec::with_capacity(batch.len());
+        for values in batch.into_iter() {
+            let p = crate::clustered_table::prepare_row_already_coerced(
+                values,
+                columns,
+                primary_idx,
+                &table_def.table_name,
+            )?;
+            prepared.push(p);
+        }
+
+        // Drop into the same helper used by the SQL INSERT path.
+        // Attack 13: defer the catalog `update_table_root` write to
+        // `Appender::finish()` so multi-flush Appenders pay it once
+        // per session, not once per flush (8.7ms saved per skipped
+        // flush on macOS APFS).
+        let count = crate::executor::apply_clustered_insert_rows(
+            storage,
+            txn,
+            conn_txn,
+            bloom,
+            table_def,
+            primary_idx,
+            &mut secondary_indexes,
+            &secondary_layouts,
+            &compiled_preds,
+            &prepared,
+            Some(ctx.clustered_leaf_hint_slot()),
+            /*defer_table_root_persist=*/ true,
+        )?;
+        ctx.stats.on_rows_changed(table_def.id, count);
+        Ok(count)
+    }
+
+    /// Attack 13: persist the final clustered root once per Appender
+    /// lifetime (called from `Appender::finish()`).
+    ///
+    /// `insert_clustered_rows_batch_with_ctx` defers the catalog
+    /// `update_table_root` write — so for an Appender doing N
+    /// auto-flushes the catalog cost is paid ONCE here, not N times
+    /// during flushes (8.7ms saved per skipped flush on macOS APFS).
+    ///
+    /// Reads the in-memory root via `txn.clustered_root(table_id)`
+    /// and emits a single `update_table_root` only when it differs
+    /// from `table_def.root_page_id`. Safe to call when the Appender
+    /// inserted zero rows — the early return avoids a no-op write.
+    pub fn flush_appender_clustered_table_root(
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
+        conn_txn: &mut axiomdb_wal::ConnectionTxn,
+        table_def: &TableDef,
+    ) -> Result<(), DbError> {
+        // Use `clustered_root_for_conn` (not `clustered_root`) so we see
+        // the in-progress root recorded by THIS txn's flushes — the
+        // process-wide `last_clustered_roots` map only updates at commit.
+        let current_root = match txn.clustered_root_for_conn(conn_txn, table_def.id) {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        if current_root == table_def.root_page_id {
+            return Ok(());
+        }
+        axiomdb_catalog::CatalogWriter::new(storage, txn, conn_txn)?
+            .update_table_root(table_def.id, current_root)?;
+        Ok(())
+    }
+
     /// Session-aware single-row update: applies strict or permissive coercion,
     /// emitting warning 1265 on permissive fallback.
     pub fn update_row_with_ctx(

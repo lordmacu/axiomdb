@@ -1,8 +1,15 @@
-#[expect(
-    clippy::too_many_arguments,
-    reason = "clustered insert secondary maintenance naturally needs executor state plus index metadata"
-)]
-fn maintain_clustered_secondary_inserts(
+/// Attack 10: caller-facing variant that accumulates root changes
+/// in-place (via `idx.root_page_id`) without writing to the catalog.
+/// Returns `(secondary_elapsed, catalog_elapsed=0)`. The caller must
+/// invoke `flush_deferred_secondary_index_roots` after the batch.
+///
+/// Attack 11: `skip_mask`, if non-empty, skips secondary indexes
+/// where `skip_mask[i] == true`. The caller is responsible for
+/// handling those indexes separately (typically: bulk-build via
+/// `BTree::bulk_load_sorted`). Pass an empty slice to maintain all
+/// indexes.
+#[expect(clippy::too_many_arguments, reason = "see maintain_clustered_secondary_inserts")]
+pub(crate) fn maintain_clustered_secondary_inserts_deferred(
     storage: &dyn StorageEngine,
     txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
@@ -13,17 +20,86 @@ fn maintain_clustered_secondary_inserts(
     compiled_preds: &[Option<Expr>],
     row_values: &[Value],
     debug_clustered_insert: bool,
+    skip_mask: &[bool],
+) -> Result<std::time::Duration, DbError> {
+    let (secondary_elapsed, _) = maintain_clustered_secondary_inserts_impl(
+        storage,
+        txn,
+        conn_txn,
+        bloom,
+        table_root_page_id,
+        secondary_indexes,
+        secondary_layouts,
+        compiled_preds,
+        row_values,
+        debug_clustered_insert,
+        /*defer_root_persist=*/ true,
+        skip_mask,
+    )?;
+    Ok(secondary_elapsed)
+}
+
+/// Persists any pending secondary-index root changes accumulated by
+/// `maintain_clustered_secondary_inserts_deferred`. Call once at the
+/// end of a batch. The `original_roots` slice MUST be the same shape
+/// as `secondary_indexes` and hold the roots BEFORE the batch started.
+pub(crate) fn flush_deferred_secondary_index_roots(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut ConnectionTxn,
+    secondary_indexes: &[IndexDef],
+    original_roots: &[u64],
+) -> Result<(), DbError> {
+    debug_assert_eq!(secondary_indexes.len(), original_roots.len());
+    let mut writer: Option<axiomdb_catalog::writer::CatalogWriter<'_>> = None;
+    for (idx, &orig_root) in secondary_indexes.iter().zip(original_roots.iter()) {
+        if idx.root_page_id != orig_root {
+            let w = match writer.as_mut() {
+                Some(w) => w,
+                None => {
+                    writer = Some(axiomdb_catalog::writer::CatalogWriter::new(
+                        storage, txn, conn_txn,
+                    )?);
+                    writer.as_mut().unwrap()
+                }
+            };
+            w.update_index_root(idx.index_id, idx.root_page_id)?;
+        }
+    }
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "see maintain_clustered_secondary_inserts")]
+fn maintain_clustered_secondary_inserts_impl(
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    conn_txn: &mut ConnectionTxn,
+    bloom: &crate::bloom::BloomRegistry,
+    table_root_page_id: u64,
+    secondary_indexes: &mut [IndexDef],
+    secondary_layouts: &[crate::clustered_secondary::ClusteredSecondaryLayout],
+    compiled_preds: &[Option<Expr>],
+    row_values: &[Value],
+    debug_clustered_insert: bool,
+    defer_root_persist: bool,
+    skip_mask: &[bool],
 ) -> Result<(std::time::Duration, std::time::Duration), DbError> {
     use std::time::{Duration, Instant};
 
     let mut secondary_time = Duration::ZERO;
     let mut root_persist_time = Duration::ZERO;
 
-    for ((idx, layout), compiled_pred) in secondary_indexes
+    for (i, ((idx, layout), compiled_pred)) in secondary_indexes
         .iter_mut()
         .zip(secondary_layouts.iter())
         .zip(compiled_preds.iter())
+        .enumerate()
     {
+        // Attack 11: caller-controlled skip for indexes that go
+        // through bulk_load_sorted instead of per-row insert.
+        if skip_mask.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let secondary_started = debug_clustered_insert.then(Instant::now);
         if let Some(pred) = compiled_pred {
             if !is_truthy(&eval(pred, row_values)?) {
@@ -65,13 +141,19 @@ fn maintain_clustered_secondary_inserts(
                 secondary_time += started.elapsed();
             }
             if new_index_root != idx.root_page_id {
-                let persist_started = debug_clustered_insert.then(Instant::now);
-                CatalogWriter::new(storage, txn, conn_txn)?
-                    .update_index_root(idx.index_id, new_index_root)?;
-                if let Some(started) = persist_started {
-                    root_persist_time += started.elapsed();
+                if defer_root_persist {
+                    // Attack 10: just track the new root in-memory;
+                    // caller flushes via flush_deferred_secondary_index_roots.
+                    idx.root_page_id = new_index_root;
+                } else {
+                    let persist_started = debug_clustered_insert.then(Instant::now);
+                    CatalogWriter::new(storage, txn, conn_txn)?
+                        .update_index_root(idx.index_id, new_index_root)?;
+                    if let Some(started) = persist_started {
+                        root_persist_time += started.elapsed();
+                    }
+                    idx.root_page_id = new_index_root;
                 }
-                idx.root_page_id = new_index_root;
             }
             continue;
         }
@@ -90,13 +172,17 @@ fn maintain_clustered_secondary_inserts(
             secondary_time += started.elapsed();
         }
         if new_index_root != idx.root_page_id {
-            let persist_started = debug_clustered_insert.then(Instant::now);
-            CatalogWriter::new(storage, txn, conn_txn)?
-                .update_index_root(idx.index_id, new_index_root)?;
-            if let Some(started) = persist_started {
-                root_persist_time += started.elapsed();
+            if defer_root_persist {
+                idx.root_page_id = new_index_root;
+            } else {
+                let persist_started = debug_clustered_insert.then(Instant::now);
+                CatalogWriter::new(storage, txn, conn_txn)?
+                    .update_index_root(idx.index_id, new_index_root)?;
+                if let Some(started) = persist_started {
+                    root_persist_time += started.elapsed();
+                }
+                idx.root_page_id = new_index_root;
             }
-            idx.root_page_id = new_index_root;
         }
     }
 
@@ -237,7 +323,7 @@ pub(crate) fn validate_generated_insert_source_values(
     Ok(())
 }
 
-pub(crate) fn materialize_generated_columns(
+pub fn materialize_generated_columns(
     schema_cols: &[CatalogColumnDef],
     row_values: &mut [Value],
 ) -> Result<(), DbError> {
@@ -296,6 +382,26 @@ fn assign_auto_increment(
     let Some(ai_col) = schema_cols.iter().position(|c| c.auto_increment) else {
         return Ok(());
     };
+
+    // Phase 24.1c: `GENERATED ALWAYS AS IDENTITY` rejects explicit values
+    // (SQL:2003). MySQL `AUTO_INCREMENT` and `GENERATED BY DEFAULT AS
+    // IDENTITY` both accept them. NULL / 0 / missing still auto-generate
+    // in every form.
+    if schema_cols[ai_col].identity_kind == axiomdb_catalog::IdentityKind::Always {
+        match values.get(ai_col) {
+            Some(Value::Null) | Some(Value::Int(0)) | Some(Value::BigInt(0)) | None => {}
+            Some(_) => {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "cannot insert explicit value into column '{}': \
+                         column is GENERATED ALWAYS AS IDENTITY",
+                        schema_cols[ai_col].name
+                    ),
+                });
+            }
+        }
+    }
+
     // MySQL: explicit 0 on an AUTO_INCREMENT column triggers sequence assignment.
     let is_auto_trigger = matches!(
         values.get(ai_col),
@@ -358,7 +464,7 @@ fn assign_auto_increment(
 /// - **CHAR(N)**: right-pads values shorter than N with spaces; rejects values
 ///   longer than N (after stripping trailing spaces, per MySQL behavior).
 /// - Columns with `type_len == 0` are unbounded (`TEXT`) and are skipped.
-pub(crate) fn enforce_text_constraints(
+pub fn enforce_text_constraints(
     schema_cols: &[CatalogColumnDef],
     row_values: &mut [Value],
 ) -> Result<(), DbError> {
@@ -418,7 +524,7 @@ pub(crate) fn enforce_text_constraints(
 ///
 /// SQL standard: CHECK passes when expr is TRUE or UNKNOWN (NULL); only
 /// explicit FALSE is a violation.
-pub(crate) fn check_row_constraints_with_cols(
+pub fn check_row_constraints_with_cols(
     constraints: &[axiomdb_catalog::schema::ConstraintDef],
     row_values: &[Value],
     table_name: &str,

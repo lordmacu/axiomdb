@@ -134,6 +134,246 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             }
         }
 
+        // ── PostgreSQL byte/bit accessors (Phase 24.5) ───────────────────────
+        // GET_BYTE(bytea, idx) → INT — value of the byte at 0-based index `idx`.
+        // Raises InvalidValue if idx is out of bounds.
+        "get_byte" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let bytes = match crate::eval::eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytes(b) => b,
+                Value::Text(s) => s.into_bytes(),
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Bytes".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let idx = match crate::eval::eval(&args[1], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n as i64,
+                Value::BigInt(n) => n,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            if idx < 0 || (idx as usize) >= bytes.len() {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "GET_BYTE: index {idx} out of range for {}-byte bytea",
+                        bytes.len()
+                    ),
+                });
+            }
+            Ok(Value::Int(bytes[idx as usize] as i32))
+        }
+
+        // SET_BYTE(bytea, idx, value) → BYTEA — copy with byte at 0-based `idx`
+        // replaced by the low 8 bits of `value`.
+        "set_byte" => {
+            if args.len() != 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "3 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let mut bytes = match crate::eval::eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytes(b) => b,
+                Value::Text(s) => s.into_bytes(),
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Bytes".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let idx = match crate::eval::eval(&args[1], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n as i64,
+                Value::BigInt(n) => n,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let value = match crate::eval::eval(&args[2], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n as u32,
+                Value::BigInt(n) => n as u32,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            if idx < 0 || (idx as usize) >= bytes.len() {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "SET_BYTE: index {idx} out of range for {}-byte bytea",
+                        bytes.len()
+                    ),
+                });
+            }
+            bytes[idx as usize] = (value & 0xFF) as u8;
+            Ok(Value::Bytes(bytes))
+        }
+
+        // GET_BIT(bytea, idx) → INT — value (0/1) of the bit at 0-based `idx`,
+        // counting MSB-first within each byte (PostgreSQL convention).
+        "get_bit" => {
+            if args.len() != 2 {
+                return Err(DbError::TypeMismatch {
+                    expected: "2 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let bytes = match crate::eval::eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytes(b) => b,
+                Value::Text(s) => s.into_bytes(),
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Bytes".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let idx = match crate::eval::eval(&args[1], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n as i64,
+                Value::BigInt(n) => n,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            if idx < 0 || (idx as usize) >= bytes.len() * 8 {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "GET_BIT: index {idx} out of range for {}-byte bytea ({} bits)",
+                        bytes.len(),
+                        bytes.len() * 8
+                    ),
+                });
+            }
+            let byte_idx = (idx as usize) / 8;
+            let bit_idx = 7 - ((idx as usize) % 8); // MSB-first
+            Ok(Value::Int(((bytes[byte_idx] >> bit_idx) & 1) as i32))
+        }
+
+        // SET_BIT(bytea, idx, value) → BYTEA — copy with single bit at 0-based
+        // `idx` set to 0 or 1 (MSB-first).
+        "set_bit" => {
+            if args.len() != 3 {
+                return Err(DbError::TypeMismatch {
+                    expected: "3 args".into(),
+                    got: format!("{}", args.len()),
+                });
+            }
+            let mut bytes = match crate::eval::eval(&args[0], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytes(b) => b,
+                Value::Text(s) => s.into_bytes(),
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Bytes".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let idx = match crate::eval::eval(&args[1], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n as i64,
+                Value::BigInt(n) => n,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            let value = match crate::eval::eval(&args[2], row)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n,
+                Value::BigInt(n) => n as i32,
+                other => {
+                    return Err(DbError::TypeMismatch {
+                        expected: "Int".into(),
+                        got: other.variant_name().into(),
+                    })
+                }
+            };
+            if idx < 0 || (idx as usize) >= bytes.len() * 8 {
+                return Err(DbError::InvalidValue {
+                    reason: format!(
+                        "SET_BIT: index {idx} out of range for {}-byte bytea ({} bits)",
+                        bytes.len(),
+                        bytes.len() * 8
+                    ),
+                });
+            }
+            if value != 0 && value != 1 {
+                return Err(DbError::InvalidValue {
+                    reason: format!("SET_BIT: third arg must be 0 or 1, got {value}"),
+                });
+            }
+            let byte_idx = (idx as usize) / 8;
+            let bit_idx = 7 - ((idx as usize) % 8);
+            let mask = 1u8 << bit_idx;
+            if value == 1 {
+                bytes[byte_idx] |= mask;
+            } else {
+                bytes[byte_idx] &= !mask;
+            }
+            Ok(Value::Bytes(bytes))
+        }
+
+        // BIT_COUNT(bytea | int) → BIGINT — number of set bits ("popcount").
+        // Handles both bytea (PostgreSQL) and integer (MySQL) inputs.
+        "bit_count" => {
+            let arg = args.first().ok_or_else(|| DbError::TypeMismatch {
+                expected: "1 arg".into(),
+                got: "0".into(),
+            })?;
+            match crate::eval::eval(arg, row)? {
+                Value::Null => Ok(Value::Null),
+                Value::Bytes(b) => {
+                    let total: u64 = b.iter().map(|&byte| byte.count_ones() as u64).sum();
+                    Ok(Value::BigInt(total as i64))
+                }
+                Value::Int(n) => Ok(Value::BigInt(n.count_ones() as i64)),
+                Value::BigInt(n) => Ok(Value::BigInt(n.count_ones() as i64)),
+                other => Err(DbError::TypeMismatch {
+                    expected: "Bytes or Int".into(),
+                    got: other.variant_name().into(),
+                }),
+            }
+        }
+
+        // ── Cryptographic hashes (Phase 24.5) ────────────────────────────────
+        // MD5(text|bytea) → TEXT (hex). MySQL/PG-compatible.
+        "md5" => hash_to_hex_text(args, row, HashAlgo::Md5),
+        "sha1" => hash_to_hex_text(args, row, HashAlgo::Sha1),
+        "sha224" => hash_to_hex_text(args, row, HashAlgo::Sha224),
+        "sha256" => hash_to_hex_text(args, row, HashAlgo::Sha256),
+        "sha384" => hash_to_hex_text(args, row, HashAlgo::Sha384),
+        "sha512" => hash_to_hex_text(args, row, HashAlgo::Sha512),
+
         // Phase 11.2c: MIME_TYPE(blob_col) → detect content type from magic bytes.
         "mime_type" => {
             let arg = args.first().ok_or_else(|| DbError::TypeMismatch {
@@ -283,4 +523,76 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
             Some((hi << 4) | lo)
         })
         .collect()
+}
+
+// ── Hashing (Phase 24.5) ────────────────────────────────────────────────────
+
+/// Cryptographic-hash family covered by MD5/SHA-1/SHA-2 SQL functions.
+#[derive(Clone, Copy)]
+enum HashAlgo {
+    Md5,
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+/// Common dispatch for hash functions: NULL → NULL, Text/Bytes/Uuid → hex digest.
+fn hash_to_hex_text(args: &[Expr], row: &[Value], algo: HashAlgo) -> Result<Value, DbError> {
+    let arg = args.first().ok_or_else(|| DbError::TypeMismatch {
+        expected: "1 arg".into(),
+        got: "0".into(),
+    })?;
+    let bytes: Vec<u8> = match crate::eval::eval(arg, row)? {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(s) => s.into_bytes(),
+        Value::Bytes(b) => b,
+        Value::Uuid(u) => u.to_vec(),
+        other => {
+            return Err(DbError::TypeMismatch {
+                expected: "Text or Bytes".into(),
+                got: other.variant_name().into(),
+            })
+        }
+    };
+    Ok(Value::Text(compute_hash(&bytes, algo)))
+}
+
+/// Hex-encoded digest of `bytes` under `algo`. Pure-Rust implementations from
+/// `md-5` / `sha1` / `sha2` keep the dependency footprint small.
+fn compute_hash(bytes: &[u8], algo: HashAlgo) -> String {
+    use sha1::Digest as _;
+    match algo {
+        HashAlgo::Md5 => {
+            let mut h = md5::Md5::new();
+            h.update(bytes);
+            hex_encode(&h.finalize())
+        }
+        HashAlgo::Sha1 => {
+            let mut h = sha1::Sha1::new();
+            h.update(bytes);
+            hex_encode(&h.finalize())
+        }
+        HashAlgo::Sha224 => {
+            let mut h = sha2::Sha224::new();
+            h.update(bytes);
+            hex_encode(&h.finalize())
+        }
+        HashAlgo::Sha256 => {
+            let mut h = sha2::Sha256::new();
+            h.update(bytes);
+            hex_encode(&h.finalize())
+        }
+        HashAlgo::Sha384 => {
+            let mut h = sha2::Sha384::new();
+            h.update(bytes);
+            hex_encode(&h.finalize())
+        }
+        HashAlgo::Sha512 => {
+            let mut h = sha2::Sha512::new();
+            h.update(bytes);
+            hex_encode(&h.finalize())
+        }
+    }
 }

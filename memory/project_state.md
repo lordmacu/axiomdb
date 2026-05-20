@@ -1,20 +1,78 @@
 # Project State
 
-## Current (2026-05-17)
+## Current (2026-05-16)
 
 **Active phase:** Phase 24 — Complete Type System
-**Active subphase:** Phase 24.3 — Exact DECIMAL(p,s) COMPLETE.
-`DECIMAL(p,s)` parser captures precision/scale into `ColumnDef.type_len=(p<<8)|s`.
-`enforce_decimal_precision` enforces ROUND_HALF_UP and integer overflow rejection.
-Division produces ~6 extra fractional digits. ROUND/TRUNC Decimal arms via `rust_decimal`.
-SHOW COLUMNS now displays `decimal(p,s)` (both `ddl_show.rs` and `exec_entry.rs` paths fixed).
-4338/4338 workspace tests, clippy clean, fmt clean. 11 wire assertions pass.
+**Active subphase:** 24.1c — GENERATED ALWAYS AS IDENTITY (plan written, implementation pending)
 
-**Last verified gates:** Phase 24.3 closeout passed 4338/4338 tests, clippy clean, fmt clean, 639/652 wire pass (13 pre-existing unrelated failures).
+**Strategic direction:** EMBEDDED-FIRST. Goal is to ship an embedded library release (like SQLite)
+before a server release. All priorities below are set accordingly. See `memory/project_embedded_release.md`.
 
-**Recently completed:** 24.1 — TINYINT/SMALLINT/BIGSERIAL (2026-05-16). 24.1b — SERIAL/SMALLSERIAL (2026-05-16). 24.2 — REAL vs DOUBLE (2026-05-16). 24.3 — Exact DECIMAL (2026-05-17).
+**Last verified gates:** Phase 24.3 closeout passed 4338/4338 tests, clippy clean, fmt clean, 639/652 wire pass.
 
-**Next:** Phase 24.1c (GENERATED ALWAYS AS IDENTITY) or 24.4 (CITEXT).
+**Recently completed:** 24.1 — TINYINT/SMALLINT/BIGSERIAL. 24.1b — SERIAL/SMALLSERIAL. 24.2 — REAL vs DOUBLE. 24.3 — Exact DECIMAL (2026-05-16).
+
+---
+
+## 🔴 HIGH PRIORITY — Embedded Release Blockers
+
+These phases/subphases MUST be completed before the embedded library release:
+
+### Phase 19.1 — Auto-vacuum background task
+**Status:** ⏳ pending
+**Why it blocks embedded:** MVCC dead tuples accumulate without periodic VACUUM. Long-running embedded
+processes will run out of disk space. This is the ONLY functional gap for embedded mode.
+**Scope:** background tokio task that wakes every N seconds, calls `vacuum()` on idle connections,
+configurable via `axiomdb.toml`. No server wire protocol changes needed.
+
+### Phase 24 — Type System Completion (remaining)
+**Status:** 🔄 in progress
+**Why it blocks embedded:** embedded users expect full SQL type support.
+Priority order:
+- [ ] 24.1c — GENERATED ALWAYS AS IDENTITY (plan written, implement NOW)
+- [ ] 24.4 — CITEXT (case-insensitive text)
+- [ ] 24.5 — BYTEA (binary data alias)
+- [ ] 24.7 — TIMESTAMPTZ (timezone-aware timestamps)
+- [ ] 24.8 — INTERVAL (time intervals)
+
+### Embedded Packaging + Documentation
+**Status:** ⏳ not started
+**Why it blocks embedded:** users cannot adopt without installation path and docs.
+- [ ] Python wheel (PyPI): `pip install axiomdb`
+- [ ] npm package: `npm install axiomdb`
+- [ ] `README.md` for embedded mode with quickstart
+- [ ] API docs (Rust `cargo doc`, Python docstrings, JS JSDoc)
+- [ ] VACUUM / memory management documentation
+- [ ] Version tag: `v0.5.0-embedded-alpha`
+
+---
+
+## 🟡 MEDIUM PRIORITY — Nice-to-have for embedded
+
+These improve the embedded experience but are NOT release blockers:
+
+- Phase 25 — Type Optimizations (better performance for types already working)
+- Phase 26 — Full ICU Collation (string ordering edge cases)
+- Phase 27 — Real Query Optimizer (DP planner) — current planner is good enough
+- Phase 28-30 — SQL Pro + Advanced Functions
+
+---
+
+## 🔵 LOW PRIORITY — Server-only, DEPRIORITIZED
+
+Do NOT work on these until after the embedded release ships:
+
+- **Phase 16** — Stored procedures, server-side pooler → server-only
+- **Phase 17** — TLS, RBAC, RLS, audit, TDE → irrelevant for in-process embedded
+- **Phase 18** — Streaming replication, PITR → server HA, not needed for embedded
+- **Phase 19.2–19.21** — pg_stat_*, Prometheus metrics, health checks → server observability
+- **Phase 22** (remaining) — REST/GraphQL/OData APIs → server-only
+- **Phase 23** — Platform compat → deprioritize
+- **Phase 31-35** — Final polish, deploy infra → post-server
+
+---
+
+## Phase subphase status
 
 ### Phase 21 subphase status
 
@@ -89,11 +147,11 @@ Phases 1–10, 22b, 39, 40 — all closed. See `docs/progreso.md` for subphase d
 
 ### Key open gaps (deferred)
 
-- Phase 4: 4.10f, 4.11b, 4.4g, 4.22f, 4.22e
-- Phase 5: 5.2d, 5.5b
-- Phase 6: 6.5b, 6.6d, 6.6c
+- Phase 4: 4.22f (DROP PRIMARY KEY on clustered — requires full rebuild)
 - Phase 39: MVCC version chains, root checkpoint persistence, FK clustered children, separator overflow, 39.19b uncommitted
 
-### GitHub
+---
+
+## GitHub
 
 Account: `lordmacu` (`lordmacu@users.noreply.github.com`). Push target: `origin main`.

@@ -277,6 +277,11 @@ pub(super) fn flush_clustered_insert_batch(
             &batch.secondary_layouts,
             &batch.compiled_preds,
             &prepared,
+            // No session hint: ctx.invalidate_all() below would clear
+            // it anyway. The local rightmost_leaf_hint inside the
+            // function already handles the batched-flush case.
+            None,
+            /*defer_table_root_persist=*/ false,
         )?
     };
 

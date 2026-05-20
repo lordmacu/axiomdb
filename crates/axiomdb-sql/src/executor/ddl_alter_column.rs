@@ -568,6 +568,7 @@ pub fn prepare_nonblocking_heap_alter(
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
             };
             let mut new_columns = columns.clone();
             new_columns.push(new_catalog_col);
@@ -1307,6 +1308,7 @@ fn alter_add_column(
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
     };
 
     // 1. Add column to catalog.
@@ -1705,6 +1707,7 @@ fn alter_modify_column(
                 enum_type_name: None,
                 array_element_type: None,
                 array_ndims: None,
+                identity_kind: axiomdb_catalog::IdentityKind::None,
     };
     CatalogWriter::new(storage, txn, conn_txn)?.create_column(new_catalog_col.clone())?;
 
