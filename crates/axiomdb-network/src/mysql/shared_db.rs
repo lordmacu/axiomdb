@@ -43,10 +43,12 @@ use axiomdb_sql::{
     analyze_cached_with_defaults,
     ast::{AlterTableOp, Stmt, TableRef},
     bloom::BloomRegistry,
-    cleanup_nonblocking_heap_alter_plan, commit_nonblocking_heap_alter, execute_read_only_with_ctx,
-    execute_with_ctx_locked, parse_with_sql_mode, prepare_nonblocking_heap_alter,
+    cleanup_nonblocking_heap_alter_plan, commit_nonblocking_heap_alter, execute_with_ctx_locked,
+    parse_with_sql_mode, prepare_nonblocking_heap_alter,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
+    sql_starts_with_select_keyword,
+    statement_cache::run_cached,
     truncate_table_unchecked_on_open, verify_and_repair_indexes_on_open, SchemaCache,
     SessionContext,
 };
@@ -287,6 +289,26 @@ impl SharedDatabase {
             });
         }
 
+        // Attack 23b — wire path epoch fast path: SELECT queries go through the
+        // per-session statement cache with the O(1) epoch check. Cache hits skip
+        // CatalogReader creation + PlanDeps::is_stale entirely. Cache misses fall
+        // through to analyze + cache (same cost as before). DDL, DML, and
+        // transaction control skip this branch and use the legacy path below.
+        // SELECT never triggers schema changes, so no schema_version bump needed.
+        if sql_starts_with_select_keyword(sql) {
+            return match run_cached(
+                sql,
+                &self.storage,
+                &self.txn,
+                &self.bloom,
+                schema_cache,
+                session,
+            ) {
+                Ok(result) => Ok((result, None)),
+                Err(e) => self.apply_on_error_pipeline_failure(sql, session, e),
+            };
+        }
+
         // ── parse ─────────────────────────────────────────────────────────────
         let stmt = match parse_with_sql_mode(sql, None, session.sql_mode_flags()) {
             Ok(s) => s,
@@ -363,26 +385,17 @@ impl SharedDatabase {
             return Ok(result);
         }
 
-        // Parse
-        let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
-
-        // Analyze (uses &self.storage, &self.txn — shared refs)
-        let snap = if let Some(ref ct) = session.conn_txn {
-            self.txn.active_snapshot(ct)
-        } else {
-            self.txn.snapshot()
-        };
-        let analyzed = analyze_cached_with_defaults(
-            stmt,
+        // Attack 23b — wire path epoch fast path (same as execute_query above).
+        // execute_read_query is already SELECT-only by contract; non-cacheable
+        // forms (DDL, SHOW, etc.) fall through inside run_cached unchanged.
+        run_cached(
+            sql,
             &self.storage,
-            snap,
-            session.effective_database(),
-            session.current_schema(),
+            &self.txn,
+            &self.bloom,
             schema_cache,
-        )?;
-
-        // Execute read-only path
-        execute_read_only_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, session)
+            session,
+        )
     }
 
     /// Handles lightweight read-only queries that depend on live transaction or

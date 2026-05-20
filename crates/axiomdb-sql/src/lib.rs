@@ -86,6 +86,7 @@ pub use parser::{parse, parse_expr_only_with_sql_mode, parse_with_sql_mode};
 pub use result::{ColumnMeta, QueryResult, Row};
 pub use schema_cache::SchemaCache;
 pub use session::SessionContext;
+pub use statement_cache::sql_starts_with_select_keyword;
 pub use table::{coerce_values_with_ctx, TableEngine};
 // Constraint helpers used by the embedded Appender (Attack 7 v1.1).
 // `materialize_generated_columns` evaluates STORED GENERATED expressions

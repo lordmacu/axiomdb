@@ -318,7 +318,7 @@ mod db {
             // run_cached now checks epoch_plan_fast_path first — if all
             // dep table epochs are current, skips CatalogReader creation
             // and PlanDeps::is_stale entirely (O(1) HashMap lookup).
-            let result = if sql_starts_with_select_keyword(sql) {
+            let result = if axiomdb_sql::sql_starts_with_select_keyword(sql) {
                 axiomdb_sql::statement_cache::run_cached(
                     sql,
                     &self.storage,
@@ -619,29 +619,7 @@ mod db {
             || lower.starts_with("release")
     }
 
-    /// Attack 20: cheap prefix sniff — does the SQL start with `SELECT`
-    /// (case-insensitive, leading whitespace tolerated)?
-    ///
-    /// Used to gate the statement-cache fast path. Catches the common
-    /// `SELECT ...` form (autocommit OLTP) and bypasses the cache for
-    /// everything else (DDL, DML, transaction control) where the cache
-    /// either doesn't apply or has been shown to net-regress (Attack 2's
-    /// outcome for INSERT). Conservative: doesn't catch `(SELECT ...)`
-    /// or `WITH ... SELECT` — those fall back to the legacy path, which
-    /// is correct (the legacy path always works).
-    fn sql_starts_with_select_keyword(sql: &str) -> bool {
-        let s = sql.trim_start().as_bytes();
-        s.len() >= 6
-            && s[0].eq_ignore_ascii_case(&b'S')
-            && s[1].eq_ignore_ascii_case(&b'E')
-            && s[2].eq_ignore_ascii_case(&b'L')
-            && s[3].eq_ignore_ascii_case(&b'E')
-            && s[4].eq_ignore_ascii_case(&b'C')
-            && s[5].eq_ignore_ascii_case(&b'T')
-            // The next char must NOT be an identifier continuation (so we
-            // don't match `SELECTED` or `SELECT_VALUE`).
-            && s.get(6).is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
-    }
+    // sql_starts_with_select_keyword is now axiomdb_sql::sql_starts_with_select_keyword
 
     fn resolve_local_dsn_path(dsn: &str) -> Result<PathBuf, DbError> {
         let parsed = parse_dsn(dsn)?;

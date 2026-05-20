@@ -16,13 +16,13 @@
 //! (just doesn't compress those positions). Adding coverage for a new
 //! variant is a pure win, never a correctness concern.
 
-use axiomdb_catalog::{schema::DEFAULT_DATABASE_NAME, CatalogReader};
+use axiomdb_catalog::CatalogReader;
 use axiomdb_core::error::DbError;
 use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 
-use crate::ast::{InsertSource, SelectItem, Stmt};
+use crate::ast::{FromClause, GroupByClause, InsertSource, JoinCondition, SelectItem, Stmt};
 use crate::bloom::BloomRegistry;
 use crate::expr::Expr;
 use crate::plan_deps::{extract_table_deps, PlanDeps};
@@ -36,6 +36,25 @@ use crate::session::SessionContext;
 /// enough for typical workloads, small enough that the bookkeeping
 /// stays cheap.
 pub const STATEMENT_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Returns `true` when `sql` begins with the `SELECT` keyword (case-insensitive,
+/// leading whitespace ignored, word-boundary enforced).
+///
+/// Used to gate the statement-cache fast path in both the embedded and wire
+/// paths. Conservative: `(SELECT ...)`, `WITH ... SELECT`, `SELECTED`, etc.
+/// all return `false` and fall through to the legacy pipeline (always correct).
+pub fn sql_starts_with_select_keyword(sql: &str) -> bool {
+    let s = sql.trim_start().as_bytes();
+    s.len() >= 6
+        && s[0].eq_ignore_ascii_case(&b'S')
+        && s[1].eq_ignore_ascii_case(&b'E')
+        && s[2].eq_ignore_ascii_case(&b'L')
+        && s[3].eq_ignore_ascii_case(&b'E')
+        && s[4].eq_ignore_ascii_case(&b'C')
+        && s[5].eq_ignore_ascii_case(&b'T')
+        && s.get(6)
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+}
 
 /// A compiled, ready-to-execute statement plan keyed in the cache by
 /// `shape_hash` and tagged with its `PlanDeps` for invalidation.
@@ -68,16 +87,49 @@ pub fn extract_literals(stmt: &mut Stmt) -> Vec<Value> {
     out
 }
 
+fn walk_from_extract(from: &mut FromClause, out: &mut Vec<Value>) {
+    match from {
+        FromClause::Unnest(unnest) => {
+            for expr in &mut unnest.exprs {
+                walk_expr_extract(expr, out);
+            }
+        }
+        FromClause::GenerateSeries(gs) => {
+            walk_expr_extract(&mut gs.start, out);
+            walk_expr_extract(&mut gs.stop, out);
+            if let Some(ref mut step) = gs.step {
+                walk_expr_extract(step, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn walk_stmt_extract(stmt: &mut Stmt, out: &mut Vec<Value>) {
     match stmt {
         Stmt::Select(s) => {
-            if let Some(ref mut wc) = s.where_clause {
-                walk_expr_extract(wc, out);
+            // FROM-clause SRFs: normalize_select_srf moves literals here during
+            // analysis, so we extract them before analysis.
+            if let Some(ref mut from) = s.from {
+                walk_from_extract(from, out);
+            }
+            for join in &mut s.joins {
+                walk_from_extract(&mut join.table, out);
             }
             for item in &mut s.columns {
                 if let SelectItem::Expr { expr, .. } = item {
                     walk_expr_extract(expr, out);
                 }
+            }
+            if let Some(ref mut wc) = s.where_clause {
+                walk_expr_extract(wc, out);
+            }
+            // LIMIT and OFFSET can differ between otherwise identical queries.
+            if let Some(ref mut lim) = s.limit {
+                walk_expr_extract(lim, out);
+            }
+            if let Some(ref mut off) = s.offset {
+                walk_expr_extract(off, out);
             }
         }
         Stmt::Insert(s) => {
@@ -179,6 +231,34 @@ pub fn shape_hash(stmt: &Stmt) -> u64 {
     h.finish()
 }
 
+fn hash_from(from: &FromClause, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    std::mem::discriminant(from).hash(h);
+    match from {
+        FromClause::Table(t) => {
+            t.name.hash(h);
+            t.schema.hash(h);
+        }
+        FromClause::Unnest(unnest) => {
+            (unnest.exprs.len() as u32).hash(h);
+            for expr in &unnest.exprs {
+                hash_expr(expr, h);
+            }
+        }
+        FromClause::GenerateSeries(gs) => {
+            hash_expr(&gs.start, h);
+            hash_expr(&gs.stop, h);
+            if let Some(ref step) = gs.step {
+                true.hash(h);
+                hash_expr(step, h);
+            } else {
+                false.hash(h);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn hash_stmt(stmt: &Stmt, h: &mut impl std::hash::Hasher) {
     use std::hash::Hash;
     std::mem::discriminant(stmt).hash(h);
@@ -219,14 +299,27 @@ fn hash_stmt(stmt: &Stmt, h: &mut impl std::hash::Hasher) {
             }
         }
         Stmt::Select(s) => {
-            // Lightweight SELECT shape: column count + each column's expr,
-            // WHERE expr shape, presence flags for grouping/ordering/limit.
-            // FROM clause structure is captured indirectly via the column
-            // references inside hash_expr. Edge case: two SELECTs that
-            // differ only in their JOIN structure could collide; in that
-            // case PlanDeps still catches stale (since they reference
-            // different tables) so the worst outcome is a re-analyze on
-            // the second call (correct, just slower).
+            // DISTINCT / DISTINCT ON
+            s.distinct.hash(h);
+            (s.distinct_on.len() as u32).hash(h);
+            for expr in &s.distinct_on {
+                hash_expr(expr, h);
+            }
+            // FROM clause: distinguishes tables and SRF variants (UNNEST, GENERATE_SERIES).
+            // After extract_literals, SRF args are Params — hash their shapes.
+            if let Some(ref from) = s.from {
+                true.hash(h);
+                hash_from(from, h);
+            } else {
+                false.hash(h);
+            }
+            // JOINs: type + table shape (including SRFs in joins)
+            (s.joins.len() as u32).hash(h);
+            for join in &s.joins {
+                std::mem::discriminant(&join.join_type).hash(h);
+                hash_from(&join.table, h);
+            }
+            // SELECT columns
             (s.columns.len() as u32).hash(h);
             for col in &s.columns {
                 std::mem::discriminant(col).hash(h);
@@ -234,12 +327,39 @@ fn hash_stmt(stmt: &Stmt, h: &mut impl std::hash::Hasher) {
                     hash_expr(expr, h);
                 }
             }
+            // WHERE
             if let Some(ref wc) = s.where_clause {
                 hash_expr(wc, h);
             }
+            // GROUP BY: discriminant + all key exprs (column refs differ between queries)
             std::mem::discriminant(&s.group_by).hash(h);
+            match &s.group_by {
+                GroupByClause::Simple(exprs) | GroupByClause::WithRollup(exprs) => {
+                    for expr in exprs {
+                        hash_expr(expr, h);
+                    }
+                }
+                _ => {}
+            }
+            // ORDER BY: full expr shape + direction (SortOrder doesn't impl Hash)
             (s.order_by.len() as u32).hash(h);
-            s.limit.is_some().hash(h);
+            for ob in &s.order_by {
+                hash_expr(&ob.expr, h);
+                std::mem::discriminant(&ob.order).hash(h);
+            }
+            // LIMIT / OFFSET: hash actual Param shape, not just presence
+            if let Some(ref lim) = s.limit {
+                true.hash(h);
+                hash_expr(lim, h);
+            } else {
+                false.hash(h);
+            }
+            if let Some(ref off) = s.offset {
+                true.hash(h);
+                hash_expr(off, h);
+            } else {
+                false.hash(h);
+            }
         }
         _ => {}
     }
@@ -292,7 +412,10 @@ fn hash_expr(expr: &Expr, h: &mut impl std::hash::Hasher) {
                 hash_expr(a, h);
             }
         }
-        Expr::Cast { expr, .. } => hash_expr(expr, h),
+        Expr::Cast { expr, target } => {
+            target.hash(h);
+            hash_expr(expr, h);
+        }
         Expr::Collate { expr, collation } => {
             collation.hash(h);
             hash_expr(expr, h);
@@ -349,6 +472,30 @@ pub fn substitute_params(mut stmt: Stmt, params: &[Value]) -> Result<Stmt, DbErr
         }
     }
 
+    // Walk expressions inside a FROM clause. `normalize_select_srf` can move
+    // UNNEST / GenerateSeries expressions from the SELECT list into the FROM
+    // clause during analysis — `sub_expr` must follow them there.
+    fn sub_from(from: &mut FromClause, params: &[Value]) {
+        match from {
+            FromClause::Unnest(unnest) => {
+                for expr in &mut unnest.exprs {
+                    sub_expr(expr, params);
+                }
+            }
+            FromClause::GenerateSeries(gs) => {
+                sub_expr(&mut gs.start, params);
+                sub_expr(&mut gs.stop, params);
+                if let Some(ref mut step) = gs.step {
+                    sub_expr(step, params);
+                }
+            }
+            // Other variants (Table, Subquery, JsonTable, etc.) either have no
+            // Params (Table) or are not reached via extract_literals (Subquery in
+            // FROM is not walked at parse time).
+            _ => {}
+        }
+    }
+
     match &mut stmt {
         Stmt::Select(s) => {
             if let Some(ref mut wc) = s.where_clause {
@@ -358,6 +505,22 @@ pub fn substitute_params(mut stmt: Stmt, params: &[Value]) -> Result<Stmt, DbErr
                 if let SelectItem::Expr { expr, .. } = item {
                     sub_expr(expr, params);
                 }
+            }
+            // Walk FROM / JOINs: analysis may move SELECT-column literals here.
+            if let Some(ref mut from) = s.from {
+                sub_from(from, params);
+            }
+            for join in &mut s.joins {
+                sub_from(&mut join.table, params);
+                if let JoinCondition::On(ref mut cond) = join.condition {
+                    sub_expr(cond, params);
+                }
+            }
+            if let Some(ref mut lim) = s.limit {
+                sub_expr(lim, params);
+            }
+            if let Some(ref mut off) = s.offset {
+                sub_expr(off, params);
             }
         }
         Stmt::Insert(s) => {
@@ -422,7 +585,7 @@ pub fn run_cached(
     schema_cache: &mut SchemaCache,
     session: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    use crate::{analyze_cached, execute_with_ctx, parse_with_sql_mode};
+    use crate::{analyze_cached_with_defaults, execute_with_ctx, parse_with_sql_mode};
 
     let mut stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
 
@@ -435,7 +598,14 @@ pub fn run_cached(
 
     // DDL / non-cacheable: legacy path, no shape extraction.
     if !is_cacheable(&stmt) {
-        let analyzed = analyze_cached(stmt, storage, snap, schema_cache)?;
+        let analyzed = analyze_cached_with_defaults(
+            stmt,
+            storage,
+            snap,
+            session.effective_database(),
+            session.current_schema(),
+            schema_cache,
+        )?;
         return execute_with_ctx(analyzed, storage, txn, bloom, session);
     }
 
@@ -480,9 +650,17 @@ pub fn run_cached(
             None => {
                 // Miss — release the reader, analyze + compute deps + cache.
                 drop(reader);
-                let analyzed = analyze_cached(stmt, storage, snap.clone(), schema_cache)?;
+                let analyzed = analyze_cached_with_defaults(
+                    stmt,
+                    storage,
+                    snap.clone(),
+                    session.effective_database(),
+                    session.current_schema(),
+                    schema_cache,
+                )?;
                 let mut reader = CatalogReader::new(storage, snap)?;
-                let deps = extract_table_deps(&analyzed, &mut reader, DEFAULT_DATABASE_NAME)?;
+                let deps =
+                    extract_table_deps(&analyzed, &mut reader, session.effective_database())?;
                 session.cache_plan(
                     hash,
                     CachedPlan {

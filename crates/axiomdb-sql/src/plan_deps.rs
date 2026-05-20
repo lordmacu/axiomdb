@@ -639,6 +639,14 @@ impl<'r, 'db> DepCollector<'r, 'db> {
         // SessionContext through here; deferred to a follow-up.
         let schema = tref.schema.as_deref().unwrap_or("public");
 
+        // information_schema is a virtual schema — no real catalog entries.
+        // The executor reads it live at query time, so no schema-version dep
+        // is needed. Empty PlanDeps means the plan is always epoch-current
+        // (epoch_plan_fast_path's is_empty() → true shortcut).
+        if crate::information_schema::is_information_schema(schema) {
+            return Ok(());
+        }
+
         match self.reader.get_table_in_database(db, schema, &tref.name)? {
             Some(table_def) => {
                 // Dedup by table_id — self-joins and aliased refs to the same
@@ -649,6 +657,17 @@ impl<'r, 'db> DepCollector<'r, 'db> {
                 Ok(())
             }
             None => {
+                // Not a regular table — try foreign table (HTTP FDW, Phase 22b.2).
+                // Foreign tables have no schema_version to track; their data is
+                // always fetched live. Record no dep (same as information_schema).
+                if self.reader.get_foreign_table(schema, &tref.name)?.is_some()
+                    || self
+                        .reader
+                        .get_foreign_table("public", &tref.name)?
+                        .is_some()
+                {
+                    return Ok(());
+                }
                 // Table not found — the analyzer should have already returned
                 // this error. Surface it so the caller knows not to cache.
                 Err(DbError::TableNotFound {

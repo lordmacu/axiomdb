@@ -673,7 +673,7 @@ the prior Attack 2 wiring net-regressed them. Cumulative range_scan speedup
 vs original baseline: **8.3×** (4× from A18 zero-alloc × 2.1× from A20
 cache).
 
-### Statement Cache Epoch Fast Path (Attack 23)
+### Statement Cache Epoch Fast Path (Attack 23 + 23b)
 
 Attack 20 eliminated parse+analyze on cache hits, but each hit still paid
 for a `CatalogReader` object (18 meta-page reads) and `PlanDeps::is_stale`
@@ -681,7 +681,7 @@ for a `CatalogReader` object (18 meta-page reads) and `PlanDeps::is_stale`
 by DDL. For a typical `SELECT ... WHERE pk = N` loop this was the dominant
 remaining cost.
 
-Two changes close this:
+Two changes close this (Attack 23 — embedded path):
 
 - **`epoch_plan_fast_path`**: `SessionContext` already tracks a
   `catalog_epoch` counter that increments only on DDL (`invalidate_all`).
@@ -697,15 +697,27 @@ Two changes close this:
 
 | Scenario | Pre-A23 | Post-A23 | Speedup |
 |---|---:|---:|---:|
-| `point_lookup` 100×SELECT | 5.6K ops/s | **11.8K ops/s** | **2.1×** |
+| `point_lookup` 100×SELECT (embedded) | 5.6K ops/s | **11.8K ops/s** | **2.1×** |
 
 (Lima VM numbers; macOS APFS native expected to be higher as seen in A20.)
 
+**Attack 23b** extends the same fast path to the **MySQL wire server path**.
+Before 23b, wire SELECT queries re-analyzed on every call. Now they route
+through `run_cached`, giving them the same O(1) epoch-check path.
+
+| Path | Wire SELECT ops/s |
+|---|---:|
+| Pre-23b (legacy analyze per call) | ~5,600 |
+| Post-23b (`run_cached` wire path) | **~11,400** |
+| Speedup | **~2×** |
+
+(macOS APFS native; Lima VM numbers will be lower due to virtio-fs overhead.)
+
 <div class="callout-advantage">
-Both fast paths are correctness-preserving: the epoch only advances when
-schema state actually changes (DDL), so a matching epoch guarantees the
-cached plan is still valid. The gap vs SQLite's `point_lookup` (66.7K
-ops/s on same hardware) tightens from 12× to 5.6× after this attack.
+After A23 + A23b, both the embedded `Db` API and MySQL wire clients share
+the same zero-catalog-I/O fast path for repeated SELECT shapes. The epoch
+only advances on DDL, so a matching tag guarantees the cached plan is valid.
+The gap vs SQLite's `point_lookup` (66.7K ops/s) tightens from 12× to 5.6×.
 </div>
 
 ### Session COUNT(*) Cache (Attack 17b)

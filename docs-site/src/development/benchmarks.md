@@ -630,3 +630,43 @@ Two micro-optimizations combine:
 After A20+A23, a repeated <code>SELECT * FROM t WHERE pk = ?</code> pays only for: one parser pass, one literal extraction, one shape hash lookup, one O(1) epoch check, and the actual B-Tree descent. No CatalogReader objects, no HeapChain scans. This is structurally equivalent to SQLite's prepared-statement fast path.
 </div>
 </div>
+
+## Attack 23b — Epoch Fast Path Extended to MySQL Wire Path
+
+Attack 23 applied the statement-cache epoch fast path only to the embedded
+`Db` API. MySQL wire clients still re-analyzed every SELECT on every call.
+Attack 23b routes wire SELECT queries through `run_cached`, giving them the
+same O(1) cache-hit path as embedded queries.
+
+```bash
+# Measured with pymysql point-lookup benchmark on macOS APFS native:
+python3 tools/bench_wire.py --scenario point_lookup
+```
+
+| Path | Wire SELECT ops/s |
+|---|---:|
+| Pre-23b (legacy per-call analyze) | ~5,600 |
+| Post-23b (`run_cached` wire path) | **~11,400** |
+| Speedup | **~2×** |
+
+**Correctness work**: the shape hash (`hash_stmt`) and literal extraction
+(`walk_stmt_extract`) were extended to cover all expression positions that
+can differ between otherwise-identical queries:
+
+- `DISTINCT` / `DISTINCT ON` expressions
+- FROM-clause SRF variant and args (UNNEST array count, GENERATE_SERIES bounds)
+- JOIN type and table shape
+- GROUP BY key expressions (not just discriminant)
+- ORDER BY expressions + direction
+- LIMIT and OFFSET (full shape, not just presence)
+
+`substitute_params` was correspondingly extended so params in FROM-clause
+SRFs, JOINs, LIMIT, and OFFSET are restored correctly on cache hits.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Advantage — Wire Path Now Equals Embedded Path</span>
+After A23b, both the embedded <code>Db</code> API and MySQL wire clients share the same statement-cache fast path. A repeated <code>SELECT * FROM t WHERE pk = ?</code> over the wire pays only for: network parse, one literal extraction, one shape hash, one epoch check, and the B-Tree descent — no CatalogReader, no HeapChain scan per query.
+</div>
+</div>

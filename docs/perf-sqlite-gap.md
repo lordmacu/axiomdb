@@ -1560,3 +1560,108 @@ The epoch fast path is correct because:
   eliminate the DML regression because DML analyze is already cheap
   and `is_stale` is net-negative there without a "DDL-only invalidation"
   split.
+
+## Attack 23b — extend epoch fast path to MySQL wire server path
+
+**Date**: 2026-05-20
+
+### Why
+
+Attack 23 applied the statement-cache epoch fast path (`run_cached`) only
+to the embedded path (`Db::run_inner`). MySQL wire clients (`shared_db.rs`
+→ `execute_query` / `execute_read_query`) still re-analyzed every SELECT on
+every call: parse → `analyze_cached_with_defaults` → execute. On a point-
+lookup this cost is ~3× the cost of the actual storage read.
+
+### Changes
+
+**`crates/axiomdb-network/src/mysql/shared_db.rs`**
+
+- `execute_query`: for SQL that starts with `SELECT`, delegates to
+  `run_cached` instead of the legacy analyze + execute pipeline.
+- `execute_read_query`: replaces the hand-rolled legacy path with
+  `run_cached`.
+
+**`crates/axiomdb-sql/src/statement_cache.rs`**
+
+- `run_cached` now uses `session.effective_database()` and
+  `session.current_schema()` (not hardcoded `"axiomdb"` / `"public"`)
+  so wire sessions that switched databases via COM_INIT_DB are handled
+  correctly.
+- `hash_stmt` for `Stmt::Select` — comprehensive shape hash covering:
+  DISTINCT / DISTINCT ON, FROM-clause table name + SRF variant and exprs
+  (UNNEST, GENERATE_SERIES), JOIN type + table, SELECT columns, WHERE,
+  GROUP BY exprs, ORDER BY exprs + direction, LIMIT shape, OFFSET shape.
+- `walk_stmt_extract` — extended with `walk_from_extract` helper so
+  literals inside FROM-clause SRFs (UNNEST arrays, GENERATE_SERIES bounds)
+  and LIMIT/OFFSET are extracted into the param vector.
+- `substitute_params` — extended to restore params in FROM-clause SRFs,
+  JOIN tables, and LIMIT/OFFSET after cache hit.
+- New `hash_from` helper: shared shape hashing for `FromClause` used by
+  both the primary FROM and JOIN tables in `hash_stmt`.
+
+**`crates/axiomdb-sql/src/plan_deps.rs`**
+
+- `visit_tableref`: early-return for `information_schema` virtual tables
+  (no catalog entry) and foreign tables (FDW, not in the main catalog).
+
+**`crates/axiomdb-sql/src/lib.rs`** / **`crates/axiomdb-embedded/src/lib.rs`**
+
+- `sql_starts_with_select_keyword` promoted from embedded-private to
+  `pub use` in `axiomdb-sql` so both the embedded and wire paths share
+  one implementation.
+
+### Correctness argument
+
+The hash-and-substitute approach is sound because:
+- `extract_literals` and `walk_stmt_extract` are exactly consistent:
+  both walk the same expression positions in the same order.
+- `substitute_params` mirrors those positions exactly — Param indices
+  are deterministic from walk order.
+- `hash_stmt` is called on the post-extraction Stmt (all literals
+  already replaced by Params), so the hash keys on shape only.
+- The epoch fast path inherits Attack 23's correctness: fires only when
+  all dep-table epochs match `catalog_epoch`.
+
+### Bug classes fixed during implementation
+
+1. **Shape collision — DISTINCT**: `SELECT DISTINCT x` and `SELECT x`
+   shared a hash. Fix: `s.distinct.hash(h)`.
+2. **Shape collision — FROM SRF**: `GENERATE_SERIES(1,5)` and
+   `GENERATE_SERIES(1,9,2)` shared a hash (SRF args not in hash nor
+   extracted). Fix: `walk_from_extract` + full FROM hashing in `hash_stmt`.
+3. **Shape collision — LIMIT/OFFSET**: `LIMIT 2 OFFSET 1` and `LIMIT 3`
+   shared a hash (`s.limit.is_some()` only). Fix: hash + extract + substitute
+   the actual limit/offset exprs.
+4. **Shape collision — CAST target type**: `CAST(x AS INT4RANGE)` and
+   `CAST(x AS XML)` shared a hash (target type not included). Fix:
+   `target.hash(h)` in `hash_expr`.
+5. **Param extraction mismatch — UNNEST**: `normalize_select_srf` moves
+   UNNEST from SELECT columns to `s.from` during analysis. `substitute_params`
+   only walked WHERE + columns, missing the moved Params. Fix: `sub_from` +
+   FROM/JOIN walking in `substitute_params`.
+6. **Database context**: `analyze_cached_with_defaults` hardcoded
+   `"axiomdb"` / `"public"` in embedded. Wire path uses
+   `session.effective_database()` / `session.current_schema()`.
+7. **information_schema lookup**: `visit_tableref` tried to catalog-look
+   up virtual schema tables, failing with NotFound. Fix: early return.
+8. **Foreign table (FDW) lookup**: `get_table_in_database` doesn't find
+   FDW tables. Fix: `get_foreign_table` fallback, return Ok(()) if found.
+
+### Results — macOS native (2026-05-20)
+
+| Path | Wire SELECT point-lookup |
+|---|---:|
+| Pre-23b (legacy analyze path) | ~5,600 ops/s |
+| Post-23b (`run_cached`) | **~11,400 ops/s** |
+| Speedup | **~2×** |
+
+### Honest read
+
+- Benchmark is macOS native (APFS), not Lima VM — absolute numbers
+  are higher than production; the 2× ratio is the meaningful signal.
+- The wire fast path fires on every repeated SELECT shape where the plan
+  is cached and no DDL has run. For read-heavy wire workloads (ORM
+  patterns, repeated point lookups) this approaches 100%.
+- DML (INSERT/UPDATE/DELETE) and DDL on the wire path still go through
+  the legacy pipeline — zero regression risk for writes.
