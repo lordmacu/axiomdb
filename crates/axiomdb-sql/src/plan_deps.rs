@@ -112,6 +112,47 @@ impl PlanDeps {
         Ok(false)
     }
 
+    /// Attack 22 (real): fast staleness check via the in-memory
+    /// `SchemaCache`. For every dep, if `schema_cache.get_schema_version`
+    /// returns a value the comparison is O(1) (just a HashMap lookup);
+    /// otherwise it falls back to the catalog-heap probe.
+    ///
+    /// This eliminates the per-dep catalog scan that made the original
+    /// Attack 2 wiring net-negative on INSERT. The first time a plan is
+    /// compiled for a table, the analyzer populates the cache as a
+    /// side effect — so by the time any cached plan exists, its deps'
+    /// versions are already in `id_to_version` and the lookup is free.
+    ///
+    /// Correctness: DDL paths call `schema_cache.invalidate()` along
+    /// with `session.invalidate_all()`, so after DDL the cache is
+    /// empty. An empty cache forces the slow-path probe, which sees
+    /// the new `schema_version` and evicts the stale plan. Either way
+    /// the cached plan is dropped before reuse.
+    pub fn is_stale_via_cache(
+        &self,
+        schema_cache: &crate::schema_cache::SchemaCache,
+        reader: &mut CatalogReader<'_>,
+    ) -> Result<bool, DbError> {
+        for &(table_id, cached_ver) in &self.tables {
+            let current = match schema_cache.get_schema_version(table_id) {
+                Some(v) => v,
+                None => {
+                    // Fall back to catalog probe.
+                    match reader.get_table_schema_version(table_id)? {
+                        None => return Ok(true),
+                        Some(v) => v,
+                    }
+                }
+            };
+            if current != cached_ver {
+                return Ok(true);
+            }
+        }
+        // Index items: same as `is_stale` — placeholder until Phase 5.
+        for _item in &self.items {}
+        Ok(false)
+    }
+
     /// Returns `true` if this statement has no catalog dependencies.
     /// DDL statements and parameter-less constant queries have empty deps.
     pub fn is_empty(&self) -> bool {

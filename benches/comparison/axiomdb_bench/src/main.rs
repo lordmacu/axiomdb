@@ -1223,6 +1223,24 @@ fn main() {
     };
     std::fs::create_dir_all(&data_dir).unwrap();
 
+    // The bench harness runs one scenario per `--scenario` invocation.
+    // Each process exits at the end of `main`; with `SET synchronous =
+    // NORMAL` (matching SQLite's bench config) the WAL may not be fully
+    // flushed when the process terminates, leaving the .db in a state
+    // recovery cannot reconcile cleanly on the next invocation
+    // (ChecksumMismatch on `Db::open`). Each scenario already calls
+    // `reset(&db)` to DROP+CREATE its table, so persisting state
+    // between scenarios has no value — wipe the data dir before opening
+    // to guarantee a clean baseline.
+    for entry in std::fs::read_dir(&data_dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            if name.starts_with("bench.") || name.starts_with("diag_") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
     if args.contains(&"--diagnose".to_string()) {
         diagnose(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-insert".to_string()) {

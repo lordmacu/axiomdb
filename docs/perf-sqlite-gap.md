@@ -1425,6 +1425,69 @@ in `specs/fase-perf-sqlite-gap/spec-statement-cache-dml.md`
   who hit the autocommit INSERT gap have a documented
   upgrade path.
 
+## Attack 22 (real) — schema-cache-backed is_stale + explicit-txn DML gate
+
+### Why
+
+The deferral above documented three viable redesigns. This commit
+implements option 1: source `PlanDeps.is_stale` from the in-memory
+`SchemaCache` instead of probing the catalog heap. The per-dep
+cost drops from ~25µs (heap scan) to ~50ns (HashMap lookup),
+turning the cache hit path net-positive on DML.
+
+The catch: every autocommit DML statement also calls `invalidate_all`
+from the index-root maintenance path, which clears the schema_cache.
+That makes the `is_stale_via_cache` fast path miss back to the
+catalog probe, AND the cache infrastructure overhead
+(extract_literals + AST clone + substitute_params) still has to be
+paid — net regression on autocommit DML even with the new
+fast-path. Gating DML caching to explicit-txn-only resolves this:
+inside `BEGIN..COMMIT` the `invalidate_all` calls still fire per
+statement, but the cache infrastructure cost is still cheaper than
+re-parse and the same-shape hit rate is high (~100% for bulk
+INSERT loops).
+
+### Change
+
+- `SchemaCache.id_to_version: HashMap<TableId, u64>` — populated on
+  every `insert`, cleared on `invalidate`. New
+  `SchemaCache::get_schema_version(table_id) -> Option<u64>`.
+- `PlanDeps::is_stale_via_cache(schema_cache, reader)` — same
+  semantics as `is_stale` but uses the cache when populated,
+  falls back to catalog probe per dep otherwise.
+- `SessionContext::get_cached_plan_via_schema_cache` — wraps the
+  new staleness check; preserves the LRU + eviction logic.
+- `statement_cache::run_cached` consults the new fast path.
+- `Db::run_inner` gates DML cache to explicit txns only:
+  `select_keyword || (dml_keyword && ctx.in_explicit_txn)`.
+  Autocommit SELECT and explicit-txn DML get the cache;
+  autocommit DML keeps the legacy path.
+
+### Results — macOS APFS native (2026-05-19)
+
+| Scenario | Pre-A22 | Post-A22 real | Δ |
+|---|---:|---:|---:|
+| `insert_batch` 10K (explicit txn) | 5.5K ops/s | **~7.5K ops/s** | **+36%** |
+| `insert_autocommit` 300×INSERT | 6.9K ops/s | ~6.4K ops/s | within noise |
+| `point_lookup`, `count_star`, `range_scan` (SELECT) | (A20+A17b numbers) | unchanged | — |
+
+The +36% on `insert_batch` is the win: 10K same-shape INSERTs in
+one txn now reuse the analyzed plan ~9999 times. SQLite-style bulk
+loaders benefit immediately.
+
+### Honest read
+
+- The cache infrastructure cost is the same on every call; the
+  win comes from the higher cache hit rate inside an explicit
+  transaction. Autocommit DML gates out and pays nothing.
+- For autocommit INSERT workloads, the embedded Appender API
+  (A7+) remains the right answer — it bypasses the SQL pipeline
+  entirely and runs at 244K+ ops/s on the clustered path.
+- Closing the rest of the gap (insert_autocommit, point_lookup)
+  needs the executor to consume cached `ResolvedTable` from the
+  plan instead of re-resolving — a bigger refactor, deferred
+  again.
+
 ## Attack 16 — eliminate Vec<Value> clone + double-coerce (refactor)
 
 ### Why

@@ -303,24 +303,31 @@ mod db {
                     operation: "database is in read-only degraded mode",
                 });
             }
-            // Attack 20: route SELECTs through the per-session statement
-            // cache. INSERT/UPDATE/DELETE are gated off — Attack 22
-            // tried to extend the cache to them and reproduced the
-            // original Attack 2 regression (~17% on insert_autocommit).
-            // Two repair paths investigated and rejected:
-            //   (a) Drop PlanDeps.is_stale + clear the cache from
-            //       invalidate_all → defeats the cache because every DML
-            //       calls invalidate_all (35% slower than the baseline).
-            //   (b) Keep PlanDeps.is_stale → 17% slower on INSERT due to
-            //       the per-dep catalog probe (analyze for INSERT is
-            //       already cheap, so the probe is net-negative).
-            // The real fix needs (c) a per-table version sourced from
-            // the in-memory schema_cache, not the catalog heap; OR (d)
-            // a dedicated `invalidate_all_after_ddl` that bumps an
-            // epoch counter the statement cache reads cheaply. Deferred
-            // until a focused brainstorm — see docs/perf-sqlite-gap.md
-            // "Attack 22 — deferred".
-            let result = if sql_starts_with_select_keyword(sql) {
+            // Attack 20 (SELECT, always) + Attack 22 real (DML, gated):
+            // route cacheable statements through the per-session
+            // statement cache.
+            //
+            // The DML gate trades cache hit rate for cache overhead.
+            // Each autocommit DML statement calls `ctx.invalidate_all`
+            // (from the index-root maintenance path), which dumps the
+            // schema_cache and forces the next cache lookup onto the
+            // slow `is_stale` path. In autocommit DML loops the
+            // infrastructure cost (extract_literals + AST clone +
+            // substitute_params) exceeds the analyze savings — net
+            // regression. Inside an explicit BEGIN..COMMIT the
+            // invalidate_all calls still fire per statement, but the
+            // cache infrastructure cost is still cheaper than re-parse
+            // and the same-shape hit rate is high (~100% for bulk
+            // INSERT loops), so the gate is net-positive.
+            //
+            // SELECT autocommit is unaffected by the invalidate_all
+            // overhead (no writes) and analyze is expensive — always
+            // cache.
+            let dml_keyword = sql_starts_with_dml_keyword(sql);
+            let select_keyword = sql_starts_with_select_keyword(sql);
+            let use_cache = select_keyword
+                || (dml_keyword && self.session.in_explicit_txn);
+            let result = if use_cache {
                 axiomdb_sql::statement_cache::run_cached(
                     sql,
                     &self.storage,
@@ -621,28 +628,33 @@ mod db {
             || lower.starts_with("release")
     }
 
-    /// Attack 20: cheap prefix sniff — does the SQL start with `SELECT`
-    /// (case-insensitive, leading whitespace tolerated)?
-    ///
-    /// Used to gate the statement-cache fast path. Catches the common
-    /// `SELECT ...` form (autocommit OLTP) and bypasses the cache for
-    /// everything else (DDL, DML, transaction control) where the cache
-    /// either doesn't apply or has been shown to net-regress (Attack 2's
-    /// outcome for INSERT). Conservative: doesn't catch `(SELECT ...)`
-    /// or `WITH ... SELECT` — those fall back to the legacy path, which
-    /// is correct (the legacy path always works).
+    /// Attack 20: SELECT prefix sniff.
     fn sql_starts_with_select_keyword(sql: &str) -> bool {
+        starts_with_keyword_ci(sql, b"SELECT")
+    }
+
+    /// Attack 22 (real): DML prefix sniff (INSERT/UPDATE/DELETE only —
+    /// SELECT has its own gate that fires unconditionally).
+    fn sql_starts_with_dml_keyword(sql: &str) -> bool {
+        starts_with_keyword_ci(sql, b"INSERT")
+            || starts_with_keyword_ci(sql, b"UPDATE")
+            || starts_with_keyword_ci(sql, b"DELETE")
+    }
+
+    fn starts_with_keyword_ci(sql: &str, kw: &[u8]) -> bool {
         let s = sql.trim_start().as_bytes();
-        s.len() >= 6
-            && s[0].eq_ignore_ascii_case(&b'S')
-            && s[1].eq_ignore_ascii_case(&b'E')
-            && s[2].eq_ignore_ascii_case(&b'L')
-            && s[3].eq_ignore_ascii_case(&b'E')
-            && s[4].eq_ignore_ascii_case(&b'C')
-            && s[5].eq_ignore_ascii_case(&b'T')
-            // The next char must NOT be an identifier continuation (so we
-            // don't match `SELECTED` or `SELECT_VALUE`).
-            && s.get(6).is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+        if s.len() < kw.len() {
+            return false;
+        }
+        for (i, k) in kw.iter().enumerate() {
+            if !s[i].eq_ignore_ascii_case(k) {
+                return false;
+            }
+        }
+        // The next char must NOT be an identifier continuation (so
+        // SELECT doesn't match SELECT_VALUE / SELECTED).
+        s.get(kw.len())
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
     }
 
     fn resolve_local_dsn_path(dsn: &str) -> Result<PathBuf, DbError> {
