@@ -15,6 +15,7 @@ fn value_matches_type(value: &Value, target: DataType) -> bool {
             | (Value::Bytes(_), DataType::Bytes)
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
+            | (Value::TimestampTz(_), DataType::TimestampTz)
             | (Value::Uuid(_), DataType::Uuid)
             | (Value::Array(_), DataType::Array(_))
             | (Value::Range(_), DataType::Range(_))
@@ -407,4 +408,177 @@ fn days_in_month(year: i32, month: i32) -> u8 {
         }
         _ => 0,
     }
+}
+
+/// Parse a text string as a TIMESTAMPTZ value (microseconds since Unix epoch, UTC).
+///
+/// Accepted formats (same as PostgreSQL):
+/// - `YYYY-MM-DD HH:MM:SS` — treated as UTC, no offset
+/// - `YYYY-MM-DD HH:MM:SS.ffffff` — with fractional seconds (up to 6 digits)
+/// - `YYYY-MM-DD HH:MM:SS+HH:MM` — explicit positive offset: subtract from UTC
+/// - `YYYY-MM-DD HH:MM:SS-HH:MM` — explicit negative offset: add to UTC
+/// - `YYYY-MM-DD HH:MM:SSZ` — Z = UTC (+00:00)
+/// - `YYYY-MM-DDTHH:MM:SS...` — T separator (ISO 8601)
+///
+/// In Permissive mode, a bare date `YYYY-MM-DD` is accepted and treated as midnight UTC.
+pub(crate) fn parse_text_to_timestamptz_micros(
+    s: &str,
+    mode: CoercionMode,
+) -> Result<i64, DbError> {
+    let trimmed = s.trim();
+    let make_err = |reason: String| DbError::InvalidCoercion {
+        from: "Text".into(),
+        to: "TIMESTAMPTZ".into(),
+        value: format!("'{s}'"),
+        reason,
+    };
+
+    let bytes = trimmed.as_bytes();
+    // Require at least "YYYY-MM-DD"
+    if bytes.len() < 10 {
+        return Err(make_err("expected YYYY-MM-DD [HH:MM:SS[.ffffff][±HH:MM|Z]]".into()));
+    }
+
+    // Parse date part: YYYY-MM-DD
+    if !(bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[7] == b'-'
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit())
+    {
+        return Err(make_err("expected YYYY-MM-DD date prefix".into()));
+    }
+
+    let year: i32 = trimmed[0..4].parse().map_err(|_| make_err("invalid year".into()))?;
+    let month: i32 = trimmed[5..7].parse().map_err(|_| make_err("invalid month".into()))?;
+    let day: i32 = trimmed[8..10].parse().map_err(|_| make_err("invalid day".into()))?;
+
+    let date_days =
+        ymd_to_days_checked(year, month, day).ok_or_else(|| make_err("invalid calendar date".into()))?;
+
+    // If only date provided
+    let rest = &trimmed[10..];
+    if rest.is_empty() {
+        if mode == CoercionMode::Strict {
+            return Err(make_err("missing time part".into()));
+        }
+        // Permissive: midnight UTC
+        return Ok(date_days as i64 * 86_400_000_000_i64);
+    }
+
+    // Separator: space or T
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes[0] != b' ' && rest_bytes[0] != b'T' {
+        return Err(make_err("expected space or T before time part".into()));
+    }
+    let rest = &rest[1..];
+    let rest_bytes = rest.as_bytes();
+
+    // Parse time part: HH:MM:SS
+    if rest_bytes.len() < 8 {
+        return Err(make_err("expected HH:MM:SS time part".into()));
+    }
+    if !(rest_bytes[0].is_ascii_digit()
+        && rest_bytes[1].is_ascii_digit()
+        && rest_bytes[2] == b':'
+        && rest_bytes[3].is_ascii_digit()
+        && rest_bytes[4].is_ascii_digit()
+        && rest_bytes[5] == b':'
+        && rest_bytes[6].is_ascii_digit()
+        && rest_bytes[7].is_ascii_digit())
+    {
+        return Err(make_err("expected HH:MM:SS".into()));
+    }
+
+    let hour: i64 = rest[0..2].parse().map_err(|_| make_err("invalid hour".into()))?;
+    let minute: i64 = rest[3..5].parse().map_err(|_| make_err("invalid minute".into()))?;
+    let second: i64 = rest[6..8].parse().map_err(|_| make_err("invalid second".into()))?;
+
+    if hour > 23 {
+        return Err(make_err(format!("hour {hour} out of range 0..23")));
+    }
+    if minute > 59 {
+        return Err(make_err(format!("minute {minute} out of range 0..59")));
+    }
+    if second > 59 {
+        return Err(make_err(format!("second {second} out of range 0..59")));
+    }
+
+    let mut pos = 8; // current position in rest
+
+    // Optional fractional seconds: .ffffff (up to 6 digits)
+    let mut frac_micros: i64 = 0;
+    if pos < rest.len() && rest_bytes[pos] == b'.' {
+        pos += 1;
+        let frac_start = pos;
+        while pos < rest.len() && rest_bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        let frac_str = &rest[frac_start..pos];
+        let frac_len = frac_str.len();
+        if frac_len > 6 {
+            return Err(make_err("fractional seconds > 6 digits not supported".into()));
+        }
+        let frac_raw: i64 = frac_str.parse().unwrap_or(0);
+        // Pad to 6 digits (microseconds)
+        frac_micros = frac_raw * 10i64.pow((6 - frac_len) as u32);
+    }
+
+    // Optional timezone offset: Z, +HH:MM, -HH:MM, +HHMM, -HHMM
+    let mut offset_secs: i64 = 0; // seconds to subtract from local to get UTC
+    if pos < rest.len() {
+        let tz_byte = rest_bytes[pos];
+        if tz_byte == b'Z' || tz_byte == b'z' {
+            pos += 1; // UTC, offset = 0
+        } else if tz_byte == b'+' || tz_byte == b'-' {
+            let sign: i64 = if tz_byte == b'+' { 1 } else { -1 };
+            pos += 1;
+            // Remaining must be HH:MM or HHMM (4 digits mandatory)
+            let tz_rest = &rest[pos..];
+            let tz_bytes = tz_rest.as_bytes();
+            if tz_bytes.len() < 4 || !tz_bytes[0].is_ascii_digit() || !tz_bytes[1].is_ascii_digit()
+            {
+                return Err(make_err("expected HH:MM or HHMM after timezone sign".into()));
+            }
+            let tz_h: i64 = tz_rest[0..2].parse().map_err(|_| make_err("invalid tz hour".into()))?;
+            // Skip optional colon
+            let colon_offset = if tz_bytes.len() > 2 && tz_bytes[2] == b':' { 1 } else { 0 };
+            let min_start = 2 + colon_offset;
+            if tz_bytes.len() < min_start + 2 {
+                return Err(make_err("expected MM in timezone offset".into()));
+            }
+            let tz_m: i64 = tz_rest[min_start..min_start + 2]
+                .parse()
+                .map_err(|_| make_err("invalid tz minute".into()))?;
+            offset_secs = sign * (tz_h * 3600 + tz_m * 60);
+            pos += min_start + 2;
+        }
+    }
+
+    if mode == CoercionMode::Strict && pos < rest.len() {
+        return Err(make_err(format!(
+            "unexpected trailing characters: '{}'",
+            &rest[pos..]
+        )));
+    }
+
+    // Compute UTC microseconds
+    let time_micros = hour * 3_600_000_000_i64
+        + minute * 60_000_000_i64
+        + second * 1_000_000_i64
+        + frac_micros;
+
+    let day_micros = date_days as i64 * 86_400_000_000_i64;
+
+    // local_micros = day_micros + time_micros
+    // utc_micros = local_micros - offset_secs * 1_000_000
+    day_micros
+        .checked_add(time_micros)
+        .and_then(|m| m.checked_sub(offset_secs * 1_000_000))
+        .ok_or_else(|| make_err("timestamp value overflows i64".into()))
 }

@@ -200,6 +200,7 @@ fn format_element_text(elem: &crate::value::Value) -> String {
         }
         crate::value::Value::Date(d) => format!("{}", d),
         crate::value::Value::Timestamp(t) => format!("{}", t),
+        crate::value::Value::TimestampTz(t) => format!("{}", t),
         crate::value::Value::Uuid(u) => {
             format!(
                 "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
@@ -801,6 +802,12 @@ fn parse_element_text(text: &str, elem_type: ColumnType) -> Result<crate::value:
                 reason: format!("invalid input syntax for type timestamp: \"{}\"", text),
             })?;
             Ok(crate::value::Value::Timestamp(t))
+        }
+        ColumnType::TimestampTz => {
+            let t: i64 = unescaped.parse().map_err(|_| DbError::InvalidValue {
+                reason: format!("invalid input syntax for type timestamptz: \"{}\"", text),
+            })?;
+            Ok(crate::value::Value::TimestampTz(t))
         }
         ColumnType::Uuid => {
             // Parse standard UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx

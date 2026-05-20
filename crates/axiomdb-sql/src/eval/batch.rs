@@ -548,7 +548,7 @@ fn fixed_size(dt: DataType) -> Option<usize> {
         | DataType::Int
         | DataType::Float
         | DataType::Date => Some(4),
-        DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
+        DataType::BigInt | DataType::Real | DataType::Timestamp | DataType::TimestampTz => Some(8),
         DataType::Text
         | DataType::Json
         | DataType::Jsonb

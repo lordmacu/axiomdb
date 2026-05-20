@@ -210,6 +210,7 @@ fn data_type_tag(ty: DataType) -> u8 {
         DataType::Composite(_) => 16,
         DataType::Ltree => 17,
         DataType::Xml => 18,
+        DataType::TimestampTz => 22,
     }
 }
 
@@ -236,6 +237,7 @@ fn data_type_from_tag(tag: u8) -> Result<DataType, DbError> {
         18 => Ok(DataType::Xml),
         19 => Ok(DataType::TinyInt),
         20 => Ok(DataType::SmallInt),
+        22 => Ok(DataType::TimestampTz),
         other => Err(DbError::ParseError {
             message: format!("invalid aggregate arg type byte {other}"),
             position: None,

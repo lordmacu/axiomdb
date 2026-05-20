@@ -130,6 +130,7 @@ fn validate_type(value: &Value, dt: DataType) -> Result<(), DbError> {
             | (Value::Bytes(_), DataType::Bytes)
             | (Value::Date(_), DataType::Date)
             | (Value::Timestamp(_), DataType::Timestamp)
+            | (Value::TimestampTz(_), DataType::TimestampTz)
             | (Value::Uuid(_), DataType::Uuid)
             | (Value::Array(_), DataType::Array(_))
             | (Value::Range(_), DataType::Range(_))
@@ -167,6 +168,7 @@ fn infer_array_elem_type(elems: &[Value]) -> crate::types::DataType {
             Value::Bytes(_) => return crate::types::DataType::Bytes,
             Value::Date(_) => return crate::types::DataType::Date,
             Value::Timestamp(_) => return crate::types::DataType::Timestamp,
+            Value::TimestampTz(_) => return crate::types::DataType::TimestampTz,
             Value::Uuid(_) => return crate::types::DataType::Uuid,
             Value::Array(_) => {
                 return crate::types::DataType::Array(Box::new(crate::types::DataType::Int))
@@ -205,7 +207,7 @@ pub fn encoded_len(values: &[Value]) -> usize {
             Value::Null => 0,
             Value::Bool(_) => 1,
             Value::Int(_) | Value::Date(_) => 4,
-            Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) => 8,
+            Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) | Value::TimestampTz(_) => 8,
             Value::Decimal(..) => 17,
             Value::Uuid(_) => 16,
             Value::Text(s) | Value::Json(s) => 3 + s.len(),
@@ -239,7 +241,7 @@ pub fn encoded_len(values: &[Value]) -> usize {
                         Value::Null => 0,
                         Value::Bool(_) => 1,
                         Value::Int(_) | Value::Date(_) => 4,
-                        Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) => 8,
+                        Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) | Value::TimestampTz(_) => 8,
                         Value::Decimal(..) => 17,
                         Value::Uuid(_) => 16,
                         Value::Text(s) | Value::Json(s) => 3 + s.len(),
@@ -280,6 +282,7 @@ fn value_to_col_type(v: &Value) -> array_codec::ColumnType {
         Value::Bytes(_) => array_codec::ColumnType::Bytes,
         Value::Date(_) => array_codec::ColumnType::Date,
         Value::Timestamp(_) => array_codec::ColumnType::Timestamp,
+        Value::TimestampTz(_) => array_codec::ColumnType::TimestampTz,
         Value::Uuid(_) => array_codec::ColumnType::Uuid,
         Value::Array(_) => array_codec::ColumnType::Array,
         Value::Range(_) => array_codec::ColumnType::Range,
@@ -307,6 +310,7 @@ fn col_type_to_data_type(ct: array_codec::ColumnType) -> DataType {
         array_codec::ColumnType::Bytes => DataType::Bytes,
         array_codec::ColumnType::Date => DataType::Date,
         array_codec::ColumnType::Timestamp => DataType::Timestamp,
+        array_codec::ColumnType::TimestampTz => DataType::TimestampTz,
         array_codec::ColumnType::Uuid => DataType::Uuid,
         array_codec::ColumnType::Array => DataType::Array(Box::new(DataType::Int)),
         array_codec::ColumnType::Range => DataType::Range(Box::new(DataType::Int)),
@@ -467,7 +471,7 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 buf.extend_from_slice(bytes);
             }
             Value::Date(d) => buf.extend_from_slice(&d.to_le_bytes()),
-            Value::Timestamp(t) => buf.extend_from_slice(&t.to_le_bytes()),
+            Value::Timestamp(t) | Value::TimestampTz(t) => buf.extend_from_slice(&t.to_le_bytes()),
             Value::Uuid(u) => buf.extend_from_slice(u),
             Value::Array(_elems) => {
                 // Get element type from DataType::Array in schema
@@ -712,6 +716,12 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>, DbErr
                 let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
                 pos += 8;
                 Value::Timestamp(v)
+            }
+            DataType::TimestampTz => {
+                ensure_bytes(bytes, pos, 8)?;
+                let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                Value::TimestampTz(v)
             }
             DataType::Uuid => {
                 ensure_bytes(bytes, pos, 16)?;
@@ -968,6 +978,12 @@ pub fn decode_row_masked(
                     pos += 8;
                     Value::Timestamp(v)
                 }
+                DataType::TimestampTz => {
+                    ensure_bytes(bytes, pos, 8)?;
+                    let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    Value::TimestampTz(v)
+                }
                 DataType::Uuid => {
                     ensure_bytes(bytes, pos, 16)?;
                     let u: [u8; 16] = bytes[pos..pos + 16].try_into().unwrap();
@@ -1062,7 +1078,7 @@ pub fn decode_row_masked(
                     ensure_bytes(bytes, pos, 4)?;
                     pos += 4;
                 }
-                DataType::BigInt | DataType::Real | DataType::Timestamp => {
+                DataType::BigInt | DataType::Real | DataType::Timestamp | DataType::TimestampTz => {
                     ensure_bytes(bytes, pos, 8)?;
                     pos += 8;
                 }

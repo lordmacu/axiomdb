@@ -384,7 +384,8 @@ fn json_value_to_axiom(
         | ColumnType::Money
         | ColumnType::Composite
         | ColumnType::Ltree
-        | ColumnType::Xml => {
+        | ColumnType::Xml
+        | ColumnType::TimestampTz => {
             let s = match v {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -516,7 +517,7 @@ fn value_to_url_string(v: &Value) -> String {
         Value::Bool(b) => if *b { "true".into() } else { "false".into() },
         Value::Bytes(b) => format!("{b:?}"),
         Value::Date(d) => d.to_string(),
-        Value::Timestamp(ts) => ts.to_string(),
+        Value::Timestamp(ts) | Value::TimestampTz(ts) => ts.to_string(),
         Value::Uuid(u) => {
             let h = u.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
             format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])

@@ -53,7 +53,7 @@ fn value_to_key_bytes(v: &Value) -> Vec<u8> {
             buf.push(0x08);
             buf.extend_from_slice(&d.to_le_bytes());
         }
-        Value::Timestamp(t) => {
+        Value::Timestamp(t) | Value::TimestampTz(t) => {
             buf.push(0x09);
             buf.extend_from_slice(&t.to_le_bytes());
         }

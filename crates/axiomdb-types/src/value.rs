@@ -48,6 +48,8 @@ pub enum Value {
     Date(i32),
     /// SQL TIMESTAMP — microseconds since 1970-01-01 00:00:00 UTC.
     Timestamp(i64),
+    /// SQL TIMESTAMPTZ — microseconds since 1970-01-01 00:00:00 UTC, displayed with +00 suffix.
+    TimestampTz(i64),
     /// SQL UUID — 128-bit identifier in big-endian byte order.
     Uuid([u8; 16]),
     /// SQL JSON — validated UTF-8 JSON text (Phase 11.4).
@@ -91,6 +93,7 @@ impl Value {
             Self::Bytes(_) => "Bytes",
             Self::Date(_) => "Date",
             Self::Timestamp(_) => "Timestamp",
+            Self::TimestampTz(_) => "TimestampTz",
             Self::Uuid(_) => "Uuid",
             Self::Json(_) => "Json",
             Self::Jsonb(_) => "Jsonb",
@@ -140,6 +143,7 @@ impl fmt::Display for Value {
             // Numeric display — ISO 8601 formatting comes with chrono in Phase 4.19.
             Self::Date(d) => write!(f, "date:{d}"),
             Self::Timestamp(t) => write!(f, "ts:{t}"),
+            Self::TimestampTz(t) => write!(f, "tstz:{t}"),
             Self::Uuid(u) => write!(
                 f,
                 "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",

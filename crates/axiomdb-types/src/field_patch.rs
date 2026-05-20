@@ -24,7 +24,7 @@ pub fn fixed_encoded_size(dt: DataType) -> Option<usize> {
         DataType::Bool => Some(1),
         DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::Date => Some(4),
         DataType::Float => Some(4),
-        DataType::BigInt | DataType::Real | DataType::Timestamp => Some(8),
+        DataType::BigInt | DataType::Real | DataType::Timestamp | DataType::TimestampTz => Some(8),
         // Variable-length or complex types: cannot patch in place.
         DataType::Text
         | DataType::Json

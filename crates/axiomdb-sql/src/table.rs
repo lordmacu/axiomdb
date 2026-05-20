@@ -209,6 +209,7 @@ pub fn column_type_to_data_type(ct: ColumnType) -> DataType {
         ColumnType::Composite => DataType::Composite(vec![]),
         ColumnType::Ltree => DataType::Ltree,
         ColumnType::Xml => DataType::Xml,
+        ColumnType::TimestampTz => DataType::TimestampTz,
     }
 }
 
@@ -244,6 +245,7 @@ pub fn column_data_types(columns: &[ColumnDef]) -> Vec<DataType> {
             ColumnType::Composite => DataType::Composite(vec![]),
             ColumnType::Ltree => DataType::Ltree,
             ColumnType::Xml => DataType::Xml,
+            ColumnType::TimestampTz => DataType::TimestampTz,
         })
         .collect()
 }
@@ -813,6 +815,7 @@ pub(crate) fn coerce_values(
                 ColumnType::Composite => DataType::Composite(vec![]),
                 ColumnType::Ltree => DataType::Ltree,
                 ColumnType::Xml => DataType::Xml,
+                ColumnType::TimestampTz => DataType::TimestampTz,
             };
             coerce(v, target, CoercionMode::Strict)
         })
@@ -887,6 +890,7 @@ pub(crate) fn coerce_values_with_ctx(
             ColumnType::Composite => DataType::Composite(vec![]),
             ColumnType::Ltree => DataType::Ltree,
             ColumnType::Xml => DataType::Xml,
+            ColumnType::TimestampTz => DataType::TimestampTz,
         };
 
         if ctx.strict_mode {

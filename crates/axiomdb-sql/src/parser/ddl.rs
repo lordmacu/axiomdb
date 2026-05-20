@@ -2226,6 +2226,7 @@ fn fdw_datatype_to_column_type(
         DataType::Text => Ok(ColumnType::Text),
         DataType::Bytes => Ok(ColumnType::Bytes),
         DataType::Timestamp => Ok(ColumnType::Timestamp),
+        DataType::TimestampTz => Ok(ColumnType::TimestampTz),
         DataType::Uuid => Ok(ColumnType::Uuid),
         DataType::Json => Ok(ColumnType::Json),
         DataType::Jsonb => Ok(ColumnType::Jsonb),

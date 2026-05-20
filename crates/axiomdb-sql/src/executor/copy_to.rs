@@ -141,6 +141,11 @@ fn value_to_csv_field(v: &Value) -> String {
             let microsecs = (ts % 1_000_000).unsigned_abs();
             format!("{secs}.{microsecs:06}")
         }
+        Value::TimestampTz(ts) => {
+            let secs = ts / 1_000_000;
+            let microsecs = (ts % 1_000_000).unsigned_abs();
+            format!("{secs}.{microsecs:06}+00")
+        }
         Value::Date(days) => {
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             if let Some(d) = epoch.checked_add_days(chrono::Days::new((*days).max(0) as u64)) {
@@ -249,7 +254,7 @@ fn value_to_json_val(v: &Value) -> serde_json::Value {
         Value::Bytes(b) => {
             serde_json::Value::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
         }
-        Value::Timestamp(_) => serde_json::Value::String(value_to_csv_field(v)),
+        Value::Timestamp(_) | Value::TimestampTz(_) => serde_json::Value::String(value_to_csv_field(v)),
         Value::Date(_) => serde_json::Value::String(value_to_csv_field(v)),
         Value::Uuid(_) => serde_json::Value::String(value_to_csv_field(v)),
         Value::Array(elems) => {

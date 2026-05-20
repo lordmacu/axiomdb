@@ -55,7 +55,8 @@ pub enum ColumnType {
     Xml = 18,       // SQL XML / XMLTYPE (Phase 20.20)
     TinyInt = 19,   // SQL TINYINT — i8 range, wire 0x01 TINY (Phase 24.1)
     SmallInt = 20,  // SQL SMALLINT — i16 range, wire 0x02 SHORT (Phase 24.1)
-    Float32 = 21,   // SQL REAL/FLOAT4 — 4-byte f32 LE, wire 0x04 FLOAT (Phase 24.2)
+    Float32 = 21,      // SQL REAL/FLOAT4 — 4-byte f32 LE, wire 0x04 FLOAT (Phase 24.2)
+    TimestampTz = 22,  // SQL TIMESTAMPTZ — i64 µs UTC, display with +00 suffix (Phase 24.7)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -83,6 +84,7 @@ impl TryFrom<u8> for ColumnType {
             19 => Ok(Self::TinyInt),
             20 => Ok(Self::SmallInt),
             21 => Ok(Self::Float32),
+            22 => Ok(Self::TimestampTz),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,
@@ -135,6 +137,7 @@ pub fn data_type_to_column_type(dt: &crate::types::DataType) -> ColumnType {
         crate::types::DataType::Composite(_) => ColumnType::Composite,
         crate::types::DataType::Ltree => ColumnType::Ltree,
         crate::types::DataType::Xml => ColumnType::Xml,
+        crate::types::DataType::TimestampTz => ColumnType::TimestampTz,
     }
 }
 
@@ -207,7 +210,7 @@ fn encode_element(
                 });
             }
         },
-        ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp => match elem {
+        ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp | ColumnType::TimestampTz => match elem {
             Value::BigInt(n) => buf.extend_from_slice(&n.to_le_bytes()),
             Value::Real(f) => {
                 if f.is_nan() {
@@ -218,13 +221,14 @@ fn encode_element(
                 buf.extend_from_slice(&f.to_le_bytes());
             }
             Value::Timestamp(t) => buf.extend_from_slice(&t.to_le_bytes()),
+            Value::TimestampTz(t) => buf.extend_from_slice(&t.to_le_bytes()),
             Value::Null => {
                 buf.extend_from_slice(&0i64.to_le_bytes());
                 return Ok(8);
             }
             _ => {
                 return Err(DbError::TypeMismatch {
-                    expected: "BIGINT/REAL/TIMESTAMP".to_string(),
+                    expected: "BIGINT/REAL/TIMESTAMP/TIMESTAMPTZ".to_string(),
                     got: elem.variant_name().to_string(),
                 });
             }
@@ -421,10 +425,10 @@ fn decode_element(
             *pos += 4;
             Ok((Value::Real(f as f64), 4))
         }
-        ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp => {
+        ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp | ColumnType::TimestampTz => {
             if *pos + 8 > blob.len() {
                 return Err(DbError::ParseError {
-                    message: "truncated: expected 8 bytes for BigInt/Real/Timestamp element"
+                    message: "truncated: expected 8 bytes for BigInt/Real/Timestamp/TimestampTz element"
                         .to_string(),
                     position: None,
                 });
@@ -442,6 +446,12 @@ fn decode_element(
                         blob[*pos - 8..*pos].try_into().map_err(|_| slice_err())?,
                     );
                     Ok((Value::Timestamp(v), 8))
+                }
+                ColumnType::TimestampTz => {
+                    let v = i64::from_le_bytes(
+                        blob[*pos - 8..*pos].try_into().map_err(|_| slice_err())?,
+                    );
+                    Ok((Value::TimestampTz(v), 8))
                 }
                 _ => {
                     let v = i64::from_le_bytes(

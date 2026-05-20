@@ -575,7 +575,7 @@ impl Hash for HashableValue {
             Value::Jsonb(b) => b.hash(state),
             Value::Bytes(b) => b.hash(state),
             Value::Date(d) => d.hash(state),
-            Value::Timestamp(t) => t.hash(state),
+            Value::Timestamp(t) | Value::TimestampTz(t) => t.hash(state),
             Value::Uuid(u) => u.hash(state),
             Value::Array(elems) => {
                 for elem in elems {
@@ -1290,7 +1290,7 @@ impl ArrayElemType {
             Value::Jsonb(_) => Self::Jsonb,
             Value::Bytes(_) => Self::Bytes,
             Value::Date(_) => Self::Date,
-            Value::Timestamp(_) => Self::Timestamp,
+            Value::Timestamp(_) | Value::TimestampTz(_) => Self::Timestamp,
             Value::Uuid(_) => Self::Uuid,
             Value::Array(_) => Self::Array,
             Value::Range(_) => Self::Range,

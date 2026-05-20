@@ -376,6 +376,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Jsonb => ColumnType::Jsonb,
         DataType::Bytes => ColumnType::Bytes,
         DataType::Timestamp => ColumnType::Timestamp,
+        DataType::TimestampTz => ColumnType::TimestampTz,
         DataType::Uuid => ColumnType::Uuid,
         DataType::Decimal => ColumnType::Decimal,
         DataType::Date => ColumnType::Date,

@@ -105,7 +105,7 @@ fn encode_value(v: &Value, buf: &mut Vec<u8>) -> Result<(), DbError> {
             let u = (*days as i64 ^ i64::MIN) as u64;
             buf.extend_from_slice(&u.to_be_bytes());
         }
-        Value::Timestamp(micros) => {
+        Value::Timestamp(micros) | Value::TimestampTz(micros) => {
             buf.push(0x07);
             let u = (*micros ^ i64::MIN) as u64;
             buf.extend_from_slice(&u.to_be_bytes());

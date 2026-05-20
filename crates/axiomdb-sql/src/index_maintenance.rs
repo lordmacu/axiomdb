@@ -166,6 +166,13 @@ fn flatten_array_elements(arr: &[Value], out: &mut Vec<Vec<u8>>) {
                 t.extend_from_slice(&micros.to_be_bytes());
                 out.push(t);
             }
+            Value::TimestampTz(micros) => {
+                // ColumnType::TimestampTz = 22, followed by 8-byte big-endian i64
+                let mut t = Vec::with_capacity(9);
+                t.push(22u8); // ColumnType::TimestampTz
+                t.extend_from_slice(&micros.to_be_bytes());
+                out.push(t);
+            }
             Value::Bytes(b) => {
                 // ColumnType::Bytes = 6, followed by length-prefixed bytes
                 let mut t = Vec::with_capacity(1 + 4 + b.len());

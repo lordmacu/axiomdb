@@ -533,7 +533,7 @@ impl std::hash::Hash for HashableValue {
                 s.hash(state);
             }
             Value::Date(d) => d.hash(state),
-            Value::Timestamp(t) => t.hash(state),
+            Value::Timestamp(t) | Value::TimestampTz(t) => t.hash(state),
             Value::Uuid(u) => u.hash(state),
             Value::Array(elems) => {
                 for elem in elems {

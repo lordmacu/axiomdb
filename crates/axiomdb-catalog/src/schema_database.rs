@@ -279,6 +279,7 @@ pub enum ColumnType {
     TinyInt = 19,    // SQL TINYINT — i8 range (-128..=127), wire 0x01 TINY (Phase 24.1)
     SmallInt = 20,   // SQL SMALLINT — i16 range (-32768..=32767), wire 0x02 SHORT (Phase 24.1)
     Float32 = 21,    // SQL REAL/FLOAT4 — 4-byte f32 LE; wire 0x04 FLOAT (Phase 24.2)
+    TimestampTz = 22, // SQL TIMESTAMPTZ — i64 µs UTC, display with +00 suffix (Phase 24.7)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -307,6 +308,7 @@ impl TryFrom<u8> for ColumnType {
             19 => Ok(Self::TinyInt),
             20 => Ok(Self::SmallInt),
             21 => Ok(Self::Float32),
+            22 => Ok(Self::TimestampTz),
             _ => Err(DbError::ParseError {
                 message: format!("unknown ColumnType discriminant: {v}"),
                 position: None,

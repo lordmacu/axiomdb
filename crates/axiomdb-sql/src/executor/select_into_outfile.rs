@@ -91,6 +91,11 @@ fn outfile_field_str(v: &Value) -> String {
             let us = (ts % 1_000_000).unsigned_abs();
             format!("{secs}.{us:06}")
         }
+        Value::TimestampTz(ts) => {
+            let secs = ts / 1_000_000;
+            let us = (ts % 1_000_000).unsigned_abs();
+            format!("{secs}.{us:06}+00")
+        }
         Value::Date(days) => {
             use chrono::NaiveDate;
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();

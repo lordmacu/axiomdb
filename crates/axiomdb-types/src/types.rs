@@ -43,6 +43,8 @@ pub enum DataType {
     Date,
     /// SQL TIMESTAMP — stored as 8-byte LE i64 (microseconds since 1970-01-01 UTC).
     Timestamp,
+    /// SQL TIMESTAMPTZ — stored as 8-byte LE i64 (microseconds UTC); displayed with +00 suffix.
+    TimestampTz,
     /// SQL UUID — stored as 16 raw bytes (big-endian UUID byte order).
     Uuid,
     /// SQL JSON — stored as u24 LE length prefix + validated UTF-8 JSON text.
@@ -94,6 +96,7 @@ impl DataType {
             Self::Bytes => "BYTES".into(),
             Self::Date => "DATE".into(),
             Self::Timestamp => "TIMESTAMP".into(),
+            Self::TimestampTz => "TIMESTAMPTZ".into(),
             Self::Uuid => "UUID".into(),
             Self::Json => "JSON".into(),
             Self::Jsonb => "JSONB".into(),

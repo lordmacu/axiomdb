@@ -540,6 +540,7 @@ pub fn value_to_sql_literal(v: &Value) -> String {
         Value::Decimal(m, s) => super::result::format_decimal_pub(*m, *s),
         Value::Date(d) => format!("'{}'", super::result::format_date_pub(*d)),
         Value::Timestamp(t) => format!("'{}'", super::result::format_timestamp_pub(*t)),
+        Value::TimestampTz(t) => format!("'{}'", super::result::format_timestamptz_pub(*t)),
         Value::Uuid(u) => {
             format!(
                 "'{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",

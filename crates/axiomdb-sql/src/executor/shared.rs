@@ -435,6 +435,7 @@ fn datatype_to_column_type(dt: &DataType) -> Result<ColumnType, DbError> {
         DataType::Composite(_) => Ok(ColumnType::Composite),
         DataType::Ltree => Ok(ColumnType::Ltree),
         DataType::Xml => Ok(ColumnType::Xml),
+        DataType::TimestampTz => Ok(ColumnType::TimestampTz),
     }
 }
 
@@ -462,6 +463,7 @@ fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Composite => DataType::Composite(vec![]),
         ColumnType::Ltree => DataType::Ltree,
         ColumnType::Xml => DataType::Xml,
+        ColumnType::TimestampTz => DataType::TimestampTz,
     }
 }
 
@@ -490,6 +492,7 @@ fn datatype_of_value(v: &Value) -> DataType {
         Value::Bytes(_) => DataType::Bytes,
         Value::Date(_) => DataType::Date,
         Value::Timestamp(_) => DataType::Timestamp,
+        Value::TimestampTz(_) => DataType::TimestampTz,
         Value::Uuid(_) => DataType::Uuid,
         Value::Array(elems) => {
             // Infer element type from the first non-null element.

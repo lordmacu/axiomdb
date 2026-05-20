@@ -65,6 +65,7 @@ mod tests {
             ColumnType::TinyInt,
             ColumnType::SmallInt,
             ColumnType::Float32,
+            ColumnType::TimestampTz,
         ];
         for v in variants {
             let byte: u8 = v.into();
@@ -73,11 +74,11 @@ mod tests {
         }
     }
 
-    // Discriminants 0, 22-254, and 255 are invalid; 1-21 are valid (Float32 = 21)
+    // Discriminants 0, 23-254, and 255 are invalid; 1-22 are valid (TimestampTz = 22)
     #[test]
     fn test_column_type_invalid_discriminant() {
         assert!(ColumnType::try_from(0).is_err());
-        assert!(ColumnType::try_from(22).is_err());
+        assert!(ColumnType::try_from(23).is_err());
         assert!(ColumnType::try_from(255).is_err());
     }
 

@@ -973,6 +973,7 @@ fn column_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Composite => "COMPOSITE",
         ColumnType::Ltree => "LTREE",
         ColumnType::Xml => "XML",
+        ColumnType::TimestampTz => "TIMESTAMPTZ",
     }
 }
 
@@ -1000,12 +1001,18 @@ fn scalar_type_to_sql_name(ct: ColumnType) -> &'static str {
         ColumnType::Composite => "COMPOSITE",
         ColumnType::Ltree => "LTREE",
         ColumnType::Xml => "XML",
+        ColumnType::TimestampTz => "TIMESTAMPTZ",
     }
 }
 
 fn column_sql_type_display(col: &axiomdb_catalog::ColumnDef) -> String {
     if let Some(ref enum_name) = col.enum_type_name {
         return enum_name.clone();
+    }
+
+    // TIMESTAMPTZ: display lowercase per PostgreSQL convention.
+    if col.col_type == ColumnType::TimestampTz {
+        return "timestamptz".to_string();
     }
 
     // DECIMAL(p,s): type_len encodes precision in upper byte, scale in lower byte.

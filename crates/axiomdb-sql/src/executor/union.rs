@@ -190,7 +190,7 @@ fn row_to_dedup_key(row: &Row) -> Vec<u8> {
                 key.push(6);
                 key.extend_from_slice(&d.to_le_bytes());
             }
-            Value::Timestamp(t) => {
+            Value::Timestamp(t) | Value::TimestampTz(t) => {
                 key.push(7);
                 key.extend_from_slice(&t.to_le_bytes());
             }

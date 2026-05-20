@@ -529,6 +529,7 @@ fn datatype_to_mysql_type(dt: DataType) -> u8 {
         DataType::Bytes => 0xfc,                                   // BLOB
         DataType::Date => 0x0a,                                    // DATE
         DataType::Timestamp => 0x07,                               // TIMESTAMP
+        DataType::TimestampTz => 0x07,                             // TIMESTAMP (always UTC)
         DataType::Uuid => 0xfd,                                    // VAR_STRING
         DataType::Array(_) => 0xfd,                                // VAR_STRING (PG text format)
         DataType::Range(_) => 0xfd,                                // VAR_STRING (text format)
@@ -553,6 +554,7 @@ fn column_display_len(dt: DataType) -> u32 {
         DataType::Bytes => 16_777_215,
         DataType::Date => 10,
         DataType::Timestamp => 19,
+        DataType::TimestampTz => 25, // "YYYY-MM-DD HH:MM:SS+00" = 22 chars + fractional headroom
         DataType::Uuid => 36,
         DataType::Array(_) => 16_777_215, // PG text format, variable-length
         DataType::Range(_) => 64,         // range literal text e.g. "[1,5)"
@@ -658,6 +660,7 @@ fn value_to_text(v: &Value) -> String {
         Value::Decimal(m, s) => format_decimal(*m, *s),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
+        Value::TimestampTz(t) => format_timestamptz(*t),
         Value::Uuid(u) => format_uuid(u),
         Value::Array(_elems) => {
             // Array text encoding deferred to Step 10.
@@ -732,6 +735,20 @@ fn format_timestamp(micros: i64) -> String {
     let m = (rem % 3600) / 60;
     let s = rem % 60;
     format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}")
+}
+
+pub(crate) fn format_timestamptz_pub(micros: i64) -> String {
+    format_timestamptz(micros)
+}
+
+fn format_timestamptz(micros: i64) -> String {
+    let secs = micros / 1_000_000;
+    let (year, month, day) = days_to_ymd(secs / 86400);
+    let rem = secs.rem_euclid(86400);
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}+00")
 }
 
 fn format_uuid(bytes: &[u8; 16]) -> String {

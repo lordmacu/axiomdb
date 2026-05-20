@@ -938,6 +938,7 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
         }
         ColumnType::Ltree => DataType::Ltree,
         ColumnType::Xml => DataType::Xml,
+        ColumnType::TimestampTz => DataType::TimestampTz,
     };
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }

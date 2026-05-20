@@ -160,6 +160,28 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
             Ok(Value::Timestamp(micros))
         }
 
+        // ── TimestampTz coercions (Phase 24.7) ────────────────────────────────
+        (Value::Text(s), DataType::TimestampTz) => {
+            let micros = parse_text_to_timestamptz_micros(&s, mode)?;
+            Ok(Value::TimestampTz(micros))
+        }
+        // Timestamp (no tz) → TimestampTz: assume the value is already UTC.
+        (Value::Timestamp(t), DataType::TimestampTz) => Ok(Value::TimestampTz(t)),
+        // TimestampTz → Timestamp: strip the timezone annotation, keep µs value.
+        (Value::TimestampTz(t), DataType::Timestamp) => Ok(Value::Timestamp(t)),
+        // Date → TimestampTz: midnight UTC on that date.
+        (Value::Date(days), DataType::TimestampTz) => {
+            let micros = (days as i64)
+                .checked_mul(86_400_000_000_i64)
+                .ok_or_else(|| DbError::InvalidCoercion {
+                    from: "Date".into(),
+                    to: "TIMESTAMPTZ".into(),
+                    value: days.to_string(),
+                    reason: "days × 86400000000 overflows i64".into(),
+                })?;
+            Ok(Value::TimestampTz(micros))
+        }
+
         // ── Bool → numeric (permissive only) ──────────────────────────────────
         (Value::Bool(b), DataType::Int) if mode == CoercionMode::Permissive => {
             Ok(Value::Int(b as i32))

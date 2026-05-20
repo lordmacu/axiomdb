@@ -616,6 +616,7 @@ mod ffi {
             Value::Decimal(m, s) => CellValue::Real(m as f64 / 10f64.powi(s as i32)),
             Value::Date(d) => CellValue::Integer(d as i64),
             Value::Timestamp(t) => CellValue::Integer(t),
+            Value::TimestampTz(t) => CellValue::Integer(t),
             Value::Text(s) | Value::Json(s) => {
                 CellValue::Text(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()))
             }
