@@ -129,7 +129,7 @@ ENGINE_CONFIGS = {
         dict(
         kind="pg",
         host="127.0.0.1",
-        port=5433,
+        port=5432,
         user="postgres",
         password="bench",
         dbname="bench",
@@ -1726,7 +1726,7 @@ def print_table(results, selected_engines):
                 ratio = axiom_ops / best_other if best_other > 0 else 0
                 row += f"  {light} {semaforo_text(light):<8}  {ratio:>6.2f}x"
             else:
-                row += f"  {'\u26aa':<10}  {'n/a':>7}"
+                row += "  \u26aa          " + "  " + "   n/a"
 
         print(row)
 
