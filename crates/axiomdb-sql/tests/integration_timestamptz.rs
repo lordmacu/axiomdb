@@ -78,7 +78,11 @@ fn timestamptz_insert_with_utc_offset() {
         &mut s,
         &mut txn,
     );
-    let out = common::rows(common::run("SELECT ts FROM t ORDER BY id", &mut s, &mut txn));
+    let out = common::rows(common::run(
+        "SELECT ts FROM t ORDER BY id",
+        &mut s,
+        &mut txn,
+    ));
     assert_eq!(out.len(), 2);
     match (&out[0][0], &out[1][0]) {
         (Value::TimestampTz(a), Value::TimestampTz(b)) => {
@@ -108,7 +112,11 @@ fn timestamptz_insert_with_positive_offset() {
         &mut s,
         &mut txn,
     );
-    let out = common::rows(common::run("SELECT ts FROM t ORDER BY id", &mut s, &mut txn));
+    let out = common::rows(common::run(
+        "SELECT ts FROM t ORDER BY id",
+        &mut s,
+        &mut txn,
+    ));
     match (&out[0][0], &out[1][0]) {
         (Value::TimestampTz(a), Value::TimestampTz(b)) => {
             assert_eq!(a, b, "+05:30 and UTC equivalent must store same µs");

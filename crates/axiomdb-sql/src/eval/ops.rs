@@ -863,7 +863,8 @@ pub(crate) fn compare_values(l: &Value, r: &Value) -> Result<std::cmp::Ordering,
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::TimestampTz(a), Value::TimestampTz(b)) => Ok(a.cmp(b)),
         // Cross-type comparison: strip tz annotation, compare µs values
-        (Value::Timestamp(a), Value::TimestampTz(b)) | (Value::TimestampTz(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
+        (Value::Timestamp(a), Value::TimestampTz(b))
+        | (Value::TimestampTz(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
         // MySQL compatibility: allow comparing DECIMAL with numeric text.
         // Common ORM pattern: `WHERE dec_col = '123.45'`.

@@ -241,7 +241,10 @@ pub fn encoded_len(values: &[Value]) -> usize {
                         Value::Null => 0,
                         Value::Bool(_) => 1,
                         Value::Int(_) | Value::Date(_) => 4,
-                        Value::BigInt(_) | Value::Real(_) | Value::Timestamp(_) | Value::TimestampTz(_) => 8,
+                        Value::BigInt(_)
+                        | Value::Real(_)
+                        | Value::Timestamp(_)
+                        | Value::TimestampTz(_) => 8,
                         Value::Decimal(..) => 17,
                         Value::Uuid(_) => 16,
                         Value::Text(s) | Value::Json(s) => 3 + s.len(),

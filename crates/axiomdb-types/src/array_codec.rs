@@ -41,22 +41,22 @@ pub enum ColumnType {
     Float = 4, // f64
     Text = 5,
     Bytes = 6,
-    Timestamp = 7,  // i64 microseconds
-    Uuid = 8,       // [u8; 16]
-    Json = 9,       // validated UTF-8 JSON text
-    Jsonb = 10,     // binary JSONB blob
-    Decimal = 11,   // i128 mantissa + u8 scale
-    Date = 12,      // i32 days since 1970-01-01
-    Array = 13,     // PostgreSQL array
-    Range = 14,     // SQL range type
-    Money = 15,     // SQL MONEY type (Phase 20.17)
-    Composite = 16, // SQL composite type (Phase 20.18)
-    Ltree = 17,     // SQL ltree hierarchical path (Phase 20.19)
-    Xml = 18,       // SQL XML / XMLTYPE (Phase 20.20)
-    TinyInt = 19,   // SQL TINYINT — i8 range, wire 0x01 TINY (Phase 24.1)
-    SmallInt = 20,  // SQL SMALLINT — i16 range, wire 0x02 SHORT (Phase 24.1)
-    Float32 = 21,      // SQL REAL/FLOAT4 — 4-byte f32 LE, wire 0x04 FLOAT (Phase 24.2)
-    TimestampTz = 22,  // SQL TIMESTAMPTZ — i64 µs UTC, display with +00 suffix (Phase 24.7)
+    Timestamp = 7,    // i64 microseconds
+    Uuid = 8,         // [u8; 16]
+    Json = 9,         // validated UTF-8 JSON text
+    Jsonb = 10,       // binary JSONB blob
+    Decimal = 11,     // i128 mantissa + u8 scale
+    Date = 12,        // i32 days since 1970-01-01
+    Array = 13,       // PostgreSQL array
+    Range = 14,       // SQL range type
+    Money = 15,       // SQL MONEY type (Phase 20.17)
+    Composite = 16,   // SQL composite type (Phase 20.18)
+    Ltree = 17,       // SQL ltree hierarchical path (Phase 20.19)
+    Xml = 18,         // SQL XML / XMLTYPE (Phase 20.20)
+    TinyInt = 19,     // SQL TINYINT — i8 range, wire 0x01 TINY (Phase 24.1)
+    SmallInt = 20,    // SQL SMALLINT — i16 range, wire 0x02 SHORT (Phase 24.1)
+    Float32 = 21,     // SQL REAL/FLOAT4 — 4-byte f32 LE, wire 0x04 FLOAT (Phase 24.2)
+    TimestampTz = 22, // SQL TIMESTAMPTZ — i64 µs UTC, display with +00 suffix (Phase 24.7)
 }
 
 impl TryFrom<u8> for ColumnType {
@@ -210,7 +210,10 @@ fn encode_element(
                 });
             }
         },
-        ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp | ColumnType::TimestampTz => match elem {
+        ColumnType::BigInt
+        | ColumnType::Float
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz => match elem {
             Value::BigInt(n) => buf.extend_from_slice(&n.to_le_bytes()),
             Value::Real(f) => {
                 if f.is_nan() {
@@ -425,11 +428,15 @@ fn decode_element(
             *pos += 4;
             Ok((Value::Real(f as f64), 4))
         }
-        ColumnType::BigInt | ColumnType::Float | ColumnType::Timestamp | ColumnType::TimestampTz => {
+        ColumnType::BigInt
+        | ColumnType::Float
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz => {
             if *pos + 8 > blob.len() {
                 return Err(DbError::ParseError {
-                    message: "truncated: expected 8 bytes for BigInt/Real/Timestamp/TimestampTz element"
-                        .to_string(),
+                    message:
+                        "truncated: expected 8 bytes for BigInt/Real/Timestamp/TimestampTz element"
+                            .to_string(),
                     position: None,
                 });
             }

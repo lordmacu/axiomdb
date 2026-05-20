@@ -129,6 +129,12 @@ pub fn execute_with_ctx_locked(
                         ctx.truncate_pending_notifications(sp.pending_notify_len);
                         let conn = ctx.conn_txn.as_mut().expect("conn_txn: checked by is_some() guard");
                         rollback_to_savepoint_with_index_undo(txn, conn, sp.wal, storage, bloom)?;
+                        // Invalidate schema cache: rollback_to_savepoint reverts
+                        // catalog changes (e.g. update_table_root from bulk DELETE)
+                        // whose root_page_id or schema_version may differ from what
+                        // the cache holds. Clearing ensures the next query re-resolves
+                        // from the rolled-back catalog state.
+                        ctx.invalidate_all();
                         // Destroy all savepoints after the target (MySQL behavior).
                         ctx.savepoints.truncate(idx + 1);
                         return Ok(QueryResult::Empty);

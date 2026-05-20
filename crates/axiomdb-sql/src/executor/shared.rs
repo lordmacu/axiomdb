@@ -101,7 +101,23 @@ fn try_cached_with_version(
         None => return Ok(None),
     };
 
-    // Cheap probe: 1 catalog row read to learn the current schema_version.
+    // A.2 fast path: if the catalog epoch hasn't changed since we last
+    // validated this table AND the query is autocommit (conn_txn is None),
+    // no DDL has run and the cached entry is guaranteed fresh. Skip the
+    // catalog probe entirely — O(1) HashMap lookup instead of a heap scan.
+    // Mirrors SQLite's schema-cookie fast path (research/sqlite/src/prepare.c:518-526).
+    //
+    // Restricted to autocommit only: inside explicit transactions, operations
+    // like bulk DELETE call update_table_root (which bumps schema_version in
+    // the WAL) and rollback_to_savepoint can revert those changes. The epoch
+    // does NOT revert with the WAL, so serving a stale cached root_page_id
+    // after a savepoint rollback would silently read from wrong B-tree pages.
+    // The schema_version probe below catches this via version mismatch.
+    if conn_txn.is_none() && ctx.is_table_epoch_current(cached_id) {
+        return Ok(ctx.get_table_if_version(database, schema, name, cached_version).cloned());
+    }
+
+    // Slow path: probe catalog for the current schema_version (one row read).
     let snap = conn_txn
         .map(|c| txn.active_snapshot(c))
         .unwrap_or_else(|| txn.snapshot());
@@ -109,9 +125,11 @@ fn try_cached_with_version(
     let current_version = reader.get_table_schema_version(cached_id)?;
 
     match current_version {
-        Some(v) if v == cached_version => Ok(ctx
-            .get_table_if_version(database, schema, name, cached_version)
-            .cloned()),
+        Some(v) if v == cached_version => {
+            // Validated: record epoch so next call skips the probe.
+            ctx.mark_table_epoch_current(cached_id);
+            Ok(ctx.get_table_if_version(database, schema, name, cached_version).cloned())
+        }
         _ => {
             // Stale entry OR table dropped — evict so the caller re-resolves.
             ctx.invalidate_table(database, schema, name);

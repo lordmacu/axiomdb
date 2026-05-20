@@ -923,6 +923,17 @@ pub struct SessionContext {
     /// callers don't have to touch this cache; correctness falls
     /// out of the comparison on lookup.
     count_star_cache: HashMap<u32, (u64, u64, u64)>,
+    /// A.2 optimization: session-level catalog epoch. Incremented by
+    /// `invalidate_all()` whenever DDL executes (the DDL fence path) or a
+    /// database/schema switch happens. When `table_epoch_cache[table_id] ==
+    /// catalog_epoch`, the cached `ResolvedTable` is guaranteed fresh without
+    /// a catalog probe in `try_cached_with_version`.
+    catalog_epoch: u64,
+    /// A.2 optimization: per-table validated epoch. Maps
+    /// `table_id → catalog_epoch at last validation`. An entry matching the
+    /// current `catalog_epoch` means the cached `ResolvedTable` is fresh and
+    /// the `get_table_schema_version` heap scan can be skipped entirely.
+    table_epoch_cache: HashMap<u32, u64>,
     /// Phase 19.1: auto-vacuum config. When `auto_vacuum_enabled` is
     /// `true` (default), every successful autocommit query that
     /// touches any table is followed by an auto-vacuum check —
@@ -1108,6 +1119,8 @@ impl SessionContext {
             statement_lru_seq: 0,
             clustered_leaf_hint: None,
             count_star_cache: HashMap::new(),
+            catalog_epoch: 0,
+            table_epoch_cache: HashMap::new(),
             auto_vacuum_enabled: true,
             auto_vacuum_threshold: 1000,
             autocommit: true,
@@ -1392,8 +1405,27 @@ impl SessionContext {
         table: &str,
         resolved: ResolvedTable,
     ) {
+        // A.2: record the catalog epoch at which this table was validated so
+        // subsequent lookups can skip the schema_version probe when the epoch
+        // is unchanged (no DDL since last resolution).
+        self.table_epoch_cache
+            .insert(resolved.def.id, self.catalog_epoch);
         self.cache
             .insert(Self::key(database, schema, table), resolved);
+    }
+
+    /// A.2 optimization: returns `true` when the cached entry for `table_id`
+    /// was validated at the current catalog epoch, meaning no DDL has run since
+    /// the last resolution and the catalog probe can be skipped entirely.
+    pub fn is_table_epoch_current(&self, table_id: u32) -> bool {
+        self.table_epoch_cache.get(&table_id).copied() == Some(self.catalog_epoch)
+    }
+
+    /// A.2 optimization: records that `table_id` was validated at the current
+    /// epoch after a successful catalog probe. Subsequent calls to
+    /// `is_table_epoch_current` will return `true` until DDL bumps the epoch.
+    pub fn mark_table_epoch_current(&mut self, table_id: u32) {
+        self.table_epoch_cache.insert(table_id, self.catalog_epoch);
     }
 
     pub fn invalidate_table(&mut self, database: &str, schema: &str, table: &str) {
@@ -1404,11 +1436,14 @@ impl SessionContext {
         // schema_version stamp and get lazy-evicted on the next lookup that
         // sees a mismatch (see `get_insert_col_positions`).
         if let Some(resolved) = self.cache.get(&Self::key(database, schema, table)) {
-            self.heap_tail.remove(&resolved.def.id);
+            let table_id = resolved.def.id;
+            self.heap_tail.remove(&table_id);
             // Attack 17b: drop the cached COUNT(*) too — the schema_version
             // tag would catch it on next lookup anyway, but evicting now
             // keeps the HashMap small after a DDL on an unrelated session.
-            self.count_star_cache.remove(&resolved.def.id);
+            self.count_star_cache.remove(&table_id);
+            // A.2: remove epoch entry so next lookup re-validates.
+            self.table_epoch_cache.remove(&table_id);
         }
         self.cache.remove(&Self::key(database, schema, table));
         // Attack 5: clear the leaf hint conservatively. Could be more
@@ -1424,6 +1459,12 @@ impl SessionContext {
         // is the DDL-fence path — schema_version may have bumped across
         // many tables. Drop the lot.
         self.count_star_cache.clear();
+        // A.2: bump epoch so `try_cached_with_version` re-validates all tables
+        // on the next lookup. table_epoch_cache is cleared so no stale epoch
+        // entries survive. The epoch is monotonically increasing; it never
+        // needs to wrap (u64 overflow would take ~600 years at 1 DDL/ns).
+        self.catalog_epoch += 1;
+        self.table_epoch_cache.clear();
         // NOTE: `statement_cache` is intentionally NOT cleared here.
         // invalidate_all is called from DDL endpoints AND from
         // DML-with-index-changes (dml_join.rs, appender.rs). Clearing
