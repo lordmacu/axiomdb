@@ -638,16 +638,17 @@ Attack 23 applied the statement-cache epoch fast path only to the embedded
 Attack 23b routes wire SELECT queries through `run_cached`, giving them the
 same O(1) cache-hit path as embedded queries.
 
-```bash
-# Measured with pymysql point-lookup benchmark on macOS APFS native:
-python3 tools/bench_wire.py --scenario point_lookup
-```
-
-| Path | Wire SELECT ops/s |
-|---|---:|
-| Pre-23b (legacy per-call analyze) | ~5,600 |
-| Post-23b (`run_cached` wire path) | **~11,400** |
-| Speedup | **~2×** |
+> **Honest correction (2026-05-20):** an earlier draft of this section
+> claimed a ~2× wire speedup. A careful before/after on the macOS-native
+> wire benchmark (`tools/bench-vs-pg-mariadb.py`, pre-23b vs post-23b binary)
+> is **dominated by noise** — the same binary swings ±60% run-to-run. The
+> honest read is **performance-neutral** on the wire path: the
+> `analyze_cached` it replaces was already cheap (resolve-table epoch
+> shortcut), so the cache's extra AST walks roughly cancel the savings. The
+> clearer win is the embedded path (Attack 23, 2.11× on Lima) and
+> `count_star`. The wire change's real value is *correctness-neutral
+> caching*, not a speedup. See `docs/perf-sqlite-gap.md` for the full
+> post-merge regression hunt (12 regressions found and fixed).
 
 **Correctness work**: the shape hash (`hash_stmt`) and literal extraction
 (`walk_stmt_extract`) were extended to cover all expression positions that

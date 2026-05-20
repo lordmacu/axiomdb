@@ -1648,20 +1648,69 @@ The hash-and-substitute approach is sound because:
 8. **Foreign table (FDW) lookup**: `get_table_in_database` doesn't find
    FDW tables. Fix: `get_foreign_table` fallback, return Ok(()) if found.
 
-### Results — macOS native (2026-05-20)
+### Post-merge regression hunt (2026-05-20)
 
-| Path | Wire SELECT point-lookup |
-|---|---:|
-| Pre-23b (legacy analyze path) | ~5,600 ops/s |
-| Post-23b (`run_cached`) | **~11,400 ops/s** |
-| Speedup | **~2×** |
+The first cut of 23b was committed claiming "all wire-test failures are
+pre-existing." That claim was **wrong**. Re-running the *same* `wire-test.py`
+against the pre-23b binary (`AXIOMDB_SERVER_BIN=...`) gave **13 failures**;
+the post-23b binary gave **25**. 23b introduced **12 regressions**, in three
+distinct root-cause classes:
 
-### Honest read
+**Class A — shape-hash collisions for unhashed constructs (10 tests):**
+GROUP_CONCAT separator/ORDER BY, `string_agg`, XMLELEMENT/XMLQUERY (String
+fields like `GroupConcat.separator`, `XmlQuery.xpath` are not in `hash_expr`),
+CUBE / `GROUPING SETS` (`GroupByClause::Sets` not hashed), `HAVING`,
+FROM-subqueries (`SELECT COUNT(*) FROM (... LIMIT 3) sub` collided with the
+no-LIMIT form), JSON_TABLE. `hash_expr` only covers ~12 of ~30 `Expr`
+variants; the rest hash to their discriminant only, and literals that escape
+extraction all hash to a constant `0xFF`. **Fix:** a conservative *whitelist*
+gate `is_cache_eligible` — only statements built from constructs the
+extract/hash/substitute trio provably round-trips use the cache; everything
+else falls through to the legacy path. Fails closed for any future variant.
 
-- Benchmark is macOS native (APFS), not Lima VM — absolute numbers
-  are higher than production; the 2× ratio is the meaningful signal.
-- The wire fast path fires on every repeated SELECT shape where the plan
-  is cached and no DDL has run. For read-heavy wire workloads (ORM
-  patterns, repeated point lookups) this approaches 100%.
-- DML (INSERT/UPDATE/DELETE) and DDL on the wire path still go through
-  the legacy pipeline — zero regression risk for writes.
+**Class B — `FOR UPDATE ... SKIP LOCKED` ignored locks (2 tests):**
+The wire `&mut self` path (`execute_query`) routed *all* SELECTs through
+`run_cached`, which executes via the non-locking `execute_with_ctx`. Before
+23b, `execute_query` used `execute_with_ctx_locked` (with the lock manager),
+so locking selects acquired/skipped row locks. **Fix:** parse once in
+`execute_query`; route `lock_clause.is_some()` selects to the legacy
+`execute_with_ctx_locked` path; non-locking selects keep the fast path.
+
+**Class C — read-your-own-commit snapshot race (the namespace COUNT=0
+intermittent failure):** the concurrent read path (`execute_read_query`) used
+`run_cached` → `execute_with_ctx`, which for a non-autocommit connection
+*opens and commits an implicit transaction per SELECT*. That new txn's
+snapshot races a just-committed write on the same connection, intermittently
+returning `COUNT(*) = 0`. Before 23b this path used `execute_read_only_with_ctx`
+(a pure snapshot reader). **Fix:** a `read_only` flag on `run_cached` —
+`execute_read_query` passes `true` (pure reader); the write-capable paths
+(`execute_query`, embedded) pass `false`.
+
+After all three fix classes: wire-test is back to **13 failures = the exact
+pre-23b baseline** (the 13 are genuinely pre-existing: JSON_TABLE NESTED,
+JSON `#>`/`#-`, view column type metadata, TABLESAMPLE(0), business-calendar,
+currency conversion). Stable across 5 consecutive runs.
+
+### Results — honest read
+
+The "~2×" speedup originally claimed here did **not** reproduce. A careful
+before/after on the macOS-native wire benchmark (`bench-vs-pg-mariadb.py
+--skip-pg --skip-maria`, pre-23b binary vs post-23b binary) is **dominated by
+measurement noise** — the same binary swings ±60% run-to-run (point_lookup
+3.2K–5.4K ops/s). Averaged, post-23b is roughly **performance-neutral** to
+slightly positive on the wire path, not 2×.
+
+Why the cache barely helps the wire path: `analyze_cached_with_defaults`
+already resolves tables through the `resolve_table` epoch shortcut, so the
+analyze it replaces was *already cheap*. The statement cache adds three AST
+walks (eligibility, extract, substitute) plus a plan clone, which roughly
+cancels the saved analyze. The clearer win is on the embedded path (Attack
+23, where the Lima measurement showed 2.11×) and on `count_star` (session
+COUNT cache). For SELECT-heavy wire workloads the value is correctness-neutral
+caching, not a dramatic speedup.
+
+- DML (INSERT/UPDATE/DELETE) and DDL on the wire path still go through the
+  legacy pipeline — zero regression risk for writes.
+- **Lesson:** never label new failures "pre-existing" without diffing against
+  the prior binary. Build the old commit in a worktree and run the identical
+  test harness via `AXIOMDB_SERVER_BIN`.

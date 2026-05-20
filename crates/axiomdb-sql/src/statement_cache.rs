@@ -22,7 +22,10 @@ use axiomdb_storage::StorageEngine;
 use axiomdb_types::Value;
 use axiomdb_wal::TxnManager;
 
-use crate::ast::{FromClause, GroupByClause, InsertSource, JoinCondition, SelectItem, Stmt};
+use crate::ast::{
+    DeleteStmt, FromClause, GroupByClause, InsertSource, InsertStmt, JoinCondition, SelectItem,
+    SelectStmt, Stmt, UpdateStmt,
+};
 use crate::bloom::BloomRegistry;
 use crate::expr::Expr;
 use crate::plan_deps::{extract_table_deps, PlanDeps};
@@ -551,20 +554,189 @@ pub fn substitute_params(mut stmt: Stmt, params: &[Value]) -> Result<Stmt, DbErr
     Ok(stmt)
 }
 
-/// Returns `true` when `stmt` is a candidate for the statement cache.
+/// Returns `true` only when EVERY construct in `stmt` is fully and
+/// consistently handled by the cache trio: `walk_stmt_extract` (literal
+/// extraction), `hash_stmt`/`hash_expr` (shape hashing), and
+/// `substitute_params` (literal restoration).
 ///
-/// We cache only the four DML/SELECT forms that `extract_literals` /
-/// `substitute_params` handle. Everything else (DDL, transaction
-/// control, SHOW, EXPLAIN, COPY, etc.) bypasses the cache and runs
-/// through the legacy parse → analyze → execute path. Caching DDL would
-/// be wrong anyway (it mutates the catalog) and the other forms see
-/// fewer call repetitions in real workloads, so the cache miss/hit
-/// economics don't favor them.
-fn is_cacheable(stmt: &Stmt) -> bool {
-    matches!(
-        stmt,
-        Stmt::Select(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
-    )
+/// This is a deliberately conservative **whitelist**. Any expression
+/// variant or clause we don't explicitly cover makes the statement
+/// ineligible, so it falls back to the always-correct legacy
+/// analyze + execute path.
+///
+/// Why fail closed: the shape hash keys cached plans. If a construct's
+/// distinguishing data is NOT in the hash (e.g. `GroupConcat.separator`
+/// and its per-aggregate `ORDER BY`, `XmlQuery.xpath`, a FROM-clause
+/// subquery's body, `GroupByClause::Sets` / `WithRollup`, `HAVING`,
+/// `lock_clause`), two structurally different queries hash equal and the
+/// cache returns the WRONG plan. Rather than enumerate every exotic
+/// field in the hash (fragile — a new AST variant silently collides),
+/// we only cache statements built from the small set of constructs the
+/// trio provably round-trips.
+///
+/// The hot paths the cache exists for — point lookups, range scans,
+/// simple grouped aggregates — are all covered. Exotic queries
+/// (GROUP_CONCAT, XML/JSON table functions, GROUPING SETS/CUBE/ROLLUP,
+/// `FOR UPDATE`, FROM-subqueries) skip the cache; they are rare and the
+/// per-call analyze cost is irrelevant for them.
+fn is_cache_eligible(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Select(s) => select_is_cache_eligible(s),
+        Stmt::Insert(s) => insert_is_cache_eligible(s),
+        Stmt::Update(s) => update_is_cache_eligible(s),
+        Stmt::Delete(s) => delete_is_cache_eligible(s),
+        _ => false,
+    }
+}
+
+/// An expression is "cache-simple" iff every node is one of the variants
+/// that `walk_expr_extract`, `hash_expr`, and `sub_expr` ALL handle
+/// recursively and identically. Anything else (GroupConcat, ArrayAgg,
+/// Grouping, Case, Window, Collate, Xml*, SqlJsonQuery, ArrayConstructor,
+/// Subscript, subqueries, …) returns `false`.
+fn expr_is_cache_simple(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Param { .. } | Expr::Column { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_is_cache_simple(left) && expr_is_cache_simple(right)
+        }
+        Expr::UnaryOp { operand, .. } => expr_is_cache_simple(operand),
+        Expr::IsNull { expr, .. } => expr_is_cache_simple(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_is_cache_simple(expr) && expr_is_cache_simple(low) && expr_is_cache_simple(high),
+        Expr::In { expr, list, .. } => {
+            expr_is_cache_simple(expr) && list.iter().all(expr_is_cache_simple)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_is_cache_simple(expr) && expr_is_cache_simple(pattern)
+        }
+        Expr::Function { args, .. } => args.iter().all(expr_is_cache_simple),
+        Expr::Cast { expr, .. } => expr_is_cache_simple(expr),
+        _ => false,
+    }
+}
+
+/// A FROM item is cache-simple iff it is a plain table or an SRF
+/// (UNNEST / GENERATE_SERIES) whose argument expressions are cache-simple.
+/// Subqueries, JSON_TABLE, XMLTABLE, VALUES, PIVOT, etc. are excluded —
+/// their bodies are not part of the shape hash.
+fn from_is_cache_simple(f: &FromClause) -> bool {
+    match f {
+        FromClause::Table(_) => true,
+        FromClause::Unnest(u) => u.exprs.iter().all(expr_is_cache_simple),
+        FromClause::GenerateSeries(gs) => {
+            expr_is_cache_simple(&gs.start)
+                && expr_is_cache_simple(&gs.stop)
+                && gs.step.as_ref().is_none_or(expr_is_cache_simple)
+        }
+        _ => false,
+    }
+}
+
+fn select_is_cache_eligible(s: &SelectStmt) -> bool {
+    // Clauses with data the shape hash / substitute do not cover.
+    if !s.with_ctes.is_empty()
+        || !s.distinct_on.is_empty()
+        || !s.hints.is_empty()
+        || s.calc_found_rows
+        || s.having.is_some()
+        || s.lock_clause.is_some()
+        || !s.set_op_rest.is_empty()
+        || s.into_outfile.is_some()
+    {
+        return false;
+    }
+    // GROUP BY: only None or plain Simple(simple exprs).
+    match &s.group_by {
+        GroupByClause::None => {}
+        GroupByClause::Simple(exprs) => {
+            if !exprs.iter().all(expr_is_cache_simple) {
+                return false;
+            }
+        }
+        GroupByClause::WithRollup(_) | GroupByClause::Sets { .. } => return false,
+    }
+    for col in &s.columns {
+        match col {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {}
+            SelectItem::Expr { expr, .. } => {
+                if !expr_is_cache_simple(expr) {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Some(ref from) = s.from {
+        if !from_is_cache_simple(from) {
+            return false;
+        }
+    }
+    for join in &s.joins {
+        if !from_is_cache_simple(&join.table) {
+            return false;
+        }
+        if let JoinCondition::On(ref cond) = join.condition {
+            if !expr_is_cache_simple(cond) {
+                return false;
+            }
+        }
+    }
+    if let Some(ref wc) = s.where_clause {
+        if !expr_is_cache_simple(wc) {
+            return false;
+        }
+    }
+    if !s.order_by.iter().all(|ob| expr_is_cache_simple(&ob.expr)) {
+        return false;
+    }
+    if let Some(ref lim) = s.limit {
+        if !expr_is_cache_simple(lim) {
+            return false;
+        }
+    }
+    if let Some(ref off) = s.offset {
+        if !expr_is_cache_simple(off) {
+            return false;
+        }
+    }
+    true
+}
+
+fn insert_is_cache_eligible(s: &InsertStmt) -> bool {
+    // Only plain `INSERT ... VALUES (...)` with cache-simple row exprs.
+    // Upsert / RETURNING / INSERT..SELECT carry exprs the trio doesn't walk.
+    if s.ignore || s.replace || !s.returning.is_empty() || s.on_conflict.is_some() {
+        return false;
+    }
+    if s.on_duplicate_update.is_some() {
+        return false;
+    }
+    match &s.source {
+        InsertSource::Values(rows) => rows.iter().all(|row| row.iter().all(expr_is_cache_simple)),
+        _ => false,
+    }
+}
+
+fn update_is_cache_eligible(s: &UpdateStmt) -> bool {
+    if !s.joins.is_empty() || !s.order_by.is_empty() || s.limit.is_some() || !s.returning.is_empty()
+    {
+        return false;
+    }
+    s.assignments.iter().all(|a| expr_is_cache_simple(&a.value))
+        && s.where_clause.as_ref().is_none_or(expr_is_cache_simple)
+}
+
+fn delete_is_cache_eligible(s: &DeleteStmt) -> bool {
+    if s.target.is_some()
+        || !s.joins.is_empty()
+        || !s.order_by.is_empty()
+        || s.limit.is_some()
+        || !s.returning.is_empty()
+    {
+        return false;
+    }
+    s.where_clause.as_ref().is_none_or(expr_is_cache_simple)
 }
 
 /// Cache-aware entrypoint: parses → looks up the per-session shape
@@ -577,6 +749,18 @@ fn is_cacheable(stmt: &Stmt) -> bool {
 /// This is the canonical entrypoint for `Db::run_inner` and any harness
 /// wanting cache-aware execution. Callers that bypass it (manual
 /// `PreparedStatement`, some test infrastructure) skip the cache.
+///
+/// `read_only`: when `true`, the statement is executed through
+/// [`crate::execute_read_only_with_ctx`] — a pure-snapshot reader that does
+/// NOT open/commit a transaction. The MySQL wire server's concurrent
+/// read path (`execute_read_query`) requires this: routing an autocommit
+/// SELECT through the write executor (`execute_with_ctx`) opens an implicit
+/// txn whose snapshot can race a just-committed write on the same
+/// connection, intermittently returning stale/empty results. When `false`,
+/// the write-capable [`crate::execute_with_ctx`] is used (embedded path and
+/// the wire `&mut self` path, which may carry staged writes in an explicit
+/// transaction). Only pass `true` when there is provably no open
+/// write-transaction with staged rows.
 pub fn run_cached(
     sql: &str,
     storage: &dyn StorageEngine,
@@ -584,10 +768,43 @@ pub fn run_cached(
     bloom: &BloomRegistry,
     schema_cache: &mut SchemaCache,
     session: &mut SessionContext,
+    read_only: bool,
 ) -> Result<QueryResult, DbError> {
-    use crate::{analyze_cached_with_defaults, execute_with_ctx, parse_with_sql_mode};
+    use crate::parse_with_sql_mode;
+    let stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
+    run_cached_stmt(stmt, storage, txn, bloom, schema_cache, session, read_only)
+}
 
-    let mut stmt = parse_with_sql_mode(sql, None, session.sql_mode_flags())?;
+/// Same as [`run_cached`] but takes an already-parsed statement, so callers
+/// that must inspect the AST before deciding to use the cache (e.g. the wire
+/// server, which routes `FOR UPDATE`/`FOR SHARE` selects to the lock-manager
+/// executor) don't pay for a second parse. See [`run_cached`] for `read_only`.
+pub fn run_cached_stmt(
+    mut stmt: Stmt,
+    storage: &dyn StorageEngine,
+    txn: &TxnManager,
+    bloom: &BloomRegistry,
+    schema_cache: &mut SchemaCache,
+    session: &mut SessionContext,
+    read_only: bool,
+) -> Result<QueryResult, DbError> {
+    use crate::analyze_cached_with_defaults;
+
+    // Choose the executor: read-only snapshot reader vs write-capable executor.
+    fn exec_final(
+        read_only: bool,
+        stmt: Stmt,
+        storage: &dyn StorageEngine,
+        txn: &TxnManager,
+        bloom: &BloomRegistry,
+        session: &mut SessionContext,
+    ) -> Result<QueryResult, DbError> {
+        if read_only {
+            crate::execute_read_only_with_ctx(stmt, storage, txn, bloom, session)
+        } else {
+            crate::execute_with_ctx(stmt, storage, txn, bloom, session)
+        }
+    }
 
     // Snapshot is needed both for analyze and for the deps probe; reuse.
     let snap = if let Some(ref ct) = session.conn_txn {
@@ -596,8 +813,10 @@ pub fn run_cached(
         txn.snapshot()
     };
 
-    // DDL / non-cacheable: legacy path, no shape extraction.
-    if !is_cacheable(&stmt) {
+    // DDL / non-cacheable / not-fully-supported: legacy path, no shape
+    // extraction. The eligibility gate fails closed for any construct whose
+    // distinguishing data is not in the shape hash (prevents wrong-plan reuse).
+    if !is_cache_eligible(&stmt) {
         let analyzed = analyze_cached_with_defaults(
             stmt,
             storage,
@@ -606,7 +825,7 @@ pub fn run_cached(
             session.current_schema(),
             schema_cache,
         )?;
-        return execute_with_ctx(analyzed, storage, txn, bloom, session);
+        return exec_final(read_only, analyzed, storage, txn, bloom, session);
     }
 
     // Extract literals (rewrites stmt in-place to shape-only).
@@ -676,5 +895,5 @@ pub fn run_cached(
 
     // Restore literals into the cached/fresh plan and execute.
     let executable = substitute_params(analyzed, &extracted)?;
-    execute_with_ctx(executable, storage, txn, bloom, session)
+    exec_final(read_only, executable, storage, txn, bloom, session)
 }

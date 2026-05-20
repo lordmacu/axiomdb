@@ -327,13 +327,16 @@ cur.execute("CREATE TABLE db_scope (id INT)")
 cur.execute("INSERT INTO db_scope VALUES (1)")
 conn.commit()
 cur.execute("SELECT COUNT(*) FROM db_scope")
-ok("axiomdb namespace resolves its own unqualified table", cur.fetchone()[0] == 1)
+_axv = cur.fetchone()[0]
+ok("axiomdb namespace resolves its own unqualified table", _axv == 1, _axv)
 
 conn.select_db("analytics")
 analytics_cur.execute("SELECT COUNT(*) FROM db_scope")
+_anv = analytics_cur.fetchone()[0]
 ok(
     "analytics namespace resolves its own unqualified table",
-    analytics_cur.fetchone()[0] == 1,
+    _anv == 1,
+    _anv,
 )
 try:
     analytics_cur.execute("DROP DATABASE analytics")

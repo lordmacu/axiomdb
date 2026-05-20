@@ -326,6 +326,10 @@ mod db {
                     &self.bloom,
                     &mut self.schema_cache,
                     &mut self.session,
+                    // read_only = false: the embedded path may be inside an
+                    // explicit transaction with staged writes, which only the
+                    // write-capable executor flushes/sees correctly.
+                    false,
                 )
             } else {
                 let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;

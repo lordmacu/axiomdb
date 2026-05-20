@@ -701,23 +701,22 @@ Two changes close this (Attack 23 — embedded path):
 
 (Lima VM numbers; macOS APFS native expected to be higher as seen in A20.)
 
-**Attack 23b** extends the same fast path to the **MySQL wire server path**.
-Before 23b, wire SELECT queries re-analyzed on every call. Now they route
-through `run_cached`, giving them the same O(1) epoch-check path.
+**Attack 23b** extends the same fast path to the **MySQL wire server path**:
+wire SELECTs route through `run_cached` instead of re-analyzing per call.
+On the wire path this is **performance-neutral** in practice (the analyze it
+replaces is already cheap via the resolve-table epoch shortcut, and the macOS
+wire benchmark is too noisy to show a clean signal); the real value is shared,
+correctness-checked caching across the embedded and wire paths. The clearer
+measured speedup is on the embedded path (above) and `count_star`.
 
-| Path | Wire SELECT ops/s |
-|---|---:|
-| Pre-23b (legacy analyze per call) | ~5,600 |
-| Post-23b (`run_cached` wire path) | **~11,400** |
-| Speedup | **~2×** |
-
-(macOS APFS native; Lima VM numbers will be lower due to virtio-fs overhead.)
-
-<div class="callout-advantage">
-After A23 + A23b, both the embedded `Db` API and MySQL wire clients share
-the same zero-catalog-I/O fast path for repeated SELECT shapes. The epoch
-only advances on DDL, so a matching tag guarantees the cached plan is valid.
-The gap vs SQLite's `point_lookup` (66.7K ops/s) tightens from 12× to 5.6×.
+<div class="callout-design">
+Routing wire SELECTs through the statement cache required three correctness
+fixes the first cut missed: (1) a conservative whitelist gate so exotic
+constructs (GROUP_CONCAT, XML, GROUPING SETS, FROM-subqueries) skip the cache
+rather than collide in the shape hash; (2) keeping <code>FOR UPDATE / SKIP
+LOCKED</code> on the lock-manager executor; (3) a read-only execution flag so
+the concurrent read path keeps its pure-snapshot reader (avoids a
+read-your-own-commit race). See <code>docs/perf-sqlite-gap.md</code>.
 </div>
 
 ### Session COUNT(*) Cache (Attack 17b)

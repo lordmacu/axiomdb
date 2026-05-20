@@ -47,8 +47,7 @@ use axiomdb_sql::{
     parse_with_sql_mode, prepare_nonblocking_heap_alter,
     result::{ColumnMeta, QueryResult},
     session::{is_ignorable_on_error, OnErrorMode},
-    sql_starts_with_select_keyword,
-    statement_cache::run_cached,
+    statement_cache::{run_cached, run_cached_stmt},
     truncate_table_unchecked_on_open, verify_and_repair_indexes_on_open, SchemaCache,
     SessionContext,
 };
@@ -289,31 +288,42 @@ impl SharedDatabase {
             });
         }
 
-        // Attack 23b — wire path epoch fast path: SELECT queries go through the
-        // per-session statement cache with the O(1) epoch check. Cache hits skip
-        // CatalogReader creation + PlanDeps::is_stale entirely. Cache misses fall
-        // through to analyze + cache (same cost as before). DDL, DML, and
-        // transaction control skip this branch and use the legacy path below.
-        // SELECT never triggers schema changes, so no schema_version bump needed.
-        if sql_starts_with_select_keyword(sql) {
-            return match run_cached(
-                sql,
+        // ── parse ─────────────────────────────────────────────────────────────
+        let stmt = match parse_with_sql_mode(sql, None, session.sql_mode_flags()) {
+            Ok(s) => s,
+            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
+        };
+
+        // Attack 23b — wire path epoch fast path: non-locking SELECTs go through
+        // the per-session statement cache with the O(1) epoch check. Cache hits
+        // skip CatalogReader creation + PlanDeps::is_stale entirely; misses cost
+        // the same as before.
+        //
+        // Locking SELECTs (FOR UPDATE / FOR SHARE / SKIP LOCKED) are EXCLUDED:
+        // they must run through `execute_with_ctx_locked` below so the lock
+        // manager actually acquires/skips row locks. Routing them through
+        // `run_cached` (which uses the non-locking executor) would silently drop
+        // the lock semantics — e.g. SKIP LOCKED would return rows locked by
+        // another transaction.
+        if matches!(&stmt, Stmt::Select(s) if s.lock_clause.is_none()) {
+            // read_only = false: this &mut self path may run inside an explicit
+            // transaction carrying staged writes, so it needs the write-capable
+            // executor (matches the pre-23b execute_with_ctx_locked behavior for
+            // non-locking selects).
+            return match run_cached_stmt(
+                stmt,
                 &self.storage,
                 &self.txn,
                 &self.bloom,
                 schema_cache,
                 session,
+                false,
             ) {
                 Ok(result) => Ok((result, None)),
                 Err(e) => self.apply_on_error_pipeline_failure(sql, session, e),
             };
         }
 
-        // ── parse ─────────────────────────────────────────────────────────────
-        let stmt = match parse_with_sql_mode(sql, None, session.sql_mode_flags()) {
-            Ok(s) => s,
-            Err(e) => return self.apply_on_error_pipeline_failure(sql, session, e),
-        };
         self.reject_stmt_if_table_under_rewrite(&stmt, session.effective_database())?;
         let is_ddl = is_schema_changing(&stmt);
 
@@ -388,6 +398,12 @@ impl SharedDatabase {
         // Attack 23b — wire path epoch fast path (same as execute_query above).
         // execute_read_query is already SELECT-only by contract; non-cacheable
         // forms (DDL, SHOW, etc.) fall through inside run_cached unchanged.
+        //
+        // read_only = true: this is the concurrent &self read path (no explicit
+        // write-transaction with staged rows), so execute through the pure
+        // snapshot reader. Using the write executor here opens an implicit txn
+        // whose snapshot can race a just-committed write on the same connection
+        // (intermittent stale/empty reads — the COUNT(*)=0 namespace bug).
         run_cached(
             sql,
             &self.storage,
@@ -395,6 +411,7 @@ impl SharedDatabase {
             &self.bloom,
             schema_cache,
             session,
+            true,
         )
     }
 
