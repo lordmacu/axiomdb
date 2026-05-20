@@ -102,18 +102,24 @@ fn try_cached_with_version(
     };
 
     // A.2 fast path: if the catalog epoch hasn't changed since we last
-    // validated this table AND the query is autocommit (conn_txn is None),
+    // validated this table AND we are not inside an explicit transaction,
     // no DDL has run and the cached entry is guaranteed fresh. Skip the
     // catalog probe entirely — O(1) HashMap lookup instead of a heap scan.
     // Mirrors SQLite's schema-cookie fast path (research/sqlite/src/prepare.c:518-526).
     //
-    // Restricted to autocommit only: inside explicit transactions, operations
-    // like bulk DELETE call update_table_root (which bumps schema_version in
-    // the WAL) and rollback_to_savepoint can revert those changes. The epoch
-    // does NOT revert with the WAL, so serving a stale cached root_page_id
-    // after a savepoint rollback would silently read from wrong B-tree pages.
-    // The schema_version probe below catches this via version mismatch.
-    if conn_txn.is_none() && ctx.is_table_epoch_current(cached_id) {
+    // Restricted to autocommit (`!ctx.in_explicit_txn`): inside explicit
+    // transactions, rollback_to_savepoint can revert WAL-level catalog
+    // changes (e.g. update_table_root from bulk DELETE) while the in-memory
+    // epoch does NOT revert, so serving a stale cached root_page_id would
+    // silently read from wrong B-tree pages.
+    //
+    // For autocommit: DML statements clear the epoch mark for their table
+    // via `invalidate_table_epoch_for_ref` in dispatch_ctx immediately after
+    // each write statement. This forces a single schema_version probe on the
+    // NEXT access, which re-validates the entry (catching any root split that
+    // happened during the write) and re-marks the epoch. Subsequent reads
+    // then use the fast path until the next write on that table.
+    if !ctx.in_explicit_txn && ctx.is_table_epoch_current(cached_id) {
         return Ok(ctx.get_table_if_version(database, schema, name, cached_version).cloned());
     }
 

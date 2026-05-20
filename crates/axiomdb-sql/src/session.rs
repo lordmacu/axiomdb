@@ -1428,6 +1428,48 @@ impl SessionContext {
         self.table_epoch_cache.insert(table_id, self.catalog_epoch);
     }
 
+    /// A.2 optimization: drop only the epoch mark for a table, keeping the
+    /// cached `ResolvedTable` entry intact. The next `try_cached_with_version`
+    /// call will fall through to the catalog schema_version probe (one row
+    /// read), confirm the entry is still valid, and re-mark the epoch.
+    ///
+    /// Called after DML statements that can trigger `update_table_root`
+    /// (B-tree root splits, VACUUM). This ensures the fast path is not served
+    /// a stale `root_page_id` if a split occurred during the write.
+    pub fn invalidate_table_epoch_for_ref(&mut self, tref: &crate::ast::TableRef) {
+        let database: String = tref
+            .database
+            .as_deref()
+            .unwrap_or_else(|| self.effective_database())
+            .to_string();
+        let table_id = if let Some(schema) = tref.schema.as_deref() {
+            self.cache
+                .get(&Self::key(&database, schema, &tref.name))
+                .map(|rt| rt.def.id)
+        } else {
+            let n = self.search_path.len();
+            let mut found = None;
+            for i in 0..n {
+                let schema = self.search_path[i].clone();
+                if let Some(rt) = self.cache.get(&Self::key(&database, &schema, &tref.name)) {
+                    found = Some(rt.def.id);
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(tid) = table_id {
+            self.table_epoch_cache.remove(&tid);
+        }
+    }
+
+    /// Drop all epoch marks without evicting the schema cache.
+    /// Used by `VACUUM` (all tables) so the next access to any table
+    /// re-validates via the catalog schema_version probe.
+    pub fn clear_table_epoch_cache(&mut self) {
+        self.table_epoch_cache.clear();
+    }
+
     pub fn invalidate_table(&mut self, database: &str, schema: &str, table: &str) {
         // Also clear any heap-tail hint for this table so a stale tail is not
         // reused after a DDL change or root rotation.

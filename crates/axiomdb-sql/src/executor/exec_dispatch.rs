@@ -43,20 +43,28 @@ fn dispatch_ctx(
             ctx.conn_txn = Some(conn);
             let result =
                 r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))?;
-            run_statement_triggers_for_result(
+            let result = run_statement_triggers_for_result(
                 TriggerEvent::Insert,
                 &table_ref,
                 result,
                 exec_ctx,
                 ctx,
-            )
+            )?;
+            // A.2: clear epoch mark so the next autocommit access re-validates
+            // the schema_version — catches any B-tree root split that occurred
+            // during the write (update_table_root bumps schema_version).
+            ctx.invalidate_table_epoch_for_ref(&table_ref);
+            Ok(result)
         }
         Stmt::Merge(s) => {
             let table_ref = s.target.clone();
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_merge_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))
+            let result =
+                r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))?;
+            ctx.invalidate_table_epoch_for_ref(&table_ref);
+            Ok(result)
         }
         Stmt::Update(s) => {
             let table_ref = s.table.clone();
@@ -65,13 +73,15 @@ fn dispatch_ctx(
             ctx.conn_txn = Some(conn);
             let result =
                 r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))?;
-            run_statement_triggers_for_result(
+            let result = run_statement_triggers_for_result(
                 TriggerEvent::Update,
                 &table_ref,
                 result,
                 exec_ctx,
                 ctx,
-            )
+            )?;
+            ctx.invalidate_table_epoch_for_ref(&table_ref);
+            Ok(result)
         }
         Stmt::Delete(s) => {
             let table_ref = s.table.clone();
@@ -79,20 +89,26 @@ fn dispatch_ctx(
             let r = execute_delete_ctx(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
             let result = r?;
-            run_statement_triggers_for_result(
+            let result = run_statement_triggers_for_result(
                 TriggerEvent::Delete,
                 &table_ref,
                 result,
                 exec_ctx,
                 ctx,
-            )
+            )?;
+            ctx.invalidate_table_epoch_for_ref(&table_ref);
+            Ok(result)
         }
         // Phase 20.5: COPY FROM / TO
         Stmt::CopyFrom(s) => {
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
             let r = execute_copy_from(s, exec_ctx, &mut conn, ctx);
             ctx.conn_txn = Some(conn);
-            r
+            let result = r?;
+            // COPY FROM inserts rows and may cause B-tree root splits;
+            // clear epoch marks so the next access re-validates.
+            ctx.clear_table_epoch_cache();
+            Ok(result)
         }
         Stmt::CopyTo(s) => {
             let conn_opt = ctx.conn_txn.take();
@@ -353,7 +369,17 @@ fn dispatch_ctx(
             Ok(QueryResult::Empty)
         }
         Stmt::Explain(inner) => execute_explain(*inner, exec_ctx, ctx),
-        Stmt::Vacuum(s) => crate::vacuum::execute_vacuum(s, exec_ctx, ctx),
+        Stmt::Vacuum(s) => {
+            // Extract table ref before consuming stmt so we can invalidate
+            // the epoch mark after vacuum may have called update_table_root.
+            let vacuum_table_ref = s.table.clone();
+            let result = crate::vacuum::execute_vacuum(s, exec_ctx, ctx)?;
+            match vacuum_table_ref {
+                Some(ref tref) => ctx.invalidate_table_epoch_for_ref(tref),
+                None => ctx.clear_table_epoch_cache(), // vacuum all: clear all marks
+            }
+            Ok(result)
+        }
         Stmt::Listen(s) => execute_listen(s, ctx),
         Stmt::Unlisten(s) => execute_unlisten(s, ctx),
         Stmt::Notify(s) => execute_notify(s, ctx),
