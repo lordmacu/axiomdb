@@ -592,3 +592,41 @@ cargo bench -p axiomdb-storage --bench storage overflow/refcounted_blob
 MySQL InnoDB and PostgreSQL TOAST expose large values through full SQL engines, while this Phase 11.2d benchmark isolates AxiomDB's overflow-chain storage path so refcount/layout regressions are visible before SQL, WAL, or network overhead hides them.
 </div>
 </div>
+
+---
+
+## Attack 23 — Statement Cache Epoch Fast Path
+
+Measured with `axiomdb_bench --scenario point_lookup --rows 10000` on Lima VM
+(AlmaLinux 10 / virtio-fs). `point_lookup` runs 100 autocommit `SELECT * FROM
+bench_users WHERE id = N` queries (different N each call, same plan shape).
+
+```bash
+cargo run -p axiomdb-bench-comparison --release -- --scenario point_lookup --rows 10000
+```
+
+| Scenario | Pre-A23 | Post-A23 | Speedup |
+|---|---:|---:|---:|
+| `point_lookup` 100×SELECT | 5,572 ops/s | **11,753 ops/s** | **2.11×** |
+
+SQLite reference on same hardware: 66.7K ops/s (gap 12× → 5.6× after A23).
+
+Two micro-optimizations combine:
+
+1. **`epoch_plan_fast_path`** in `run_cached`: skips `CatalogReader::new` (18
+   meta-page reads) + `PlanDeps::is_stale` (1 HeapChain scan/dep-table) when
+   all dep-table epoch tags match `catalog_epoch`. The epoch counter only
+   advances on DDL — so a match guarantees plan validity in O(1).
+
+2. **`select_has_function_call` guard** in `rewrite_custom_aggregates_in_select`:
+   skips the second `CatalogReader::new` for plain `SELECT` queries that contain
+   no function calls. `point_lookup` queries have no function calls, so this
+   fires 100% of the time after the warm-up query.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Advantage — Zero Catalog I/O on Hot SELECT Paths</span>
+After A20+A23, a repeated <code>SELECT * FROM t WHERE pk = ?</code> pays only for: one parser pass, one literal extraction, one shape hash lookup, one O(1) epoch check, and the actual B-Tree descent. No CatalogReader objects, no HeapChain scans. This is structurally equivalent to SQLite's prepared-statement fast path.
+</div>
+</div>

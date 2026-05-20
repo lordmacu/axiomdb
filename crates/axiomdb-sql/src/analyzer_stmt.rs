@@ -1062,12 +1062,64 @@ fn on_behavior_contains_aggregate(behavior: &crate::expr::SqlJsonOnBehavior) -> 
     }
 }
 
+/// Returns `true` if any expression position in `stmt` contains a function call.
+/// Used as a cheap pre-check before creating a `CatalogReader` in
+/// `rewrite_custom_aggregates_in_select` — avoids the catalog read entirely for
+/// simple queries (SELECT *, point-lookup WHERE, no GROUP BY / HAVING).
+fn select_has_function_call(stmt: &SelectStmt) -> bool {
+    fn expr_has_fn(e: &Expr) -> bool {
+        match e {
+            Expr::Function { .. } | Expr::GroupConcat { .. } | Expr::ArrayAgg { .. } => true,
+            Expr::BinaryOp { left, right, .. } => expr_has_fn(left) || expr_has_fn(right),
+            Expr::UnaryOp { operand, .. }
+            | Expr::Collate { expr: operand, .. }
+            | Expr::IsNull { expr: operand, .. }
+            | Expr::IsBoolean { expr: operand, .. }
+            | Expr::Cast { expr: operand, .. } => expr_has_fn(operand),
+            Expr::Between { expr, low, high, .. } => {
+                expr_has_fn(expr) || expr_has_fn(low) || expr_has_fn(high)
+            }
+            Expr::Like { expr, pattern, escape, .. } => {
+                expr_has_fn(expr)
+                    || expr_has_fn(pattern)
+                    || escape.as_ref().is_some_and(|esc| expr_has_fn(esc))
+            }
+            Expr::In { expr, list, .. } => expr_has_fn(expr) || list.iter().any(expr_has_fn),
+            Expr::Case { operand, when_thens, else_result } => {
+                operand.as_ref().is_some_and(|o| expr_has_fn(o))
+                    || when_thens.iter().any(|(w, t)| expr_has_fn(w) || expr_has_fn(t))
+                    || else_result.as_ref().is_some_and(|er| expr_has_fn(er))
+            }
+            Expr::Row(elems) => elems.iter().any(expr_has_fn),
+            _ => false,
+        }
+    }
+
+    stmt.columns.iter().any(|c| {
+        if let crate::ast::SelectItem::Expr { expr, .. } = c {
+            expr_has_fn(expr)
+        } else {
+            false
+        }
+    }) || stmt.where_clause.as_ref().is_some_and(expr_has_fn)
+        || stmt.group_by.exprs().iter().any(expr_has_fn)
+        || stmt.having.as_ref().is_some_and(expr_has_fn)
+        || stmt.order_by.iter().any(|ob| expr_has_fn(&ob.expr))
+        || stmt.distinct_on.iter().any(expr_has_fn)
+}
+
 fn rewrite_custom_aggregates_in_select(
     stmt: &mut SelectStmt,
     storage: &dyn StorageEngine,
     snapshot: TransactionSnapshot,
     default_schema: &str,
 ) -> Result<(), DbError> {
+    // Fast bail: skip the catalog read entirely when the statement contains no
+    // function calls. For simple point-lookups (SELECT * WHERE pk = ?) this is
+    // always true, saving one CatalogReader::new (≈19 read_page calls).
+    if !select_has_function_call(stmt) {
+        return Ok(());
+    }
     let mut reader = CatalogReader::new(storage, snapshot)?;
 
     if let Some(expr) = stmt.where_clause.as_mut() {

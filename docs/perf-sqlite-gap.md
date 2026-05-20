@@ -1470,3 +1470,93 @@ to remove but not cleanly measurable in the current macOS bench
 - Shipping as a refactor + correctness improvement; not
   claiming a perf number until we can re-bench from a clean
   cold state.
+
+## Attack 23 — statement cache epoch fast path + select_has_function_call guard
+
+**Date**: 2026-05-20
+
+### Why
+
+After Attack 20, autocommit SELECT cache hits (`run_cached`) still
+paid per-hit overhead:
+
+1. **`CatalogReader::new`** (inside `rewrite_custom_aggregates_in_select`)
+   — reads 18 meta-page fields even for plain `SELECT * FROM t WHERE id=?`
+   that has no function calls.
+2. **`CatalogReader::new` + `PlanDeps::is_stale`** — on every cache hit,
+   opens a CatalogReader and calls `get_table_schema_version` (HeapChain
+   scan) per dep-table to verify the plan is still valid. For a 1-table
+   SELECT this is one full catalog scan per query.
+
+Both costs exist because the existing schema-validation mechanism
+(`PlanDeps.is_stale`) is catalog-bound. The `catalog_epoch` counter
+in `SessionContext` (already present from Phase 40 A.2 work) provides
+an O(1) shortcut: it increments only on DDL via `invalidate_all()`.
+If the per-table epoch tag in `table_epoch_cache` matches `catalog_epoch`,
+the table schema cannot have changed — the plan is valid.
+
+### Changes
+
+**`crates/axiomdb-sql/src/session.rs`**
+
+- New `epoch_plan_fast_path(hash) -> Option<(Stmt, usize)>`: takes
+  `&self`, checks all dep table IDs against `table_epoch_cache`, returns
+  the cloned analyzed stmt + param_count on a full match.
+- New `bump_cached_plan_lru(hash)`: bumps the LRU counter for the cached
+  plan without any catalog I/O.
+
+**`crates/axiomdb-sql/src/statement_cache.rs`**
+
+- `run_cached` now tries `session.epoch_plan_fast_path(hash)` before
+  creating `CatalogReader`. On epoch hit: validate param_count, bump LRU,
+  jump directly to execute — zero catalog I/O.
+- On epoch miss: existing slow path (CatalogReader + PlanDeps::is_stale).
+
+**`crates/axiomdb-sql/src/analyzer_stmt.rs`**
+
+- New `select_has_function_call(stmt) -> bool`: walks all projection
+  columns, WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT ON looking for
+  `Expr::Function`, `GroupConcat`, or `ArrayAgg`. Fully recursive across
+  all expression shapes.
+- `rewrite_custom_aggregates_in_select` returns early when
+  `!select_has_function_call(stmt)`, skipping `CatalogReader::new`
+  entirely. Plain `SELECT * FROM t WHERE id = ?` pays nothing.
+
+### Correctness argument
+
+The epoch fast path is correct because:
+- `catalog_epoch` is bumped **only** by DDL via `invalidate_all()`.
+- `table_epoch_cache[table_id]` is set to `catalog_epoch` each time
+  a table's schema is validated by `try_cached_with_version`.
+- If `table_epoch_cache[id] == catalog_epoch` for all dep tables, no DDL
+  has run since last validation → schema_versions in PlanDeps are still
+  correct → plan is valid.
+- Gated identically to the existing executor A.2 path:
+  `!in_explicit_txn` is NOT required here (the epoch only advances on
+  DDL, not on DML row changes), so it works inside explicit transactions
+  too, unlike the executor's `!in_explicit_txn` guard.
+
+### Results — Lima VM (AlmaLinux 10 / virtio-fs, 2026-05-20)
+
+| Scenario | Pre-A23 | Post-A23 (median) | Speedup |
+|---|---:|---:|---:|
+| `point_lookup` 100×SELECT | 5,572 ops/s | **11,753 ops/s** | **2.11×** |
+
+### Honest read
+
+- The Lima numbers are smaller than macOS native (A20 measured 14.5K on
+  APFS) due to virtio-fs overhead in the mmap layer. The relative gain
+  (2.1×) is the signal, not the absolute ops/s.
+- The fast path fires on every repeated `SELECT` shape where:
+  (a) the plan is in the cache, AND
+  (b) no DDL has run since the plan was last validated.
+  For read-heavy workloads this is nearly 100% of cache lookups.
+- `select_has_function_call` is a tree walk — O(n_nodes_in_AST), but
+  point-lookup ASTs have ≤ 10 nodes. For complex queries with window
+  functions the early-return fires in O(1) (first column is already
+  a function call).
+- INSERT/UPDATE/DELETE still not covered by the statement cache
+  (Attack 22 still deferred) — the epoch fast path alone doesn't
+  eliminate the DML regression because DML analyze is already cheap
+  and `is_stale` is net-negative there without a "DDL-only invalidation"
+  split.

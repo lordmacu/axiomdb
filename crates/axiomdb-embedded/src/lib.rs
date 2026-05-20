@@ -314,12 +314,10 @@ mod db {
             //   (b) Keep PlanDeps.is_stale → 17% slower on INSERT due to
             //       the per-dep catalog probe (analyze for INSERT is
             //       already cheap, so the probe is net-negative).
-            // The real fix needs (c) a per-table version sourced from
-            // the in-memory schema_cache, not the catalog heap; OR (d)
-            // a dedicated `invalidate_all_after_ddl` that bumps an
-            // epoch counter the statement cache reads cheaply. Deferred
-            // until a focused brainstorm — see docs/perf-sqlite-gap.md
-            // "Attack 22 — deferred".
+            // Attack 23 implemented option (d) for the SELECT path:
+            // run_cached now checks epoch_plan_fast_path first — if all
+            // dep table epochs are current, skips CatalogReader creation
+            // and PlanDeps::is_stale entirely (O(1) HashMap lookup).
             let result = if sql_starts_with_select_keyword(sql) {
                 axiomdb_sql::statement_cache::run_cached(
                     sql,

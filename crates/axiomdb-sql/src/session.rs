@@ -1636,6 +1636,42 @@ impl SessionContext {
             .insert(shape_hash, (plan, self.statement_lru_seq));
     }
 
+    /// A.2 epoch fast path for the statement cache.
+    ///
+    /// Returns `Some((analyzed_stmt, param_count))` when:
+    ///   - `hash` is in the cache, AND
+    ///   - every dep table has an epoch-current entry in `table_epoch_cache`.
+    ///
+    /// When both conditions hold, the plan's `schema_version` stamps are
+    /// guaranteed current — no catalog probe is needed. The caller must still
+    /// call `substitute_params` before executing.
+    ///
+    /// Returns `None` on cache miss or when any dep is epoch-stale.
+    pub fn epoch_plan_fast_path(&self, hash: u64) -> Option<(crate::ast::Stmt, usize)> {
+        let (plan, _) = self.statement_cache.get(&hash)?;
+        let epoch = self.catalog_epoch;
+        let all_current = plan.deps.tables.is_empty()
+            || plan
+                .deps
+                .tables
+                .iter()
+                .all(|&(id, _)| self.table_epoch_cache.get(&id).copied() == Some(epoch));
+        if all_current {
+            Some((plan.analyzed.clone(), plan.param_count))
+        } else {
+            None
+        }
+    }
+
+    /// Bumps the LRU sequence for a cached plan without re-validating deps.
+    /// Called on the epoch fast path where validation is skipped.
+    pub fn bump_cached_plan_lru(&mut self, shape_hash: u64) {
+        self.statement_lru_seq += 1;
+        if let Some((_, seq)) = self.statement_cache.get_mut(&shape_hash) {
+            *seq = self.statement_lru_seq;
+        }
+    }
+
     /// Diagnostic / test accessor for the statement cache size.
     pub fn statement_cache_count(&self) -> usize {
         self.statement_cache.len()

@@ -673,6 +673,41 @@ the prior Attack 2 wiring net-regressed them. Cumulative range_scan speedup
 vs original baseline: **8.3×** (4× from A18 zero-alloc × 2.1× from A20
 cache).
 
+### Statement Cache Epoch Fast Path (Attack 23)
+
+Attack 20 eliminated parse+analyze on cache hits, but each hit still paid
+for a `CatalogReader` object (18 meta-page reads) and `PlanDeps::is_stale`
+(one HeapChain scan per dep-table) to verify the plan wasn't invalidated
+by DDL. For a typical `SELECT ... WHERE pk = N` loop this was the dominant
+remaining cost.
+
+Two changes close this:
+
+- **`epoch_plan_fast_path`**: `SessionContext` already tracks a
+  `catalog_epoch` counter that increments only on DDL (`invalidate_all`).
+  On each cache lookup the statement cache checks whether all dep-table
+  epoch tags match `catalog_epoch`. On a match: skip `CatalogReader`
+  creation and `PlanDeps::is_stale` entirely — the plan is validated in
+  O(1) with zero catalog I/O.
+
+- **`select_has_function_call` guard**: `rewrite_custom_aggregates_in_select`
+  created a `CatalogReader` unconditionally to scan for custom aggregate
+  definitions. A fast AST walk detects that plain `SELECT * FROM t WHERE
+  pk = N` has no function calls at all, and the catalog scan is skipped.
+
+| Scenario | Pre-A23 | Post-A23 | Speedup |
+|---|---:|---:|---:|
+| `point_lookup` 100×SELECT | 5.6K ops/s | **11.8K ops/s** | **2.1×** |
+
+(Lima VM numbers; macOS APFS native expected to be higher as seen in A20.)
+
+<div class="callout-advantage">
+Both fast paths are correctness-preserving: the epoch only advances when
+schema state actually changes (DDL), so a matching epoch guarantees the
+cached plan is still valid. The gap vs SQLite's `point_lookup` (66.7K
+ops/s on same hardware) tightens from 12× to 5.6× after this attack.
+</div>
+
 ### Session COUNT(*) Cache (Attack 17b)
 
 The `SELECT COUNT(*) FROM t` fast path now consults a per-session cache

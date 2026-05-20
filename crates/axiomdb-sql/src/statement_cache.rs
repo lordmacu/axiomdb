@@ -443,8 +443,25 @@ pub fn run_cached(
     let extracted = extract_literals(&mut stmt);
     let hash = shape_hash(&stmt);
 
-    // Cache lookup with PlanDeps validation.
-    let analyzed = {
+    // A.2 epoch fast path: if all dep tables have epoch-current cached entries,
+    // the plan's schema_versions are guaranteed current — skip CatalogReader
+    // creation and PlanDeps::is_stale (which does a HeapChain scan per dep).
+    // Mirrors the epoch shortcut in resolve_table_cached / try_cached_with_version.
+    let analyzed = if let Some((plan_analyzed, param_count)) = session.epoch_plan_fast_path(hash) {
+        if extracted.len() != param_count {
+            return Err(DbError::Internal {
+                message: format!(
+                    "statement cache: literal count mismatch \
+                     (cached plan expects {} params, got {})",
+                    param_count,
+                    extracted.len()
+                ),
+            });
+        }
+        session.bump_cached_plan_lru(hash);
+        plan_analyzed
+    } else {
+        // Slow path: CatalogReader + PlanDeps::is_stale (one catalog probe per dep).
         let mut reader = CatalogReader::new(storage, snap.clone())?;
         match session.get_cached_plan(hash, &mut reader)? {
             Some(plan) => {
