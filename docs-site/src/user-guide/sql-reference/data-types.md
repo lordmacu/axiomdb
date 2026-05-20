@@ -163,7 +163,25 @@ CREATE TABLE users (
 );
 -- SELECT * FROM users WHERE email = 'ALICE@EXAMPLE.COM'
 -- matches rows where email = 'alice@example.com'
+-- Original case is preserved on read.
 ```
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">How CITEXT works (Phase 24.4)</span>
+<code>CITEXT</code> is parsed as <code>TEXT</code> with an implicit
+<code>utf8mb4_unicode_ci</code> collation. The collation does NFC
+normalization, Unicode-aware lowercase, and stripping of combining marks —
+so <code>'José'</code>, <code>'JOSE'</code>, and <code>'jose'</code> all
+compare equal. Storage preserves the original bytes verbatim.
+Explicit <code>COLLATE utf8mb4_bin</code> on a CITEXT column overrides the
+default and restores case-sensitive comparison. Locale-specific rules
+(Turkish dotless-i, German ß↔SS, language-aware sort) are not yet covered —
+a future <code>icu-collations</code> feature flag will add ICU-backed
+collations for those.
+</div>
+</div>
 
 ---
 

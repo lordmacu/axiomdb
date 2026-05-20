@@ -804,6 +804,19 @@ fn decimal_arith(op: BinaryOp, m1: i128, s1: u8, m2: i128, s2: u8) -> Result<Val
 // ── Comparison ────────────────────────────────────────────────────────────────
 
 fn eval_comparison(op: BinaryOp, l: Value, r: Value) -> Result<Value, DbError> {
+    // Text equality fast path — `compare_text` adds a raw-text tie-break
+    // on top of the canonical comparison so it can be used for ORDER BY
+    // (deterministic sort), but that tie-break makes case-equal strings
+    // like `"Alice"` and `"alice"` report `Less` under collations like
+    // `Es` (utf8mb4_unicode_ci) when their canonical forms match. For
+    // `=` / `<>` we want the canonical comparison alone — call `text_eq`
+    // directly, which doesn't tie-break.
+    if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+        if let (Value::Text(a), Value::Text(b)) = (&l, &r) {
+            let eq = crate::text_semantics::text_eq(current_eval_collation(), a, b);
+            return Ok(Value::Bool(if op == BinaryOp::Eq { eq } else { !eq }));
+        }
+    }
     let ord = compare_values(&l, &r)?;
     Ok(Value::Bool(match op {
         BinaryOp::Eq => ord == std::cmp::Ordering::Equal,

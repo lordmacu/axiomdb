@@ -574,9 +574,17 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         None
     };
 
-    let (data_type, type_len, is_char, declared_type_name, array_ndims, array_size_hints) =
+    let (data_type, type_len, is_char, declared_type_name, array_ndims, array_size_hints, citext) =
         if let Some(dt) = serial_type.clone() {
-            (dt, 0u16, false, None::<crate::ast::TableRef>, 0u8, vec![])
+            (
+                dt,
+                0u16,
+                false,
+                None::<crate::ast::TableRef>,
+                0u8,
+                vec![],
+                false,
+            )
         } else {
             parse_column_data_type(p)?
         };
@@ -689,6 +697,15 @@ fn parse_column_def(p: &mut Parser) -> Result<ColumnDef, DbError> {
         }
     }
 
+    // Phase 24.4: when the column was declared `CITEXT` and no
+    // explicit `COLLATE` clause overrode it, apply the default
+    // case-insensitive collation. The existing collation-aware
+    // equality path (post-`text_eq` fix in eval/ops.rs) then makes
+    // `WHERE col = 'value'` case-insensitive transparently.
+    if citext && collation.is_none() {
+        collation = Some(normalize_collation_name("utf8mb4_unicode_ci")?);
+    }
+
     Ok(ColumnDef {
         name,
         data_type,
@@ -717,6 +734,7 @@ fn parse_column_data_type(
         Option<crate::ast::TableRef>,
         u8,
         Vec<Option<u16>>,
+        bool, // Phase 24.4: parsed as CITEXT
     ),
     DbError,
 > {
@@ -728,11 +746,12 @@ fn parse_column_data_type(
             None,
             parsed.ndims,
             parsed.size_hints,
+            parsed.citext,
         )),
         Err(err) => {
             if is_custom_type_start(p.peek()) {
                 let type_name = p.parse_table_ref()?;
-                Ok((DataType::Text, 0, false, Some(type_name), 0, vec![]))
+                Ok((DataType::Text, 0, false, Some(type_name), 0, vec![], false))
             } else {
                 Err(err)
             }
@@ -1231,6 +1250,11 @@ pub(crate) struct ParsedDataType {
     pub is_char: bool,
     pub ndims: u8,
     pub size_hints: Vec<Option<u16>>,
+    /// Phase 24.4: set when the column was declared `CITEXT`. The
+    /// column-def builder consumes this and applies the
+    /// `utf8mb4_unicode_ci` default collation when no explicit
+    /// `COLLATE` was given.
+    pub citext: bool,
 }
 
 /// Parses a SQL data type keyword, returning `(DataType, type_len, is_char, ndims, size_hints)`.
@@ -1241,6 +1265,8 @@ pub(crate) struct ParsedDataType {
 /// `size_hints` has one entry per dimension with `None` for unbounded.
 pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError> {
     let pos = p.current_pos();
+    // Phase 24.4: snapshot CITEXT BEFORE the match consumes the token.
+    let citext = matches!(p.peek(), Token::TyCitext);
     let (data_type, type_len, is_char) = match p.peek().clone() {
         Token::TyInt | Token::TyInteger => {
             p.advance();
@@ -1282,6 +1308,13 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
             (DataType::Bool, 0, false)
         }
         Token::TyText => {
+            p.advance();
+            (DataType::Text, 0, false)
+        }
+        Token::TyCitext => {
+            // Phase 24.4: CITEXT — same storage as TEXT, equality goes
+            // through the implicit `utf8mb4_unicode_ci` collation that
+            // `parse_column_def` applies to the resulting ColumnDef.
             p.advance();
             (DataType::Text, 0, false)
         }
@@ -1429,6 +1462,7 @@ pub(crate) fn parse_data_type(p: &mut Parser) -> Result<ParsedDataType, DbError>
         is_char,
         ndims,
         size_hints,
+        citext,
     })
 }
 
