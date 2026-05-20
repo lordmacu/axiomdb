@@ -176,10 +176,52 @@ normalization, Unicode-aware lowercase, and stripping of combining marks —
 so <code>'José'</code>, <code>'JOSE'</code>, and <code>'jose'</code> all
 compare equal. Storage preserves the original bytes verbatim.
 Explicit <code>COLLATE utf8mb4_bin</code> on a CITEXT column overrides the
-default and restores case-sensitive comparison. Locale-specific rules
-(Turkish dotless-i, German ß↔SS, language-aware sort) are not yet covered —
-a future <code>icu-collations</code> feature flag will add ICU-backed
-collations for those.
+default and restores case-sensitive comparison.
+</div>
+</div>
+
+### Locale-aware collations (opt-in, Phase 24.4b)
+
+For locale-specific rules — Turkish dotless-i, German ß↔SS, Swedish
+`å`/`ä`/`ö` at end of alphabet, etc. — enable the
+<code>icu-collations</code> Cargo feature. AxiomDB then routes equality and
+ordering through <a href="https://icu4x.unicode.org/">ICU4X</a> at Primary
+strength (case + accent insensitive, locale-tailored).
+
+```toml
+[dependencies]
+axiomdb-embedded = { version = "1", features = ["icu-collations"] }
+```
+
+Supported locales: Turkish (`utf8mb4_tr_0900_ai_ci`), German (`_de_`),
+Spanish (`_es_`), Swedish (`_sv_`), French (`_fr_`), Czech (`_cs_`),
+Polish (`_pl_`), Unicode root (`utf8mb4_und_0900_ai_ci`). Either the
+MySQL form or the BCP-47 shorthand (`tr-icu`, `de-icu`, etc.) works.
+
+```sql
+-- German collation: 'Straße' = 'Strasse' (DIN 5007-1)
+CREATE TABLE addresses (
+    street TEXT COLLATE utf8mb4_de_0900_ai_ci
+);
+
+-- Swedish sort: å sorts after z
+CREATE TABLE cities (
+    name TEXT COLLATE utf8mb4_sv_0900_ai_ci
+);
+SELECT name FROM cities ORDER BY name;
+-- ..., 'Stockholm', 'Uppsala', 'Visby', 'Åmål', 'Örebro'
+```
+
+<div class="callout callout-tip">
+<span class="callout-icon">💡</span>
+<div class="callout-body">
+<span class="callout-label">Binary size trade-off</span>
+The <code>icu-collations</code> feature adds ~1.2 MB to the embedded
+binary (the bundled CLDR data tables — covers ~140 world locales, of which
+AxiomDB exposes 8). Default builds stay at ~8 MB. When the feature is
+disabled the <code>Icu(...)</code> variant still parses but falls back to
+the generic <code>utf8mb4_unicode_ci</code> semantics — case-insensitive
+without locale tailoring.
 </div>
 </div>
 

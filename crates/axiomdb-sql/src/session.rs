@@ -154,6 +154,65 @@ pub enum SessionCollation {
     /// CI+AI fold: NFC + lowercase + strip combining marks.
     /// `Jose`, `JOSE`, `José` compare equal.
     Es,
+    /// Phase 24.4b: ICU4X locale-aware collation. Selects from a small
+    /// curated set of locales that the embedded library bakes in. Cost:
+    /// ~500 KB-1 MB of UCD data added to the binary; only present when
+    /// the `icu-collations` Cargo feature is enabled (the variant exists
+    /// regardless so the `SessionCollation` size stays stable across
+    /// feature combinations, but `text_eq`/`compare_text` fall back to
+    /// the `Es` algorithm when the feature is off).
+    Icu(IcuLocale),
+}
+
+/// Phase 24.4b: small enum of locales the ICU-backed collator path
+/// supports. Each variant maps to a BCP-47 locale tag at runtime in
+/// `text_semantics.rs`. The set is curated rather than open-ended so
+/// that the binary doesn't have to bake every CLDR locale — adding a
+/// new one is a one-line change + a data-cost decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcuLocale {
+    /// Turkish — handles dotless `i` ↔ `I`, dotted `İ` ↔ `i`.
+    /// MySQL alias: `utf8mb4_tr_0900_ai_ci`.
+    Turkish,
+    /// German — handles `ß` ↔ `SS` per DIN 5007-1.
+    /// MySQL alias: `utf8mb4_de_0900_ai_ci`.
+    German,
+    /// Spanish — `ñ` between `n` and `o` in sort order.
+    /// MySQL alias: `utf8mb4_es_0900_ai_ci`.
+    Spanish,
+    /// Swedish — `å`, `ä`, `ö` sort at the end of the alphabet.
+    /// MySQL alias: `utf8mb4_sv_0900_ai_ci`.
+    Swedish,
+    /// French — accent-sensitive comparison from the end of the word.
+    /// MySQL alias: `utf8mb4_fr_0900_ai_ci`.
+    French,
+    /// Czech — `č`, `š`, `ž` etc. sort as separate letters.
+    /// MySQL alias: `utf8mb4_cs_0900_ai_ci`.
+    Czech,
+    /// Polish — Polish letters `ą`, `ć`, etc. sort distinctly.
+    /// MySQL alias: `utf8mb4_pl_0900_ai_ci`.
+    Polish,
+    /// Generic Unicode CI+AI (Primary strength, no locale tailoring).
+    /// MySQL alias: `utf8mb4_0900_ai_ci`. Used when the user wants
+    /// locale-aware behaviour but doesn't specify a language.
+    UnicodeCi,
+}
+
+impl IcuLocale {
+    /// Returns the BCP-47 locale tag the ICU4X collator constructs from.
+    /// Empty string for `UnicodeCi` (root locale).
+    pub fn bcp47(self) -> &'static str {
+        match self {
+            Self::Turkish => "tr",
+            Self::German => "de",
+            Self::Spanish => "es",
+            Self::Swedish => "sv",
+            Self::French => "fr",
+            Self::Czech => "cs",
+            Self::Polish => "pl",
+            Self::UnicodeCi => "und",
+        }
+    }
 }
 
 /// Parses a `SET collation = ...` value.
@@ -164,12 +223,41 @@ pub fn parse_session_collation_setting(raw: &str) -> Result<Option<SessionCollat
     if s.eq_ignore_ascii_case("default") {
         return Ok(None);
     }
-    match normalize_collation_name(s)?.as_str() {
+    let normalized = normalize_collation_name(s)?;
+    match normalized.as_str() {
         "binary" => Ok(Some(SessionCollation::Binary)),
         "es" => Ok(Some(SessionCollation::Es)),
         "default" => Ok(None),
+        // Phase 24.4b: ICU locale-aware collations. The normalizer maps
+        // both MySQL aliases (`utf8mb4_tr_0900_ai_ci`) and BCP-47-style
+        // names (`tr-icu`) to the canonical `icu_tr` / `icu_de` / etc.
+        // form. Parsing succeeds whether or not the `icu-collations`
+        // feature is compiled in — the runtime `text_eq`/`compare_text`
+        // implementations decide whether to use ICU or fall back to the
+        // `Es` algorithm.
+        other if other.starts_with("icu_") => {
+            let tag = &other[4..];
+            let locale = match tag {
+                "tr" => IcuLocale::Turkish,
+                "de" => IcuLocale::German,
+                "es" => IcuLocale::Spanish,
+                "sv" => IcuLocale::Swedish,
+                "fr" => IcuLocale::French,
+                "cs" => IcuLocale::Czech,
+                "pl" => IcuLocale::Polish,
+                "und" => IcuLocale::UnicodeCi,
+                _ => {
+                    return Err(DbError::InvalidValue {
+                        reason: format!(
+                            "unsupported ICU locale '{tag}'; expected tr | de | es | sv | fr | cs | pl | und"
+                        ),
+                    });
+                }
+            };
+            Ok(Some(SessionCollation::Icu(locale)))
+        }
         _ => Err(DbError::InvalidValue {
-            reason: format!("invalid collation value '{raw}'; expected binary | es | DEFAULT"),
+            reason: format!("invalid collation value '{raw}'; expected binary | es | utf8mb4_*_ai_ci | DEFAULT"),
         }),
     }
 }
@@ -194,9 +282,24 @@ pub fn normalize_collation_name(raw: &str) -> Result<String, DbError> {
         "es" | "utf8mb4_0900_ai_ci" | "utf8mb4_general_ci" | "utf8mb4_unicode_ci" => {
             Ok("es".into())
         }
+        // Phase 24.4b: ICU locale aliases. The MySQL form is
+        // `utf8mb4_<lang>_0900_ai_ci` (libmysqlclient adds the
+        // language-specific tailoring on top of the 0900 collation
+        // root); we accept both the MySQL form and the BCP-47 shorthand
+        // (`tr-icu`, `de-icu`, etc.) for portability. The canonical
+        // form `icu_<lang>` is also accepted as input so round-tripping
+        // works (read collation from catalog → re-parse).
+        "utf8mb4_tr_0900_ai_ci" | "tr-icu" | "icu_tr" => Ok("icu_tr".into()),
+        "utf8mb4_de_0900_ai_ci" | "de-icu" | "icu_de" => Ok("icu_de".into()),
+        "utf8mb4_es_0900_ai_ci" | "es-icu" | "icu_es" => Ok("icu_es".into()),
+        "utf8mb4_sv_0900_ai_ci" | "sv-icu" | "icu_sv" => Ok("icu_sv".into()),
+        "utf8mb4_fr_0900_ai_ci" | "fr-icu" | "icu_fr" => Ok("icu_fr".into()),
+        "utf8mb4_cs_0900_ai_ci" | "cs-icu" | "icu_cs" => Ok("icu_cs".into()),
+        "utf8mb4_pl_0900_ai_ci" | "pl-icu" | "icu_pl" => Ok("icu_pl".into()),
+        "utf8mb4_und_0900_ai_ci" | "und-icu" | "icu_und" => Ok("icu_und".into()),
         _ => Err(DbError::InvalidValue {
             reason: format!(
-                "invalid collation value '{raw}'; expected binary | es or a supported alias"
+                "invalid collation value '{raw}'; expected binary | es | utf8mb4_<lang>_0900_ai_ci | <lang>-icu"
             ),
         }),
     }
@@ -206,6 +309,13 @@ pub fn session_collation_from_name(raw: &str) -> Result<SessionCollation, DbErro
     match normalize_collation_name(raw)?.as_str() {
         "binary" => Ok(SessionCollation::Binary),
         "es" => Ok(SessionCollation::Es),
+        // Phase 24.4b: forward ICU canonical names to the locale parser.
+        other if other.starts_with("icu_") => {
+            // Reuse parse_session_collation_setting's locale match.
+            parse_session_collation_setting(other)?.ok_or_else(|| DbError::InvalidValue {
+                reason: format!("invalid ICU collation '{raw}'"),
+            })
+        }
         _ => Err(DbError::InvalidValue {
             reason: format!("invalid collation value '{raw}'"),
         }),
@@ -217,6 +327,14 @@ pub fn session_collation_name(c: SessionCollation) -> &'static str {
     match c {
         SessionCollation::Binary => "binary",
         SessionCollation::Es => "es",
+        SessionCollation::Icu(IcuLocale::Turkish) => "icu_tr",
+        SessionCollation::Icu(IcuLocale::German) => "icu_de",
+        SessionCollation::Icu(IcuLocale::Spanish) => "icu_es",
+        SessionCollation::Icu(IcuLocale::Swedish) => "icu_sv",
+        SessionCollation::Icu(IcuLocale::French) => "icu_fr",
+        SessionCollation::Icu(IcuLocale::Czech) => "icu_cs",
+        SessionCollation::Icu(IcuLocale::Polish) => "icu_pl",
+        SessionCollation::Icu(IcuLocale::UnicodeCi) => "icu_und",
     }
 }
 
