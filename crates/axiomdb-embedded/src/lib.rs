@@ -320,30 +320,48 @@ mod db {
             // epoch counter the statement cache reads cheaply. Deferred
             // until a focused brainstorm — see docs/perf-sqlite-gap.md
             // "Attack 22 — deferred".
-            if sql_starts_with_select_keyword(sql) {
-                return axiomdb_sql::statement_cache::run_cached(
+            let result = if sql_starts_with_select_keyword(sql) {
+                axiomdb_sql::statement_cache::run_cached(
                     sql,
                     &self.storage,
                     &self.txn,
                     &self.bloom,
                     &mut self.schema_cache,
                     &mut self.session,
+                )
+            } else {
+                let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
+                let snap = if let Some(ref ct) = self.session.conn_txn {
+                    self.txn.active_snapshot(ct)
+                } else {
+                    self.txn.snapshot()
+                };
+                let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
+                execute_with_ctx(
+                    analyzed,
+                    &self.storage,
+                    &self.txn,
+                    &self.bloom,
+                    &mut self.session,
+                )
+            };
+
+            // Phase 19.1: inline auto-vacuum after a successful autocommit
+            // query. Skipped inside explicit txns and in degraded mode
+            // (the helper guards both). Errors are logged inside the
+            // helper, never propagated — the user's already-successful
+            // query result must not be turned into a failure by background
+            // maintenance.
+            if result.is_ok() && !self.degraded {
+                axiomdb_sql::vacuum::auto_vacuum_if_needed(
+                    &self.storage,
+                    &self.txn,
+                    &self.bloom,
+                    &mut self.session,
                 );
             }
-            let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
-            let snap = if let Some(ref ct) = self.session.conn_txn {
-                self.txn.active_snapshot(ct)
-            } else {
-                self.txn.snapshot()
-            };
-            let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
-            execute_with_ctx(
-                analyzed,
-                &self.storage,
-                &self.txn,
-                &self.bloom,
-                &mut self.session,
-            )
+
+            result
         }
 
         /// Returns the last error message, or `None` if the last operation succeeded.

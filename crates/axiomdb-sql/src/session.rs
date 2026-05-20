@@ -539,6 +539,20 @@ impl StaleStatsTracker {
         self.changes.get(&table_id).copied().unwrap_or(0)
     }
 
+    /// Phase 19.1: after a successful auto-vacuum the change counter
+    /// for that table is reset so the next 1000 (configurable)
+    /// changes trigger the next vacuum.
+    pub fn reset_changes_for(&mut self, table_id: u32) {
+        self.changes.remove(&table_id);
+        self.stale.remove(&table_id);
+    }
+
+    /// Phase 19.1: enumerate every (table_id, change_count) pair so the
+    /// auto-vacuum hook can decide which tables to vacuum.
+    pub fn changes_iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.changes.iter().map(|(&id, &n)| (id, n))
+    }
+
     /// Records multiple row changes at once (e.g. after batch DELETE).
     pub fn on_rows_changed(&mut self, table_id: u32, count: u64) {
         *self.changes.entry(table_id).or_insert(0) += count;
@@ -789,6 +803,24 @@ pub struct SessionContext {
     /// callers don't have to touch this cache; correctness falls
     /// out of the comparison on lookup.
     count_star_cache: HashMap<u32, (u64, u64, u64)>,
+    /// Phase 19.1: auto-vacuum config. When `auto_vacuum_enabled` is
+    /// `true` (default), every successful autocommit query that
+    /// touches any table is followed by an auto-vacuum check —
+    /// tables whose accumulated `stats.changes_for` count exceeds
+    /// `auto_vacuum_threshold` get inline-vacuumed before the next
+    /// query.
+    ///
+    /// Configurable via:
+    /// - `SET autovacuum = ON|OFF`
+    /// - `SET autovacuum_vacuum_threshold = N`
+    ///
+    /// Skipped inside explicit BEGIN..ROLLBACK/COMMIT — would cross
+    /// transaction boundaries. Skipped in degraded (read-only) mode.
+    pub auto_vacuum_enabled: bool,
+    /// Phase 19.1: per-session threshold (default 1000 changes).
+    /// PostgreSQL uses 50 + 0.2 * row_count; we keep it simple and
+    /// global until we have ALTER TABLE SET (per-table) in 19.x.
+    pub auto_vacuum_threshold: u64,
     /// Staleness tracker for per-column statistics (Phase 6.11).
     pub stats: StaleStatsTracker,
     /// Whether the connection is in autocommit mode (MySQL default: `true`).
@@ -956,6 +988,8 @@ impl SessionContext {
             statement_lru_seq: 0,
             clustered_leaf_hint: None,
             count_star_cache: HashMap::new(),
+            auto_vacuum_enabled: true,
+            auto_vacuum_threshold: 1000,
             autocommit: true,
             strict_mode: true,
             ansi_quotes: false,

@@ -508,3 +508,67 @@ client, autocommit throughput is still limited by one durable fsync per visible
 statement response.
 </div>
 </div>
+
+## Auto-vacuum (Phase 19.1)
+
+For embedded workloads where the process runs for hours or days, dead
+MVCC tuples from `DELETE` / `UPDATE` would accumulate without manual
+intervention. Phase 19.1 introduces **inline-at-commit auto-vacuum**:
+after every successful autocommit query, the embedded `Db` checks each
+table that received writes during this session and runs `VACUUM` on any
+whose accumulated change count crosses a threshold.
+
+```sql
+-- Defaults (no action required):
+--   autovacuum = ON
+--   autovacuum_vacuum_threshold = 1000  (changes per table)
+
+-- Tune for write-heavy tables:
+SET autovacuum_vacuum_threshold = 100;
+
+-- Disable for latency-sensitive paths (you can still run VACUUM manually):
+SET autovacuum = OFF;
+```
+
+### How it works
+
+- Triggered at the end of `Db::run`/`Db::query` after a successful
+  autocommit query.
+- Iterates the per-session change counter (already maintained by every
+  `INSERT`/`UPDATE`/`DELETE`).
+- For each user table whose count meets or exceeds the threshold:
+  opens a fresh short-lived transaction, runs `vacuum_one_table`,
+  commits, and resets that table's counter.
+- Errors are logged via `eprintln!` and **never propagate** — the
+  user's already-successful query result is not turned into a failure
+  by background maintenance.
+
+### Skipped when
+
+- Inside an explicit `BEGIN..COMMIT` (would cross transaction
+  boundaries — auto-vacuum needs its own snapshot).
+- The DB is in degraded read-only mode (after a `DiskFull` error).
+- `SET autovacuum = OFF`.
+- The threshold is `u64::MAX` (effectively disabled).
+
+### Inline vs background
+
+This is the SQLite-style design: auto-vacuum runs **on the same thread**
+as the user's query, after that query commits. There is no background
+Tokio task — embedded callers don't need an async runtime just to keep
+their database clean. A future Phase 19.1b will add an optional
+background variant for the wire-server path where multiple sessions
+share the same DB.
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Design — inline at commit, like SQLite</span>
+PostgreSQL runs auto-vacuum from a dedicated background process
+(`autovacuum_launcher`). SQLite runs <code>PRAGMA auto_vacuum</code>
+inline at commit time — no background thread, no IPC. For an embedded
+library this is the right trade: no extra runtime, no API change, no
+concurrency bugs. Long-running deletes will see one occasional vacuum
+latency spike, which is far better than unbounded file growth.
+</div>
+</div>
