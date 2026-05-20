@@ -172,7 +172,7 @@ pub fn execute_read_only_with_ctx(
                     };
                     let mut row = vec![
                         Value::Text(c.name.clone()),
-                        Value::Text(type_str.into()),
+                        Value::Text(type_str),
                         Value::Text(null_str.into()),
                         Value::Text("".into()),
                         Value::Null,

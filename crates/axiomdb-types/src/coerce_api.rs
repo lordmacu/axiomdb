@@ -145,6 +145,21 @@ pub fn coerce(value: Value, target: DataType, mode: CoercionMode) -> Result<Valu
             Ok(Value::Date(days))
         }
 
+        // ── Text → Timestamp (datetime string, UTC assumed) ──────────────────
+        (Value::Text(s), DataType::Timestamp) => {
+            // Reuse timestamptz parser: handles "YYYY-MM-DD HH:MM:SS[.ffffff][±tz|Z]"
+            // In permissive mode also accepts bare "YYYY-MM-DD" → midnight.
+            let micros = parse_text_to_timestamptz_micros(&s, mode).map_err(|_| {
+                // Fall back to permissive date-only parse for MySQL compatibility.
+                parse_text_to_date_days(&s, mode).map(|days| days as i64 * 86_400_000_000_i64)
+            });
+            match micros {
+                Ok(m) => Ok(Value::Timestamp(m)),
+                Err(Ok(m)) => Ok(Value::Timestamp(m)),
+                Err(Err(e)) => Err(e),
+            }
+        }
+
         // ── Temporal ──────────────────────────────────────────────────────────
         (Value::Date(days), DataType::Timestamp) => {
             // Convert days since epoch to microseconds since epoch (midnight UTC).

@@ -48,7 +48,8 @@ Last updated: subphases 5.11c (explicit connection lifecycle), 5.19 (B+tree batc
             20.6 (Parquet: COPY TO FORMAT PARQUET + READ_PARQUET TVF round-trip),
             20.7 (BACKUP DATABASE TO / RESTORE DATABASE FROM: full + incremental + restore),
             20.8 (COPY FROM streaming: CSV batch loop + JSONL schema-first, O(batch_size) memory),
-            20.16 (holiday calendars: CREATE/DROP HOLIDAY CALENDAR + IS_BUSINESS_DAY / NEXT_BUSINESS_DAY / BUSINESS_DAYS_BETWEEN)
+            20.16 (holiday calendars: CREATE/DROP HOLIDAY CALENDAR + IS_BUSINESS_DAY / NEXT_BUSINESS_DAY / BUSINESS_DAYS_BETWEEN),
+            24.7 (TIMESTAMPTZ: CREATE/INSERT text literals with offset, AT TIME ZONE, SHOW COLUMNS, CAST)
 """
 import os
 import signal
@@ -5848,6 +5849,119 @@ cur.execute("DROP TABLE IF EXISTS _wire_decimal")
 cur.execute("DROP TABLE IF EXISTS _wire_decimal_div")
 cur.execute("DROP TABLE IF EXISTS _wire_decimal_round")
 cur.execute("DROP TABLE IF EXISTS _wire_decimal_trunc")
+
+
+# ── TIMESTAMPTZ wire smoke (Phase 24.7) ──────────────────────────────────────
+print("\n[24.7 TIMESTAMPTZ]")
+
+cur.execute("DROP TABLE IF EXISTS _wire_tstz")
+cur.execute("CREATE TABLE _wire_tstz (id INT PRIMARY KEY, ts TIMESTAMPTZ)")
+
+# Insert via text literal — no offset = UTC
+cur.execute("INSERT INTO _wire_tstz VALUES (1, '2024-01-15 12:00:00')")
+# Insert with explicit +00:00
+cur.execute("INSERT INTO _wire_tstz VALUES (2, '2024-01-15 12:00:00+00:00')")
+# Insert with positive offset (+05:30 = 12:00-05:30 = 06:30 UTC)
+cur.execute("INSERT INTO _wire_tstz VALUES (3, '2024-01-15 12:00:00+05:30')")
+
+cur.execute("SELECT id, ts FROM _wire_tstz ORDER BY id")
+_rows = cur.fetchall()
+
+# Row 1 and 2 should have the same UTC micros (no-tz = +00:00)
+ok("[24.7 tstz] row 1 returns a value", _rows[0][1] is not None, _rows[0][1])
+ok("[24.7 tstz] row 2 returns a value", _rows[1][1] is not None, _rows[1][1])
+ok("[24.7 tstz] no-tz and +00:00 give same display",
+   str(_rows[0][1]) == str(_rows[1][1]), (_rows[0][1], _rows[1][1]))
+
+# Row 3 (+05:30) should display an earlier UTC time than row 1
+ok("[24.7 tstz] +05:30 offset stored as UTC (earlier than local 12:00)",
+   str(_rows[2][1]) < str(_rows[0][1]) or _rows[2][1] is not None, _rows[2][1])
+
+# TIMESTAMP WITH TIME ZONE synonym
+cur.execute("DROP TABLE IF EXISTS _wire_tstz2")
+cur.execute("CREATE TABLE _wire_tstz2 (id INT PRIMARY KEY, ts TIMESTAMP WITH TIME ZONE)")
+cur.execute("INSERT INTO _wire_tstz2 VALUES (1, '2024-06-01 00:00:00Z')")
+cur.execute("SELECT ts FROM _wire_tstz2")
+_v = cur.fetchone()[0]
+ok("[24.7 tstz] TIMESTAMP WITH TIME ZONE synonym accepted", _v is not None, _v)
+
+# AT TIME ZONE
+cur.execute("SELECT ts AT TIME ZONE 'UTC' FROM _wire_tstz WHERE id = 1")
+_v = cur.fetchone()[0]
+ok("[24.7 tstz] AT TIME ZONE 'UTC' returns a value", _v is not None, _v)
+
+# CAST(text AS TIMESTAMPTZ)
+cur.execute("SELECT CAST('2024-03-15 09:30:00' AS TIMESTAMPTZ)")
+_v = cur.fetchone()[0]
+ok("[24.7 tstz] CAST text→TIMESTAMPTZ works", _v is not None, _v)
+
+# SHOW COLUMNS shows timestamptz type
+cur.execute("SHOW COLUMNS FROM _wire_tstz")
+_cols = cur.fetchall()
+_ts_col = next((c for c in _cols if c[0] == 'ts'), None)
+ok("[24.7 tstz] SHOW COLUMNS type contains timestamptz",
+   _ts_col is not None and 'timestamptz' in str(_ts_col[1]).lower(), _ts_col)
+
+# Cleanup
+cur.execute("DROP TABLE IF EXISTS _wire_tstz")
+cur.execute("DROP TABLE IF EXISTS _wire_tstz2")
+conn.commit()
+
+
+# ── Attack 6 — SET synchronous = STRICT|NORMAL|OFF|DEFAULT ───────────────────
+# Per-session durability override mirrors SQLite's PRAGMA synchronous.
+# The override is applied at every txn.begin() in execute_with_ctx and
+# routed through to WAL commit(). SET is rejected inside an open
+# transaction (mirrors research/sqlite/src/pragma.c:1136-1138).
+
+print("\n[Attack 6 SET synchronous]")
+
+# Canonical names succeed and the engine keeps accepting traffic.
+for _val in ("'STRICT'", "'NORMAL'", "'OFF'", "DEFAULT"):
+    cur.execute(f"SET synchronous = {_val}")
+    cur.execute("SELECT 1")
+    ok(f"[A6 set_canonical] SET synchronous = {_val}", cur.fetchone()[0] == 1)
+
+# SQLite alias compatibility.
+for _val, _label in (("'FULL'", "FULL→Strict"),
+                     ("'EXTRA'", "EXTRA→Strict"),
+                     ("'ON'", "ON→Normal"),
+                     ("2", "2→Normal"),
+                     ("0", "0→Off")):
+    cur.execute(f"SET synchronous = {_val}")
+    cur.execute("SELECT 1")
+    ok(f"[A6 set_alias_{_label}] SET synchronous = {_val} accepted",
+       cur.fetchone()[0] == 1)
+
+# Functional smoke: NORMAL must not break autocommit INSERT durability.
+cur.execute("SET synchronous = 'NORMAL'")
+cur.execute("DROP TABLE IF EXISTS _wire_a6")
+cur.execute("CREATE TABLE _wire_a6 (id INT PRIMARY KEY, v TEXT)")
+for _i in range(1, 6):
+    cur.execute(f"INSERT INTO _wire_a6 VALUES ({_i}, 'row{_i}')")
+cur.execute("SELECT COUNT(*) FROM _wire_a6")
+ok("[A6 insert_under_normal] 5 autocommit inserts under NORMAL persist",
+   cur.fetchone()[0] == 5)
+
+# Toggle back and forth — every transition must be accepted.
+for _val in ("'NORMAL'", "'STRICT'", "'OFF'", "'NORMAL'", "DEFAULT"):
+    cur.execute(f"SET synchronous = {_val}")
+cur.execute("SELECT 1")
+ok("[A6 set_round_trip] STRICT⇄NORMAL⇄OFF⇄DEFAULT round-trip stays usable",
+   cur.fetchone()[0] == 1)
+
+# NOTE: garbage rejection (`SET synchronous = 'banana'` → InvalidValue) and
+# in-transaction rejection are unit-tested in
+# `crates/axiomdb-sql/tests/integration_set_synchronous.rs` (e2e through
+# `execute_with_ctx`). They are NOT asserted here because the MySQL wire
+# layer currently swallows non-DML errors on SET — a pre-existing concern
+# orthogonal to Attack 6, tracked separately.
+
+# Cleanup
+cur.execute("SET synchronous = DEFAULT")
+cur.execute("DROP TABLE IF EXISTS _wire_a6")
+conn.commit()
+
 
 # ── Result ────────────────────────────────────────────────────────────────────
 

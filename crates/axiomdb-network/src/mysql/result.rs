@@ -246,6 +246,7 @@ fn encode_binary_cell(
         (DataType::Bytes, Value::Bytes(b)) => write_lenenc_str(buf, b), // raw bytes, no transcoding
         (DataType::Date, Value::Date(days)) => encode_binary_date(buf, *days),
         (DataType::Timestamp, Value::Timestamp(ts)) => encode_binary_timestamp(buf, *ts),
+        (DataType::TimestampTz, Value::TimestampTz(ts)) => encode_binary_timestamp(buf, *ts),
         (DataType::Uuid, Value::Uuid(u)) => {
             let s_text = format_uuid(u);
             let encoded = charset::encode_text(results_collation.charset, &s_text)?;
