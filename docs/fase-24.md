@@ -254,6 +254,150 @@ Wire smoke: 11 assertions in `tools/wire-test.py` under `[24.3 decimal]`.
 
 ---
 
+## 24.7 — TIMESTAMPTZ (2026-05-20)
+
+### Problem
+
+AxiomDB had no way to store or query timestamps with timezone awareness.
+The existing `Timestamp` type (no-tz) stored wall-clock time with no UTC
+normalization, making it impossible to compare timestamps from different
+timezones without manual arithmetic.
+
+### Solution
+
+#### New type variants
+
+`DataType::TimestampTz` added to `axiomdb-types/src/types.rs`.
+`Value::TimestampTz(i64)` added to `axiomdb-types/src/value.rs` — the i64
+stores **microseconds since Unix epoch, always UTC**. No timezone info is stored;
+normalization happens at insert time.
+
+`ColumnType::TimestampTz = 22` added to both `axiomdb-catalog/src/schema_database.rs`
+and the local copy in `axiomdb-types/src/array_codec.rs`.
+
+#### Parser
+
+`crates/axiomdb-sql/src/parser/ddl.rs`:
+- `Token::TyTimestamp` arm checks for `WITH TIME ZONE` continuation → `DataType::TimestampTz`
+- `Token::Ident(s) if s.eq_ignore_ascii_case("TIMESTAMPTZ")` → `DataType::TimestampTz`
+
+Both `TIMESTAMPTZ` and `TIMESTAMP WITH TIME ZONE` are recognized.
+
+#### Codec
+
+`crates/axiomdb-types/src/codec.rs`:
+- `encode_row`: `Value::TimestampTz(t)` shares the 8-byte LE arm with `Value::Timestamp(t)`
+- `decode_row`: `DataType::TimestampTz` arm reads 8 bytes → `Value::TimestampTz`
+
+#### Text parsing
+
+`parse_text_to_timestamptz_micros()` in `coerce_helpers.rs` — pure arithmetic
+parser (no `chrono` dependency) that handles:
+- `YYYY-MM-DD HH:MM:SS[.ffffff]` — bare datetime, assumed UTC
+- `YYYY-MM-DD HH:MM:SS[.ffffff][±HH:MM]` — UTC offset applied at parse time
+- `YYYY-MM-DD HH:MM:SS[.ffffff]Z` — explicit UTC
+
+All offsets are normalized out; what is stored is always UTC µs.
+
+#### Coercions
+
+`crates/axiomdb-types/src/coerce_api.rs`:
+- `Text → TimestampTz` — parse via `parse_text_to_timestamptz_micros`
+- `Text → Timestamp` — same parser, strips tz offset, returns wall-clock
+- `Timestamp → TimestampTz` — reinterprets as UTC (identity on bits)
+- `TimestampTz → Timestamp` — drops tz assumption (identity on bits)
+- `Date → TimestampTz` — midnight UTC of that date
+
+#### AT TIME ZONE
+
+Parsed in `src/parser/expr.rs` as a postfix operator; lowered to internal
+function `__at_time_zone(expr, tz_string)` at parse time (no new AST node).
+
+`crates/axiomdb-sql/src/eval/functions/datetime.rs`:
+- Validates `tz_string` is `"UTC"`, `"+00:00"`, or `"Z"`
+- Returns `Value::TimestampTz(t)` unchanged (UTC stub)
+- Non-UTC zones produce `DbError::Unsupported` (full tz DB deferred)
+
+#### Comparison
+
+`crates/axiomdb-sql/src/eval/ops.rs`:
+- `TimestampTz ↔ TimestampTz` — direct i64 comparison
+- `Timestamp ↔ TimestampTz` — cross-type (reinterpret bits as UTC)
+- `TimestampTz ↔ Text` — parse text then compare
+
+#### Wire protocol
+
+`crates/axiomdb-network/src/mysql/result.rs`:
+- Column type: `0x07` (TIMESTAMP), display length 25
+- Text protocol: `format_timestamptz()` → `"YYYY-MM-DD HH:MM:SS+00"`
+- Binary protocol: reuses `encode_binary_timestamp`
+
+#### Exhaustive match coverage
+
+13 additional files updated with `TimestampTz` arms to satisfy Rust's
+non-exhaustive match requirement — see `specs/fase-24/plan-24.7-timestamptz.md`
+for the complete list.
+
+### Files changed
+
+| Crate | File | Change |
+|-------|------|--------|
+| axiomdb-types | `src/value.rs` | `Value::TimestampTz(i64)` variant |
+| axiomdb-types | `src/types.rs` | `DataType::TimestampTz` variant |
+| axiomdb-types | `src/codec.rs` | encode/decode/validate/infer arms |
+| axiomdb-types | `src/coerce_helpers.rs` | `parse_text_to_timestamptz_micros`, `value_matches_type` |
+| axiomdb-types | `src/coerce_api.rs` | Text/Timestamp/Date → TimestampTz coerce arms |
+| axiomdb-types | `src/array_codec.rs` | `ColumnType::TimestampTz=22`, encode/decode |
+| axiomdb-types | `src/array_io.rs` | `format_element_text`, `parse_element_text` |
+| axiomdb-types | `src/field_patch.rs` | `fixed_encoded_size` 8-byte arm |
+| axiomdb-catalog | `src/schema_database.rs` | `ColumnType::TimestampTz=22` |
+| axiomdb-catalog | `src/schema_aggregate.rs` | `data_type_tag/from_tag` discriminant 22 |
+| axiomdb-sql | `src/parser/ddl.rs` | `TIMESTAMPTZ` + `TIMESTAMP WITH TIME ZONE` |
+| axiomdb-sql | `src/parser/expr.rs` | AT TIME ZONE postfix → `__at_time_zone` |
+| axiomdb-sql | `src/eval/ops.rs` | comparison arms |
+| axiomdb-sql | `src/eval/functions/datetime.rs` | `__at_time_zone` handler |
+| axiomdb-sql | `src/eval/functions/mod.rs` | datetime dispatcher |
+| axiomdb-sql | `src/eval/batch.rs` | `fixed_size` arm |
+| axiomdb-sql | `src/eval/core.rs` | HashableValue, ArrayElemType arms |
+| axiomdb-sql | `src/executor/agg_having.rs` | `value_to_key_bytes` |
+| axiomdb-sql | `src/executor/copy_to.rs` | CSV/JSON output |
+| axiomdb-sql | `src/executor/ddl_show.rs` | `column_type_to_sql_name`, `column_sql_type_display` |
+| axiomdb-sql | `src/executor/exec_entry.rs` | SHOW COLUMNS type display |
+| axiomdb-sql | `src/executor/fdw_http.rs` | URL string arm |
+| axiomdb-sql | `src/executor/information_schema_exec.rs` | 3 IS arms |
+| axiomdb-sql | `src/executor/joins.rs` | hash arm |
+| axiomdb-sql | `src/executor/select_into_outfile.rs` | outfile arm |
+| axiomdb-sql | `src/executor/shared.rs` | datatype↔column_type |
+| axiomdb-sql | `src/executor/union.rs` | dedup key |
+| axiomdb-sql | `src/index_maintenance.rs` | `flatten_array_elements` |
+| axiomdb-sql | `src/json_table.rs` | `datatype_to_column_type` |
+| axiomdb-sql | `src/key_encoding.rs` | `encode_value` |
+| axiomdb-sql | `src/planner_select.rs` | literal coercion |
+| axiomdb-sql | `src/table.rs` | 4 conversion arms |
+| axiomdb-sql | `tests/integration_timestamptz.rs` | 12 integration tests (NEW FILE) |
+| axiomdb-network | `src/mysql/result.rs` | wire 0x07, text/binary encode, `format_timestamptz` |
+| axiomdb-network | `src/mysql/prepared.rs` | `value_to_sql_literal` |
+| axiomdb-embedded | `src/lib.rs` | `value_to_cell` |
+| tools | `wire-test.py` | 8 new [24.7 TIMESTAMPTZ] assertions |
+
+### Tests
+
+12 integration tests in `crates/axiomdb-sql/tests/integration_timestamptz.rs`:
+- DDL: `TIMESTAMPTZ` and `TIMESTAMP WITH TIME ZONE` parse to `DataType::TimestampTz`
+- INSERT/SELECT roundtrip: value stored as positive i64 µs
+- UTC offset normalization: `+00:00` and bare datetime store identical bits
+- Positive offset normalization: `12:00+05:30` = `06:30+00:00`
+- NULL handling
+- Comparison / ORDER BY with 3 timestamps
+- CAST from Text and from Timestamp column
+- AT TIME ZONE 'UTC' conversion
+- Codec roundtrip (encode_row → decode_row)
+- SHOW COLUMNS returns "timestamptz" in type name
+
+Wire smoke: 8 assertions in `tools/wire-test.py` under `[24.7 TIMESTAMPTZ]`.
+
+---
+
 ## Subphases planned
 
 | ID | Status | Description |
@@ -266,7 +410,7 @@ Wire smoke: 11 assertions in `tools/wire-test.py` under `[24.3 decimal]`.
 | 24.4 | ⏳ | CITEXT |
 | 24.5 | ⏳ | BYTEA/BLOB with TOAST |
 | 24.6 | ⏳ | BIT(n) / VARBIT(n) |
-| 24.7 | ⏳ | TIMESTAMPTZ |
+| 24.7 | ✅ Done | TIMESTAMPTZ — Value::TimestampTz(i64) µs UTC, AT TIME ZONE stub, wire 0x07 |
 | 24.8 | ⏳ | INTERVAL |
 | 24.10 | ⏳ | INET, CIDR, MACADDR |
 | 24.13 | ⏳ | Domain types |

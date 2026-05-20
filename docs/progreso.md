@@ -3,7 +3,7 @@
 > Automatically updated with `/subfase-completa`
 > Legend: ✅ completed | 🔄 in progress | ⏳ pending | ⏸ blocked
 >
-> **MySQL+PG parity path: 221/442 subphases (50.0%) — Phase 11, 13, 20, 21 complete; Phase 22b complete; Phase 24 active (24.1, 24.1b, 24.2, 24.3 done)**
+> **MySQL+PG parity path: 222/442 subphases (50.2%) — Phase 11, 13, 20, 21 complete; Phase 22b complete; Phase 24 active (24.1, 24.1b, 24.2, 24.3, 24.7 done)**
 >
 > **Wishlist / feature extras** (Vector/GIS, GraphQL, OData, Toolkit, MongoDB/DoltDB/Arrow, AI, Distributed, AxiomQL, Browser Wasm, Oracle-specific DDL, IoT/time-series, Lua/WASM runtimes, advanced compliance security, SQL:2011 bi-temporal) moved to [`features-roadmap.md`](./features-roadmap.md) — 301 items. Nothing deleted from code — todo queda tracked para repescar una vez el core esté estable.
 
@@ -274,7 +274,7 @@ JSON parity, window functions, generated columns, views, sequences, ENUMs, array
 - [ ] 24.4 ⏳ CITEXT — automatic case-insensitive comparisons
 - [ ] 24.5 ⏳ BYTEA/BLOB — binary with automatic TOAST
 - [ ] 24.6 ⏳ BIT(n) / VARBIT(n) — bit strings with `bitvec`
-- [ ] 24.7 ⏳ TIMESTAMPTZ — always UTC internally, convert on display
+- [x] 24.7 ✅ TIMESTAMPTZ — Value::TimestampTz(i64) µs UTC, ColumnType=22, TIMESTAMPTZ + TIMESTAMP WITH TIME ZONE parser, 8B LE codec, AT TIME ZONE 'UTC' stub, format "+00" wire display, Text/Timestamp/Date coercions. Completed 2026-05-20.
 - [ ] 24.8 ⏳ INTERVAL — months/days/µs separated with calendar arithmetic
 - [x] 24.9 ✅ UUID v4/v7 — implemented in Phase 4.19c: `gen_random_uuid()`/`uuid_generate_v4()` (v4 random); `uuid_generate_v7()`/`uuid7()` (v7 time-ordered, better B-tree locality); `is_valid_uuid(text)→BOOL`; storage as `[u8;16]` in codec
 - [ ] 24.10 ⏳ INET, CIDR, MACADDR — network types with operators
