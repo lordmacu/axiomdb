@@ -1040,9 +1040,29 @@ mod ffi {
         rows: Vec<Vec<Value>>,
         /// Current row index; `usize::MAX` before the first `step`.
         pos: usize,
-        /// Scratch buffer for text accessors on values that need formatting
-        /// (Uuid/Jsonb/Array/Range/Composite). Valid until the next such access.
+        /// Scratch buffer for single-cell text accessors on values that need
+        /// formatting (Uuid/Jsonb/Array/Range/Composite). Valid until the next
+        /// such access.
         scratch: Vec<u8>,
+        /// Per-cell scratch for the bulk `axiomdb_cursor_row` accessor: one
+        /// owned buffer per formatted cell of the current row. Inner `Vec<u8>`
+        /// allocations stay valid even when the outer `Vec` reallocs, so the
+        /// pointers handed out remain valid until the next `cursor_row`/step/close.
+        row_scratch: Vec<Vec<u8>>,
+    }
+
+    /// One result cell, flattened for the bulk row accessor.
+    ///
+    /// `type_code`: 0=NULL, 1=INT, 2=REAL, 3=TEXT, 4=BLOB. For INT read
+    /// `int_val`; for REAL read `real_val`; for TEXT/BLOB read `ptr`/`len`
+    /// (zero-copy into the live row, valid until the next `cursor_row`/step/close).
+    #[repr(C)]
+    pub struct AxiomCell {
+        pub type_code: c_int,
+        pub int_val: i64,
+        pub real_val: f64,
+        pub ptr: *const u8,
+        pub len: usize,
     }
 
     /// Type code for a [`Value`] — mirrors `CellValue::type_code`.
@@ -1107,6 +1127,7 @@ mod ffi {
                     rows,
                     pos: usize::MAX,
                     scratch: Vec::new(),
+                    row_scratch: Vec::new(),
                 }))
             }
             Ok(_) => Box::into_raw(Box::new(AxiomCursor {
@@ -1114,6 +1135,7 @@ mod ffi {
                 rows: Vec::new(),
                 pos: usize::MAX,
                 scratch: Vec::new(),
+                row_scratch: Vec::new(),
             })),
             Err(_) => std::ptr::null_mut(),
         }
@@ -1306,6 +1328,103 @@ mod ffi {
                 std::ptr::null()
             }
         }
+    }
+
+    /// Fills `out[0..columns]` with every cell of the current row in a single
+    /// call, eliminating the ~2 FFI crossings per cell of the scalar accessors.
+    /// Returns the number of columns written, or 0 if there is no current row.
+    ///
+    /// TEXT/BLOB cells expose zero-copy pointers into the live row; values that
+    /// need formatting (Uuid/Jsonb/Array/Range/Composite) point into per-cursor
+    /// scratch. All pointers are valid until the next `axiomdb_cursor_row`,
+    /// `axiomdb_cursor_step`, or `axiomdb_cursor_close`.
+    ///
+    /// # Safety
+    /// `cur` from `axiomdb_cursor_open`; `out` must point to at least
+    /// `axiomdb_cursor_columns(cur)` writable [`AxiomCell`] slots.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_row(
+        cur: *mut AxiomCursor,
+        out: *mut AxiomCell,
+    ) -> c_int {
+        if cur.is_null() || out.is_null() {
+            return 0;
+        }
+        // Disjoint field borrows: read `rows`, write `row_scratch`.
+        let AxiomCursor {
+            rows,
+            pos,
+            row_scratch,
+            ..
+        } = &mut *cur;
+        let row = match rows.get(*pos) {
+            Some(r) => r,
+            None => return 0,
+        };
+        row_scratch.clear();
+        for (i, v) in row.iter().enumerate() {
+            let cell = &mut *out.add(i);
+            cell.int_val = 0;
+            cell.real_val = 0.0;
+            cell.ptr = std::ptr::null();
+            cell.len = 0;
+            match v {
+                Value::Null => cell.type_code = AXIOMDB_TYPE_NULL,
+                Value::Bool(b) => {
+                    cell.type_code = AXIOMDB_TYPE_INTEGER;
+                    cell.int_val = *b as i64;
+                }
+                Value::Int(x) => {
+                    cell.type_code = AXIOMDB_TYPE_INTEGER;
+                    cell.int_val = *x as i64;
+                }
+                Value::BigInt(x) => {
+                    cell.type_code = AXIOMDB_TYPE_INTEGER;
+                    cell.int_val = *x;
+                }
+                Value::Date(d) => {
+                    cell.type_code = AXIOMDB_TYPE_INTEGER;
+                    cell.int_val = *d as i64;
+                }
+                Value::Timestamp(t) | Value::TimestampTz(t) => {
+                    cell.type_code = AXIOMDB_TYPE_INTEGER;
+                    cell.int_val = *t;
+                }
+                Value::Real(f) => {
+                    cell.type_code = AXIOMDB_TYPE_REAL;
+                    cell.real_val = *f;
+                }
+                Value::Decimal(m, s) => {
+                    cell.type_code = AXIOMDB_TYPE_REAL;
+                    cell.real_val = *m as f64 / 10f64.powi(*s as i32);
+                }
+                Value::Text(s) | Value::Json(s) => {
+                    cell.type_code = AXIOMDB_TYPE_TEXT;
+                    cell.ptr = s.as_ptr();
+                    cell.len = s.len();
+                }
+                Value::Bytes(b) => {
+                    cell.type_code = AXIOMDB_TYPE_BLOB;
+                    cell.ptr = b.as_ptr();
+                    cell.len = b.len();
+                }
+                other => {
+                    // Formatted text into per-cell scratch (stable pointer).
+                    let formatted = match other {
+                        Value::Uuid(u) => format_uuid(u),
+                        Value::Jsonb(b) => axiomdb_types::JsonbDecoder::to_string(b.as_ref())
+                            .unwrap_or_else(|_| "null".to_string()),
+                        _ => other.to_string(),
+                    };
+                    row_scratch.push(formatted.into_bytes());
+                    let buf = row_scratch.last().unwrap();
+                    cell.type_code = AXIOMDB_TYPE_TEXT;
+                    cell.ptr = buf.as_ptr();
+                    cell.len = buf.len();
+                }
+            }
+        }
+        row.len() as c_int
     }
 
     /// Closes the cursor and frees its result set.
@@ -2023,6 +2142,55 @@ mod ffi {
                     assert_eq!(*id, i as i64);
                     assert_eq!(name, &format!("u{i}"));
                 }
+                axiomdb_close(db);
+            }
+        }
+
+        #[test]
+        fn cursor_row_bulk_matches_scalar() {
+            unsafe {
+                let db = open_mem_db();
+                exec(db, "CREATE TABLE t (id INT, name TEXT, score REAL)");
+                exec(db, "INSERT INTO t VALUES (1, 'alice', 3.5)");
+                exec(db, "INSERT INTO t VALUES (2, 'béta', 2.0)");
+                let sql = CString::new("SELECT id, name, score FROM t ORDER BY id").unwrap();
+                let cur = axiomdb_cursor_open(db, sql.as_ptr());
+                let ncols = axiomdb_cursor_columns(cur) as usize;
+                let mut cells: Vec<AxiomCell> = (0..ncols)
+                    .map(|_| AxiomCell {
+                        type_code: 0,
+                        int_val: 0,
+                        real_val: 0.0,
+                        ptr: std::ptr::null(),
+                        len: 0,
+                    })
+                    .collect();
+
+                // row 1 — bulk fills every cell in one call
+                assert_eq!(axiomdb_cursor_step(cur), 1);
+                assert_eq!(axiomdb_cursor_row(cur, cells.as_mut_ptr()) as usize, 3);
+                assert_eq!(cells[0].type_code, AXIOMDB_TYPE_INTEGER);
+                assert_eq!(cells[0].int_val, 1);
+                assert_eq!(cells[1].type_code, AXIOMDB_TYPE_TEXT);
+                assert_eq!(
+                    std::slice::from_raw_parts(cells[1].ptr, cells[1].len),
+                    b"alice"
+                );
+                assert_eq!(cells[2].type_code, AXIOMDB_TYPE_REAL);
+                assert_eq!(cells[2].real_val, 3.5);
+
+                // row 2 — non-ASCII zero-copy text
+                assert_eq!(axiomdb_cursor_step(cur), 1);
+                axiomdb_cursor_row(cur, cells.as_mut_ptr());
+                assert_eq!(cells[0].int_val, 2);
+                let n2 = std::slice::from_raw_parts(cells[1].ptr, cells[1].len);
+                assert_eq!(std::str::from_utf8(n2).unwrap(), "béta");
+
+                // past end → 0
+                assert_eq!(axiomdb_cursor_step(cur), 0);
+                assert_eq!(axiomdb_cursor_row(cur, cells.as_mut_ptr()), 0);
+
+                axiomdb_cursor_close(cur);
                 axiomdb_close(db);
             }
         }

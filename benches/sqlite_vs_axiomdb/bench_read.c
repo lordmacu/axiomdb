@@ -49,6 +49,16 @@ extern double axiomdb_cursor_double(const AxiomCursor *cur, int col);
 extern const char *axiomdb_cursor_text(AxiomCursor *cur, int col, size_t *len);
 extern void axiomdb_cursor_close(AxiomCursor *cur);
 
+/* Bulk row accessor: fills all cells of the current row in one call. */
+typedef struct {
+    int32_t type_code; /* 0=NULL,1=INT,2=REAL,3=TEXT,4=BLOB */
+    int64_t int_val;
+    double real_val;
+    const unsigned char *ptr;
+    size_t len;
+} AxiomCell;
+extern int axiomdb_cursor_row(AxiomCursor *cur, AxiomCell *out);
+
 #define N_ROWS 10000
 #define ITERS 15
 #define WARMUP 3
@@ -170,6 +180,30 @@ static double bench_axiom_cursor(AxiomDb *db, volatile uint64_t *sink) {
     return el;
 }
 
+/* ── AxiomDB: Tier 1.5 bulk row accessor (one FFI call per row) ───────────── */
+static double bench_axiom_cursor_row(AxiomDb *db, volatile uint64_t *sink) {
+    double t0 = now_ms();
+    AxiomCursor *cur = axiomdb_cursor_open(db, "SELECT * FROM t");
+    int cols = axiomdb_cursor_columns(cur);
+    AxiomCell cells[32];
+    uint64_t acc = 0;
+    while (axiomdb_cursor_step(cur) == 1) {
+        axiomdb_cursor_row(cur, cells);
+        for (int c = 0; c < cols; c++) {
+            switch (cells[c].type_code) {
+            case 1: acc += (uint64_t)cells[c].int_val; break;
+            case 3: acc += cells[c].len; break;
+            case 2: acc += (uint64_t)cells[c].real_val; break;
+            default: break;
+            }
+        }
+    }
+    axiomdb_cursor_close(cur);
+    double el = now_ms() - t0;
+    *sink += acc;
+    return el;
+}
+
 /* ── SQLite: per-column accessors (its native C API) ─────────────────────── */
 static double bench_sqlite(sqlite3 *db, volatile uint64_t *sink) {
     double t0 = now_ms();
@@ -238,27 +272,30 @@ int main(void) {
     sqlite3_exec(sdb, "COMMIT", 0, 0, 0);
 
     /* ── Timed loops ── */
-    double sq[ITERS], ax[ITERS], pk[ITERS], cu[ITERS];
+    double sq[ITERS], ax[ITERS], pk[ITERS], cu[ITERS], cr[ITERS];
     for (int k = 0; k < ITERS + WARMUP; k++) {
         double s = bench_sqlite(sdb, &sink);
         double a = bench_axiom_percell(adb, &sink);
         double p = bench_axiom_packed(adb, &sink);
         double c = bench_axiom_cursor(adb, &sink);
+        double r = bench_axiom_cursor_row(adb, &sink);
         if (k >= WARMUP) {
             sq[k - WARMUP] = s;
             ax[k - WARMUP] = a;
             pk[k - WARMUP] = p;
             cu[k - WARMUP] = c;
+            cr[k - WARMUP] = r;
         }
     }
 
     double msq = median(sq, ITERS), max = median(ax, ITERS);
-    double mpk = median(pk, ITERS), mcu = median(cu, ITERS);
+    double mpk = median(pk, ITERS), mcu = median(cu, ITERS), mcr = median(cr, ITERS);
     printf("C read benchmark — 10K x 6, materialize every cell (median of %d)\n\n", ITERS);
     printf("  SQLite C API (sqlite3_column_*):    %6.2f ms   1.00x  (baseline)\n", msq);
     printf("  AxiomDB C API (per-cell accessors): %6.2f ms   %.2fx\n", max, max / msq);
     printf("  AxiomDB C API (packed buffer):      %6.2f ms   %.2fx\n", mpk, mpk / msq);
     printf("  AxiomDB C API (Tier 1 cursor):      %6.2f ms   %.2fx\n", mcu, mcu / msq);
+    printf("  AxiomDB C API (bulk row accessor):  %6.2f ms   %.2fx\n", mcr, mcr / msq);
     printf("\n  (sink=%llu — prevents dead-code elimination)\n",
            (unsigned long long)sink);
 
