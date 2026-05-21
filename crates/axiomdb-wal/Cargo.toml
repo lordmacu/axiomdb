@@ -15,6 +15,9 @@ tokio           = { workspace = true, features = ["sync"] }
 libc            = "0.2"
 
 [dev-dependencies]
+# Enable axiomdb-storage's `testing` feature for tests/benches so crash tests can
+# use FaultInjectionStorage (power-loss simulation). Release builds are unaffected.
+axiomdb-storage = { workspace = true, features = ["testing"] }
 tempfile  = { workspace = true }
 criterion = { workspace = true }
 
