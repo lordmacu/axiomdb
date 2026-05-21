@@ -709,9 +709,7 @@ fn jsonb_contains_blob(doc: &[u8], cand: &serde_json::Value) -> Result<bool, DbE
 /// otherwise decodes the doc node (small) and uses the serde reference.
 fn jsonbvalue_contains(dv: &JsonbValue, cv: &serde_json::Value) -> Result<bool, DbError> {
     match (dv, cv) {
-        (JsonbValue::Container(sub), serde_json::Value::Object(_)) => {
-            jsonb_contains_blob(sub, cv)
-        }
+        (JsonbValue::Container(sub), serde_json::Value::Object(_)) => jsonb_contains_blob(sub, cv),
         _ => Ok(serde_contains(&dv.to_serde(), cv)),
     }
 }

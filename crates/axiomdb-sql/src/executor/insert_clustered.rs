@@ -311,6 +311,7 @@ pub(crate) fn apply_clustered_insert_rows(
     let mut fast_path_hits = 0u64;
     let mut physical_lookup_time = Duration::ZERO;
     let mut tree_insert_time = Duration::ZERO;
+    let mut wal_time = Duration::ZERO;
     let mut secondary_time = Duration::ZERO;
     let mut root_persist_time = Duration::ZERO;
 
@@ -373,7 +374,7 @@ pub(crate) fn apply_clustered_insert_rows(
                         .collect();
                     txn.record_clustered_insert_batch(conn_txn, table_def.id, &entries)?;
                     if let Some(started) = wal_started {
-                        tree_insert_time += started.elapsed();
+                        wal_time += started.elapsed();
                     }
 
                     for inserted_row in &rows[row_idx..row_idx + inserted] {
@@ -546,12 +547,13 @@ pub(crate) fn apply_clustered_insert_rows(
 
     if debug_clustered_insert {
         eprintln!(
-            "[clustered-insert-debug] rows={} append_biased={} fast_path_hits={} lookup_ms={:.3} tree_ms={:.3} secondary_ms={:.3} root_persist_ms={:.3}",
+            "[clustered-insert-debug] rows={} append_biased={} fast_path_hits={} lookup_ms={:.3} tree_ms={:.3} wal_ms={:.3} secondary_ms={:.3} root_persist_ms={:.3}",
             rows.len(),
             append_biased,
             fast_path_hits,
             physical_lookup_time.as_secs_f64() * 1000.0,
             tree_insert_time.as_secs_f64() * 1000.0,
+            wal_time.as_secs_f64() * 1000.0,
             secondary_time.as_secs_f64() * 1000.0,
             root_persist_time.as_secs_f64() * 1000.0,
         );

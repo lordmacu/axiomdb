@@ -418,6 +418,16 @@ impl MmapStorage {
     /// Writes raw bytes at `offset` in the file via `pwrite()`.
     fn pwrite_bytes(&self, offset: u64, data: &[u8]) -> Result<(), DbError> {
         use std::os::unix::fs::FileExt;
+        // Diagnostic-only timing (zero-cost when not armed: one Relaxed load).
+        if crate::io_stats::armed() {
+            let t0 = std::time::Instant::now();
+            let r = self
+                .file
+                .write_all_at(data, offset)
+                .map_err(|e| classify_io(e, "pwrite"));
+            crate::io_stats::record_pwrite(t0.elapsed().as_nanos() as u64, data.len() as u64);
+            return r;
+        }
         self.file
             .write_all_at(data, offset)
             .map_err(|e| classify_io(e, "pwrite"))

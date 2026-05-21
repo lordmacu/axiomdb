@@ -1186,6 +1186,16 @@ impl<'a> CatalogWriter<'a> {
         let rows = HeapChain::scan_visible(self.storage, self.page_ids.tables, snap)?;
 
         for (page_id, slot_id, data) in rows {
+            // Cheap id pre-filter: a TableDef serializes its `id` as the first
+            // 4 bytes (u32 LE, schema_table.rs to_bytes). Skip the full
+            // `TableDef::from_bytes` (columns/indexes/constraints/FKs) for every
+            // non-matching row — this scan runs once per insert COMMIT and was
+            // ~42% of the clustered flush (O(num_tables × full deserialize)).
+            if data.len() < 4
+                || u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != table_id
+            {
+                continue;
+            }
             let (def, _) = TableDef::from_bytes(&data)?;
             if def.id == table_id {
                 // Delete old row.

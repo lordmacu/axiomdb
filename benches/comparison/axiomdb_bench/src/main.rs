@@ -1774,9 +1774,13 @@ fn diagnose_wrapper(data_dir: &Path, n_rows: usize) {
         db.run(sql).unwrap();
     }
     let wrap_ns = t0.elapsed().as_nanos();
+    axiomdb_storage::io_stats::reset();
+    axiomdb_storage::io_stats::arm();
     let t0 = Instant::now();
     db.run("COMMIT").unwrap();
     let commit_normal_ns = t0.elapsed().as_nanos();
+    let (pwrite_ns, pwrite_count, pwrite_bytes) = axiomdb_storage::io_stats::snapshot();
+    axiomdb_storage::io_stats::disarm();
 
     let m = (sqls.len() - 1) as u128;
     let us = |ns: u128| ns as f64 / 1000.0 / m as f64;
@@ -1806,6 +1810,25 @@ fn diagnose_wrapper(data_dir: &Path, n_rows: usize) {
     eprintln!(
         "║  COMMIT Path B (NORMAL, flush_no_sync)    {:>8.2} ms total      ║",
         commit_normal_ns as f64 / 1_000_000.0
+    );
+    let pct = |part: u128| {
+        if commit_normal_ns > 0 {
+            part as f64 / commit_normal_ns as f64 * 100.0
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "║   ↳ pwrite I/O (B would defer) {:>7.2} ms = {:>4.1}%  ({} writes, {} KB)",
+        pwrite_ns as f64 / 1_000_000.0,
+        pct(pwrite_ns as u128),
+        pwrite_count,
+        pwrite_bytes / 1024,
+    );
+    eprintln!(
+        "║   ↳ B-tree CPU (not deferrable) {:>6.2} ms = {:>4.1}%                ",
+        commit_normal_ns.saturating_sub(pwrite_ns as u128) as f64 / 1_000_000.0,
+        pct(commit_normal_ns.saturating_sub(pwrite_ns as u128)),
     );
     eprintln!("╚══════════════════════════════════════════════════════════════════╝");
     eprintln!();

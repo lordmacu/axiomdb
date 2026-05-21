@@ -15,6 +15,7 @@ pub mod heap;
 pub mod heap_chain;
 pub mod heap_hint;
 pub mod integrity;
+pub mod io_stats;
 pub mod local_page_batch;
 pub mod memory;
 pub mod meta;

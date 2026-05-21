@@ -963,16 +963,59 @@ encoder now borrows the bytes via `Cow` instead of allocating a normalized `Stri
 per value — byte-identical output, fewer per-row allocations on every write path that
 stores text. Non-ASCII still normalizes.
 
-### Next levers (post-parser cost model)
+### Insert write path — what's done and what's next
 
-Per-row ~8.3 µs vs SQLite ~1.8 µs. Measured with `--diagnose-wrapper`: the `Db::run`
-wrapper adds **0** overhead (the earlier "~2µs" was a cross-harness artifact), and
-the COMMIT (~36 ms/10K, ~43% of the row) is **not** fsync — at `synchronous=NORMAL`
-(no fsync) it costs the same as Strict. Root cause: **transactional INSERT staging
-(Phase 5.21)** defers the real B-tree + WAL + index apply to COMMIT. So the real
-insert levers are: (1) the **staged-flush B-tree bulk apply** at commit (sort +
-clustered insert + WAL — the biggest; SQLite defers data pages to a background
-checkpoint), (2) the **codec** (NFC fast-path done above; the rest is small),
-(3) lex `StringLit`, (4) analyze. Caveat: `--diagnose-insert/-deep` over-report
-(per-phase `Instant::now()` overhead); trust one-timer-per-loop diagnostics. See
-`docs/checkpoint-sqlite-parity.md`.
+`insert_batch` per-row ~8.3 µs vs SQLite ~1.8 µs (macOS, fair: both run `BEGIN; N
+parsed INSERTs; COMMIT` at `synchronous=NORMAL`). Inside a txn, INSERTs **stage**
+cheaply (encode + buffer); the real work happens at COMMIT
+(`flush_clustered_insert_batch` → `apply_clustered_insert_rows`). Commit breakdown
+for 10K rows (~30 ms), via `AXIOMDB_DEBUG_CLUSTERED_INSERT=1`:
+
+| Commit phase | Cost | % |
+|---|---:|---:|
+| `tree_ms` — B-tree apply (materialize + insert_cell + split + page-write + CRC) | ~11 ms | 37% |
+| `root_persist` — catalog: an **fsync** in `ensure_database_roots` | ~12 ms | 42% |
+| `wal_ms` — WAL serialize | ~1.8 ms | 6% |
+| lookup / sort / setup | ~5 ms | ~15% |
+
+**Done this round (both shipped, byte-identical):** the VALUES literal fast-path
+(parser) and the NFC ASCII fast-path (codec) above — insert_batch 5.31× → ~4.6×.
+
+**Measurement myths busted (all cross-harness artifacts):** the `Db::run` wrapper
+adds **0** overhead; the per-row "execute 3.6 µs / prepare_row 1.1 µs" from
+`--diagnose-insert/-deep` is **inflated** by per-phase `Instant::now()` overhead.
+Trust one-timer-per-loop diagnostics (`--diagnose-wrapper`, `--diagnose-parse`).
+
+**What we could attack next (ranked):**
+
+1. **`tree_ms` — the B-tree apply (~37%, contained, NO durability impact).** Our
+   `materialize_leaf_cell` (page_utils.rs:331,339) does **2 copies/row**
+   (`key.to_vec()` + `row_data.to_vec()` → an `OwnedLeafCell` → page). SQLite's
+   `insertCellFast` (research/sqlite/src/btree.c:7465) does **1**: `allocateSpace`
+   (O(1) gap, btree.c:1898) then one `memcpy` source→page. Our `encoded_row` is
+   already laid out in `StagedClusteredRow` (cf. SQLite `BTREE_PREFORMAT`,
+   btree.c:9569) → write it straight into the leaf, drop the intermediate owned cell.
+   Also port `balance_quick` (btree.c:7992): O(1) append split (move only the
+   overflow cell, no redistribute). **The next clean win.**
+
+2. **`root_persist` fsync (~42%) — the biggest, but LOAD-BEARING.**
+   `ensure_database_roots` does `storage.flush()` (sync_all of the MAIN file) on every
+   `CatalogWriter::new` = every insert COMMIT. Making it conditional gave a huge win
+   (4.25×→3.6×) but **broke crash recovery**
+   (`test_dirty_open_truncates_unlogged_tables_only`): that fsync persists the data
+   pages each commit; the WAL/recovery does not reconstruct the catalog+data without
+   it. Removing it safely = SQLite's WAL model — write dirty pages to the WAL
+   sequentially at commit, defer their placement in the main file to a **background
+   checkpoint** (research/sqlite/src/wal.c `sqlite3WalFrames` + `sqlite3WalCheckpoint`;
+   `synchronous=NORMAL` skips the per-commit fsync). Safety-critical, multi-subphase —
+   not incremental.
+
+3. **lex (~0.9 µs/row, the parse floor)** — `StringLit` allocates a `String` per text
+   literal; borrow `&str` when there are no escapes. **analyze (~0.7 µs)** — confirm
+   INSERT uses the `Arc<ResolvedTable>` fast path.
+
+**Diagnostics available:** `axiomdb_bench --diagnose-parse` (lex vs AST-build),
+`--diagnose-insert[-deep]` (per-phase; over-reports — see above), `--diagnose-wrapper`
+(wrapper + COMMIT + pwrite I/O); `AXIOMDB_DEBUG_CLUSTERED_INSERT=1` (flush phases:
+lookup/tree/wal/secondary/root_persist); `axiomdb_storage::io_stats` (armable pwrite
+ns/count). See `docs/checkpoint-sqlite-parity.md`.

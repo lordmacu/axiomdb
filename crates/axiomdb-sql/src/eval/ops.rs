@@ -1992,13 +1992,15 @@ mod jsonb_extract_binary_tests {
         check(doc, &["profile", "missing"]);
         check(doc, &["tags", "9"]);
         check(doc, &["active", "x"]); // descend into a scalar → no match
-        // whole document
+                                      // whole document
         check(doc, &[]);
     }
 
     #[test]
     fn binary_explicit_values() {
-        let blob = blob_of(r#"{"active":1,"name":"alice","profile":{"plan":"pro"},"tags":["web","paid"]}"#);
+        let blob = blob_of(
+            r#"{"active":1,"name":"alice","profile":{"plan":"pro"},"tags":["web","paid"]}"#,
+        );
         let t = |parts: &[&str]| jsonb_extract_binary(&blob, &segs(parts), true).unwrap();
         assert_eq!(t(&["active"]), Value::Text("1".into()));
         assert_eq!(t(&["name"]), Value::Text("alice".into()));
