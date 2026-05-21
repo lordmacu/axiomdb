@@ -453,7 +453,8 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..per_thread {
                     let pid = t * per_thread + i;
-                    log.append(pid, pid + 1, 0, &page((pid & 0xFF) as u8)).unwrap();
+                    log.append(pid, pid + 1, 0, &page((pid & 0xFF) as u8))
+                        .unwrap();
                 }
             }));
         }

@@ -751,7 +751,7 @@ The fix is SQLite's proven **write-ahead page-frame** model: page writes go to t
 WAL as frames first; the main file is updated only by a checkpoint; a commit is
 durable once its frames are `fsync`'d in the WAL. The foundation is the
 [`wal_frame`](https://github.com/lordmacu/nexusdb) module
-(`crates/axiomdb-wal/src/wal_frame.rs`).
+(`crates/axiomdb-storage/src/wal_frame.rs`).
 
 **Frame format** (borrowed from SQLite `wal.c`, adapted to our explicit `lsn`):
 
@@ -774,14 +774,57 @@ Per frame: header (32 B) + one page image (PAGE_SIZE)
 scan into a `WalIndex` (`page_id` → latest **committed** frame; frames past the last
 commit marker are an unfinished transaction and are excluded).
 
+### Subphase 3 — write-ahead integration (live read/write path)
+
+The `FrameLog`/`WalIndex` now live in **`axiomdb-storage`** so `MmapStorage` owns them
+directly — the page-frame log is *physical* durability and belongs beside
+`doublewrite` and the buffer pool. (Keeping it in `axiomdb-wal` would have created a
+dependency cycle: `wal` already depends on `storage`.)
+
+`MmapStorage` gains an opt-in redo log (`enable_redo_log`). While **disabled** (the
+subphase-3 default) `read_page`/`write_page` behave byte-for-byte as before. While
+**enabled**:
+
+- **`write_page`** stamps the page's `PageHeader.lsn` (header offset 24 — the body
+  checksum at offset 12 is untouched, so there is no recompute), writes the main file,
+  appends a page frame, records it in the live `WalIndex`, and caches the stamped page
+  so a read-after-write is a pool hit. In subphase 3 this is a **dual-write** (main
+  file *and* frame): the main file stays authoritative, so `flush()` and durability are
+  unchanged. Frame-only writes and dropping the per-commit flush are subphase 4.
+- **`read_page`** consults the wal-index on a buffer-pool miss — SQLite `walFindFrame`
+  ordering: **pool hit → wal-index → main file**. An empty index or a disabled log
+  short-circuits to the mmap path, so warm reads and the disabled path pay nothing.
+
+**Multi-writer scalability.** The frame log mirrors the engine's existing concurrency
+models instead of serializing writers behind a global lock:
+
+- `FrameLog::append` is **lock-free** — it reserves the file offset with an atomic
+  `fetch_add` (like `ConcurrentWalWriter`'s LSN reservation) and writes with `pwrite`,
+  which is thread-safe for disjoint regions. There is no `Mutex<FrameLog>`.
+- `WalIndex` is **16-way sharded** (the same partitioning as the buffer pool); two
+  writers updating different pages never contend.
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed</span>
+The read path is SQLite's <code>walFindFrame</code> (the <code>iLast==0</code> early-out
+becomes our "empty index ⇒ skip the lookup"). The lock-free append + sharded index
+follow PostgreSQL's <code>WALInsertLock</code> reservation and MySQL 8.0's lock-free
+redo log — adapted to our atomic-offset + <code>pwrite</code> model.
+</div>
+</div>
+
 <div class="callout callout-design">
 <span class="callout-icon">🧭</span>
 <div class="callout-body">
 <span class="callout-label">Status</span>
-This module is the isolated, unit-tested foundation. Wiring it into the live
-read/write path (`write_page` appends a frame; `read_page` consults the wal-index
-before the main file) and the checkpoint/recovery is the remaining work — at which
-point the per-commit main-file <code>fsync</code> is removed and the <code>t0_…</code>
-regression test flips green.
+The read/write path is now frame-aware. Remaining: subphase 4 (commit boundary —
+frame-only writes, drop the per-commit main-file <code>fsync</code>, and track the
+contiguous durable prefix for concurrent appends), subphase 5 (recovery rebuilds the
+wal-index from committed frames — the <code>t0_…</code> regression flips green),
+subphase 6 (checkpoint copies frames to the main file), and subphase 7 (the full
+crash suite). Until then the per-commit flush stays and <code>t0_…</code> is
+<code>#[ignore]</code>d.
 </div>
 </div>

@@ -1278,7 +1278,11 @@ mod tests {
         assert!(!s.redo_enabled(), "redo off by default");
         s.enable_redo_log(&path).unwrap();
         assert!(s.redo_enabled());
-        assert_eq!(s.wal_index_len(), 0, "index empty until a frame is appended");
+        assert_eq!(
+            s.wal_index_len(),
+            0,
+            "index empty until a frame is appended"
+        );
         assert_eq!(s.current_frame_lsn(), 1, "fresh log ⇒ first LSN is 1");
         // Empty index ⇒ reads fall through to mmap exactly as before.
         let pid = s.alloc_page(PageType::Data).unwrap();
@@ -1296,7 +1300,10 @@ mod tests {
         p.body_mut()[0] = 0x7C;
         p.update_checksum();
         s.write_page(pid, &p).unwrap();
-        assert!(s.frame_index_contains(pid), "page recorded in the live index");
+        assert!(
+            s.frame_index_contains(pid),
+            "page recorded in the live index"
+        );
         assert!(s.current_frame_lsn() >= 2, "lsn advanced past the write");
         assert_eq!(s.read_page(pid).unwrap().body()[0], 0x7C);
     }
@@ -1349,12 +1356,14 @@ mod tests {
         p.update_checksum();
         s.write_page(pid, &p).unwrap();
         s.evict_from_pool(pid); // force the miss path
-        // Corrupt the MAIN file's copy of this page. If the read still returns the
-        // correct bytes, they came from the frame log (the mmap copy is now garbage
+
+        // Corrupt the MAIN file's copy of this page: if the read still returns the
+        // correct bytes they came from the frame log (the mmap copy is now garbage
         // and would fail its checksum).
         {
             let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            f.write_all_at(&[0xFFu8; 64], pid * PAGE_SIZE as u64).unwrap();
+            f.write_all_at(&[0xFFu8; 64], pid * PAGE_SIZE as u64)
+                .unwrap();
         }
         let got = s.read_page(pid).unwrap();
         assert_eq!(

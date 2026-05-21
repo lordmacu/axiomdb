@@ -3,7 +3,7 @@
 Phase: redo-recovery (project B) — subphase 3
 Task: wire `MmapStorage` read/write to the page-frame log, additively
 Spec: specs/fase-redo-recovery/spec-subfase-3-write-ahead.md
-Status: draft
+Status: done
 
 ## Summary
 

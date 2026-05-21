@@ -2,7 +2,7 @@
 
 Phase: redo-recovery (project B) — subphase 3
 Task: Make `MmapStorage`'s live read/write path frame-log-aware, additively.
-Status: draft
+Status: implemented
 Effort: **max** (data-loss risk; touches the hot read/write path).
 
 ## Context
