@@ -789,10 +789,8 @@ fn jsonb_contains_blob(doc: &[u8], cand: &serde_json::Value) -> Result<bool, DbE
                         None => false,
                     },
                     // Scalar: compare raw element bytes — no decode, no allocation.
-                    _ => match dr.scalar_element_eq(vidx, cv)? {
-                        Some(eq) => eq,
-                        None => false, // a container can't equal a scalar
-                    },
+                    // `None` (a container can't equal a scalar) → default `false`.
+                    _ => dr.scalar_element_eq(vidx, cv)?.unwrap_or_default(),
                 };
                 if !contained {
                     return Ok(false);
@@ -905,7 +903,7 @@ mod tests {
             json!({"flag": true}),                       // bool
             json!({"none": null}),                       // null value
             json!({"active": "1"}),                      // type mismatch (str vs int)
-            json!({"active": 1.0}),                       // int element vs float candidate
+            json!({"active": 1.0}),                      // int element vs float candidate
             json!({"score": 3}),                         // float element vs int candidate
             json!([1, 2]),                               // array candidate vs object doc
             json!(1),                                    // scalar candidate vs object doc
