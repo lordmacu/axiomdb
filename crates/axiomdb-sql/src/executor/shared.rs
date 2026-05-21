@@ -92,12 +92,16 @@ fn try_cached_with_version(
     schema: &str,
     name: &str,
 ) -> Result<Option<Arc<ResolvedTable>>, DbError> {
-    // Read the cached (table_id, schema_version) — release the borrow before
-    // touching `ctx` again for invalidation.
-    let (cached_id, cached_version) = match ctx.get_table(database, schema, name) {
-        Some(r) => (r.def.id, r.def.schema_version),
+    // Single cache lookup: clone the `Arc` once (releasing the `ctx` borrow so
+    // we can re-borrow `&mut ctx` below for epoch marking / invalidation). The
+    // warm path then reuses this same `Arc` instead of rebuilding the
+    // `database.schema.table` key for a second `HashMap` probe.
+    let cached = match ctx.get_table_arc(database, schema, name) {
+        Some(arc) => arc,
         None => return Ok(None),
     };
+    let cached_id = cached.def.id;
+    let cached_version = cached.def.schema_version;
 
     // A.2 fast path: if the catalog epoch hasn't changed since we last
     // validated this table AND we are not inside an explicit transaction,
@@ -118,7 +122,7 @@ fn try_cached_with_version(
     // happened during the write) and re-marks the epoch. Subsequent reads
     // then use the fast path until the next write on that table.
     if !ctx.in_explicit_txn && ctx.is_table_epoch_current(cached_id) {
-        return Ok(ctx.get_table_arc_if_version(database, schema, name, cached_version));
+        return Ok(Some(cached));
     }
 
     // Slow path: probe catalog for the current schema_version (one row read).
@@ -132,7 +136,7 @@ fn try_cached_with_version(
         Some(v) if v == cached_version => {
             // Validated: record epoch so next call skips the probe.
             ctx.mark_table_epoch_current(cached_id);
-            Ok(ctx.get_table_arc_if_version(database, schema, name, cached_version))
+            Ok(Some(cached))
         }
         _ => {
             // Stale entry OR table dropped — evict so the caller re-resolves.

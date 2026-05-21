@@ -669,11 +669,17 @@ fn execute_select_ctx(
                     )?
                 }
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key }
+            crate::planner::AccessMethod::IndexLookup { index_def, key, covers_predicate }
                 if resolved.def.is_clustered() && index_def.is_primary =>
             {
                 // ── Clustered PK point lookup (Phase 39.15) ──────────────────
                 // Direct B-tree search returns full row inline — no heap fetch.
+                // The exact-PK key reproduces the entire WHERE, so skip the
+                // per-row recheck below (SQLite TERM_CODED analog), exactly as
+                // the covering IndexRange arm does.
+                if *covers_predicate {
+                    where_already_applied = true;
+                }
                 // Attack 5: pass the session's leaf hint so consecutive PK
                 // lookups in the same leaf skip the descent.
                 let looked_up = crate::time_select_phase!(
@@ -692,12 +698,12 @@ fn execute_select_ctx(
                     None => vec![],
                 }
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key }
+            crate::planner::AccessMethod::IndexLookup { index_def, key, .. }
                 if resolved.def.is_clustered() =>
             {
                 clustered_secondary_rows_for_lookup(storage, &resolved, index_def, key, snap)?
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+            crate::planner::AccessMethod::IndexLookup { index_def, key, .. } => {
                 // Bloom filter: skip B-Tree read if key is definitely absent.
                 // Only applied for UNIQUE indexes — non-unique indexes store key||RID in
                 // the bloom (one entry per row), but the lookup key here is the bare value.

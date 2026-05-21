@@ -27,6 +27,12 @@ pub enum AccessMethod {
         index_def: IndexDef,
         /// Pre-encoded key bytes (via `encode_index_key`).
         key: Vec<u8>,
+        /// True when this single-key lookup reproduces the ENTIRE WHERE
+        /// predicate (a bare `col = literal` on a single-column index), so the
+        /// executor may skip the per-row WHERE re-evaluation (SQLite
+        /// `disableTerm`/`TERM_CODED`). Only the SELECT planner's exact-equality
+        /// rule sets this; DELETE/UPDATE leave it `false` (they always recheck).
+        covers_predicate: bool,
     },
 
     /// Range scan: iterate over B-Tree entries between `lo` and `hi`

@@ -289,7 +289,7 @@ fn execute_select(
                     )?
                 }
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key }
+            crate::planner::AccessMethod::IndexLookup { index_def, key, .. }
                 if resolved.def.is_clustered() && index_def.is_primary =>
             {
                 // Clustered PK point lookup (non-ctx path).
@@ -304,12 +304,12 @@ fn execute_select(
                     None => vec![],
                 }
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key }
+            crate::planner::AccessMethod::IndexLookup { index_def, key, .. }
                 if resolved.def.is_clustered() =>
             {
                 clustered_secondary_rows_for_lookup(storage, &resolved, index_def, key, snap)?
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+            crate::planner::AccessMethod::IndexLookup { index_def, key, .. } => {
                 if index_def.is_unique {
                     let lo = rid_lo(key);
                     let hi = rid_hi(key);

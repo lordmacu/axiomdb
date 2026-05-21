@@ -81,14 +81,14 @@ fn collect_clustered_update_candidates(
                 raw_rows.push(row?);
             }
         }
-        crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
+        crate::planner::AccessMethod::IndexLookup { index_def, key, .. } if index_def.is_primary => {
             if let Some(row) =
                 axiomdb_storage::clustered_tree::lookup(storage, Some(root_pid), &key[..], &snap)?
             {
                 raw_rows.push(row);
             }
         }
-        crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+        crate::planner::AccessMethod::IndexLookup { index_def, key, .. } => {
             let hi = clustered_secondary_high_bound(&key[..]);
             raw_rows.extend(clustered_rows_for_secondary_access(
                 storage,

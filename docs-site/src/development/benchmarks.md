@@ -749,7 +749,7 @@ scan perf (see "Where you run matters" below).
 | select_where | **0.92×** | ✅ faster |
 | group_by | 1.00× | ✅ parity |
 | crud_flow/select | 1.10× | ~parity |
-| point_lookup | 2.10× | 🔶 behind (was 4.2×; ~2× remains) |
+| point_lookup | **1.3×** | 🔶 behind (was 4.2× → 2.1× → 1.3×; closing) |
 
 Writes remain a separate frontier: insert ~4–8×, `crud_flow/delete` ~230×
 (structural — SQLite's `DELETE`-all is an O(1) truncate).
@@ -890,15 +890,31 @@ stats without a version bump but already calls `invalidate_table`, which now dro
 the stats entry too. Mirrors SQLite loading `sqlite_stat1` into the in-memory
 schema once, not per query. Result: `list_stats` **~579 → ~43 ns**.
 
-Cumulative (macOS, prepared, 10K rows): total point-lookup **~4290 → ~3300 ns
-(~23%)**.
+**Landed: single warm-resolve cache lookup.** `try_cached_with_version` built the
+`database.schema.table` key and probed the cache **twice** (once to read the
+schema_version, once to clone the entry). Collapsed to a single `get_table_arc`
+that clones the `Arc` once and reuses it. Result: `resolve_table` **~499 → ~320 ns**
+(the rest is the remaining `format!` key + db/`search_path` `String` allocs).
+
+**Landed: skip WHERE re-eval for covering point lookups.** A clustered-PK
+`SELECT * WHERE pk = ?` re-evaluated `pk = ?` against the row it just fetched by
+that key — allocating four subquery-cache `HashMap`s + an `ExecSubqueryRunner` per
+lookup. `AccessMethod::IndexLookup` now carries `covers_predicate`, set `true` only
+when the planner matched the **whole** WHERE as a bare single-column equality
+(`extract_eq_col_literal`); the executor then sets `where_already_applied` and
+skips the recheck (SQLite `disableTerm`/`TERM_CODED`, same as the covering range
+arm). DELETE/UPDATE keep it `false` (they always recheck). Result: `WHERE re-eval`
+**~163 → ~50 ns**.
+
+Cumulative (macOS, prepared, 10K rows): total point-lookup **~4290 → ~2850 ns
+(~33%)**; real `--compare` throughput **~261K → ~397K ops/s (+52%)**, gap vs
+SQLite **2.0× → 1.3×**.
 
 Next levers, in order of size: cache `ColumnMeta` for the bare-`SELECT *` shape
-(~390 ns); intern the cache key / avoid the per-call `String` allocs that now
-dominate resolve (~500 ns residual); set `where_already_applied` for an exact-PK
-`IndexLookup` (the `covers_predicate` analog already used for ranges) to skip the
-WHERE re-eval (~165 ns). Each helps every small-result query, not just point
-lookups. (Attribution infra: `crates/axiomdb-sql/src/bench_timings.rs`
-`SelectPhaseTimings`, feature `bench-timings`.)
+(~385 ns — needs `QueryResult` to hold `Arc` columns, a wider change); intern the
+resolve cache key / borrow the db + schema strings to kill the remaining ~300 ns
+of `String` allocs. Both help every small-result query, not just point lookups.
+(Attribution infra: `crates/axiomdb-sql/src/bench_timings.rs` `SelectPhaseTimings`,
+feature `bench-timings`.)
 
 - **Writes:** insert path (WAL per-row) and the structural `DELETE`-all gap.

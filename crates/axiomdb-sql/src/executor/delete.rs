@@ -415,7 +415,12 @@ fn normalize_clustered_delete_access_method(
                     .unwrap_or(false);
 
             if is_single_key_point {
-                crate::planner::AccessMethod::IndexLookup { index_def, key: lo }
+                crate::planner::AccessMethod::IndexLookup {
+                    index_def,
+                    key: lo,
+                    // DELETE rechecks the full WHERE on fetched rows.
+                    covers_predicate: false,
+                }
             } else {
                 crate::planner::AccessMethod::IndexRange {
                     index_def,
@@ -616,14 +621,14 @@ fn collect_clustered_delete_candidates(
                 raw_rows.push(row?);
             }
         }
-        crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
+        crate::planner::AccessMethod::IndexLookup { index_def, key, .. } if index_def.is_primary => {
             if let Some(row) =
                 axiomdb_storage::clustered_tree::lookup(storage, Some(root_pid), &key, &snap)?
             {
                 raw_rows.push(row);
             }
         }
-        crate::planner::AccessMethod::IndexLookup { index_def, key } => {
+        crate::planner::AccessMethod::IndexLookup { index_def, key, .. } => {
             let hi = clustered_delete_secondary_high_bound(&key);
             raw_rows.extend(clustered_rows_for_secondary_delete_access(
                 storage,
@@ -775,7 +780,7 @@ fn collect_delete_candidates(
             )
         }
 
-        AccessMethod::IndexLookup { index_def, key } => {
+        AccessMethod::IndexLookup { index_def, key, .. } => {
             // Point lookup via B-Tree → batch heap read → WHERE recheck.
             let candidate_rids: Vec<RecordId> = if index_def.is_unique {
                 if index_def.is_unique

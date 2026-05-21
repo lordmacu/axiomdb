@@ -80,9 +80,13 @@ pub fn plan_select(
                         };
                     }
                     if idx.columns.len() == 1 {
+                        // `extract_eq_col_literal` matched the WHOLE WHERE (a bare
+                        // `col = literal`, never a conjunct of an AND), and the
+                        // single-column key reproduces it exactly → covering.
                         return AccessMethod::IndexLookup {
                             index_def: idx.clone(),
                             key,
+                            covers_predicate: true,
                         };
                     } else {
                         let mut hi = key.clone();

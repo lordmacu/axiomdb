@@ -189,7 +189,12 @@ fn normalize_clustered_update_access_method(
                     .unwrap_or(false);
 
             if is_single_key_point {
-                crate::planner::AccessMethod::IndexLookup { index_def, key: lo }
+                crate::planner::AccessMethod::IndexLookup {
+                    index_def,
+                    key: lo,
+                    // UPDATE rechecks the full WHERE on fetched rows.
+                    covers_predicate: false,
+                }
             } else {
                 crate::planner::AccessMethod::IndexRange {
                     index_def,

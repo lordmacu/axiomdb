@@ -150,6 +150,9 @@ pub fn plan_delete_candidates(
                     return AccessMethod::IndexLookup {
                         index_def: idx.clone(),
                         key,
+                        // DELETE/UPDATE always recheck the full WHERE on fetched
+                        // rows, so coverage is irrelevant here — keep it false.
+                        covers_predicate: false,
                     };
                 } else {
                     let mut hi = key.clone();
@@ -224,6 +227,9 @@ pub fn plan_update_candidates(
                     return AccessMethod::IndexLookup {
                         index_def: idx.clone(),
                         key,
+                        // DELETE/UPDATE always recheck the full WHERE on fetched
+                        // rows, so coverage is irrelevant here — keep it false.
+                        covers_predicate: false,
                     };
                 } else {
                     let mut hi = key.clone();

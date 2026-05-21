@@ -250,7 +250,13 @@ fn normalize_clustered_access_method(
                     .unwrap_or(false);
 
             if is_single_key_point {
-                crate::planner::AccessMethod::IndexLookup { index_def, key: lo }
+                crate::planner::AccessMethod::IndexLookup {
+                    index_def,
+                    key: lo,
+                    // Converted from an IndexOnlyScan, which carries no coverage
+                    // flag — stay conservative and let the executor recheck.
+                    covers_predicate: false,
+                }
             } else {
                 crate::planner::AccessMethod::IndexRange {
                     index_def,
