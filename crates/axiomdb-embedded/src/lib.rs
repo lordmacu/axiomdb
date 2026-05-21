@@ -68,7 +68,13 @@ pub use db::Db;
 pub use db::Row;
 
 #[cfg(feature = "sync-api")]
+pub use shared_db::{Connection, SharedDb};
+
+#[cfg(feature = "sync-api")]
 mod appender;
+
+#[cfg(feature = "sync-api")]
+mod shared_db;
 
 #[cfg(feature = "sync-api")]
 mod db {
