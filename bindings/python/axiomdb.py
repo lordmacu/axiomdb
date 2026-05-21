@@ -76,6 +76,7 @@ TYPE_BLOB = 4
 # ── Packed buffer format (must match crates/axiomdb-embedded/src/lib.rs) ───────
 
 _PACKED_MAGIC = 0x41584D31  # "AXM1"
+_COLUMNAR_MAGIC = 0x41584D32  # "AXM2"
 _U32 = struct.Struct("<I")
 _U64 = struct.Struct("<Q")
 _I64 = struct.Struct("<q")
@@ -135,6 +136,80 @@ def _parse_packed(buf: bytes) -> Tuple[List[str], List[tuple]]:
         append(tuple(row))
     return col_names, rows
 
+
+def _parse_columnar(buf: bytes) -> Tuple[List[str], List[tuple]]:
+    """Parses a columnar (AXM2) buffer into (column_names, rows-as-tuples).
+
+    Homogeneous columns are bulk-decoded with a single ``struct.unpack_from``
+    (one C call for the whole column), and rows are assembled with ``zip`` (also
+    C-level) — far less interpreted per-cell work than the row-major parser.
+    Columns with NULLs/mixed types use a per-cell ('M') fallback.
+    """
+    u32_from = _U32.unpack_from
+    magic = u32_from(buf, 0)[0]
+    if magic != _COLUMNAR_MAGIC:
+        raise AxiomDBError(f"corrupt columnar buffer (magic={magic:#x})")
+    n_cols = u32_from(buf, 4)[0]
+    n_rows = _U64.unpack_from(buf, 8)[0]
+    off = 16
+
+    names: List[str] = []
+    for _ in range(n_cols):
+        ln = u32_from(buf, off)[0]
+        off += 4
+        names.append(buf[off:off + ln].decode("utf-8"))
+        off += ln
+
+    columns: List[tuple] = []
+    for _ in range(n_cols):
+        kind = buf[off]
+        off += 1
+        if kind == 0x49:  # 'I' — bulk int64
+            columns.append(struct.unpack_from(f"<{n_rows}q", buf, off))
+            off += n_rows * 8
+        elif kind == 0x46:  # 'F' — bulk float64
+            columns.append(struct.unpack_from(f"<{n_rows}d", buf, off))
+            off += n_rows * 8
+        elif kind in (0x54, 0x42):  # 'T' / 'B' — bulk lengths, then slice
+            lens = struct.unpack_from(f"<{n_rows}I", buf, off)
+            off += n_rows * 4
+            binary = kind == 0x42
+            arr = [None] * n_rows
+            for i in range(n_rows):
+                ln = lens[i]
+                s = buf[off:off + ln]
+                arr[i] = s if binary else s.decode("utf-8")
+                off += ln
+            columns.append(arr)
+        else:  # 'M' — per-cell (handles NULL / mixed)
+            i64_from = _I64.unpack_from
+            f64_from = _F64.unpack_from
+            arr = [None] * n_rows
+            for i in range(n_rows):
+                tag = buf[off]
+                off += 1
+                if tag == TYPE_INTEGER:
+                    arr[i] = i64_from(buf, off)[0]
+                    off += 8
+                elif tag == TYPE_TEXT:
+                    ln = u32_from(buf, off)[0]
+                    off += 4
+                    arr[i] = buf[off:off + ln].decode("utf-8")
+                    off += ln
+                elif tag == TYPE_REAL:
+                    arr[i] = f64_from(buf, off)[0]
+                    off += 8
+                elif tag == TYPE_BLOB:
+                    ln = u32_from(buf, off)[0]
+                    off += 4
+                    arr[i] = buf[off:off + ln]
+                    off += ln
+                # TYPE_NULL → leave None
+            columns.append(arr)
+
+    rows = list(zip(*columns)) if (n_rows and n_cols) else []
+    return names, rows
+
 # ── C function signatures ───────────────────────────────────────────────────
 
 _lib.axiomdb_open.argtypes = [ctypes.c_char_p]
@@ -187,6 +262,12 @@ _lib.axiomdb_query_packed.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)
 ]
 _lib.axiomdb_query_packed.restype = ctypes.c_void_p
+
+# Columnar (AXM2): bulk-decodable layout — far faster to parse in Python.
+_lib.axiomdb_query_packed_columnar.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)
+]
+_lib.axiomdb_query_packed_columnar.restype = ctypes.c_void_p
 
 _lib.axiomdb_packed_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _lib.axiomdb_packed_free.restype = None
@@ -277,25 +358,28 @@ class AxiomDB:
         return result
 
     def _query_packed(self, sql: str) -> Tuple[List[str], List[tuple]]:
-        """Run a query and materialize it via the packed buffer (one FFI call).
+        """Run a query and materialize it via the columnar buffer (one FFI call).
 
         Returns (column_names, rows-as-tuples). Internal — used by `query`,
-        `query_tuples`, and `query_with_columns`.
+        `query_tuples`, and `query_with_columns`. The columnar (AXM2) layout
+        lets Python bulk-decode numeric columns with one ``struct.unpack`` and
+        assemble rows with ``zip`` — much less interpreted per-cell work than
+        row-major.
         """
         self._check_open()
         length = ctypes.c_size_t(0)
-        ptr = _lib.axiomdb_query_packed(
+        ptr = _lib.axiomdb_query_packed_columnar(
             self._ptr, sql.encode("utf-8"), ctypes.byref(length)
         )
         if not ptr:
             raise AxiomDBError(self._last_error() or "query failed")
         try:
             # One copy of the whole buffer into a Python bytes object, then a
-            # single Python-side parse loop (no per-cell FFI crossings).
+            # single columnar parse (no per-cell FFI crossings).
             buf = ctypes.string_at(ptr, length.value)
         finally:
             _lib.axiomdb_packed_free(ptr, length.value)
-        return _parse_packed(buf)
+        return _parse_columnar(buf)
 
     def query(self, sql: str) -> List[Dict[str, Any]]:
         """Execute a SELECT and return rows as a list of dicts.
