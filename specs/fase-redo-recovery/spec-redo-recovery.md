@@ -63,28 +63,32 @@ UNLOGGED tables remain non-durable (truncated on dirty open, unchanged).
 - **The contained insert micro-opts** (codec, insertCellFast — already shown marginal).
 - **On-disk page-format change.** `PageHeader.lsn` already exists.
 
-## Architecture decision: PHYSICAL page-image REDO (not logical)
+## Architecture decision: SQLite-WAL pure write-ahead (Option A — LOCKED 2026-05-21)
 
-We log a **full page image** (per dirty page, per commit) to the WAL and REDO by
-writing those bytes back. Rationale:
+**DECISION (user, 2026-05-21 — "the most robust"): Option A, SQLite's proven
+write-ahead WAL model.** Page writes go to the **WAL as page frames first**; the main
+DB file is updated only by a (background) **checkpoint**. A commit is durable once its
+frames + a commit marker are fsync'd in the WAL — *nothing in the main file is required
+for durability*. Recovery replays committed frames. This is SQLite's WAL mode
+(`research/sqlite/src/wal.c`: `sqlite3WalFrames`, `walFindFrame`, `sqlite3WalCheckpoint`).
 
-1. **It dissolves the hard blockers uniformly.** Logical redo would have to solve,
-   per-path: B-tree split page-allocation determinism (clustered), index records
-   (none exist today — would need rebuild-from-base), overflow/TOAST chains, and
-   free-list reconstruction. Physical redo treats *everything as a page* — clustered
-   leaves, index pages, overflow pages, catalog heap, AND the free-list bitmap are
-   all just pages whose images replay identically. The per-path work vanishes.
-2. **Idempotence is trivial with the existing `pageLSN`.** REDO applies a frame only
-   if `frame.lsn > on_disk_page.lsn` — safe to replay any number of times (double
-   crash). ARIES-standard, and the field already exists.
-3. **It is our embedded reference's model.** SQLite's WAL is page-frame based; the
-   `PageWrite.page_bytes` were already reserved for exactly this.
-4. **Torn-page safety comes for free.** A frame is the whole page; replaying it
-   repairs a torn page (may let us retire doublewrite later).
+Considered alternatives (rejected): **B** = keep mmap-direct writes, capture the
+txn's dirty pages as frames at commit (needs per-txn dirty-page tracking — none today);
+**C** = logical replay of committed records (page-allocation-determinism risk). Per the
+project's robustness-first principle, **A is the proven, lowest-risk *end state*** even
+though it is the **largest rework** (the storage read/write path becomes WAL-aware).
+A also: dissolves every per-path blocker (everything is a page frame); needs **no
+per-txn dirty tracking** (frames are appended as pages are written — true write-ahead);
+removes the per-commit main-file fsync entirely; gives torn-page safety for free (a
+frame is a whole page → likely retires `doublewrite`).
 
-Cost: more WAL bytes than logical (page images), but only DIRTY pages per commit,
-written sequentially. Acceptable and SQLite-proven. The existing logical records are
-kept for UNDO/MVCC (hybrid log).
+**Idempotence:** the existing `PageHeader.lsn` — checkpoint/recovery apply a frame only
+if `frame.lsn > on_disk_page.lsn`. The existing logical WAL records stay for UNDO/MVCC
+(hybrid: **undo from logical records, redo from page frames**).
+
+**Reads become WAL-aware:** `read_page` must consult the WAL frame index (latest frame
+for the page) before the main file — SQLite's `walFindFrame` + wal-index (`-shm`).
+This is the crux of the rework and the main source of risk/perf-sensitivity.
 
 ## Design
 
@@ -139,17 +143,30 @@ while keeping the fsynced WAL. This is the foundation of every crash test below.
 - **T6** uncommitted txn at crash is still UNDONE (no regression).
 - **T7** soak: randomized op streams + random crash points vs an oracle.
 
-## Subphase breakdown
+## Subphase breakdown (Option A — SQLite-WAL write-ahead)
 
-1. **Fault-injection crash harness + T0** — the simulator + the failing
-   hole-characterization test. (Proves the problem; foundation for all tests.)
-2. **Maintain `PageHeader.lsn`** on writes (no format change). Unit-verify.
-3. **WAL page-frame logging** for committed dirty pages (extend PageWrite).
-4. **REDO replay pass** in `recovery.rs` (committed frames forward, pageLSN guard,
-   file grow). T1/T2 green.
-5. **Drop per-commit main-file flush** + checkpoint integration + recycle. T3/T4.
-6. **Full crash-test suite** (T5–T7) + perf validation (autocommit/insert_batch A/B)
-   + docs + memory.
+> The earlier "Design" subsections above predate the A decision (they sketched the
+> lighter per-commit-capture model B); the authoritative high-level design is now the
+> A architecture block. Detailed design lands in each per-subphase spec/plan.
+
+1. ✅ **DONE — Fault-injection crash harness + T0** (commits `89f3bd1d`, `21fc3060`):
+   the power-loss simulator + the failing hole-characterization test.
+2. **WAL page-frame format + writer/reader** — define a page frame
+   `{ page_id, lsn, commit-marker, page_bytes, crc }`, a frame appender + reader, and
+   the **wal-index** (page_id → latest committed frame) for reads. Mirror SQLite
+   `wal.c`; the page-frame WAL may be a distinct file/section.
+3. **Write path → write-ahead (the crux)** — `write_page` appends a frame (stamping
+   `PageHeader.lsn` = frame LSN) instead of touching the main file; `read_page`
+   consults the wal-index first (`walFindFrame`), then the main file. Main perf/risk
+   surface; folds in the old "maintain pageLSN" step.
+4. **Commit** — commit = (frames already appended) + commit marker + WAL fsync; drop
+   the per-commit main-file `storage.flush()`. Defines the durable commit boundary.
+5. **Recovery** — on open, scan WAL frames, rebuild the wal-index up to the last
+   committed frame so reads see committed data; ignore uncommitted frames (reconcile
+   with the existing logical UNDO). **T0 flips GREEN here** (the proof REDO works).
+6. **Checkpoint** — copy committed frames → main file (pageLSN guard), fsync main,
+   reset/truncate the WAL. Reconcile with / likely retire `doublewrite`.
+7. **Full crash suite** (T1–T7) + perf A/B (autocommit win) + docs + memory.
 
 ## Risk register
 
