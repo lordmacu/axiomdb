@@ -23,6 +23,10 @@ members = [
     "crates/axiomdb-embedded",
     "benches/comparison/axiomdb_bench", "crates/axiomdb-lock",
 ]
+# axiomdb-py links libpython via PyO3 — building it under `cargo build
+# --workspace` would require Python dev linkage on the Lima VM. It is built
+# only via maturin, so keep it out of the workspace graph.
+exclude = ["bindings/axiomdb-py"]
 
 [workspace.package]
 version     = "0.1.0"

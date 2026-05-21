@@ -1,0 +1,25 @@
+[package]
+name = "axiomdb-py"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native (PyO3) Python binding for the AxiomDB embedded engine"
+publish = false
+
+# Excluded from the workspace (see root Cargo.toml [workspace].exclude): this
+# crate links against libpython via PyO3, which would break `cargo build
+# --workspace` on the Lima build VM. Built only via maturin.
+
+[lib]
+name = "axiomdb_native"
+# cdylib: the importable Python extension module (.so/.pyd/.dylib).
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py38: one wheel works on CPython 3.8+ (stable ABI). The per-item
+# function-call overhead vs the unstable macros is negligible next to object
+# construction itself.
+pyo3 = { version = "0.22", features = ["abi3-py38", "extension-module"] }
+axiomdb-embedded = { path = "../../crates/axiomdb-embedded" }
+axiomdb-types = { path = "../../crates/axiomdb-types" }
+axiomdb-core = { path = "../../crates/axiomdb-core" }

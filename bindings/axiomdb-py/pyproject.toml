@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "axiomdb"
+version = "0.1.0"
+description = "AxiomDB embedded database — native Python binding"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+]
+
+[tool.maturin]
+# The compiled module is importable as `axiomdb_native`.
+module-name = "axiomdb_native"
+features = ["pyo3/extension-module"]
