@@ -683,8 +683,10 @@ dispatch path in `eval/functions/json.rs`. That module implements
 `JSON_EXTRACT`, `JSON_SET`, `JSON_REMOVE`, `JSON_KEYS`, `JSON_VALID`, and
 `JSON_TYPE` with `serde_json` and simple dot-path traversal.
 
-For a `JSONB` (binary) operand, `JSON_EXTRACT` (and therefore `->`/`->>`) plus
-the `#>`/`#>>` path operators navigate the blob directly via `JsonbRef`
+For a `JSONB` (binary) operand, `JSON_EXTRACT` (and therefore `->`/`->>`), the
+`#>`/`#>>` path operators, and `JSON_PATH_EXISTS` (for simple `$.key`/`[idx]`
+jsonpaths — wildcards, filters, and recursive descent still defer to the serde
+walk) navigate the blob directly via `JsonbRef`
 (O(log k) binary-search key lookup, O(1) array index) and decode **only the
 target node**, instead of decoding the whole document into a `serde_json` tree
 on every row — previously the dominant cost on JSONB scans. Text/`JSON`

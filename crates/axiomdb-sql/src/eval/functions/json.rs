@@ -283,8 +283,16 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             if matches!(json_val, Value::Null) {
                 return Ok(Value::Null);
             }
-            let sj = value_to_serde_json(&json_val)?;
             let steps = parse_jsonpath(&path_str)?;
+            // Fast path: simple key/index navigation on a JSONB blob, decoding
+            // only the nodes along the path. Complex jsonpath (wildcards, filters,
+            // recursive, array key-unwrapping) returns None → serde walk below.
+            if let Value::Jsonb(ref blob) = json_val {
+                if let Some(exists) = jsonb_path_exists_binary(blob, &steps) {
+                    return Ok(Value::Bool(exists));
+                }
+            }
+            let sj = value_to_serde_json(&json_val)?;
             let results = execute_jsonpath(&sj, &steps);
             Ok(Value::Bool(!results.is_empty()))
         }
@@ -1893,6 +1901,73 @@ fn jsonb_extract_path_node(blob: &[u8], path: &str) -> Result<Option<serde_json:
         Some(v) => v.to_serde(),
         None => jsonb_to_serde(blob)?,
     }))
+}
+
+/// Binary existence check for `JSON_PATH_EXISTS` on a `Value::Jsonb` blob.
+///
+/// Handles the common jsonpath shape — a leading `$` then `.key`/`[idx]` steps —
+/// by navigating `JsonbRef` and decoding only the nodes along the path. Returns
+/// `Some(exists)` when it can answer, or `None` to signal the caller to fall back
+/// to the full `serde_json` + `execute_jsonpath` walk. It bails (`None`) on any
+/// step it does not model identically: wildcards, recursive descent, filters,
+/// `.size()`/`.type()`, and `.key` applied to an array (which `execute_jsonpath`
+/// unwraps over elements). The handled cases mirror `apply_steps` exactly:
+/// `.key` on a scalar and `[idx]` on a non-array both yield "no match".
+fn jsonb_path_exists_binary(blob: &[u8], steps: &[PathStep]) -> Option<bool> {
+    use axiomdb_types::JsonbValue;
+
+    // `execute_jsonpath_env` strips a leading Root before walking.
+    let steps = match steps.first() {
+        Some(PathStep::Root) => &steps[1..],
+        _ => steps,
+    };
+    let mut node: Option<JsonbValue> = None;
+    for step in steps {
+        match step {
+            PathStep::Key(k) => {
+                let bytes: &[u8] = match &node {
+                    None => blob,
+                    Some(JsonbValue::Container(sub)) => sub.as_slice(),
+                    // `.key` on a scalar → no match (apply_steps `_ => vec![]`).
+                    Some(_) => return Some(false),
+                };
+                let r = JsonbRef::new(bytes);
+                if r.is_array() {
+                    // apply_steps unwraps `.key` over array elements — defer.
+                    return None;
+                }
+                if r.is_scalar() {
+                    return Some(false);
+                }
+                match r.get_key(k) {
+                    Ok(Some(v)) => node = Some(v),
+                    Ok(None) => return Some(false),
+                    Err(_) => return None,
+                }
+            }
+            PathStep::Index(i) => {
+                let bytes: &[u8] = match &node {
+                    None => blob,
+                    Some(JsonbValue::Container(sub)) => sub.as_slice(),
+                    // `[idx]` on a scalar → no match.
+                    Some(_) => return Some(false),
+                };
+                let r = JsonbRef::new(bytes);
+                if !r.is_array() {
+                    // `[idx]` on an object/scalar → no match.
+                    return Some(false);
+                }
+                match r.get_index(*i as i64) {
+                    Ok(Some(v)) => node = Some(v),
+                    Ok(None) => return Some(false),
+                    Err(_) => return None,
+                }
+            }
+            // Wildcards, recursive, filters, and accessors are not modeled here.
+            _ => return None,
+        }
+    }
+    Some(true)
 }
 
 /// Split `key[0][1]` into `("key", ["0", "1"])`.
@@ -3826,5 +3901,47 @@ mod jsonb_extract_path_tests {
         assert_eq!(binary(&blob, "$.profile.plan"), Value::Text("pro".into()));
         assert_eq!(binary(&blob, "$.tags[0]"), Value::Text("web".into()));
         assert_eq!(binary(&blob, "$.missing"), Value::Null);
+    }
+
+    #[test]
+    fn binary_path_exists_matches_serde_reference() {
+        let blob = blob_of(
+            r#"{"id":7,"active":1,"profile":{"plan":"pro"},"tags":["web","paid"],"matrix":[[1,2]]}"#,
+        );
+        let sj = jsonb_to_serde(&blob).unwrap();
+        // Simple paths: the fast path must answer (Some) and match the serde walk.
+        for p in [
+            "$",
+            "$.id",
+            "$.active",
+            "$.profile",
+            "$.profile.plan",
+            "$.profile.missing",
+            "$.tags",
+            "$.tags[0]",
+            "$.tags[1]",
+            "$.tags[5]",
+            "$.matrix[0][1]",
+            "$.missing",
+            "$.id[0]",
+            "$.active.x",
+        ] {
+            let steps = parse_jsonpath(p).unwrap();
+            let serde = !execute_jsonpath(&sj, &steps).is_empty();
+            assert_eq!(
+                jsonb_path_exists_binary(&blob, &steps),
+                Some(serde),
+                "simple path={p}",
+            );
+        }
+        // Complex paths must defer (None) so the serde walk handles them.
+        for p in ["$.*", "$.tags[*]", "$..plan"] {
+            let steps = parse_jsonpath(p).unwrap();
+            assert_eq!(
+                jsonb_path_exists_binary(&blob, &steps),
+                None,
+                "complex path={p}",
+            );
+        }
     }
 }
