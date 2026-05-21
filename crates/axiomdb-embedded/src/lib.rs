@@ -87,7 +87,7 @@ mod db {
         analyze_cached,
         ast::{InsertSource, SelectItem, Stmt},
         bloom::BloomRegistry,
-        execute_with_ctx,
+        execute_read_only_with_ctx, execute_with_ctx,
         expr::Expr,
         parse_with_sql_mode,
         result::QueryResult,
@@ -325,6 +325,13 @@ mod db {
             // dep table epochs are current, skips CatalogReader creation
             // and PlanDeps::is_stale entirely (O(1) HashMap lookup).
             let result = if axiomdb_sql::sql_starts_with_select_keyword(sql) {
+                // Read-only (snapshot, no per-statement write-txn begin/commit)
+                // only in autocommit: with no open `conn_txn` there are no staged
+                // writes the read-only executor could miss. Inside an explicit
+                // transaction we keep the write-capable path so staged rows are
+                // flushed/visible. Computed before the call (avoids borrowing
+                // `self.session` both mutably and immutably).
+                let read_only = self.session.conn_txn.is_none();
                 axiomdb_sql::statement_cache::run_cached(
                     sql,
                     &self.storage,
@@ -332,10 +339,7 @@ mod db {
                     &self.bloom,
                     &mut self.schema_cache,
                     &mut self.session,
-                    // read_only = false: the embedded path may be inside an
-                    // explicit transaction with staged writes, which only the
-                    // write-capable executor flushes/sees correctly.
-                    false,
+                    read_only,
                 )
             } else {
                 let stmt = parse_with_sql_mode(sql, None, self.session.sql_mode_flags())?;
@@ -506,8 +510,14 @@ mod db {
             // Clone the analyzed AST and substitute Param nodes with Literal values.
             let stmt = substitute_params(self.analyzed.clone(), params)?;
 
-            // Execute directly — no parse, no analyze.
-            execute_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
+            // Read-only fast path: a SELECT in autocommit (no staged writes in an
+            // open txn) is served from a snapshot — skips the per-statement
+            // write-txn begin/commit that `execute_with_ctx` does for SELECT.
+            if matches!(stmt, Stmt::Select(_)) && db.session.conn_txn.is_none() {
+                execute_read_only_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
+            } else {
+                execute_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
+            }
         }
 
         /// Returns the number of `?` parameters in this prepared statement.

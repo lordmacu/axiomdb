@@ -770,6 +770,23 @@ re-checked. On macOS-native the clustered range scan moves from ~1.2–1.6× tow
 parity with SQLite; correctness is unchanged (exclusive boundaries already
 returned the right rows via the old recheck — now without the per-row cost).
 
+### Read-only snapshot path — no write-txn per SELECT
+
+A `SELECT` in **autocommit** used to open and commit a write `ConnectionTxn`
+around the read (txn-id allocation + commit bookkeeping) — wasted work for a
+query that writes nothing. Like SQLite (a read statement runs in a read
+transaction, never journaling), AxiomDB now serves autocommit `SELECT`s from a
+snapshot via the read-only executor, skipping the begin/commit entirely. Inside
+an explicit transaction the write-capable path is kept (staged rows must stay
+flushed/visible), so the fast path only triggers when there are no staged
+writes.
+
+The win shows up on small-result queries, where the per-statement overhead is
+the whole cost: prepared `point_lookup` dropped ~8 µs → ~4 µs (macOS), and
+`COUNT(*)` (prepared, with the count cache below) is now ~0.29× — **~3.4× faster
+than SQLite**. Scans were already amortizing the overhead, so they are unchanged
+(full_scan ~0.78×, range_scan ~0.79×).
+
 ### Session COUNT(*) Cache (Attack 17b)
 
 The `SELECT COUNT(*) FROM t` fast path now consults a per-session cache
