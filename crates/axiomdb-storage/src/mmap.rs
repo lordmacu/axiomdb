@@ -908,6 +908,41 @@ impl StorageEngine for MmapStorage {
         Ok(())
     }
 
+    fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        let Some(frame_log) = &self.frame_log else {
+            return Ok(0);
+        };
+        let index = frame_log.build_index(is_committed)?;
+        let mut redone = 0usize;
+        for frame in index.frames() {
+            // On-disk page LSN, read raw (no checksum verify): the page may be stale.
+            // A committed frame whose page no longer exists in the main file (allocated
+            // after the last flush, then lost) needs file growth to restore — that is
+            // the checkpoint's job (subphase 6), so skip it here.
+            let page_lsn = match self.read_page_raw(frame.page_id) {
+                Ok(bytes) => u64::from_le_bytes(
+                    bytes[LSN_OFFSET..LSN_OFFSET + 8]
+                        .try_into()
+                        .expect("8 bytes"),
+                ),
+                Err(DbError::PageNotFound { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            // Idempotence guard (Postgres pageLSN, xlogutils.c): apply only when the
+            // frame is strictly newer. The frame is a full page image whose embedded
+            // lsn becomes the page lsn, so a recovery re-entry sees `==` and skips.
+            if frame.lsn > page_lsn {
+                let page_bytes = frame_log.read_page_at(frame.offset)?;
+                // Write the frame bytes DIRECTLY (no new frame appended) + drop the
+                // stale cached copy so the next read reloads the redone bytes.
+                self.pwrite_bytes(frame.page_id * PAGE_SIZE as u64, &page_bytes[..])?;
+                self.buffer_pool.invalidate(frame.page_id);
+                redone += 1;
+            }
+        }
+        Ok(redone)
+    }
+
     fn deferred_free_count(&self) -> usize {
         self.deferred_frees
             .lock()
@@ -1453,5 +1488,64 @@ mod tests {
         );
         s.sync_frame_log().unwrap(); // fsync the frame log (commit-boundary primitive)
         s.set_current_txn(0); // reset for this thread
+    }
+
+    #[test]
+    fn redo_restores_a_page_whose_main_file_write_was_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("redo.db");
+        let row_byte = 0xC7u8;
+
+        // Session A (redo ON): write ROW under committed txn 5 → frame ROW@lsnN durable.
+        // flush() persists page_count/freelist into the meta page so B/C see the page.
+        let page_id = {
+            let mut s = MmapStorage::create(&db).unwrap();
+            s.enable_redo_log(&db).unwrap();
+            let page_id = s.alloc_page(PageType::Data).unwrap();
+            s.set_current_txn(5);
+            let mut p = Page::new(PageType::Data, page_id);
+            p.body_mut()[0] = row_byte;
+            p.update_checksum();
+            s.write_page(page_id, &p).unwrap();
+            s.sync_frame_log().unwrap(); // frame durable in <db>.wf
+            s.set_current_txn(0);
+            s.flush().unwrap();
+            page_id
+        };
+
+        // Session B (redo OFF): clobber the main-file page with an empty lsn-0 image,
+        // modelling the lost (un-fsync'd) main-file write. The .wf is untouched.
+        {
+            let s = MmapStorage::open(&db).unwrap();
+            s.write_page(page_id, &Page::new(PageType::Data, page_id))
+                .unwrap();
+            s.flush().unwrap();
+            assert_eq!(
+                s.read_page(page_id).unwrap().body()[0],
+                0,
+                "precondition: the main file lost the row"
+            );
+        }
+
+        // Session C (redo ON): REDO restores the row from the frame, idempotently.
+        {
+            let mut s = MmapStorage::open(&db).unwrap();
+            s.enable_redo_log(&db).unwrap();
+            assert_eq!(
+                s.redo_committed_frames(&|t| t == 5).unwrap(),
+                1,
+                "one committed page redone"
+            );
+            assert_eq!(
+                s.read_page(page_id).unwrap().body()[0],
+                row_byte,
+                "committed row restored by REDO"
+            );
+            assert_eq!(
+                s.redo_committed_frames(&|t| t == 5).unwrap(),
+                0,
+                "idempotent re-run is a no-op (pageLSN guard)"
+            );
+        }
     }
 }
