@@ -2011,10 +2011,9 @@ mod ffi {
                     let id = axiomdb_cursor_int(cur, 0);
                     let mut len = 0usize;
                     let p = axiomdb_cursor_text(cur, 1, &mut len);
-                    let name =
-                        std::str::from_utf8(std::slice::from_raw_parts(p as *const u8, len))
-                            .unwrap()
-                            .to_string();
+                    let name = std::str::from_utf8(std::slice::from_raw_parts(p as *const u8, len))
+                        .unwrap()
+                        .to_string();
                     got.push((id, name));
                 }
                 axiomdb_cursor_close(cur);

@@ -499,33 +499,66 @@ pub fn eval(expr: &Expr, row: &[Value]) -> Result<Value, DbError> {
         }
 
         // Phase 20.20 — XML constructor special forms.
-        Expr::XmlElement { tag, attrs, content } => {
+        Expr::XmlElement {
+            tag,
+            attrs,
+            content,
+        } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = (tag, attrs, content); return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = (tag, attrs, content);
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlelement(tag, attrs, content, row, &mut NoSubquery)
         }
         Expr::XmlForest { items } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = items; return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = items;
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlforest(items, row, &mut NoSubquery)
         }
-        Expr::XmlRoot { doc, version, standalone } => {
+        Expr::XmlRoot {
+            doc,
+            version,
+            standalone,
+        } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = (doc, version, standalone); return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = (doc, version, standalone);
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlroot(doc, version, *standalone, row, &mut NoSubquery)
         }
         Expr::XmlConcat { args } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = args; return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = args;
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlconcat(args, row, &mut NoSubquery)
         }
         Expr::XmlQuery { xpath, doc } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = (xpath, doc); return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = (xpath, doc);
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlquery(xpath, doc, row, &mut NoSubquery)
         }
@@ -1149,33 +1182,66 @@ pub fn eval_with<R: SubqueryRunner>(
         }
 
         // Phase 20.20 — XML constructor special forms.
-        Expr::XmlElement { tag, attrs, content } => {
+        Expr::XmlElement {
+            tag,
+            attrs,
+            content,
+        } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = (tag, attrs, content); return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = (tag, attrs, content);
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlelement(tag, attrs, content, row, sq)
         }
         Expr::XmlForest { items } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = items; return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = items;
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlforest(items, row, sq)
         }
-        Expr::XmlRoot { doc, version, standalone } => {
+        Expr::XmlRoot {
+            doc,
+            version,
+            standalone,
+        } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = (doc, version, standalone); return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = (doc, version, standalone);
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlroot(doc, version, *standalone, row, sq)
         }
         Expr::XmlConcat { args } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = args; return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = args;
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlconcat(args, row, sq)
         }
         Expr::XmlQuery { xpath, doc } => {
             #[cfg(not(feature = "xml"))]
-            { let _ = (xpath, doc); return Err(DbError::NotImplemented { feature: "XML functions (compile with xml feature to enable)".into() }); }
+            {
+                let _ = (xpath, doc);
+                return Err(DbError::NotImplemented {
+                    feature: "XML functions (compile with xml feature to enable)".into(),
+                });
+            }
             #[cfg(feature = "xml")]
             super::functions::xml::eval_xmlquery(xpath, doc, row, sq)
         }
