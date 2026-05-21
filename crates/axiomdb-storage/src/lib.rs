@@ -25,6 +25,7 @@ pub mod mmap;
 pub mod page;
 pub mod page_lock;
 pub mod page_ref;
+mod txn_stamp;
 pub mod wal_frame;
 pub mod zone_map;
 

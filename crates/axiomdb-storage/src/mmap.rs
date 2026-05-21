@@ -47,15 +47,6 @@ const CHECKSUM_OFFSET: usize = 12;
 // only the body [HEADER_SIZE..], so stamping the lsn here never invalidates it.
 const LSN_OFFSET: usize = 24;
 
-thread_local! {
-    /// Current transaction id used to stamp page frames (project B, subphase 4).
-    /// Set per statement by the executor via `set_current_txn`; read by `write_page`
-    /// on the redo path. A thread-local is correct under multi-writer because a
-    /// statement runs synchronously on one thread (no `spawn_blocking`/rayon between
-    /// `set_current_txn` and the statement's `write_page`s). `0` = system write.
-    static CURRENT_TXN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 // ── DbFileMeta ────────────────────────────────────────────────────────────────
 
 /// File metadata stored in the body of page 0.
@@ -503,7 +494,7 @@ impl MmapStorage {
             // Stamp the writing txn (thread-local, set per statement by the executor).
             // 0 = non-transactional/system write (e.g. bootstrap); recovery treats
             // such frames per the committed predicate in subphase 5.
-            let txn_id = CURRENT_TXN.with(|c| c.get());
+            let txn_id = crate::txn_stamp::get();
             let offset = frame_log.append(page_id, lsn, txn_id, &buf)?;
             self.wal_index.record(FrameRef {
                 page_id,
@@ -894,11 +885,11 @@ impl StorageEngine for MmapStorage {
     }
 
     fn set_current_txn(&self, txn_id: u64) {
-        CURRENT_TXN.with(|c| c.set(txn_id));
+        crate::txn_stamp::set(txn_id);
     }
 
     fn current_txn(&self) -> u64 {
-        CURRENT_TXN.with(|c| c.get())
+        crate::txn_stamp::get()
     }
 
     fn sync_frame_log(&self) -> Result<(), DbError> {

@@ -16,6 +16,8 @@
 //! pages: the WAL is durable at commit, the un-flushed data pages are lost on crash,
 //! and recovery must REDO them.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use axiomdb_core::error::DbError;
@@ -24,6 +26,7 @@ use crate::{
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, PAGE_SIZE},
+    wal_frame::FrameLog,
 };
 
 const INITIAL_PAGES: u64 = 64;
@@ -79,6 +82,14 @@ struct State {
 pub struct FaultInjectionStorage {
     state: RwLock<State>,
     page_locks: crate::page_lock::PageLockTable,
+    /// Durable page-frame redo log (project B subphase 5). `None` ⇒ redo disabled
+    /// ⇒ behaves as a plain in-RAM engine. Set once by [`enable_redo_log`]. A
+    /// simulated power loss never touches this file — modelling a real fsync'd WAL.
+    ///
+    /// [`enable_redo_log`]: FaultInjectionStorage::enable_redo_log
+    frame_log: Option<FrameLog>,
+    /// Monotonic LSN stamped into each written page (`0` while redo is disabled).
+    frame_lsn: AtomicU64,
 }
 
 impl FaultInjectionStorage {
@@ -89,6 +100,37 @@ impl FaultInjectionStorage {
         FaultInjectionStorage {
             state: RwLock::new(State { current, durable }),
             page_locks: crate::page_lock::PageLockTable::new(),
+            frame_log: None,
+            frame_lsn: AtomicU64::new(0),
+        }
+    }
+
+    /// Enables a durable page-frame redo log at `path` (project B subphase 5),
+    /// mirroring [`MmapStorage::enable_redo_log`]. Call before any write. The log's
+    /// file survives [`simulate_power_loss`] while volatile data pages revert, so
+    /// recovery can REDO committed frames the data pages lost.
+    ///
+    /// [`MmapStorage::enable_redo_log`]: crate::MmapStorage::enable_redo_log
+    /// [`simulate_power_loss`]: FaultInjectionStorage::simulate_power_loss
+    pub fn enable_redo_log(&mut self, path: &Path) -> Result<(), DbError> {
+        self.frame_log = Some(FrameLog::create(path)?);
+        self.frame_lsn.store(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// (test) Whether the durable frame log holds a committed frame for `page_id`
+    /// under `is_committed`. Asserts that fsync'd frames survive a simulated crash.
+    pub fn frame_log_has_committed(
+        &self,
+        page_id: u64,
+        is_committed: &dyn Fn(u64) -> bool,
+    ) -> bool {
+        match &self.frame_log {
+            Some(fl) => fl
+                .build_index(is_committed)
+                .map(|idx| idx.latest(page_id).is_some())
+                .unwrap_or(false),
+            None => false,
         }
     }
 
@@ -102,11 +144,27 @@ impl FaultInjectionStorage {
 
     fn write_page_inner(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
         page.verify_checksum()?;
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        state.current.ensure_capacity(page_id);
-        let idx = page_id as usize;
-        state.current.pages[idx] = page.clone();
-        state.current.allocated[idx] = true;
+        if let Some(frame_log) = &self.frame_log {
+            // Redo on: stamp the page LSN and append a frame stamped with the current
+            // txn (mirrors MmapStorage). The data page stays volatile until flush();
+            // the appended frame is made durable by sync_frame_log at the commit.
+            let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
+            let mut stamped = page.clone();
+            stamped.set_lsn(lsn);
+            let txn_id = crate::txn_stamp::get();
+            frame_log.append(page_id, lsn, txn_id, stamped.as_bytes())?;
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            state.current.ensure_capacity(page_id);
+            let idx = page_id as usize;
+            state.current.pages[idx] = stamped;
+            state.current.allocated[idx] = true;
+        } else {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            state.current.ensure_capacity(page_id);
+            let idx = page_id as usize;
+            state.current.pages[idx] = page.clone();
+            state.current.allocated[idx] = true;
+        }
         Ok(())
     }
 }
@@ -190,6 +248,21 @@ impl StorageEngine for FaultInjectionStorage {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.durable = state.current.clone();
         Ok(())
+    }
+
+    fn set_current_txn(&self, txn_id: u64) {
+        crate::txn_stamp::set(txn_id);
+    }
+
+    fn current_txn(&self) -> u64 {
+        crate::txn_stamp::get()
+    }
+
+    fn sync_frame_log(&self) -> Result<(), DbError> {
+        match &self.frame_log {
+            Some(fl) => fl.sync(),
+            None => Ok(()),
+        }
     }
 
     fn page_count(&self) -> u64 {
@@ -296,5 +369,27 @@ mod tests {
             matches!(storage.read_page(b), Err(DbError::PageNotFound { .. })),
             "b (post-flush alloc) is gone"
         );
+    }
+
+    #[test]
+    fn frame_log_survives_power_loss_while_data_page_reverts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = FaultInjectionStorage::new();
+        storage.enable_redo_log(&dir.path().join("fi.wf")).unwrap();
+
+        let id = storage.alloc_page(PageType::Data).unwrap();
+        storage.write_page(id, &data_page(id, 0xAA)).unwrap(); // baseline, txn 0
+        storage.flush().unwrap();
+
+        storage.set_current_txn(5);
+        storage.write_page(id, &data_page(id, 0xBB)).unwrap(); // committed-row write
+        storage.sync_frame_log().unwrap();
+        storage.set_current_txn(0);
+
+        storage.simulate_power_loss();
+        // The volatile data page reverted to the durable baseline …
+        assert_eq!(storage.read_page(id).unwrap().body()[0], 0xAA);
+        // … but the fsync'd frame for txn 5 is still in the (separate) frame log.
+        assert!(storage.frame_log_has_committed(id, &|t| t == 5));
     }
 }
