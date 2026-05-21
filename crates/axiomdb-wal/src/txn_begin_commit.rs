@@ -88,6 +88,20 @@ impl TxnManager {
     ///
     /// # Errors
     /// - I/O errors from WAL write or fsync.
+    /// Commits and makes the page-frame redo log durable first (write-ahead order:
+    /// the txn's data frames are `fsync`'d BEFORE the logical `Commit` record, so
+    /// recovery never sees a committed txn whose frames are missing). This is the
+    /// entry point the executor uses; plain [`commit`](Self::commit) stays for tests
+    /// and non-redo callers. `sync_frame_log` is a no-op unless the redo log is on.
+    pub fn commit_durable(
+        &self,
+        conn_txn: ConnectionTxn,
+        storage: &dyn StorageEngine,
+    ) -> Result<Option<TxnId>, DbError> {
+        storage.sync_frame_log()?;
+        self.commit(conn_txn)
+    }
+
     pub fn commit(&self, mut conn_txn: ConnectionTxn) -> Result<Option<TxnId>, DbError> {
         let txn_id = conn_txn.txn_id;
 

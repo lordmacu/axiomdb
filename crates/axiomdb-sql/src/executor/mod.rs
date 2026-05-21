@@ -181,7 +181,7 @@ pub fn truncate_table_unchecked_on_open(
     match result {
         Ok(()) => {
             let tid = conn_txn.txn_id;
-            let _ = txn.commit(conn_txn)?;
+            let _ = txn.commit_durable(conn_txn, storage)?;
             txn.release_immediate_committed_frees(storage, tid)?;
             txn.drain_committed_page_batches(storage)?;
             AUTO_INC_SEQ.with(|seq| {

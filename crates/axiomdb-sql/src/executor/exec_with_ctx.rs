@@ -471,7 +471,7 @@ fn commit_active_txn(
         return Err(e);
     }
     ctx.clear_deferred_fk_constraints();
-    let commit = txn.commit(conn)?;
+    let commit = txn.commit_durable(conn, storage)?;
     ctx.flush_pending_notifications();
     Ok(commit)
 }

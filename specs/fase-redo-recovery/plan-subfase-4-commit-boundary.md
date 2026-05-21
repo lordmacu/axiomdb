@@ -156,23 +156,42 @@ log is fsync'd inside `commit(conn, storage)` before the WAL `Commit` record.
 // Plus: existing suites stay green (additive).
 ```
 
-### Implementation outline
+### 4c-1 — commit fsyncs the frame log (DONE)
+Rather than change `commit(conn)`'s signature (it has ~37 wal-test call sites), add a
+thin wrapper that centralizes the write-ahead fsync; tests/non-redo callers keep
+`commit`:
 ```rust
-// txn_begin_commit.rs: commit takes storage, fsyncs frames BEFORE the Commit record.
-pub fn commit(&self, mut conn_txn: ConnectionTxn, storage: &dyn StorageEngine)
+// txn_begin_commit.rs
+pub fn commit_durable(&self, conn: ConnectionTxn, storage: &dyn StorageEngine)
     -> Result<Option<TxnId>, DbError> {
-    storage.sync_frame_log()?;                 // write-ahead: data (frames) durable first
-    // ... existing: append Commit entry + commit_data_sync()/flush_no_sync() ...
+    storage.sync_frame_log()?;   // write-ahead: frames durable BEFORE the Commit record
+    self.commit(conn)
 }
-
-// executor (exec_with_ctx.rs ~L20 begin, ~L474 commit) + other commit sites:
-struct TxnScope<'a> { s: &'a dyn StorageEngine }
-impl Drop for TxnScope<'_> { fn drop(&mut self) { self.s.set_current_txn(0); } }
-// after begin: storage.set_current_txn(conn.txn_id); let _scope = TxnScope { s: storage };
-// commit: txn.commit(conn, storage)   // was txn.commit(conn)
 ```
-Update ALL `txn.commit(conn)` call sites (exec_entry, sequence_runtime, mod,
-cron_runtime) to pass `storage`.
+All 8 executor commit sites (exec_entry ×2, sequence_runtime, mod, cron_runtime ×3,
+exec_with_ctx) now call `commit_durable(conn, storage)`.
+
+### 4c-2 — executor stamps the real txn_id (PENDING — subtle, do carefully)
+`write_page` currently stamps `CURRENT_TXN` (0 until set). The executor must set it to
+the live txn id around each statement's writes. **A simple set/reset-to-0 is wrong**
+because sub-transactions (`sequence_runtime::next_sequence_value`, `cron_runtime`) do
+their own begin+commit *inside* a parent statement and commit independently (a `nextval`
+persists even if the parent rolls back) — their frames must carry *their* txn_id, then
+restore the parent's. Use a **save/restore RAII guard** + a `current_txn()` getter:
+```rust
+// engine.rs: fn current_txn(&self) -> u64 { 0 }  // MmapStorage reads the thread-local
+struct TxnStamp<'a> { s: &'a dyn StorageEngine, prev: u64 }
+impl<'a> TxnStamp<'a> {
+    fn new(s: &'a dyn StorageEngine, txn_id: u64) -> Self {
+        let prev = s.current_txn(); s.set_current_txn(txn_id); Self { s, prev }
+    }
+}
+impl Drop for TxnStamp<'_> { fn drop(&mut self) { self.s.set_current_txn(self.prev); } }
+```
+Insertion points: at the top of `dispatch(stmt, storage, txn, conn)` (covers all DML,
+autocommit + explicit multi-statement), and in `next_sequence_value` + the cron write
+fns right after their `begin()` (nested sub-txn, restored on drop). The save/restore
+makes nesting correct.
 
 ### Verification
 ```bash

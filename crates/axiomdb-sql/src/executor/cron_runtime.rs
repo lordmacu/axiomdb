@@ -62,7 +62,7 @@ fn cron_schedule_fn(
     let mut conn = runner.txn.begin()?;
     let mut writer = CatalogWriter::new(runner.storage, runner.txn, &mut conn)?;
     writer.upsert_cron_job(def)?;
-    if let Some(txn_id) = runner.txn.commit(conn)? {
+    if let Some(txn_id) = runner.txn.commit_durable(conn, runner.storage)? {
         runner.txn.wal_flush_and_fsync()?;
         runner.txn.advance_committed_single(txn_id);
     }
@@ -86,7 +86,7 @@ fn cron_unschedule_fn(
     let mut conn = runner.txn.begin()?;
     let mut writer = CatalogWriter::new(runner.storage, runner.txn, &mut conn)?;
     let deleted = writer.delete_cron_job(&name)?;
-    if let Some(txn_id) = runner.txn.commit(conn)? {
+    if let Some(txn_id) = runner.txn.commit_durable(conn, runner.storage)? {
         runner.txn.wal_flush_and_fsync()?;
         runner.txn.advance_committed_single(txn_id);
     }
@@ -121,7 +121,7 @@ fn cron_set_enabled_fn(
     let mut conn = runner.txn.begin()?;
     let mut writer = CatalogWriter::new(runner.storage, runner.txn, &mut conn)?;
     writer.upsert_cron_job(def)?;
-    if let Some(txn_id) = runner.txn.commit(conn)? {
+    if let Some(txn_id) = runner.txn.commit_durable(conn, runner.storage)? {
         runner.txn.wal_flush_and_fsync()?;
         runner.txn.advance_committed_single(txn_id);
     }

@@ -79,7 +79,7 @@ fn next_sequence_value(
     let value = advance_sequence_value(&mut def)?;
     let mut writer = CatalogWriter::new(storage, txn, &mut conn)?;
     writer.replace_sequence_state(def)?;
-    if let Some(txn_id) = txn.commit(conn)? {
+    if let Some(txn_id) = txn.commit_durable(conn, storage)? {
         txn.wal_flush_and_fsync()?;
         txn.advance_committed_single(txn_id);
     }

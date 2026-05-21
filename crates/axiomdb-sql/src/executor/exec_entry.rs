@@ -688,7 +688,7 @@ pub fn execute(
         match stmt {
             Stmt::Commit => {
                 let tid = conn.txn_id;
-                txn.commit(conn)?;
+                txn.commit_durable(conn, storage)?;
                 txn.release_immediate_committed_frees(storage, tid)?;
                 txn.drain_committed_page_batches(storage)?;
                 return Ok(QueryResult::Empty);
@@ -731,7 +731,7 @@ pub fn execute(
             let tid = conn.txn_id;
             match dispatch(other, storage, txn, &mut conn) {
                 Ok(result) => {
-                    txn.commit(conn)?;
+                    txn.commit_durable(conn, storage)?;
                     txn.release_immediate_committed_frees(storage, tid)?;
                     txn.drain_committed_page_batches(storage)?;
                     Ok(result)
