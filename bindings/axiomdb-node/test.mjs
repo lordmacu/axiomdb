@@ -32,6 +32,20 @@ try{
   ck('rollback', db.queryTuplesPacked('SELECT COUNT(*) FROM t')[0][0]===3);
   let threw=false; try{db.queryTuplesPacked('SELECT * FROM nope');}catch{threw=true;} ck('bad sql throws', threw);
 
+  // parameter binding
+  db.execute('CREATE TABLE p (id INT, name TEXT, score REAL, avatar BLOB)');
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [1,'alice',3.5,null]);
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [2,'héllo',2.25,Buffer.from([9,8,7])]);
+  const prow=db.queryTuples('SELECT id,name,score,avatar FROM p WHERE id = ?', [2])[0];
+  ck('param row', prow[0]===2 && prow[1]==='héllo' && prow[2]===2.25);
+  ck('param blob', Buffer.isBuffer(prow[3]) && prow[3][0]===9 && prow[3][2]===7);
+  ck('param map', JSON.stringify(db.query('SELECT id,name FROM p WHERE name = ?', ['alice']))===JSON.stringify([{id:1,name:'alice'}]));
+  ck('param packed', JSON.stringify(db.queryTuplesPacked('SELECT id FROM p WHERE id = ?', [1]))===JSON.stringify([[1]]));
+  const evil="x'; DROP TABLE p; --";
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [3,evil,0.0,null]);
+  ck('injection-safe', db.queryTuples('SELECT name FROM p WHERE id = ?', [3])[0][0]===evil);
+  ck('table survived', db.queryTuples('SELECT COUNT(*) FROM p')[0][0]===3);
+
   db.close();
   console.log(failed?`\n${failed} FAILED`:'\nALL PASS');
 }finally{rmSync(dir,{recursive:true,force:true});}

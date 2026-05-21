@@ -51,6 +51,21 @@ try {
   try { db.queryTuples('SELECT * FROM nonexistent'); } catch { threw = true; }
   check('bad sql throws', threw);
 
+  // parameter binding
+  db.execute('CREATE TABLE p (id INT, name TEXT, score REAL, avatar BLOB)');
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [1, 'alice', 3.5, null]);
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [2, 'héllo', 2.25, Buffer.from([9, 8, 7])]);
+  const prow = db.queryTuples('SELECT id, name, score, avatar FROM p WHERE id = ?', [2])[0];
+  check('param row', prow[0] === 2 && prow[1] === 'héllo' && prow[2] === 2.25);
+  check('param blob', Buffer.isBuffer(prow[3]) && prow[3][0] === 9 && prow[3][2] === 7);
+  const pmap = db.query('SELECT id, name FROM p WHERE name = ?', ['alice']);
+  check('param map', JSON.stringify(pmap) === JSON.stringify([{ id: 1, name: 'alice' }]));
+  // injection-safe: a value containing SQL is bound, not executed
+  const evil = "x'; DROP TABLE p; --";
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [3, evil, 0.0, null]);
+  check('injection-safe', db.queryTuples('SELECT name FROM p WHERE id = ?', [3])[0][0] === evil);
+  check('table survived', db.queryTuples('SELECT COUNT(*) FROM p')[0][0] === 3);
+
   db.close();
   console.log(`\n${failed === 0 ? 'ALL PASS' : failed + ' FAILED'}`);
 } finally {

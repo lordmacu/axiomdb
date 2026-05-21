@@ -25,6 +25,22 @@ db.close();
 Cell types: `int`, `double`, `String`, `Uint8List` (BLOB), or `null`. Dart's
 `int` is 64-bit, so integers are exact.
 
+## Parameter binding
+
+Pass a list of values to bind `?` placeholders. This is **real
+prepared-statement binding** (the engine parses, analyzes, and substitutes the
+values) — no string interpolation, so untrusted input cannot inject SQL:
+
+```dart
+db.execute('INSERT INTO users VALUES (?, ?)', [1, 'Alice']);
+final rows = db.queryTuples('SELECT * FROM users WHERE id = ?', [1]);
+final recs = db.query('SELECT * FROM users WHERE name = ?', ['Alice']);
+```
+
+Param types: `null`, `int`, `double`, `String`, and `Uint8List`/`List<int>`
+(BLOB). All of `execute`, `queryTuples`, `query`, and `queryWithColumns` accept
+an optional positional `params` argument.
+
 ## Performance
 
 10K rows × 6 cols, materialize every cell (macOS, median of 11):

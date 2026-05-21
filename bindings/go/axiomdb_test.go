@@ -120,3 +120,49 @@ func TestBadSQL(t *testing.T) {
 		t.Error("expected error for bad SQL")
 	}
 }
+
+func TestParamBinding(t *testing.T) {
+	db := openTmp(t)
+	db.Execute("CREATE TABLE t (id INT, name TEXT, score REAL, avatar BLOB)")
+	if _, err := db.Execute("INSERT INTO t VALUES (?, ?, ?, ?)", 1, "alice", 3.5, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Execute("INSERT INTO t VALUES (?, ?, ?, ?)", 2, "héllo", 2.25, []byte{9, 8, 7}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.QueryTuples("SELECT id, name, score, avatar FROM t WHERE id = ?", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	if rows[0][0].(int64) != 2 || rows[0][1].(string) != "héllo" || rows[0][2].(float64) != 2.25 {
+		t.Errorf("row mismatch: %#v", rows[0])
+	}
+	if blob, ok := rows[0][3].([]byte); !ok || !bytes.Equal(blob, []byte{9, 8, 7}) {
+		t.Errorf("blob mismatch: %#v", rows[0][3])
+	}
+}
+
+func TestParamInjectionSafe(t *testing.T) {
+	db := openTmp(t)
+	db.Execute("CREATE TABLE t (id INT, name TEXT)")
+	evil := "x'; DROP TABLE t; --"
+	if _, err := db.Execute("INSERT INTO t VALUES (?, ?)", 1, evil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.QueryTuples("SELECT name FROM t WHERE id = ?", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0][0].(string) != evil {
+		t.Errorf("want %q, got %#v", evil, rows[0][0])
+	}
+	// table survived — value bound, not executed
+	cnt, _ := db.QueryTuples("SELECT COUNT(*) FROM t")
+	if cnt[0][0].(int64) != 1 {
+		t.Errorf("table mutated: count=%v", cnt[0][0])
+	}
+}

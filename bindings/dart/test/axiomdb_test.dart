@@ -82,4 +82,44 @@ void main() {
     addTearDown(db.close);
     expect(() => db.queryTuples('SELECT * FROM nonexistent'), throwsA(isA<AxiomDBException>()));
   });
+
+  test('parameter binding — execute + query', () {
+    final db = tmpDB();
+    addTearDown(db.close);
+    db.execute('CREATE TABLE t (id INT, name TEXT, score REAL, avatar BLOB)');
+    db.execute('INSERT INTO t VALUES (?, ?, ?, ?)', [1, 'alice', 3.5, null]);
+    db.execute('INSERT INTO t VALUES (?, ?, ?, ?)', [2, 'bøb', 2.25, Uint8List.fromList([9, 8, 7])]);
+
+    final rows = db.queryTuples('SELECT id, name, score, avatar FROM t WHERE id = ?', [2]);
+    expect(rows.length, 1);
+    expect(rows[0][0], 2);
+    expect(rows[0][1], 'bøb');
+    expect(rows[0][2], 2.25);
+    expect(rows[0][3], [9, 8, 7]);
+  });
+
+  test('parameter binding — injection-safe', () {
+    final db = tmpDB();
+    addTearDown(db.close);
+    db.execute('CREATE TABLE t (id INT, name TEXT)');
+    // A value containing SQL is treated as a literal, not executed.
+    const evil = "x'; DROP TABLE t; --";
+    db.execute('INSERT INTO t VALUES (?, ?)', [1, evil]);
+    final rows = db.queryTuples('SELECT name FROM t WHERE id = ?', [1]);
+    expect(rows[0][0], evil);
+    // Table still exists.
+    expect(db.queryTuples('SELECT COUNT(*) FROM t').first[0], 1);
+  });
+
+  test('parameter binding — null filter', () {
+    final db = tmpDB();
+    addTearDown(db.close);
+    db.execute('CREATE TABLE t (id INT, name TEXT)');
+    db.execute('INSERT INTO t VALUES (?, ?)', [1, 'a']);
+    db.execute('INSERT INTO t VALUES (?, ?)', [2, 'b']);
+    final maps = db.query('SELECT id, name FROM t WHERE name = ?', ['b']);
+    expect(maps, [
+      {'id': 2, 'name': 'b'}
+    ]);
+  });
 }

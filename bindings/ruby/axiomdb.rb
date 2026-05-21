@@ -47,6 +47,8 @@ module AxiomDBNative
   extern 'void axiomdb_packed_free(void*, size_t)'
   extern 'void axiomdb_close(void*)'
   extern 'char* axiomdb_last_error(void*)'
+  extern 'long long axiomdb_execute_params(void*, const char*, const void*, size_t)'
+  extern 'void* axiomdb_query_packed_params(void*, const char*, const void*, size_t, void*)'
 end
 
 class AxiomDB
@@ -60,28 +62,44 @@ class AxiomDB
   end
 
   # Execute a DDL/DML statement. Returns rows affected.
-  def execute(sql)
+  #
+  # Pass +params+ (an array) to bind +?+ placeholders with real
+  # prepared-statement binding — no string interpolation, no SQL injection:
+  #
+  #   db.execute('INSERT INTO t VALUES (?, ?)', [1, 'Alice'])
+  #
+  # Each param maps from: nil, Integer, Float, String (UTF-8 → TEXT, binary →
+  # BLOB), true/false.
+  def execute(sql, params = nil)
     check_open
-    n = AxiomDBNative.axiomdb_execute(@ptr, sql)
+    n = if params.nil? || params.empty?
+          AxiomDBNative.axiomdb_execute(@ptr, sql)
+        else
+          enc = encode_params(params)
+          AxiomDBNative.axiomdb_execute_params(@ptr, sql, enc, enc.bytesize)
+        end
     raise AxiomDBError, last_error || 'execute failed' if n < 0
 
     n
   end
 
   # Execute a SELECT, returning rows as arrays (fastest path).
-  def query_tuples(sql)
-    query_packed(sql)[1]
+  # Pass +params+ to bind +?+ placeholders safely (see #execute).
+  def query_tuples(sql, params = nil)
+    query_packed(sql, params)[1]
   end
 
   # Execute a SELECT, returning rows as hashes (column name => value).
-  def query(sql)
-    cols, rows = query_packed(sql)
+  # Pass +params+ to bind +?+ placeholders safely (see #execute).
+  def query(sql, params = nil)
+    cols, rows = query_packed(sql, params)
     rows.map { |row| cols.zip(row).to_h }
   end
 
   # Execute a SELECT, returning [column_names, rows-as-arrays].
-  def query_with_columns(sql)
-    query_packed(sql)
+  # Pass +params+ to bind +?+ placeholders safely (see #execute).
+  def query_with_columns(sql, params = nil)
+    query_packed(sql, params)
   end
 
   def begin_txn
@@ -118,21 +136,60 @@ class AxiomDB
     raise AxiomDBError, 'database is closed' if @ptr.nil? || @ptr.null?
   end
 
-  # One FFI call returns the whole result in COLUMNAR (AXM2) layout; copy it
-  # into a Ruby string, free the native buffer, then parse. Columnar lets Ruby
-  # bulk-decode numeric columns with a single `unpack('q<*')`/`unpack('E*')` and
-  # assemble rows with `transpose` — both C-level — instead of an interpreted
-  # per-cell loop (~4× faster parse here). Returns [columns, rows].
-  def query_packed(sql)
+  # One FFI call returns the whole result; copy it into a Ruby string, free the
+  # native buffer, then parse. With no params, uses the COLUMNAR (AXM2) layout —
+  # Ruby bulk-decodes numeric columns with a single `unpack('q<*')`/`unpack('E*')`
+  # and assembles rows with `transpose` (both C-level, ~4× faster parse). With
+  # params, uses the row-major (AXM1) prepared-statement path. Returns
+  # [columns, rows].
+  def query_packed(sql, params = nil)
     check_open
     len_ptr = Fiddle::Pointer.malloc(Fiddle::SIZEOF_SIZE_T, Fiddle::RUBY_FREE)
-    buf_ptr = AxiomDBNative.axiomdb_query_packed_columnar(@ptr, sql, len_ptr)
+    if params.nil? || params.empty?
+      buf_ptr = AxiomDBNative.axiomdb_query_packed_columnar(@ptr, sql, len_ptr)
+      columnar = true
+    else
+      enc = encode_params(params)
+      buf_ptr = AxiomDBNative.axiomdb_query_packed_params(@ptr, sql, enc, enc.bytesize, len_ptr)
+      columnar = false
+    end
     raise AxiomDBError, last_error || 'query failed' if buf_ptr.null?
 
     len = len_ptr[0, Fiddle::SIZEOF_SIZE_T].unpack1('Q<')
     data = buf_ptr[0, len] # copy native bytes into a Ruby string
     AxiomDBNative.axiomdb_packed_free(buf_ptr, len)
-    parse_columnar(data)
+    columnar ? parse_columnar(data) : parse_packed(data)
+  end
+
+  # Serialize positional +params+ into the AxiomDB param buffer: u32 count, then
+  # per-param {u8 tag, payload}. Tags mirror the packed cell encoding:
+  # 0=NULL, 1=INT i64, 2=REAL f64, 3=TEXT, 4=BLOB. A binary-encoded String is
+  # bound as a BLOB; any other String is bound as UTF-8 TEXT.
+  def encode_params(params)
+    out = String.new # ASCII-8BIT (binary) by default
+    out << [params.length].pack('L<')
+    params.each do |p|
+      case p
+      when nil
+        out << [0].pack('C')
+      when true, false
+        out << [1].pack('C') << [p ? 1 : 0].pack('q<')
+      when Integer
+        out << [1].pack('C') << [p].pack('q<')
+      when Float
+        out << [2].pack('C') << [p].pack('E')
+      when String
+        if p.encoding == Encoding::BINARY
+          out << [4].pack('C') << [p.bytesize].pack('L<') << p
+        else
+          b = p.encode('UTF-8').b
+          out << [3].pack('C') << [b.bytesize].pack('L<') << b
+        end
+      else
+        raise AxiomDBError, "unsupported param type: #{p.class}"
+      end
+    end
+    out
   end
 
   # Decode the columnar (AXM2) buffer. Homogeneous columns are read in one

@@ -18,7 +18,7 @@
 
 use pyo3::create_exception;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyTuple};
 
 use axiomdb_core::error::DbError;
 use axiomdb_embedded::Db;
@@ -68,6 +68,36 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyObject {
     }
 }
 
+/// Converts a Python object into an AxiomDB [`Value`] for `?` parameter binding.
+///
+/// Mapping: None → Null, int (incl. bool) → BigInt, float → Real, str → Text,
+/// bytes/bytearray → Bytes. `int` is checked before `float` because PyO3's
+/// `f64` extraction would otherwise coerce ints lossily.
+fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        Ok(Value::Null)
+    } else if let Ok(i) = obj.extract::<i64>() {
+        // Python `bool` is an `int` subclass → True/False bind as 1/0.
+        Ok(Value::BigInt(i))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        Ok(Value::Real(f))
+    } else if let Ok(s) = obj.extract::<String>() {
+        Ok(Value::Text(s))
+    } else if let Ok(b) = obj.downcast::<PyBytes>() {
+        Ok(Value::Bytes(b.as_bytes().to_vec()))
+    } else if let Ok(ba) = obj.downcast::<PyByteArray>() {
+        Ok(Value::Bytes(ba.to_vec()))
+    } else {
+        Err(AxiomDBError::new_err("unsupported param type".to_string()))
+    }
+}
+
+/// Extracts a Python sequence (list/tuple) of `?` params into `Value`s.
+fn extract_params(params: &Bound<'_, PyAny>) -> PyResult<Vec<Value>> {
+    let items: Vec<Bound<'_, PyAny>> = params.extract()?;
+    items.iter().map(py_to_value).collect()
+}
+
 /// Builds a `list[tuple]` from owned engine rows, one tuple per row.
 #[inline]
 fn rows_to_tuples<'py>(py: Python<'py>, rows: &[Vec<Value>]) -> Bound<'py, PyList> {
@@ -105,19 +135,59 @@ impl Connection {
     }
 
     /// Executes a DDL/DML statement. Returns rows affected.
-    fn execute(&mut self, sql: &str) -> PyResult<u64> {
-        self.db_mut()?.execute(sql).map_err(map_err)
+    ///
+    /// Pass `params` (a list/tuple) to bind `?` placeholders with real
+    /// prepared-statement binding — no string interpolation, no SQL injection:
+    ///
+    /// ```python
+    /// conn.execute("INSERT INTO t VALUES (?, ?)", [1, "Alice"])
+    /// ```
+    #[pyo3(signature = (sql, params=None))]
+    fn execute(&mut self, sql: &str, params: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
+        match params {
+            None => self.db_mut()?.execute(sql).map_err(map_err),
+            Some(p) => {
+                let values = extract_params(p)?;
+                self.db_mut()?.execute_params(sql, &values).map_err(map_err)
+            }
+        }
     }
 
     /// Executes a SELECT and returns rows as `list[tuple]` (fastest path).
-    fn query<'py>(&mut self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyList>> {
-        let rows = self.db_mut()?.query(sql).map_err(map_err)?;
+    /// Pass `params` to bind `?` placeholders safely (see `execute`).
+    #[pyo3(signature = (sql, params=None))]
+    fn query<'py>(
+        &mut self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let rows = match params {
+            None => self.db_mut()?.query(sql).map_err(map_err)?,
+            Some(p) => {
+                let values = extract_params(p)?;
+                self.db_mut()?.query_params(sql, &values).map_err(map_err)?.1
+            }
+        };
         Ok(rows_to_tuples(py, &rows))
     }
 
     /// Executes a SELECT and returns rows as `list[dict]` (column name → value).
-    fn query_dict<'py>(&mut self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyList>> {
-        let (cols, rows) = self.db_mut()?.query_with_columns(sql).map_err(map_err)?;
+    /// Pass `params` to bind `?` placeholders safely (see `execute`).
+    #[pyo3(signature = (sql, params=None))]
+    fn query_dict<'py>(
+        &mut self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let (cols, rows) = match params {
+            None => self.db_mut()?.query_with_columns(sql).map_err(map_err)?,
+            Some(p) => {
+                let values = extract_params(p)?;
+                self.db_mut()?.query_params(sql, &values).map_err(map_err)?
+            }
+        };
         let dicts = rows.iter().map(|row| {
             let d = PyDict::new_bound(py);
             for (name, v) in cols.iter().zip(row.iter()) {
@@ -130,12 +200,21 @@ impl Connection {
     }
 
     /// Executes a SELECT and returns `(column_names, list[tuple])`.
+    /// Pass `params` to bind `?` placeholders safely (see `execute`).
+    #[pyo3(signature = (sql, params=None))]
     fn query_with_columns<'py>(
         &mut self,
         py: Python<'py>,
         sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Vec<String>, Bound<'py, PyList>)> {
-        let (cols, rows) = self.db_mut()?.query_with_columns(sql).map_err(map_err)?;
+        let (cols, rows) = match params {
+            None => self.db_mut()?.query_with_columns(sql).map_err(map_err)?,
+            Some(p) => {
+                let values = extract_params(p)?;
+                self.db_mut()?.query_params(sql, &values).map_err(map_err)?
+            }
+        };
         Ok((cols, rows_to_tuples(py, &rows)))
     }
 

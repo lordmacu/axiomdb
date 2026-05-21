@@ -66,6 +66,14 @@ const axiomdb_query_packed = lib.func(
   'uint8_t* axiomdb_query_packed(void* db, const char* sql, _Out_ size_t* out_len)'
 );
 const axiomdb_packed_free = lib.func('void axiomdb_packed_free(uint8_t* ptr, size_t len)');
+// Parameter binding: serialize ? params into a buffer; the engine prepares +
+// binds them (real prepared-statement binding, not string escaping).
+const axiomdb_execute_params = lib.func(
+  'int64_t axiomdb_execute_params(void* db, const char* sql, const uint8_t* params, size_t params_len)'
+);
+const axiomdb_query_packed_params = lib.func(
+  'uint8_t* axiomdb_query_packed_params(void* db, const char* sql, const uint8_t* params, size_t params_len, _Out_ size_t* out_len)'
+);
 
 // ── Packed buffer parser ──────────────────────────────────────────────────────
 
@@ -116,6 +124,58 @@ function parsePacked(buf) {
   return { columns, rows };
 }
 
+/**
+ * Serializes positional params into the AxiomDB param buffer: u32 count, then
+ * per-param {u8 tag, payload}. Tags mirror the packed cell encoding:
+ * 0=NULL, 1=INT i64, 2=REAL f64, 3=TEXT, 4=BLOB.
+ */
+function encodeParams(params) {
+  const chunks = [];
+  const header = Buffer.allocUnsafe(4);
+  header.writeUInt32LE(params.length, 0);
+  chunks.push(header);
+  for (const p of params) {
+    if (p === null || p === undefined) {
+      chunks.push(Buffer.from([TYPE_NULL]));
+    } else if (typeof p === 'number') {
+      const b = Buffer.allocUnsafe(9);
+      if (Number.isInteger(p)) {
+        b[0] = TYPE_INTEGER;
+        b.writeBigInt64LE(BigInt(p), 1);
+      } else {
+        b[0] = TYPE_REAL;
+        b.writeDoubleLE(p, 1);
+      }
+      chunks.push(b);
+    } else if (typeof p === 'bigint') {
+      const b = Buffer.allocUnsafe(9);
+      b[0] = TYPE_INTEGER;
+      b.writeBigInt64LE(p, 1);
+      chunks.push(b);
+    } else if (typeof p === 'boolean') {
+      const b = Buffer.allocUnsafe(9);
+      b[0] = TYPE_INTEGER;
+      b.writeBigInt64LE(p ? 1n : 0n, 1);
+      chunks.push(b);
+    } else if (typeof p === 'string') {
+      const sb = Buffer.from(p, 'utf8');
+      const hdr = Buffer.allocUnsafe(5);
+      hdr[0] = TYPE_TEXT;
+      hdr.writeUInt32LE(sb.length, 1);
+      chunks.push(hdr, sb);
+    } else if (Buffer.isBuffer(p) || p instanceof Uint8Array) {
+      const bb = Buffer.isBuffer(p) ? p : Buffer.from(p);
+      const hdr = Buffer.allocUnsafe(5);
+      hdr[0] = TYPE_BLOB;
+      hdr.writeUInt32LE(bb.length, 1);
+      chunks.push(hdr, bb);
+    } else {
+      throw new Error(`unsupported param type: ${typeof p}`);
+    }
+  }
+  return Buffer.concat(chunks);
+}
+
 // ── JavaScript API ──────────────────────────────────────────────────────────
 
 export class AxiomDB {
@@ -129,10 +189,26 @@ export class AxiomDB {
     }
   }
 
-  /** Execute a DDL/DML statement. Returns rows affected. */
-  execute(sql) {
+  /**
+   * Execute a DDL/DML statement. Returns rows affected.
+   *
+   * Pass `params` (an array) to bind `?` placeholders with real
+   * prepared-statement binding — no string interpolation, no SQL injection:
+   *
+   *   db.execute('INSERT INTO t VALUES (?, ?)', [1, 'Alice']);
+   *
+   * Each param maps from: null, number, bigint, boolean, string, or
+   * Buffer/Uint8Array (BLOB).
+   */
+  execute(sql, params) {
     this.#checkOpen();
-    const result = axiomdb_execute(this.#ptr, sql);
+    let result;
+    if (!params || params.length === 0) {
+      result = axiomdb_execute(this.#ptr, sql);
+    } else {
+      const enc = encodeParams(params);
+      result = axiomdb_execute_params(this.#ptr, sql, enc, enc.length);
+    }
     if (result < 0) {
       throw new Error(this.#lastError() || 'execute failed');
     }
@@ -140,10 +216,16 @@ export class AxiomDB {
   }
 
   /** Run a SELECT via the packed buffer (one FFI call). Internal. */
-  #queryPacked(sql) {
+  #queryPacked(sql, params) {
     this.#checkOpen();
     const lenOut = [0n];
-    const ptr = axiomdb_query_packed(this.#ptr, sql, lenOut);
+    let ptr;
+    if (!params || params.length === 0) {
+      ptr = axiomdb_query_packed(this.#ptr, sql, lenOut);
+    } else {
+      const enc = encodeParams(params);
+      ptr = axiomdb_query_packed_params(this.#ptr, sql, enc, enc.length, lenOut);
+    }
     if (!ptr) {
       throw new Error(this.#lastError() || 'query failed');
     }
@@ -162,10 +244,10 @@ export class AxiomDB {
 
   /**
    * Execute a SELECT and return rows as an array of objects
-   * (column name → value).
+   * (column name → value). Pass `params` to bind `?` placeholders (see execute).
    */
-  query(sql) {
-    const { columns, rows } = this.#queryPacked(sql);
+  query(sql, params) {
+    const { columns, rows } = this.#queryPacked(sql, params);
     return rows.map((row) => {
       const obj = {};
       for (let c = 0; c < columns.length; c++) obj[columns[c]] = row[c];
@@ -175,15 +257,16 @@ export class AxiomDB {
 
   /**
    * Execute a SELECT and return rows as arrays (fastest path; matches
-   * better-sqlite3's `.raw().all()` shape).
+   * better-sqlite3's `.raw().all()` shape). Pass `params` to bind `?`
+   * placeholders (see execute).
    */
-  queryTuples(sql) {
-    return this.#queryPacked(sql).rows;
+  queryTuples(sql, params) {
+    return this.#queryPacked(sql, params).rows;
   }
 
   /** Execute a SELECT and return { columns, rows } (rows as arrays). */
-  queryWithColumns(sql) {
-    return this.#queryPacked(sql);
+  queryWithColumns(sql, params) {
+    return this.#queryPacked(sql, params);
   }
 
   /** Close the database. Safe to call multiple times. */

@@ -37,6 +37,12 @@ typedef _CloseC = Void Function(Pointer<_AxiomDb>);
 typedef _CloseD = void Function(Pointer<_AxiomDb>);
 typedef _LastErrorC = Pointer<Utf8> Function(Pointer<_AxiomDb>);
 typedef _LastErrorD = Pointer<Utf8> Function(Pointer<_AxiomDb>);
+typedef _ExecParamsC = Int64 Function(Pointer<_AxiomDb>, Pointer<Utf8>, Pointer<Uint8>, Size);
+typedef _ExecParamsD = int Function(Pointer<_AxiomDb>, Pointer<Utf8>, Pointer<Uint8>, int);
+typedef _QueryParamsC = Pointer<Uint8> Function(
+    Pointer<_AxiomDb>, Pointer<Utf8>, Pointer<Uint8>, Size, Pointer<Size>);
+typedef _QueryParamsD = Pointer<Uint8> Function(
+    Pointer<_AxiomDb>, Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Size>);
 
 // ── Library loading ───────────────────────────────────────────────────────────
 
@@ -66,6 +72,9 @@ final _queryPacked = _lib.lookupFunction<_QueryPackedC, _QueryPackedD>('axiomdb_
 final _packedFree = _lib.lookupFunction<_PackedFreeC, _PackedFreeD>('axiomdb_packed_free');
 final _closeFn = _lib.lookupFunction<_CloseC, _CloseD>('axiomdb_close');
 final _lastErrorFn = _lib.lookupFunction<_LastErrorC, _LastErrorD>('axiomdb_last_error');
+final _execParams = _lib.lookupFunction<_ExecParamsC, _ExecParamsD>('axiomdb_execute_params');
+final _queryPackedParams =
+    _lib.lookupFunction<_QueryParamsC, _QueryParamsD>('axiomdb_query_packed_params');
 
 const int _packedMagic = 0x41584D31; // "AXM1"
 
@@ -117,13 +126,35 @@ class AxiomDB {
   }
 
   /// Executes a DDL/DML statement. Returns rows affected.
-  int execute(String sql) {
+  ///
+  /// Pass [params] to bind values positionally (`?` placeholders) — this is the
+  /// safe way to handle untrusted input (no SQL injection, no manual escaping):
+  ///
+  /// ```dart
+  /// db.execute('INSERT INTO users VALUES (?, ?)', [1, 'Alice']);
+  /// ```
+  ///
+  /// Each param maps to a cell type: `null`, `int`, `double`, `String`, or
+  /// `List<int>`/`Uint8List` (BLOB).
+  int execute(String sql, [List<Object?>? params]) {
     _checkOpen();
     final csql = sql.toNativeUtf8();
     try {
-      final n = _exec(_ptr, csql);
-      if (n < 0) throw AxiomDBException(lastError() ?? 'execute failed');
-      return n;
+      if (params == null || params.isEmpty) {
+        final n = _exec(_ptr, csql);
+        if (n < 0) throw AxiomDBException(lastError() ?? 'execute failed');
+        return n;
+      }
+      final encoded = _encodeParams(params);
+      final pptr = malloc<Uint8>(encoded.length);
+      try {
+        pptr.asTypedList(encoded.length).setAll(0, encoded);
+        final n = _execParams(_ptr, csql, pptr, encoded.length);
+        if (n < 0) throw AxiomDBException(lastError() ?? 'execute failed');
+        return n;
+      } finally {
+        malloc.free(pptr);
+      }
     } finally {
       malloc.free(csql);
     }
@@ -131,14 +162,22 @@ class AxiomDB {
 
   /// Executes a SELECT, returning rows as lists (fastest). Cell types:
   /// int, double, String, Uint8List (BLOB), or null.
-  List<List<Object?>> queryTuples(String sql) => _queryPackedParse(sql).$2;
+  ///
+  /// Pass [params] to bind `?` placeholders safely (see [execute]).
+  List<List<Object?>> queryTuples(String sql, [List<Object?>? params]) =>
+      _queryPackedParse(sql, params).$2;
 
   /// Executes a SELECT, returning (columnNames, rows).
-  (List<String>, List<List<Object?>>) queryWithColumns(String sql) => _queryPackedParse(sql);
+  ///
+  /// Pass [params] to bind `?` placeholders safely (see [execute]).
+  (List<String>, List<List<Object?>>) queryWithColumns(String sql, [List<Object?>? params]) =>
+      _queryPackedParse(sql, params);
 
   /// Executes a SELECT, returning rows as maps (column name → value).
-  List<Map<String, Object?>> query(String sql) {
-    final (cols, rows) = _queryPackedParse(sql);
+  ///
+  /// Pass [params] to bind `?` placeholders safely (see [execute]).
+  List<Map<String, Object?>> query(String sql, [List<Object?>? params]) {
+    final (cols, rows) = _queryPackedParse(sql, params);
     return rows.map((row) {
       final m = <String, Object?>{};
       for (var i = 0; i < cols.length; i++) {
@@ -152,12 +191,23 @@ class AxiomDB {
   int commit() => execute('COMMIT');
   int rollback() => execute('ROLLBACK');
 
-  (List<String>, List<List<Object?>>) _queryPackedParse(String sql) {
+  (List<String>, List<List<Object?>>) _queryPackedParse(String sql, [List<Object?>? params]) {
     _checkOpen();
     final csql = sql.toNativeUtf8();
     final lenPtr = malloc<Size>();
+    Pointer<Uint8> pptr = nullptr;
+    var pLen = 0;
     try {
-      final ptr = _queryPacked(_ptr, csql, lenPtr);
+      Pointer<Uint8> ptr;
+      if (params == null || params.isEmpty) {
+        ptr = _queryPacked(_ptr, csql, lenPtr);
+      } else {
+        final encoded = _encodeParams(params);
+        pLen = encoded.length;
+        pptr = malloc<Uint8>(pLen);
+        pptr.asTypedList(pLen).setAll(0, encoded);
+        ptr = _queryPackedParams(_ptr, csql, pptr, pLen, lenPtr);
+      }
       if (ptr == nullptr) throw AxiomDBException(lastError() ?? 'query failed');
       final len = lenPtr.value;
       // One copy of the native buffer into an owned Uint8List, then free + parse.
@@ -167,8 +217,55 @@ class AxiomDB {
     } finally {
       malloc.free(csql);
       malloc.free(lenPtr);
+      if (pptr != nullptr) malloc.free(pptr);
     }
   }
+}
+
+/// Serializes positional [params] into the AxiomDB param buffer:
+/// `u32 count`, then per-param `{u8 tag, payload}`. Tags mirror the packed
+/// cell encoding: 0=null, 1=int(i64), 2=double(f64), 3=text, 4=blob.
+Uint8List _encodeParams(List<Object?> params) {
+  final out = BytesBuilder(copy: false);
+  final hdr = ByteData(4)..setUint32(0, params.length, Endian.little);
+  out.add(hdr.buffer.asUint8List());
+  for (final p in params) {
+    if (p == null) {
+      out.addByte(0);
+    } else if (p is bool) {
+      out.addByte(1);
+      final b = ByteData(8)..setInt64(0, p ? 1 : 0, Endian.little);
+      out.add(b.buffer.asUint8List());
+    } else if (p is int) {
+      out.addByte(1);
+      final b = ByteData(8)..setInt64(0, p, Endian.little);
+      out.add(b.buffer.asUint8List());
+    } else if (p is double) {
+      out.addByte(2);
+      final b = ByteData(8)..setFloat64(0, p, Endian.little);
+      out.add(b.buffer.asUint8List());
+    } else if (p is String) {
+      out.addByte(3);
+      final bytes = utf8.encode(p);
+      final l = ByteData(4)..setUint32(0, bytes.length, Endian.little);
+      out.add(l.buffer.asUint8List());
+      out.add(bytes);
+    } else if (p is Uint8List) {
+      out.addByte(4);
+      final l = ByteData(4)..setUint32(0, p.length, Endian.little);
+      out.add(l.buffer.asUint8List());
+      out.add(p);
+    } else if (p is List<int>) {
+      out.addByte(4);
+      final bytes = Uint8List.fromList(p);
+      final l = ByteData(4)..setUint32(0, bytes.length, Endian.little);
+      out.add(l.buffer.asUint8List());
+      out.add(bytes);
+    } else {
+      throw AxiomDBException('unsupported param type: ${p.runtimeType}');
+    }
+  }
+  return out.toBytes();
 }
 
 /// Decodes a packed (AXM1) buffer. Dart's `int` is 64-bit, so integers are exact.

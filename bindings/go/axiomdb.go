@@ -25,6 +25,8 @@ extern uint8_t* axiomdb_query_packed(AxiomDb* db, const char* sql, size_t* out_l
 extern void axiomdb_packed_free(uint8_t* ptr, size_t len);
 extern void axiomdb_close(AxiomDb* db);
 extern const char* axiomdb_last_error(AxiomDb* db);
+extern long long axiomdb_execute_params(AxiomDb* db, const char* sql, const uint8_t* params, size_t params_len);
+extern uint8_t* axiomdb_query_packed_params(AxiomDb* db, const char* sql, const uint8_t* params, size_t params_len, size_t* out_len);
 */
 import "C"
 
@@ -83,13 +85,32 @@ func (db *DB) lastError(fallback string) error {
 }
 
 // Execute runs a DDL/DML statement and returns rows affected.
-func (db *DB) Execute(sql string) (int64, error) {
+//
+// Pass params to bind ? placeholders with real prepared-statement binding —
+// no string interpolation, no SQL injection:
+//
+//	db.Execute("INSERT INTO t VALUES (?, ?)", 1, "Alice")
+//
+// Each param maps from: nil, bool, int/int32/int64, float32/float64, string,
+// or []byte (BLOB).
+func (db *DB) Execute(sql string, params ...any) (int64, error) {
 	if db.ptr == nil {
 		return 0, errors.New("axiomdb: database is closed")
 	}
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))
-	n := C.axiomdb_execute(db.ptr, csql)
+	var n C.longlong
+	if len(params) == 0 {
+		n = C.axiomdb_execute(db.ptr, csql)
+	} else {
+		enc, err := encodeParams(params)
+		if err != nil {
+			return 0, err
+		}
+		n = C.axiomdb_execute_params(
+			db.ptr, csql, (*C.uint8_t)(unsafe.Pointer(&enc[0])), C.size_t(len(enc)),
+		)
+	}
 	if n < 0 {
 		return 0, db.lastError("execute failed")
 	}
@@ -98,14 +119,25 @@ func (db *DB) Execute(sql string) (int64, error) {
 
 // queryPacked runs a SELECT and returns (columnNames, rows). One cgo call plus
 // a single Go parse pass; no per-cell cgo crossings.
-func (db *DB) queryPacked(sql string) ([]string, [][]any, error) {
+func (db *DB) queryPacked(sql string, params []any) ([]string, [][]any, error) {
 	if db.ptr == nil {
 		return nil, nil, errors.New("axiomdb: database is closed")
 	}
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))
 	var outLen C.size_t
-	ptr := C.axiomdb_query_packed(db.ptr, csql, &outLen)
+	var ptr *C.uint8_t
+	if len(params) == 0 {
+		ptr = C.axiomdb_query_packed(db.ptr, csql, &outLen)
+	} else {
+		enc, err := encodeParams(params)
+		if err != nil {
+			return nil, nil, err
+		}
+		ptr = C.axiomdb_query_packed_params(
+			db.ptr, csql, (*C.uint8_t)(unsafe.Pointer(&enc[0])), C.size_t(len(enc)), &outLen,
+		)
+	}
 	if ptr == nil {
 		return nil, nil, db.lastError("query failed")
 	}
@@ -117,19 +149,22 @@ func (db *DB) queryPacked(sql string) ([]string, [][]any, error) {
 
 // QueryTuples runs a SELECT and returns rows as []any slices (positional).
 // Column types map to: int64, float64, string, []byte, or nil (NULL).
-func (db *DB) QueryTuples(sql string) ([][]any, error) {
-	_, rows, err := db.queryPacked(sql)
+// Pass params to bind ? placeholders safely (see Execute).
+func (db *DB) QueryTuples(sql string, params ...any) ([][]any, error) {
+	_, rows, err := db.queryPacked(sql, params)
 	return rows, err
 }
 
 // QueryWithColumns runs a SELECT and returns column names plus rows.
-func (db *DB) QueryWithColumns(sql string) ([]string, [][]any, error) {
-	return db.queryPacked(sql)
+// Pass params to bind ? placeholders safely (see Execute).
+func (db *DB) QueryWithColumns(sql string, params ...any) ([]string, [][]any, error) {
+	return db.queryPacked(sql, params)
 }
 
 // Query runs a SELECT and returns rows as maps (column name → value).
-func (db *DB) Query(sql string) ([]map[string]any, error) {
-	cols, rows, err := db.queryPacked(sql)
+// Pass params to bind ? placeholders safely (see Execute).
+func (db *DB) Query(sql string, params ...any) ([]map[string]any, error) {
+	cols, rows, err := db.queryPacked(sql, params)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +183,59 @@ func (db *DB) Query(sql string) ([]map[string]any, error) {
 func (db *DB) Begin() error    { _, err := db.Execute("BEGIN"); return err }
 func (db *DB) Commit() error   { _, err := db.Execute("COMMIT"); return err }
 func (db *DB) Rollback() error { _, err := db.Execute("ROLLBACK"); return err }
+
+// encodeParams serializes positional params into the AxiomDB param buffer:
+// u32 count, then per-param {u8 tag, payload}. Tags mirror the packed cell
+// encoding: 0=NULL, 1=INT i64, 2=REAL f64, 3=TEXT, 4=BLOB.
+func encodeParams(params []any) ([]byte, error) {
+	buf := make([]byte, 4, 16+len(params)*8)
+	binary.LittleEndian.PutUint32(buf, uint32(len(params)))
+	var tmp [8]byte
+	putI64 := func(tag byte, v int64) {
+		buf = append(buf, tag)
+		binary.LittleEndian.PutUint64(tmp[:], uint64(v))
+		buf = append(buf, tmp[:]...)
+	}
+	putBytes := func(tag byte, b []byte) {
+		buf = append(buf, tag)
+		binary.LittleEndian.PutUint32(tmp[:4], uint32(len(b)))
+		buf = append(buf, tmp[:4]...)
+		buf = append(buf, b...)
+	}
+	for _, p := range params {
+		switch v := p.(type) {
+		case nil:
+			buf = append(buf, tagNull)
+		case bool:
+			if v {
+				putI64(tagInt, 1)
+			} else {
+				putI64(tagInt, 0)
+			}
+		case int:
+			putI64(tagInt, int64(v))
+		case int32:
+			putI64(tagInt, int64(v))
+		case int64:
+			putI64(tagInt, v)
+		case float32:
+			buf = append(buf, tagReal)
+			binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(float64(v)))
+			buf = append(buf, tmp[:]...)
+		case float64:
+			buf = append(buf, tagReal)
+			binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(v))
+			buf = append(buf, tmp[:]...)
+		case string:
+			putBytes(tagText, []byte(v))
+		case []byte:
+			putBytes(tagBlob, v)
+		default:
+			return nil, fmt.Errorf("axiomdb: unsupported param type %T", v)
+		}
+	}
+	return buf, nil
+}
 
 // parsePacked decodes a packed result buffer into (columns, rows). Go's i64 is
 // native, so integers are exact (no BigInt workaround like JS/Python need).

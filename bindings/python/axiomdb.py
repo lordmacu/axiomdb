@@ -210,6 +210,41 @@ def _parse_columnar(buf: bytes) -> Tuple[List[str], List[tuple]]:
     rows = list(zip(*columns)) if (n_rows and n_cols) else []
     return names, rows
 
+
+def _encode_params(params) -> bytes:
+    """Serializes positional ``params`` into the AxiomDB param buffer.
+
+    Layout: ``u32 count`` then per-param ``{u8 tag, payload}`` — tags mirror the
+    packed cell encoding (0=NULL, 1=INT i64, 2=REAL f64, 3=TEXT, 4=BLOB). ``bool``
+    is treated as INT (Python ``bool`` is an ``int`` subclass).
+    """
+    out = bytearray(_U32.pack(len(params)))
+    for p in params:
+        if p is None:
+            out.append(TYPE_NULL)
+        elif isinstance(p, bool):
+            out.append(TYPE_INTEGER)
+            out += _I64.pack(1 if p else 0)
+        elif isinstance(p, int):
+            out.append(TYPE_INTEGER)
+            out += _I64.pack(p)
+        elif isinstance(p, float):
+            out.append(TYPE_REAL)
+            out += _F64.pack(p)
+        elif isinstance(p, str):
+            b = p.encode("utf-8")
+            out.append(TYPE_TEXT)
+            out += _U32.pack(len(b))
+            out += b
+        elif isinstance(p, (bytes, bytearray, memoryview)):
+            b = bytes(p)
+            out.append(TYPE_BLOB)
+            out += _U32.pack(len(b))
+            out += b
+        else:
+            raise AxiomDBError(f"unsupported param type: {type(p).__name__}")
+    return bytes(out)
+
 # ── C function signatures ───────────────────────────────────────────────────
 
 _lib.axiomdb_open.argtypes = [ctypes.c_char_p]
@@ -271,6 +306,21 @@ _lib.axiomdb_query_packed_columnar.restype = ctypes.c_void_p
 
 _lib.axiomdb_packed_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _lib.axiomdb_packed_free.restype = None
+
+# ── Parameter binding (real prepared-statement binding, not string escaping) ───
+# The binding serializes ? param values into a small buffer; the engine
+# deserializes, prepares, binds, and runs — no SQL injection, no manual quoting.
+
+_lib.axiomdb_execute_params.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t
+]
+_lib.axiomdb_execute_params.restype = ctypes.c_int64
+
+_lib.axiomdb_query_packed_params.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+_lib.axiomdb_query_packed_params.restype = ctypes.c_void_p
 
 # ── Appender FFI (Attack 8) ──────────────────────────────────────────────────
 
@@ -345,69 +395,90 @@ class AxiomDB:
             _lib.axiomdb_close(self._ptr)
             self._ptr = None
 
-    def execute(self, sql: str) -> int:
+    def execute(self, sql: str, params=None) -> int:
         """Execute a SQL statement (INSERT, UPDATE, DELETE, DDL).
 
-        Returns the number of rows affected.
-        Raises AxiomDBError on failure.
+        Pass ``params`` (a sequence) to bind ``?`` placeholders with real
+        prepared-statement binding — no string interpolation, no SQL injection::
+
+            db.execute("INSERT INTO t VALUES (?, ?)", [1, "Alice"])
+
+        Returns the number of rows affected. Raises AxiomDBError on failure.
         """
         self._check_open()
-        result = _lib.axiomdb_execute(self._ptr, sql.encode("utf-8"))
+        csql = sql.encode("utf-8")
+        if not params:
+            result = _lib.axiomdb_execute(self._ptr, csql)
+        else:
+            enc = _encode_params(params)
+            result = _lib.axiomdb_execute_params(self._ptr, csql, enc, len(enc))
         if result < 0:
             raise AxiomDBError(self._last_error() or "execute failed")
         return result
 
-    def _query_packed(self, sql: str) -> Tuple[List[str], List[tuple]]:
-        """Run a query and materialize it via the columnar buffer (one FFI call).
+    def _query_packed(self, sql: str, params=None) -> Tuple[List[str], List[tuple]]:
+        """Run a query and materialize it in one FFI call.
 
         Returns (column_names, rows-as-tuples). Internal — used by `query`,
-        `query_tuples`, and `query_with_columns`. The columnar (AXM2) layout
-        lets Python bulk-decode numeric columns with one ``struct.unpack`` and
-        assemble rows with ``zip`` — much less interpreted per-cell work than
-        row-major.
+        `query_tuples`, and `query_with_columns`. With no params, uses the
+        columnar (AXM2) layout so Python can bulk-decode numeric columns with
+        one ``struct.unpack`` and assemble rows with ``zip``. With params, uses
+        the row-major (AXM1) prepared-statement path.
         """
         self._check_open()
         length = ctypes.c_size_t(0)
-        ptr = _lib.axiomdb_query_packed_columnar(
-            self._ptr, sql.encode("utf-8"), ctypes.byref(length)
-        )
+        csql = sql.encode("utf-8")
+        if not params:
+            ptr = _lib.axiomdb_query_packed_columnar(
+                self._ptr, csql, ctypes.byref(length)
+            )
+            parse = _parse_columnar
+        else:
+            enc = _encode_params(params)
+            ptr = _lib.axiomdb_query_packed_params(
+                self._ptr, csql, enc, len(enc), ctypes.byref(length)
+            )
+            parse = _parse_packed  # param path emits row-major AXM1
         if not ptr:
             raise AxiomDBError(self._last_error() or "query failed")
         try:
             # One copy of the whole buffer into a Python bytes object, then a
-            # single columnar parse (no per-cell FFI crossings).
+            # single parse (no per-cell FFI crossings).
             buf = ctypes.string_at(ptr, length.value)
         finally:
             _lib.axiomdb_packed_free(ptr, length.value)
-        return _parse_columnar(buf)
+        return parse(buf)
 
-    def query(self, sql: str) -> List[Dict[str, Any]]:
+    def query(self, sql: str, params=None) -> List[Dict[str, Any]]:
         """Execute a SELECT and return rows as a list of dicts.
 
         Each dict maps column name → Python value.
         Types: int, float, str, bytes, None (NULL).
 
+        Pass ``params`` to bind ``?`` placeholders safely (see `execute`).
         Uses the packed-buffer path (one FFI call); for the fastest
         materialization use `query_tuples` (skips dict construction).
         """
-        col_names, rows = self._query_packed(sql)
+        col_names, rows = self._query_packed(sql, params)
         return [dict(zip(col_names, r)) for r in rows]
 
-    def query_tuples(self, sql: str) -> List[tuple]:
+    def query_tuples(self, sql: str, params=None) -> List[tuple]:
         """Execute a SELECT and return rows as a list of tuples.
 
         Fastest materialization path — matches `sqlite3.Cursor.fetchall()`
         shape (positional tuples, no column-name dict construction).
+        Pass ``params`` to bind ``?`` placeholders safely (see `execute`).
         """
-        _col_names, rows = self._query_packed(sql)
+        _col_names, rows = self._query_packed(sql, params)
         return rows
 
-    def query_with_columns(self, sql: str) -> Tuple[List[str], List[tuple]]:
+    def query_with_columns(self, sql: str, params=None) -> Tuple[List[str], List[tuple]]:
         """Execute a SELECT and return (column_names, rows-as-tuples).
 
         Use when you need both the column names and the fast tuple shape.
+        Pass ``params`` to bind ``?`` placeholders safely (see `execute`).
         """
-        return self._query_packed(sql)
+        return self._query_packed(sql, params)
 
     def last_error(self) -> Optional[str]:
         """Return the last error message, or None if no error."""

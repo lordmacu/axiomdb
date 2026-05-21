@@ -8,7 +8,7 @@
 #![deny(clippy::all)]
 
 use napi::bindgen_prelude::*;
-use napi::{Env, JsUnknown};
+use napi::{Env, JsBigInt, JsBoolean, JsBuffer, JsNumber, JsString, JsUnknown, ValueType};
 use napi_derive::napi;
 
 use axiomdb_core::error::DbError;
@@ -17,6 +17,55 @@ use axiomdb_types::Value;
 
 fn to_napi_err(e: DbError) -> Error {
     Error::from_reason(e.to_string())
+}
+
+/// Converts a JS value into an AxiomDB [`Value`] for `?` parameter binding.
+///
+/// Mapping: null/undefined → Null, boolean → BigInt(0/1), integral number →
+/// BigInt, fractional number → Real, bigint → BigInt, string → Text,
+/// Buffer → Bytes.
+fn js_to_value(v: &JsUnknown) -> Result<Value> {
+    match v.get_type()? {
+        ValueType::Null | ValueType::Undefined => Ok(Value::Null),
+        ValueType::Boolean => {
+            let b = unsafe { v.cast::<JsBoolean>() }.get_value()?;
+            Ok(Value::BigInt(i64::from(b)))
+        }
+        ValueType::Number => {
+            let f = unsafe { v.cast::<JsNumber>() }.get_double()?;
+            // Integral, safe-range numbers bind as INT (matches the koffi path);
+            // anything else is a REAL.
+            if f.fract() == 0.0 && (-9_007_199_254_740_992.0..=9_007_199_254_740_992.0).contains(&f)
+            {
+                Ok(Value::BigInt(f as i64))
+            } else {
+                Ok(Value::Real(f))
+            }
+        }
+        ValueType::BigInt => {
+            let (val, _lossless) = unsafe { v.cast::<JsBigInt>() }.get_i64()?;
+            Ok(Value::BigInt(val))
+        }
+        ValueType::String => {
+            let s = unsafe { v.cast::<JsString>() }.into_utf8()?.into_owned()?;
+            Ok(Value::Text(s))
+        }
+        ValueType::Object if v.is_buffer()? => {
+            let buf = unsafe { v.cast::<JsBuffer>() }.into_value()?;
+            Ok(Value::Bytes(buf.to_vec()))
+        }
+        other => Err(Error::from_reason(format!(
+            "unsupported param type: {other:?}"
+        ))),
+    }
+}
+
+/// Converts an optional JS params array into engine [`Value`]s.
+fn extract_params(params: &Option<Vec<JsUnknown>>) -> Result<Vec<Value>> {
+    match params {
+        None => Ok(Vec::new()),
+        Some(p) => p.iter().map(js_to_value).collect(),
+    }
 }
 
 fn format_uuid(u: &[u8; 16]) -> String {
@@ -174,17 +223,39 @@ impl Connection {
     }
 
     /// Executes a DDL/DML statement. Returns rows affected.
+    ///
+    /// Pass `params` (an array) to bind `?` placeholders with real
+    /// prepared-statement binding — no string interpolation, no SQL injection.
     #[napi]
-    pub fn execute(&mut self, sql: String) -> Result<i64> {
-        let db = self.db_mut()?;
-        Ok(db.execute(&sql).map_err(to_napi_err)? as i64)
+    pub fn execute(&mut self, sql: String, params: Option<Vec<JsUnknown>>) -> Result<i64> {
+        if params.is_none() {
+            return Ok(self.db_mut()?.execute(&sql).map_err(to_napi_err)? as i64);
+        }
+        let values = extract_params(&params)?;
+        Ok(self
+            .db_mut()?
+            .execute_params(&sql, &values)
+            .map_err(to_napi_err)? as i64)
     }
 
     /// Executes a SELECT and returns rows as arrays (fastest; matches
-    /// better-sqlite3's `.raw().all()` shape).
+    /// better-sqlite3's `.raw().all()` shape). Pass `params` to bind `?`.
     #[napi]
-    pub fn query_tuples(&mut self, env: Env, sql: String) -> Result<Array> {
-        let rows = self.db_mut()?.query(&sql).map_err(to_napi_err)?;
+    pub fn query_tuples(
+        &mut self,
+        env: Env,
+        sql: String,
+        params: Option<Vec<JsUnknown>>,
+    ) -> Result<Array> {
+        let rows = if params.is_none() {
+            self.db_mut()?.query(&sql).map_err(to_napi_err)?
+        } else {
+            let values = extract_params(&params)?;
+            self.db_mut()?
+                .query_params(&sql, &values)
+                .map_err(to_napi_err)?
+                .1
+        };
         let mut out = env.create_array(rows.len() as u32)?;
         for (i, row) in rows.iter().enumerate() {
             let mut r = env.create_array(row.len() as u32)?;
@@ -197,12 +268,19 @@ impl Connection {
     }
 
     /// Executes a SELECT and returns rows as objects (column name → value).
+    /// Pass `params` to bind `?` placeholders safely.
     #[napi]
-    pub fn query(&mut self, env: Env, sql: String) -> Result<Array> {
-        let (cols, rows) = self
-            .db_mut()?
-            .query_with_columns(&sql)
-            .map_err(to_napi_err)?;
+    pub fn query(&mut self, env: Env, sql: String, params: Option<Vec<JsUnknown>>) -> Result<Array> {
+        let (cols, rows) = if params.is_none() {
+            self.db_mut()?
+                .query_with_columns(&sql)
+                .map_err(to_napi_err)?
+        } else {
+            let values = extract_params(&params)?;
+            self.db_mut()?
+                .query_params(&sql, &values)
+                .map_err(to_napi_err)?
+        };
         let mut out = env.create_array(rows.len() as u32)?;
         for (i, row) in rows.iter().enumerate() {
             let mut obj = env.create_object()?;
@@ -216,13 +294,20 @@ impl Connection {
 
     /// Executes a SELECT and returns the whole result as one packed `Buffer`
     /// (the JS side parses it). Avoids the per-cell N-API object construction of
-    /// `queryTuples`/`query`, which dominates for large results.
+    /// `queryTuples`/`query`, which dominates for large results. Pass `params`
+    /// to bind `?` placeholders safely.
     #[napi]
-    pub fn query_packed(&mut self, sql: String) -> Result<Buffer> {
-        let (cols, rows) = self
-            .db_mut()?
-            .query_with_columns(&sql)
-            .map_err(to_napi_err)?;
+    pub fn query_packed(&mut self, sql: String, params: Option<Vec<JsUnknown>>) -> Result<Buffer> {
+        let (cols, rows) = if params.is_none() {
+            self.db_mut()?
+                .query_with_columns(&sql)
+                .map_err(to_napi_err)?
+        } else {
+            let values = extract_params(&params)?;
+            self.db_mut()?
+                .query_params(&sql, &values)
+                .map_err(to_napi_err)?
+        };
         Ok(pack_result(&cols, &rows).into())
     }
 

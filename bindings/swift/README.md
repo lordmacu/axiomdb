@@ -29,6 +29,21 @@ Cells are an `AxiomValue` enum: `.null`, `.int(Int64)`, `.double(Double)`,
 `.text(String)`, `.blob([UInt8])`. Swift's `Int64` is native, so integers are
 exact.
 
+## Parameter binding
+
+Pass an `[AxiomValue]` to bind `?` placeholders. This is **real
+prepared-statement binding** (the engine parses, analyzes, and substitutes the
+values) — no string interpolation, so untrusted input cannot inject SQL:
+
+```swift
+try db.execute("INSERT INTO users VALUES (?, ?)", [.int(1), .text("Alice")])
+let rows = try db.queryTuples("SELECT * FROM users WHERE id = ?", [.int(1)])
+let recs = try db.query("SELECT * FROM users WHERE name = ?", [.text("Alice")])
+```
+
+`execute`, `queryTuples`, `query`, and `queryWithColumns` all take an optional
+trailing `params: [AxiomValue]` argument.
+
 ## Performance
 
 10K rows × 6 cols, materialize every cell into Swift values (macOS, median):

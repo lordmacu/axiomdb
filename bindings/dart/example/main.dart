@@ -72,8 +72,18 @@ void main() {
       print('caught → ${e.message}');
     }
 
-    // ⚠️ Parameter binding is not implemented yet — values are interpolated
-    // into SQL. ALWAYS escape/validate untrusted input until bind params land.
+    // 9. Parameter binding (?, positional). The SAFE way to handle untrusted
+    //    input — real prepared-statement binding, no string interpolation, no
+    //    SQL injection. Params: null, int, double, String, Uint8List (BLOB).
+    db.execute('INSERT INTO users VALUES (?, ?, ?, ?)', [
+      2001,
+      "Robert'); DROP TABLE users; --", // treated as a literal, not executed
+      8.0,
+      Uint8List.fromList([0xCA, 0xFE]),
+    ]);
+    final bound = db.query('SELECT id, name FROM users WHERE id = ?', [2001]);
+    print('param → ${bound.first}'); // {id: 2001, name: Robert'); DROP TABLE users; --}
+    print('table survived → count=${db.queryTuples('SELECT COUNT(*) FROM users').first[0]}');
   } finally {
     db.close(); // release the engine; safe to call more than once
   }

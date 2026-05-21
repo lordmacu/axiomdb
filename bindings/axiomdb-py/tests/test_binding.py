@@ -124,6 +124,49 @@ def test_bad_sql_raises():
         c.close()
 
 
+def test_param_binding():
+    with tempfile.TemporaryDirectory() as d:
+        c = adb.connect(os.path.join(d, "t.db"))
+        c.execute("CREATE TABLE t (id INT, name TEXT, score REAL, avatar BLOB)")
+        c.execute("INSERT INTO t VALUES (?, ?, ?, ?)", [1, "alice", 3.5, None])
+        c.execute("INSERT INTO t VALUES (?, ?, ?, ?)", (2, "bøb", 2.25, b"\x09\x08\x07"))
+        rows = c.query("SELECT id, name, score, avatar FROM t WHERE id = ?", [2])
+        assert rows == [(2, "bøb", 2.25, b"\x09\x08\x07")], rows
+        dicts = c.query_dict("SELECT id, name FROM t WHERE name = ?", ["alice"])
+        assert dicts == [{"id": 1, "name": "alice"}], dicts
+        c.close()
+
+
+def test_param_matches_sqlite():
+    rows = [(1, "a", 1.5), (2, "b", 2.5), (3, "c", 3.5)]
+    with tempfile.TemporaryDirectory() as d:
+        c = adb.connect(os.path.join(d, "ax.db"))
+        c.execute("CREATE TABLE t (id INT, name TEXT, score REAL)")
+        for r in rows:
+            c.execute("INSERT INTO t VALUES (?, ?, ?)", r)
+        ax = c.query("SELECT id, name, score FROM t WHERE id > ? ORDER BY id", [1])
+        c.close()
+
+        sq = sqlite3.connect(os.path.join(d, "sq.db"))
+        sq.execute("CREATE TABLE t (id INT, name TEXT, score REAL)")
+        sq.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
+        sq.commit()
+        ref = sq.execute("SELECT id, name, score FROM t WHERE id > ? ORDER BY id", [1]).fetchall()
+        sq.close()
+        assert ax == ref, (ax, ref)
+
+
+def test_param_injection_safe():
+    with tempfile.TemporaryDirectory() as d:
+        c = adb.connect(os.path.join(d, "t.db"))
+        c.execute("CREATE TABLE t (id INT, name TEXT)")
+        evil = "x'; DROP TABLE t; --"
+        c.execute("INSERT INTO t VALUES (?, ?)", [1, evil])
+        assert c.query("SELECT name FROM t WHERE id = ?", [1]) == [(evil,)]
+        assert c.query("SELECT COUNT(*) FROM t") == [(1,)]
+        c.close()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

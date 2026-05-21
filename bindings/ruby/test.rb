@@ -66,6 +66,23 @@ Dir.mktmpdir do |dir|
   end
   failed += 1 unless check('bad sql raises', threw)
 
+  # parameter binding
+  db.execute('CREATE TABLE p (id INT, name TEXT, score REAL, avatar BLOB)')
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [1, 'alice', 3.5, nil])
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [2, 'héllo', 2.25, [9, 8, 7].pack('C*')])
+  prow = db.query_tuples('SELECT id, name, score, avatar FROM p WHERE id = ?', [2])[0]
+  failed += 1 unless check('param query row', prow[0] == 2 && prow[1] == 'héllo' && prow[2] == 2.25)
+  failed += 1 unless check('param blob', prow[3].bytes == [9, 8, 7])
+  pmap = db.query('SELECT id, name FROM p WHERE name = ?', ['alice'])
+  failed += 1 unless check('param map', pmap == [{ 'id' => 1, 'name' => 'alice' }])
+
+  # injection-safe: a value containing SQL is bound, not executed
+  evil = "x'; DROP TABLE p; --"
+  db.execute('INSERT INTO p VALUES (?, ?, ?, ?)', [3, evil, 0.0, nil])
+  back = db.query_tuples('SELECT name FROM p WHERE id = ?', [3])[0][0]
+  failed += 1 unless check('injection-safe', back == evil)
+  failed += 1 unless check('table survived', db.query_tuples('SELECT COUNT(*) FROM p')[0][0] == 3)
+
   db.close
 end
 

@@ -27,6 +27,22 @@ db.Begin(); db.Execute("INSERT ..."); db.Commit() // or db.Rollback()
 Value types: `int64`, `float64`, `string`, `[]byte`, or `nil` (NULL). Go's native
 `int64` means integers are exact (no BigInt workaround like JS/Python need).
 
+## Parameter binding
+
+Pass variadic values to bind `?` placeholders. This is **real prepared-statement
+binding** (the engine parses, analyzes, and substitutes the values) — no string
+interpolation, so untrusted input cannot inject SQL:
+
+```go
+db.Execute("INSERT INTO users VALUES (?, ?)", 1, "Alice")
+rows, _ := db.QueryTuples("SELECT * FROM users WHERE id = ?", 1)
+recs, _ := db.Query("SELECT * FROM users WHERE name = ?", "Alice")
+```
+
+Param types: `nil`, `bool`, `int`/`int32`/`int64`, `float32`/`float64`,
+`string`, and `[]byte` (BLOB). `Execute`, `QueryTuples`, `Query`, and
+`QueryWithColumns` all take variadic params.
+
 ## Performance
 
 10K rows × 6 cols, materialize every cell (macOS, median):

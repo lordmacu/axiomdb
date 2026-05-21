@@ -55,14 +55,15 @@ function parsePacked(buf) {
 export class Connection {
   #c;
   constructor(path) { this.#c = new native.Connection(path); }
-  execute(sql) { return this.#c.execute(sql); }
+  // Pass `params` (an array) to bind `?` placeholders safely (no SQL injection).
+  execute(sql, params) { return this.#c.execute(sql, params); }
   // Native object construction (slower on Node):
-  query(sql) { return this.#c.query(sql); }
-  queryTuples(sql) { return this.#c.queryTuples(sql); }
+  query(sql, params) { return this.#c.query(sql, params); }
+  queryTuples(sql, params) { return this.#c.queryTuples(sql, params); }
   // Packed buffer + JS parse (faster on Node):
-  queryTuplesPacked(sql) { return parsePacked(this.#c.queryPacked(sql)).rows; }
-  queryPacked(sql) {
-    const { columns, rows } = parsePacked(this.#c.queryPacked(sql));
+  queryTuplesPacked(sql, params) { return parsePacked(this.#c.queryPacked(sql, params)).rows; }
+  queryPacked(sql, params) {
+    const { columns, rows } = parsePacked(this.#c.queryPacked(sql, params));
     return rows.map((r) => {
       const o = {};
       for (let i = 0; i < columns.length; i++) o[columns[i]] = r[i];

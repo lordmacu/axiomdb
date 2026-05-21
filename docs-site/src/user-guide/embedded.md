@@ -128,6 +128,45 @@ match db.run("INSERT INTO users VALUES (2, 'Bob', 7.2)")? {
 }
 ```
 
+### Parameter binding (`?` placeholders)
+
+Bind values to `?` placeholders instead of formatting them into the SQL string.
+This is **real prepared-statement binding** (parse + analyze + substitute), so
+untrusted input can never alter the statement — the SQLite `sqlite3_bind_*`
+model, not string escaping.
+
+```rust
+use axiomdb_types::Value;
+
+// DML — returns rows affected
+db.execute_params(
+    "INSERT INTO users VALUES (?, ?, ?)",
+    &[Value::Int(1), Value::Text("Alice".into()), Value::Real(9.5)],
+)?;
+
+// SELECT — returns (column names, rows)
+let (columns, rows) = db.query_params(
+    "SELECT id, name FROM users WHERE score > ?",
+    &[Value::Real(8.0)],
+)?;
+```
+
+The number of `?` placeholders must equal `params.len()`, otherwise the call
+returns a `DbError`. For repeated execution, `Db::prepare` returns a
+`PreparedStatement` you can `execute(&mut db, &params)` many times — parse +
+analyze happen once.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🛡️</span>
+<div class="callout-body">
+<span class="callout-label">Injection-safe by construction</span>
+A value like <code>"x'; DROP TABLE users; --"</code> bound through <code>?</code>
+is stored as a literal string — it is never parsed as SQL. Every language
+binding (Dart, Python, Node.js, Go, Ruby, Swift) routes through this same engine
+path, so the guarantee is identical across languages.
+</div>
+</div>
+
 ### Explicit transactions
 
 ```rust
@@ -473,6 +512,28 @@ id          name        price
 All pointers returned by <code>axiomdb_rows_get_text</code>, <code>axiomdb_rows_get_blob</code>, and <code>axiomdb_rows_column_name</code> are valid until <code>axiomdb_rows_free</code> is called. Copy the data if you need it to outlive the result set.
 </div>
 </div>
+
+### Parameter binding (C FFI)
+
+For `?` placeholders from C and the FFI-based bindings, serialize the parameter
+values into a small buffer and call the `_params` variants:
+
+```c
+/* Returns rows affected (-1 on error) */
+int64_t  axiomdb_execute_params      (AxiomDb* db, const char* sql,
+                                      const uint8_t* params, size_t params_len);
+/* Returns a packed result buffer (NULL on error); free with axiomdb_packed_free */
+uint8_t* axiomdb_query_packed_params (AxiomDb* db, const char* sql,
+                                      const uint8_t* params, size_t params_len,
+                                      size_t* out_len);
+```
+
+The parameter buffer is little-endian: a `uint32` count, then for each param a
+`uint8` tag followed by its payload — `0`=NULL, `1`=INT (`int64`), `2`=REAL
+(`double`), `3`=TEXT (`uint32` length + UTF-8 bytes), `4`=BLOB (`uint32` length +
+bytes). Every shipped binding (Dart, Python, Node.js, Go, Ruby, Swift) encodes
+this format — see `bindings/<lang>/` for a reference encoder, and pass the values
+in your language's natural types (the binding does the serialization for you).
 
 ### Python (ctypes)
 

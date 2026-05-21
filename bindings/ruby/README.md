@@ -25,6 +25,22 @@ Value types: `Integer`, `Float`, `String` (UTF-8), binary `String` (BLOB), or
 `nil` (NULL). Ruby's `Integer` is arbitrary-precision, so i64 is exact (no BigInt
 workaround like JS/Python need).
 
+## Parameter binding
+
+Pass an array to bind `?` placeholders. This is **real prepared-statement
+binding** (the engine parses, analyzes, and substitutes the values) — no string
+interpolation, so untrusted input cannot inject SQL:
+
+```ruby
+db.execute('INSERT INTO users VALUES (?, ?)', [1, 'Alice'])
+db.query_tuples('SELECT * FROM users WHERE id = ?', [1])
+db.query('SELECT * FROM users WHERE name = ?', ['Alice'])
+```
+
+Param types: `nil`, `Integer`, `Float`, `true`/`false`, `String` (UTF-8 → TEXT,
+binary-encoded → BLOB). `execute`, `query_tuples`, `query`, and
+`query_with_columns` all take an optional `params` array.
+
 ## Performance
 
 10K rows × 6 cols, materialize every cell (macOS, median of 11):

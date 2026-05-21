@@ -281,6 +281,64 @@ mod db {
             })
         }
 
+        /// Executes a DDL/DML statement with bound `?` parameters.
+        ///
+        /// Real prepared-statement binding (parse + analyze + substitute), not
+        /// string interpolation — safe against SQL injection. Returns rows
+        /// affected.
+        ///
+        /// ```rust,no_run
+        /// # let mut db = axiomdb_embedded::Db::open("./test.db").unwrap();
+        /// # db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        /// use axiomdb_types::Value;
+        /// db.execute_params(
+        ///     "INSERT INTO t VALUES (?, ?)",
+        ///     &[Value::Int(1), Value::Text("Alice".into())],
+        /// ).unwrap();
+        /// ```
+        pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64, DbError> {
+            Ok(match self.run_params(sql, params)? {
+                QueryResult::Affected { count, .. } => count,
+                QueryResult::Rows { rows, .. } => rows.len() as u64,
+                QueryResult::Empty => 0,
+            })
+        }
+
+        /// Executes a SELECT with bound `?` parameters, returning column names
+        /// and rows. Safe against SQL injection (see [`execute_params`]).
+        ///
+        /// [`execute_params`]: Db::execute_params
+        pub fn query_params(
+            &mut self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<(Vec<String>, Vec<Row>), DbError> {
+            Ok(match self.run_params(sql, params)? {
+                QueryResult::Rows { columns, rows } => {
+                    (columns.into_iter().map(|c| c.name).collect(), rows)
+                }
+                _ => (vec![], vec![]),
+            })
+        }
+
+        /// Prepares + executes `sql` with `params`, capturing any error into
+        /// `error_msg` (so `last_error()` works, mirroring `run`).
+        fn run_params(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
+            let prepared = match self.prepare(sql) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.error_msg = CString::new(e.to_string()).ok();
+                    return Err(e);
+                }
+            };
+            let result = prepared.execute(self, params);
+            match &result {
+                Ok(_) => self.error_msg = None,
+                Err(e) => self.error_msg = CString::new(e.to_string()).ok(),
+            }
+            result
+        }
+
         /// Executes a SQL statement and returns the full `QueryResult`.
         ///
         /// Useful when you need column metadata, last_insert_id, etc.
@@ -1174,6 +1232,148 @@ mod ffi {
         if !ptr.is_null() {
             drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
         }
+    }
+
+    // ── Parameter binding ─────────────────────────────────────────────────────
+    //
+    // Real prepared-statement binding (not client-side string escaping): the
+    // binding serializes the `?` parameter values into a small buffer, the FFI
+    // deserializes them to `Value`s, then `Db::prepare` + `PreparedStatement::
+    // execute` substitutes and runs. Buffer format (LE):
+    //   u32 n_params
+    //   n_params × { u8 tag, payload }  (tag: 0=NULL,1=INT i64,2=REAL f64,
+    //                                    3=TEXT u32+bytes, 4=BLOB u32+bytes)
+
+    /// Deserializes a parameter buffer into `Value`s. NULL/empty → no params.
+    unsafe fn deserialize_params(ptr: *const u8, len: usize) -> Vec<Value> {
+        if ptr.is_null() || len < 4 {
+            return Vec::new();
+        }
+        let buf = std::slice::from_raw_parts(ptr, len);
+        let rd_u32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let n = rd_u32(buf, 0) as usize;
+        let mut off = 4;
+        let mut params = Vec::with_capacity(n);
+        for _ in 0..n {
+            if off >= buf.len() {
+                break;
+            }
+            let tag = buf[off];
+            off += 1;
+            match tag {
+                1 => {
+                    let v = i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                    off += 8;
+                    params.push(Value::BigInt(v));
+                }
+                2 => {
+                    let v = f64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                    off += 8;
+                    params.push(Value::Real(v));
+                }
+                3 => {
+                    let l = rd_u32(buf, off) as usize;
+                    off += 4;
+                    params.push(Value::Text(
+                        String::from_utf8_lossy(&buf[off..off + l]).into_owned(),
+                    ));
+                    off += l;
+                }
+                4 => {
+                    let l = rd_u32(buf, off) as usize;
+                    off += 4;
+                    params.push(Value::Bytes(buf[off..off + l].to_vec()));
+                    off += l;
+                }
+                _ => params.push(Value::Null),
+            }
+        }
+        params
+    }
+
+    /// Executes a DDL/DML statement with bound `?` parameters. Returns rows
+    /// affected, or -1 on error (see `axiomdb_last_error`).
+    ///
+    /// # Safety
+    /// `db`/`sql` as in `axiomdb_execute`; `params_ptr`/`params_len` describe a
+    /// parameter buffer (may be NULL/0 for no params).
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_execute_params(
+        db: *mut Db,
+        sql: *const c_char,
+        params_ptr: *const u8,
+        params_len: usize,
+    ) -> i64 {
+        if db.is_null() || sql.is_null() {
+            return -1;
+        }
+        let db = &mut *db;
+        let sql = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let params = deserialize_params(params_ptr, params_len);
+        let prepared = match db.prepare(sql) {
+            Ok(p) => p,
+            Err(e) => {
+                db.error_msg = std::ffi::CString::new(e.to_string()).ok();
+                return -1;
+            }
+        };
+        match prepared.execute(db, &params) {
+            Ok(axiomdb_sql::result::QueryResult::Affected { count, .. }) => count as i64,
+            Ok(axiomdb_sql::result::QueryResult::Rows { rows, .. }) => rows.len() as i64,
+            Ok(_) => 0,
+            Err(e) => {
+                db.error_msg = std::ffi::CString::new(e.to_string()).ok();
+                -1
+            }
+        }
+    }
+
+    /// Executes a SELECT with bound `?` parameters and serializes the result
+    /// into a packed (AXM1) buffer. Returns NULL on error. Free with
+    /// `axiomdb_packed_free`.
+    ///
+    /// # Safety
+    /// As in `axiomdb_query_packed`, plus `params_ptr`/`params_len`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_query_packed_params(
+        db: *mut Db,
+        sql: *const c_char,
+        params_ptr: *const u8,
+        params_len: usize,
+        out_len: *mut usize,
+    ) -> *mut u8 {
+        if db.is_null() || sql.is_null() || out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        let db = &mut *db;
+        let sql = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let params = deserialize_params(params_ptr, params_len);
+        let prepared = match db.prepare(sql) {
+            Ok(p) => p,
+            Err(e) => {
+                db.error_msg = std::ffi::CString::new(e.to_string()).ok();
+                return std::ptr::null_mut();
+            }
+        };
+        let buf = match prepared.execute(db, &params) {
+            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => {
+                pack_rows(&columns, rows)
+            }
+            Ok(_) => pack_rows(&[], Vec::new()),
+            Err(e) => {
+                db.error_msg = std::ffi::CString::new(e.to_string()).ok();
+                return std::ptr::null_mut();
+            }
+        };
+        let boxed = buf.into_boxed_slice();
+        *out_len = boxed.len();
+        Box::into_raw(boxed) as *mut u8
     }
 
     // ── Cursor API (zero-copy over the materialized result, Tier 1) ───────────

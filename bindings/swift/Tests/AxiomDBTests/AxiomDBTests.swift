@@ -79,4 +79,35 @@ final class AxiomDBTests: XCTestCase {
         defer { db.close() }
         XCTAssertThrowsError(try db.queryTuples("SELECT * FROM nonexistent"))
     }
+
+    func testParamBinding() throws {
+        let db = try tmpDB()
+        defer { db.close() }
+        try db.execute("CREATE TABLE t (id INT, name TEXT, score REAL, avatar BLOB)")
+        try db.execute("INSERT INTO t VALUES (?, ?, ?, ?)", [.int(1), .text("alice"), .double(3.5), .null])
+        try db.execute(
+            "INSERT INTO t VALUES (?, ?, ?, ?)",
+            [.int(2), .text("héllo"), .double(2.25), .blob([9, 8, 7])])
+
+        let rows = try db.queryTuples(
+            "SELECT id, name, score, avatar FROM t WHERE id = ?", [.int(2)])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0], [.int(2), .text("héllo"), .double(2.25), .blob([9, 8, 7])])
+
+        let maps = try db.query("SELECT id, name FROM t WHERE name = ?", [.text("alice")])
+        XCTAssertEqual(maps.count, 1)
+        XCTAssertEqual(maps[0]["id"], .int(1))
+    }
+
+    func testParamInjectionSafe() throws {
+        let db = try tmpDB()
+        defer { db.close() }
+        try db.execute("CREATE TABLE t (id INT, name TEXT)")
+        let evil = "x'; DROP TABLE t; --"
+        try db.execute("INSERT INTO t VALUES (?, ?)", [.int(1), .text(evil)])
+        let rows = try db.queryTuples("SELECT name FROM t WHERE id = ?", [.int(1)])
+        XCTAssertEqual(rows[0][0], .text(evil))
+        // table survived — value bound, not executed
+        XCTAssertEqual(try db.queryTuples("SELECT COUNT(*) FROM t")[0][0], .int(1))
+    }
 }
