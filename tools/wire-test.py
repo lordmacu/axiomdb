@@ -6080,6 +6080,34 @@ ok("[page-cache] read after update sees fresh bytes (invalidation)",
 cur.execute("DROP TABLE IF EXISTS wire_pagecache")
 conn.commit()
 
+# ── perf-sqlite-gap [range-bounds] — exclusive bound is honored exactly ───────
+# Clustered-PK range with an exclusive upper bound must NOT include the boundary
+# key (planner carries strictness; executor skips per-row recheck when covering).
+
+cur.execute("DROP TABLE IF EXISTS wire_range")
+cur.execute("CREATE TABLE wire_range (id INT PRIMARY KEY, v TEXT)")
+for i in range(1, 11):
+    cur.execute(f"INSERT INTO wire_range VALUES ({i}, 'r{i}')")
+conn.commit()
+
+cur.execute("SELECT id FROM wire_range WHERE id >= 3 AND id < 7 ORDER BY id")
+ok("[range-bounds] >= lo AND < hi excludes the upper boundary",
+   [r[0] for r in cur.fetchall()] == [3, 4, 5, 6])
+
+cur.execute("SELECT id FROM wire_range WHERE id > 3 AND id <= 7 ORDER BY id")
+ok("[range-bounds] > lo AND <= hi excludes lower, includes upper",
+   [r[0] for r in cur.fetchall()] == [4, 5, 6, 7])
+
+# Range + residual: the index-covered id range is exact, the residual still filters.
+cur.execute("UPDATE wire_range SET v = 'keep' WHERE id IN (4, 6)")
+conn.commit()
+cur.execute("SELECT id FROM wire_range WHERE id >= 3 AND id < 9 AND v = 'keep' ORDER BY id")
+ok("[range-bounds] residual predicate still filters within a covering range",
+   [r[0] for r in cur.fetchall()] == [4, 6])
+
+cur.execute("DROP TABLE IF EXISTS wire_range")
+conn.commit()
+
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
