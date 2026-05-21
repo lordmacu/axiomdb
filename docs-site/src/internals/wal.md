@@ -737,3 +737,51 @@ Storing the override on <code>ConnectionTxn</code> (not mutating the
 free of races.
 </div>
 </div>
+
+## Page-frame WAL (REDO recovery — project B, in progress)
+
+Crash recovery is currently **UNDO-only**: it rolls back uncommitted transactions
+but never **REDOes** committed ones. Committed data survives a crash only because the
+data pages are eagerly `fsync`'d to the main file at commit. A committed write whose
+page was *not* flushed (e.g. an insert that didn't change the table root) can be lost
+on power loss — see the regression test
+`axiomdb-wal/tests/integration_redo_recovery.rs` (`t0_…`, currently `#[ignore]`d).
+
+The fix is SQLite's proven **write-ahead page-frame** model: page writes go to the
+WAL as frames first; the main file is updated only by a checkpoint; a commit is
+durable once its frames are `fsync`'d in the WAL. The foundation is the
+[`wal_frame`](https://github.com/lordmacu/nexusdb) module
+(`crates/axiomdb-wal/src/wal_frame.rs`).
+
+**Frame format** (borrowed from SQLite `wal.c`, adapted to our explicit `lsn`):
+
+```text
+File header (32 B): magic | version | page_size | salt | header_crc | _pad
+Per frame: header (32 B) + one page image (PAGE_SIZE)
+  header: page_id:u64 | lsn:u64 | commit_marker:u32 | salt:u64 | frame_crc:u32
+```
+
+- **`commit_marker`** (SQLite's `nTruncate` idea): `0` on a non-commit frame; the
+  committing `txn_id` on the **last frame of a committed transaction**. The frame
+  stream is thus self-delimiting — no separate commit record is needed.
+- **`salt`** is copied from the file header into every frame. Frames whose salt ≠ the
+  run's salt are stale (from a previous WAL run) and end the valid prefix.
+- **`frame_crc`** (crc32c over the header sans crc ++ the page) detects a torn /
+  partially-written frame. Because the log is append-only, damage is always at the
+  tail, so a scan stops at the first invalid frame — that is the valid prefix.
+
+`FrameLog` appends/syncs frames and `scan`s the valid prefix; `build_index` folds the
+scan into a `WalIndex` (`page_id` → latest **committed** frame; frames past the last
+commit marker are an unfinished transaction and are excluded).
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Status</span>
+This module is the isolated, unit-tested foundation. Wiring it into the live
+read/write path (`write_page` appends a frame; `read_page` consults the wal-index
+before the main file) and the checkpoint/recovery is the remaining work — at which
+point the per-commit main-file <code>fsync</code> is removed and the <code>t0_…</code>
+regression test flips green.
+</div>
+</div>
