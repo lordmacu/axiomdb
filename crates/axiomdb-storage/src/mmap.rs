@@ -459,15 +459,35 @@ impl MmapStorage {
     }
 
     fn read_page_from_mmap(mmap: &Mmap, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
+        Ok(crate::page_ref::PageRef::from_arc(Self::read_arc_from_mmap(
+            mmap, page_id,
+        )?))
+    }
+
+    /// Reads a page from the mmap straight into an `Arc<Page>` — one heap
+    /// allocation, one 16 KB copy, then a single CRC32c verify. This is the hot
+    /// read path: it avoids the `PageRef → into_page() → Arc::new()` round-trip
+    /// (which would cost a second allocation and two extra 16 KB moves).
+    fn read_arc_from_mmap(mmap: &Mmap, page_id: u64) -> Result<Arc<Page>, DbError> {
         let offset = page_id as usize * PAGE_SIZE;
         if offset + PAGE_SIZE > mmap.len() {
             return Err(DbError::PageNotFound { page_id });
         }
-        let mut bytes = [0u8; PAGE_SIZE];
-        bytes.copy_from_slice(&mmap[offset..offset + PAGE_SIZE]);
-        let page_ref = crate::page_ref::PageRef::from_bytes(bytes);
-        page_ref.verify_checksum()?;
-        Ok(page_ref)
+        let mut boxed = Box::<Page>::new_uninit();
+        // SAFETY: `Page` is `repr(C, align(64))` and exactly `PAGE_SIZE` bytes;
+        // `[offset, offset + PAGE_SIZE)` is in bounds (checked above), and the
+        // box has `PAGE_SIZE` bytes of capacity. After the copy every byte is
+        // initialized, so `assume_init` is sound.
+        let arc: Arc<Page> = unsafe {
+            std::ptr::copy_nonoverlapping(
+                mmap.as_ptr().add(offset),
+                boxed.as_mut_ptr() as *mut u8,
+                PAGE_SIZE,
+            );
+            Arc::from(boxed.assume_init())
+        };
+        arc.verify_checksum()?;
+        Ok(arc)
     }
 
     /// Copies raw page bytes from the mmap (no CRC check). Acquires read lock.
@@ -588,16 +608,12 @@ impl StorageEngine for MmapStorage {
         if let Some(page) = self.buffer_pool.get(page_id) {
             return Ok(crate::page_ref::PageRef::from_arc(page));
         }
-        // Cold miss: take the mmap read lock, copy the page, verify its CRC32c
-        // once, then cache it. `into_page()` here is a sole-owner move (the
-        // PageRef from `read_page_from_mmap` was just built), so there is no
-        // extra copy before wrapping it in the shared `Arc`.
+        // Cold miss: take the mmap read lock, read straight into an Arc<Page>
+        // (one alloc, one copy), verify its CRC32c once, then cache it.
         let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
-        let page_ref = Self::read_page_from_mmap(&mmap, page_id)?;
+        let arc = Self::read_arc_from_mmap(&mmap, page_id)?;
         drop(mmap);
-        let arc = self
-            .buffer_pool
-            .insert(page_id, Arc::new(page_ref.into_page()));
+        let arc = self.buffer_pool.insert(page_id, arc);
         Ok(crate::page_ref::PageRef::from_arc(arc))
     }
 
@@ -964,7 +980,11 @@ mod tests {
         p.update_checksum();
         s.write_page(pid, &p).unwrap(); // must invalidate the cached copy
         let got = s.read_page(pid).unwrap();
-        assert_eq!(got.body()[0], 0xAB, "read after write must see the new bytes");
+        assert_eq!(
+            got.body()[0],
+            0xAB,
+            "read after write must see the new bytes"
+        );
     }
 
     #[test]

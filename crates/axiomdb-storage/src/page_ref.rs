@@ -144,11 +144,12 @@ mod tests {
         let mut bytes = [0u8; PAGE_SIZE];
         bytes[crate::page::HEADER_SIZE] = 0x7E; // a body marker
         let pr = PageRef::from_bytes(bytes);
-        let pr2 = pr.clone(); // now shared (strong_count == 2)
-        // Shared → into_page clones; the surviving handle stays valid.
+        // pr2 shares the Arc (strong_count == 2), so into_page on pr must clone
+        // while the other handle stays valid.
+        let pr2 = pr.clone();
         let p1 = pr.into_page();
         assert_eq!(p1.as_bytes()[crate::page::HEADER_SIZE], 0x7E);
-        // pr2 is now the sole owner → moves.
+        // pr2 is now the sole owner, so into_page moves with no copy.
         assert_eq!(PageRef::strong_count_for_test(&pr2), 1);
         let p2 = pr2.into_page();
         assert_eq!(p2.as_bytes()[crate::page::HEADER_SIZE], 0x7E);
