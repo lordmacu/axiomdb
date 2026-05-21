@@ -396,6 +396,67 @@ pub fn scan_clustered_table_masked(
     Ok(result)
 }
 
+/// Clustered full scan with a raw-byte `BatchPredicate` applied BEFORE decode.
+///
+/// Mirrors the heap scan's Phase 8.1 fast path ([`TableEngine::scan_table_filtered_parallel`]):
+/// `batch_pred.eval_on_raw` filters each row directly on its encoded bytes, so
+/// rows that fail the `WHERE` are NEVER decoded (no `Vec<Value>`, no per-TEXT
+/// `String` allocation for rejected rows). Only survivors are decoded.
+///
+/// `batch_pred` must have been produced by [`crate::eval::batch::try_compile`]
+/// for the same `WHERE` expression and these columns — `try_compile` only
+/// accepts predicates whose `eval_on_raw` is exactly equivalent to the scalar
+/// `eval` (numeric/bool/timestamp comparisons AND-ed together, NULL → excluded),
+/// so the result set is identical to the decode-then-`eval` path.
+pub fn scan_clustered_table_filtered(
+    storage: &dyn StorageEngine,
+    table_def: &TableDef,
+    columns: &[ColumnDef],
+    snap: TransactionSnapshot,
+    mask: Option<&[bool]>,
+    batch_pred: &crate::eval::batch::BatchPredicate,
+) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
+    let col_types = column_data_types(columns);
+    let mut result = Vec::new();
+    axiomdb_storage::clustered_tree::scan_all_callback(
+        storage,
+        Some(table_def.root_page_id),
+        &snap,
+        |inline_data, overflow| {
+            if let Some((first_page, tail_len)) = overflow {
+                // Overflow row: the predicate column may live in the tail, so the
+                // full bytes must be assembled before evaluating (rare path).
+                let tail =
+                    axiomdb_storage::clustered_overflow::read_chain(storage, first_page, tail_len)?;
+                let mut full = Vec::with_capacity(inline_data.len() + tail.len());
+                full.extend_from_slice(inline_data);
+                full.extend_from_slice(&tail);
+                if !batch_pred.eval_on_raw(&full) {
+                    return Ok(());
+                }
+                let values = match mask {
+                    Some(m) => decode_row_masked(&full, &col_types, m)?,
+                    None => decode_row(&full, &col_types)?,
+                };
+                result.push((CLUSTERED_DUMMY_RID, values));
+            } else {
+                // Inline row (common case): filter in place on the borrowed slice;
+                // decode only if it survives.
+                if !batch_pred.eval_on_raw(inline_data) {
+                    return Ok(());
+                }
+                let values = match mask {
+                    Some(m) => decode_row_masked(inline_data, &col_types, m)?,
+                    None => decode_row(inline_data, &col_types)?,
+                };
+                result.push((CLUSTERED_DUMMY_RID, values));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(result)
+}
+
 /// Point lookup on a clustered B-tree by primary key bytes.
 ///
 /// Wrapper that forwards to [`lookup_clustered_row_with_hint`] with no

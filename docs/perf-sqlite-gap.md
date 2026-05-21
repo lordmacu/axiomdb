@@ -1783,3 +1783,34 @@ Write paths (insert 5–37×, delete 74×) are a separate investigation.
   both engines do the SAME work (here: both must materialize columns) before
   trusting a ratio. The scan engine was never 11× behind — that was the binding
   plus a lazy-vs-eager mismatch.
+
+## Scan Tier-next: clustered BatchPredicate for select_where (2026-05-20)
+
+`select_where` (`SELECT * FROM t WHERE active = TRUE`) was the worst non-point
+read gap. Diagnosis (`axiomdb_bench --diagnose`): the per-row predicate eval was
+**273ns/row** (+2728µs over full_scan for 10K rows) — *more* than the 226ns/row
+decode. The clustered scan decoded EVERY row (mask=None for `SELECT *`) then
+filtered with the recursive `eval()` interpreter; the heap scan already had a
+raw-byte `BatchPredicate` fast path (`scan_table_filtered_parallel`) the
+clustered scan lacked.
+
+**Fix:** `scan_clustered_table_filtered` applies `BatchPredicate::eval_on_raw`
+to each row's encoded bytes BEFORE decode (same contract the heap path trusts —
+`try_compile` only accepts predicates whose raw-byte eval is exactly equivalent
+to `eval()`, NULL → excluded). Rows that fail the `WHERE` are never decoded — no
+`Vec<Value>`, no per-TEXT `String` for rejected rows — and the surviving rows use
+fast raw-byte comparison instead of the AST interpreter. Falls back to
+decode-all + `eval()` for predicates `try_compile` can't handle (OR / LIKE / IN /
+TEXT / subquery).
+
+Measured (pure-Rust engine, `--compare`, both materialize, 10K rows):
+
+| Scenario | Before | After | SQLite | Gap before → after |
+|---|---:|---:|---:|---|
+| select_where | 2.14M ops/s | **~5.9M ops/s** | ~7.1M | 3.45× → **~1.2×** |
+
+A ~2.75× lift on `select_where`, closing the gap to SQLite from 3.45× to ~1.2×
+(essentially competitive). full_scan stays at parity (~0.96–1.15×), range_scan
+improved (~1.95× → ~1.6×). 3125/3125 sql tests pass.
+
+Remaining: point_lookup (~5.8×, per-query overhead) is now the dominant read gap.

@@ -709,3 +709,25 @@ matches SQLite's when both engines materialize every column. The remaining read
 gaps are point lookups (per-query overhead) and filtered scans (decode-then-filter).
 </div>
 </div>
+
+## select_where: clustered BatchPredicate (filter before decode)
+
+The clustered scan now compiles the `WHERE` into a raw-byte `BatchPredicate`
+(like the heap scan) and filters each row on its encoded bytes BEFORE decoding —
+rows that fail the predicate are never decoded (no `Vec<Value>`, no per-TEXT
+`String`). Falls back to the scalar `eval()` for predicates that can't be
+compiled (OR / LIKE / IN / TEXT / subquery).
+
+| Scenario (10K rows, fair --compare) | Before | After | SQLite | Gap |
+|---|---:|---:|---:|---|
+| select_where | 2.14M | **~5.9M ops/s** | ~7.1M | 3.45× → ~1.2× |
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Advantage — Predicate pushdown before decode</span>
+Filtering on encoded bytes before materialization (SQLite's lazy-column idea,
+applied as a compiled predicate) lifts <code>SELECT * ... WHERE</code> on a
+clustered table ~2.75× and brings it within ~1.2× of SQLite.
+</div>
+</div>

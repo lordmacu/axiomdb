@@ -448,25 +448,57 @@ fn execute_select_ctx(
                     }
                     if mask.iter().all(|&b| b) { None } else { Some(mask) }
                 };
-                let mut rows = crate::table::scan_clustered_table_masked(
-                    storage,
-                    &resolved.def,
-                    &resolved.columns,
-                    snap,
-                    clustered_decode_mask.as_deref(),
-                )?;
-                // Apply WHERE filter on decoded values (clustered scan doesn't
-                // support inline BatchPredicate yet — Phase 39.20 optimization).
                 if let Some(ref wc) = stmt.where_clause {
-                    if !expr_has_subquery(wc) {
+                    // Phase 39.20: compile a raw-byte BatchPredicate so rows that
+                    // fail the WHERE are filtered BEFORE decode — never paying the
+                    // Vec<Value> + per-TEXT String allocations for rejected rows.
+                    // Mirrors the heap scan fast path (scan_table_filtered_parallel).
+                    let col_types_dt: Vec<axiomdb_types::DataType> = resolved
+                        .columns
+                        .iter()
+                        .map(|c| crate::table::column_type_to_data_type(c.col_type))
+                        .collect();
+                    if let Some(bp) = crate::eval::batch::try_compile(wc, &col_types_dt) {
+                        // try_compile only accepts predicates whose eval_on_raw is
+                        // exactly equivalent to eval() — the predicate is fully
+                        // applied here, so skip the later re-filter.
                         where_already_applied = true;
+                        crate::table::scan_clustered_table_filtered(
+                            storage,
+                            &resolved.def,
+                            &resolved.columns,
+                            snap,
+                            clustered_decode_mask.as_deref(),
+                            &bp,
+                        )?
+                    } else {
+                        // Fallback (OR / LIKE / IN / Text / subquery, etc.):
+                        // decode all rows, then filter via scalar eval.
+                        if !expr_has_subquery(wc) {
+                            where_already_applied = true;
+                        }
+                        let mut rows = crate::table::scan_clustered_table_masked(
+                            storage,
+                            &resolved.def,
+                            &resolved.columns,
+                            snap,
+                            clustered_decode_mask.as_deref(),
+                        )?;
+                        rows.retain(|(_, values)| match eval(wc, values) {
+                            Ok(v) => is_truthy(&v),
+                            Err(_) => true,
+                        });
+                        rows
                     }
-                    rows.retain(|(_, values)| match eval(wc, values) {
-                        Ok(v) => is_truthy(&v),
-                        Err(_) => true,
-                    });
+                } else {
+                    crate::table::scan_clustered_table_masked(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        snap,
+                        clustered_decode_mask.as_deref(),
+                    )?
                 }
-                rows
             }
             crate::planner::AccessMethod::Scan => {
                 // Phase 8.1: inline WHERE filter during scan — skip result push
