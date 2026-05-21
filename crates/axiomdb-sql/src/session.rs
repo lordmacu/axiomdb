@@ -878,7 +878,13 @@ pub struct SessionContext {
     /// Stable per-session id used by the in-process LISTEN / NOTIFY broker.
     pub session_id: u64,
     /// Cached table schemas keyed by `"database.schema.table"`.
-    cache: HashMap<String, ResolvedTable>,
+    ///
+    /// Stored behind `Arc` so the hot resolve path hands out a cheap pointer
+    /// clone (one atomic increment) instead of deep-cloning the whole
+    /// `ResolvedTable` (def + columns + indexes + constraints + FKs) on every
+    /// statement. Mirrors SQLite, which keeps a single `Table*` in the schema
+    /// hash and never copies the struct per query (`research/sqlite/src/build.c`).
+    cache: HashMap<String, Arc<ResolvedTable>>,
     /// Per-table heap-tail hint cache (Phase 5.18).
     ///
     /// Key: `table_id`. Value: `(root_page_id, tail_page_id)`.
@@ -1378,48 +1384,71 @@ impl SessionContext {
     }
 
     pub fn get_table(&self, database: &str, schema: &str, table: &str) -> Option<&ResolvedTable> {
-        self.cache.get(&Self::key(database, schema, table))
+        self.cache
+            .get(&Self::key(database, schema, table))
+            .map(Arc::as_ref)
     }
 
-    /// Returns the cached `ResolvedTable` for `(database, schema, table)` only
-    /// if its `def.schema_version` equals `expected_version`.
+    /// Like [`Self::get_table`] but returns a cheap `Arc` clone instead of a
+    /// borrow, for callers that need to keep the schema alive past a later
+    /// `&mut self` borrow (e.g. the clustered-insert batch fast path).
+    pub fn get_table_arc(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+    ) -> Option<Arc<ResolvedTable>> {
+        self.cache
+            .get(&Self::key(database, schema, table))
+            .map(Arc::clone)
+    }
+
+    /// Returns a cheap `Arc` clone of the cached `ResolvedTable` for
+    /// `(database, schema, table)` only if its `def.schema_version` equals
+    /// `expected_version`.
     ///
     /// Returns `None` on cache miss OR on version mismatch. Does NOT auto-evict
     /// on mismatch — the caller is expected to re-resolve and overwrite via
     /// [`Self::cache_table`].
     ///
-    /// This is the cache-hit fast path for `resolve_table_cached` inside
-    /// explicit transactions, mirroring SQLite's schema-cookie check
-    /// (`research/sqlite/src/prepare.c:518-526`).
-    pub fn get_table_if_version(
+    /// This is the cache-hit fast path for `resolve_table_cached`. The returned
+    /// `Arc` makes the warm path an atomic refcount bump rather than a deep
+    /// clone of the whole schema, mirroring SQLite's schema-cookie check
+    /// (`research/sqlite/src/prepare.c:518-526`) over a shared `Table*`.
+    pub fn get_table_arc_if_version(
         &self,
         database: &str,
         schema: &str,
         table: &str,
         expected_version: u64,
-    ) -> Option<&ResolvedTable> {
+    ) -> Option<Arc<ResolvedTable>> {
         let cached = self.cache.get(&Self::key(database, schema, table))?;
         if cached.def.schema_version == expected_version {
-            Some(cached)
+            Some(Arc::clone(cached))
         } else {
             None
         }
     }
 
+    /// Inserts `resolved` into the schema cache and returns the shared `Arc`
+    /// handle, so the cold resolve path can cache and return in one step
+    /// without a second lookup or a deep clone.
     pub fn cache_table(
         &mut self,
         database: &str,
         schema: &str,
         table: &str,
         resolved: ResolvedTable,
-    ) {
+    ) -> Arc<ResolvedTable> {
         // A.2: record the catalog epoch at which this table was validated so
         // subsequent lookups can skip the schema_version probe when the epoch
         // is unchanged (no DDL since last resolution).
         self.table_epoch_cache
             .insert(resolved.def.id, self.catalog_epoch);
+        let arc = Arc::new(resolved);
         self.cache
-            .insert(Self::key(database, schema, table), resolved);
+            .insert(Self::key(database, schema, table), Arc::clone(&arc));
+        arc
     }
 
     /// A.2 optimization: returns `true` when the cached entry for `table_id`

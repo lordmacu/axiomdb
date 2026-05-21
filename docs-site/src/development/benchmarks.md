@@ -849,28 +849,45 @@ is representative of bare-metal deployment.
 ### Remaining read work — point_lookup phase attribution
 
 `--diagnose-point --features bench-timings` splits the prepared point-lookup
-execute into phases (per lookup, macOS, 10K rows):
+execute into phases (per lookup, macOS, 10K rows). The earlier "executor setup +
+project" lump (~2937 ns / 60%) was drilled one level deeper to find the dominant
+*removable* item before optimizing:
 
 | Phase | ns | share | removable? |
 |---|---:|---:|---|
-| clone analyzed AST | ~277 | 6% | yes |
-| planner (`plan_select_ctx`) | ~194 | 4% | yes |
-| lookup (B-tree descent + decode) | ~1066 | 22% | no — already ≈ SQLite seek+extract |
-| **executor setup + project** | **~2937** | **60%** | **partly — this is the gap** |
+| clone analyzed AST | ~249 | 6% | yes |
+| **resolve_table** | **~837** | **19%** | **yes — deep-cloned the schema every call** |
+| **list_stats (catalog)** | **~579** | **13%** | **yes — heap scan that returns empty without `ANALYZE`** |
+| planner (`plan_select_ctx`) | ~177 | 4% | yes |
+| lookup (B-tree descent + decode) | ~846 | 19% | no — already ≈ SQLite seek+extract |
+| WHERE re-eval | ~179 | 4% | yes — key already covers a PK equality |
+| build_column_meta | ~392 | 9% | yes — `ColumnMeta` + name `String` clones |
+| project + result + glue | ~863 | 19% | partly |
 
-**Conclusion: the "B1" idea (cache plan + skip AST clone) is NOT worth it** — it
-only removes ~470 ns (10%). The real lookup work is already fast (~1066 ns, ahead
-of SQLite). The gap is the **general executor's per-statement setup** in
-`execute_select_ctx` / `execute_read_only_with_ctx`: resolving the table, a
-catalog `list_stats` read for the planner cost gate, allocating the four
-subquery-cache `HashMap`s, building `ColumnMeta`, and constructing the result
-`Vec` — work SQLite avoids with a compiled VDBE program + pre-allocated registers.
+**Landed: `resolve_table` now hands out an `Arc<ResolvedTable>`.** The session
+schema cache (`SessionContext`) stored an owned `ResolvedTable` and the hot
+resolve path *deep-cloned* it (def + columns + indexes + constraints + FKs) on
+every statement, because `ctx` is borrowed `&mut` and the cached entry cannot be
+held across the rest of execution. Storing the entry behind `Arc` makes the warm
+path a single atomic refcount bump. This mirrors SQLite, which keeps one `Table*`
+in its schema hash and never copies the struct per query
+(`research/sqlite/src/build.c`).
 
-Next lever: trim that setup for the simple single-table case — skip the stats
-catalog read when the plan is a PK lookup, lazily allocate the subquery caches
-(only when the query has subqueries), and reuse result/column-meta buffers. This
-helps every small-result query, not just point lookups. (Attribution infra:
-`crates/axiomdb-sql/src/bench_timings.rs` `SelectPhaseTimings`, feature
-`bench-timings`.)
+Result (macOS, prepared, 10K rows): `resolve_table` **~837 → ~499 ns** (the
+residual is the `format!` cache-key build + `search_path`/db `String` clones, not
+the clone), total prepared point-lookup **~4290 → ~3870 ns (~10%)**. The win
+scales with table width — a 5-column bench table clones little; real 20+ column
+schemas clone far more. The same change also turns the clustered-INSERT batch
+fast-path (which deep-cloned `ResolvedTable` per row inside an explicit txn) into
+an `Arc` clone, a bonus for batch-insert throughput.
+
+Next levers, in order of size: skip the `list_stats` catalog read when the plan
+is a PK lookup (or cache stats per table, SQLite-style, in the schema entry);
+cache `ColumnMeta` for the bare-`SELECT *` shape; intern the cache key / avoid the
+per-call `String` allocs in resolve; set `where_already_applied` for an exact-PK
+`IndexLookup` (the `covers_predicate` analog already used for ranges) to skip the
+WHERE re-eval. Each helps every small-result query, not just point lookups.
+(Attribution infra: `crates/axiomdb-sql/src/bench_timings.rs` `SelectPhaseTimings`,
+feature `bench-timings`.)
 
 - **Writes:** insert path (WAL per-row) and the structural `DELETE`-all gap.

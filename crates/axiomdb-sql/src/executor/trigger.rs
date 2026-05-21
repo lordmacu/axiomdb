@@ -163,7 +163,7 @@ fn run_statement_triggers_for_result(
             table,
         )?;
         ctx.conn_txn = Some(conn);
-        (resolved.def.table_name, resolved.def.triggers)
+        (resolved.def.table_name.clone(), resolved.def.triggers.clone())
     };
 
     let matching: Vec<_> = all_triggers

@@ -4,7 +4,7 @@ fn resolve_table_cached(
     ctx: &mut SessionContext,
     conn_txn: Option<&axiomdb_wal::ConnectionTxn>,
     tref: &crate::ast::TableRef,
-) -> Result<ResolvedTable, DbError> {
+) -> Result<Arc<ResolvedTable>, DbError> {
     let database = effective_database_for_ref(tref, ctx);
 
     // If the user explicitly specified a database, verify it exists first.
@@ -34,8 +34,7 @@ fn resolve_table_cached(
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
-        ctx.cache_table(&database, schema, &tref.name, resolved.clone());
-        return Ok(resolved);
+        return Ok(ctx.cache_table(&database, schema, &tref.name, resolved));
     }
 
     // Unqualified name: scan search_path in order until a match is found.
@@ -54,8 +53,7 @@ fn resolve_table_cached(
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         if let Ok(resolved) = resolver.resolve_table(Some(&schema), &tref.name) {
-            ctx.cache_table(&database, &schema, &tref.name, resolved.clone());
-            return Ok(resolved);
+            return Ok(ctx.cache_table(&database, &schema, &tref.name, resolved));
         }
 
         // Phase 22b.2: fall back to foreign table catalog when not in regular catalog.
@@ -64,7 +62,7 @@ fn resolve_table_cached(
             .unwrap_or_else(|| txn.snapshot());
         let mut reader = CatalogReader::new(storage, snap)?;
         if let Some(ftable) = reader.get_foreign_table(&schema, &tref.name)? {
-            return Ok(fdw_resolved_table(ftable));
+            return Ok(Arc::new(fdw_resolved_table(ftable)));
         }
     }
     // None of the search_path schemas had the table (regular or foreign).
@@ -93,7 +91,7 @@ fn try_cached_with_version(
     database: &str,
     schema: &str,
     name: &str,
-) -> Result<Option<ResolvedTable>, DbError> {
+) -> Result<Option<Arc<ResolvedTable>>, DbError> {
     // Read the cached (table_id, schema_version) — release the borrow before
     // touching `ctx` again for invalidation.
     let (cached_id, cached_version) = match ctx.get_table(database, schema, name) {
@@ -120,7 +118,7 @@ fn try_cached_with_version(
     // happened during the write) and re-marks the epoch. Subsequent reads
     // then use the fast path until the next write on that table.
     if !ctx.in_explicit_txn && ctx.is_table_epoch_current(cached_id) {
-        return Ok(ctx.get_table_if_version(database, schema, name, cached_version).cloned());
+        return Ok(ctx.get_table_arc_if_version(database, schema, name, cached_version));
     }
 
     // Slow path: probe catalog for the current schema_version (one row read).
@@ -134,7 +132,7 @@ fn try_cached_with_version(
         Some(v) if v == cached_version => {
             // Validated: record epoch so next call skips the probe.
             ctx.mark_table_epoch_current(cached_id);
-            Ok(ctx.get_table_if_version(database, schema, name, cached_version).cloned())
+            Ok(ctx.get_table_arc_if_version(database, schema, name, cached_version))
         }
         _ => {
             // Stale entry OR table dropped — evict so the caller re-resolves.
@@ -266,7 +264,7 @@ fn translate_exclusion_violation_ctx(
             index_name,
         ) {
             Ok(Some(constraint)) => DbError::ExclusionViolation {
-                table: resolved.def.table_name,
+                table: resolved.def.table_name.clone(),
                 constraint,
             },
             _ => err,
