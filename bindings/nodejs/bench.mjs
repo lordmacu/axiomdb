@@ -52,7 +52,7 @@ function axiomPacked(db){
   const nr=Number(buf.readBigUInt64LE(off));off+=8;
   for(let c=0;c<nc;c++){const l=buf.readUInt32LE(off);off+=4+l;}
   const out=[];
-  for(let r=0;r<nr;r++){const row=new Array(nc);for(let c=0;c<nc;c++){const tag=buf[off++];if(tag===1){row[c]=Number(buf.readBigInt64LE(off));off+=8;}else if(tag===3){const l=buf.readUInt32LE(off);off+=4;row[c]=buf.toString('utf8',off,off+l);off+=l;}else if(tag===2){row[c]=buf.readDoubleLE(off);off+=8;}else if(tag===4){const l=buf.readUInt32LE(off);off+=4;row[c]=buf.subarray(off,off+l);off+=l;}else row[c]=null;}out.push(row);}
+  for(let r=0;r<nr;r++){const row=new Array(nc);for(let c=0;c<nc;c++){const tag=buf[off++];if(tag===1){row[c]=buf.readUInt32LE(off)+buf.readInt32LE(off+4)*4294967296;off+=8;}else if(tag===3){const l=buf.readUInt32LE(off);off+=4;row[c]=buf.toString('utf8',off,off+l);off+=l;}else if(tag===2){row[c]=buf.readDoubleLE(off);off+=8;}else if(tag===4){const l=buf.readUInt32LE(off);off+=4;row[c]=buf.subarray(off,off+l);off+=l;}else row[c]=null;}out.push(row);}
   packed_free(ptr,len);
   return performance.now()-t0;
 }
@@ -71,7 +71,7 @@ try{
   // correctness check (packed tuples vs sqlite raw)
   const lenP=[0n];const ptr=query_packed(adb,'SELECT * FROM t',lenP);const len=Number(lenP[0]);const buf=Buffer.from(koffi.view(ptr,len));
   let off=4;const nc=buf.readUInt32LE(off);off+=4;const nr=Number(buf.readBigUInt64LE(off));off+=8;for(let c=0;c<nc;c++){const l=buf.readUInt32LE(off);off+=4+l;}
-  const first=[];for(let c=0;c<nc;c++){const tag=buf[off++];if(tag===1){first.push(Number(buf.readBigInt64LE(off)));off+=8;}else if(tag===3){const l=buf.readUInt32LE(off);off+=4;first.push(buf.toString('utf8',off,off+l));off+=l;}else if(tag===2){first.push(buf.readDoubleLE(off));off+=8;}else first.push(null);}
+  const first=[];for(let c=0;c<nc;c++){const tag=buf[off++];if(tag===1){first.push(buf.readUInt32LE(off)+buf.readInt32LE(off+4)*4294967296);off+=8;}else if(tag===3){const l=buf.readUInt32LE(off);off+=4;first.push(buf.toString('utf8',off,off+l));off+=l;}else if(tag===2){first.push(buf.readDoubleLE(off));off+=8;}else first.push(null);}
   packed_free(ptr,len);
   console.log('correctness row0 sqlite:', ref[0]);
   console.log('correctness row0 packed:', first, '->', JSON.stringify(first)===JSON.stringify(ref[0])?'MATCH':'MISMATCH');

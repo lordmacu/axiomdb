@@ -10,10 +10,19 @@ where PyO3 native construction wins.
 | Approach | time | vs better-sqlite3 |
 |---|---|---|
 | `better-sqlite3` `.raw().all()` (C++ / raw V8) | ~3.4 ms | 1.00× |
-| **napi packed** (`queryPacked` → Buffer + JS parse) | **~5.8 ms** | **~1.66×** ← best AxiomDB path |
-| koffi packed (`bindings/nodejs`, FFI + JS parse) | ~6.7 ms | ~2.03× |
+| **napi packed** (`queryPacked` → Buffer + JS parse, no-BigInt) | **~4.6 ms** | **~1.40×** ← best AxiomDB path |
+| koffi packed (`bindings/nodejs`, FFI + JS parse, no-BigInt) | ~5.8 ms | ~1.51× |
 | napi per-value (`queryTuples`, build JS in Rust) | ~9.2 ms | ~2.7× |
 | koffi per-cell (original, ~2 FFI calls/cell) | ~28 ms | ~8.9× |
+
+### Parser optimization — avoid per-cell BigInt
+
+The packed-buffer paths first read INT cells as `Number(buf.readBigInt64LE(off))`,
+which allocates a BigInt per integer cell. Reading the i64 as two i32s instead —
+`buf.readUInt32LE(off) + buf.readInt32LE(off + 4) * 4294967296` — drops the
+BigInt allocation and cut the JS parse ~33% (napi packed 1.66× → 1.40×, koffi
+packed 2.03× → ~1.5×). Exact within the ±2^53 safe-integer range; values beyond
+it are approximated, same as `Number(BigInt)`.
 
 ## Why building JS objects in Rust (napi) is *slower* here
 
