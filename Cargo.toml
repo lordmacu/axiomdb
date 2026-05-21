@@ -26,7 +26,7 @@ members = [
 # axiomdb-py links libpython via PyO3 — building it under `cargo build
 # --workspace` would require Python dev linkage on the Lima VM. It is built
 # only via maturin, so keep it out of the workspace graph.
-exclude = ["bindings/axiomdb-py"]
+exclude = ["bindings/axiomdb-py", "bindings/axiomdb-node"]
 
 [workspace.package]
 version     = "0.1.0"

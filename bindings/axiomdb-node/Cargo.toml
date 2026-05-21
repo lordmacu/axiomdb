@@ -1,0 +1,28 @@
+[package]
+name = "axiomdb-node"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native (N-API / napi-rs) Node.js binding for the AxiomDB embedded engine"
+publish = false
+
+# Excluded from the workspace (root Cargo.toml [workspace].exclude): links the
+# Node N-API runtime, which would break `cargo build --workspace` on the Lima
+# VM. Built only via @napi-rs/cli (`napi build`).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# N-API is a stable ABI: one .node addon works across Node versions.
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+axiomdb-embedded = { path = "../../crates/axiomdb-embedded" }
+axiomdb-types = { path = "../../crates/axiomdb-types" }
+axiomdb-core = { path = "../../crates/axiomdb-core" }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true

@@ -1,0 +1,19 @@
+{
+  "name": "axiomdb-native",
+  "version": "0.1.0",
+  "description": "AxiomDB embedded database — native Node.js addon (napi-rs)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "axiomdb-node"
+  },
+  "license": "MIT OR Apache-2.0",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.6.2",
+    "better-sqlite3": "^12.10.0"
+  },
+  "scripts": {
+    "build": "napi build --release",
+    "build:debug": "napi build"
+  }
+}
