@@ -691,6 +691,14 @@ on every row — previously the dominant cost on JSONB scans. Text/`JSON`
 operands still take the `serde_json` path. The tail conversion is shared, so
 results are byte-identical to the serde walk.
 
+`JSON_CONTAINS` / `@>` containment is optimized the same way: the candidate is
+decoded once, then the document is navigated binary (`JsonbRef::get_key`) so only
+the keys the candidate references are decoded — irrelevant keys are skipped
+entirely. Every value comparison still defers to the `serde_contains` reference,
+so results are identical. (PostgreSQL's `JsonbDeepContains` goes one step further
+with fully-binary scalar comparison and a GIN index that filters then rechecks;
+both are tracked as follow-ups.)
+
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">

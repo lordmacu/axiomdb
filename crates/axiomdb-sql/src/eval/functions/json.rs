@@ -163,12 +163,12 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             let cand_blob = value_to_jsonb_blob(&candidate)?;
             if args.len() == 3 {
                 let path = eval_path_arg(args, 2, row, name)?;
-                let sj = jsonb_to_serde(&target_blob)?;
-                let sub = extract_path(&sj, &path)?;
-                match sub {
+                // Navigate the blob binary to the path node (decode only it)
+                // instead of decoding the whole document then re-encoding.
+                match jsonb_extract_path_node(&target_blob, &path)? {
                     None => return Ok(Value::Null),
                     Some(v) => {
-                        target_blob = JsonbEncoder::encode(v)?;
+                        target_blob = JsonbEncoder::encode(&v)?;
                     }
                 }
             }
@@ -1839,10 +1839,7 @@ fn extract_path<'a>(
 /// Mirrors `extract_path`'s component logic exactly (dot-split, then bracket
 /// indices), so for any given blob the resulting node is identical — only the
 /// per-row full-document decode is avoided. Returns `None` if the path misses.
-fn jsonb_extract_path_node(
-    blob: &[u8],
-    path: &str,
-) -> Result<Option<serde_json::Value>, DbError> {
+fn jsonb_extract_path_node(blob: &[u8], path: &str) -> Result<Option<serde_json::Value>, DbError> {
     use axiomdb_types::JsonbValue;
 
     let components = normalized_path_components(path)?;
@@ -3821,8 +3818,9 @@ mod jsonb_extract_path_tests {
 
     #[test]
     fn binary_path_explicit_values() {
-        let blob =
-            blob_of(r#"{"active":1,"name":"alice","profile":{"plan":"pro"},"tags":["web","paid"]}"#);
+        let blob = blob_of(
+            r#"{"active":1,"name":"alice","profile":{"plan":"pro"},"tags":["web","paid"]}"#,
+        );
         assert_eq!(binary(&blob, "$.active"), Value::Int(1));
         assert_eq!(binary(&blob, "$.name"), Value::Text("alice".into()));
         assert_eq!(binary(&blob, "$.profile.plan"), Value::Text("pro".into()));

@@ -664,9 +664,56 @@ impl<'a> JsonbRef<'a> {
 /// - Arrays: every element in `candidate` must appear in `doc`.
 /// - Scalars: equality.
 pub fn jsonb_contains(doc: &[u8], candidate: &[u8]) -> Result<bool, DbError> {
-    let doc_v = JsonbDecoder::decode(doc)?;
+    // The candidate is small (and constant across rows in a scan); decode it once.
+    // The doc is navigated binary so we never decode keys the candidate ignores.
     let cand_v = JsonbDecoder::decode(candidate)?;
-    Ok(serde_contains(&doc_v, &cand_v))
+    jsonb_contains_blob(doc, &cand_v)
+}
+
+/// Containment check that navigates the doc binary via `JsonbRef::get_key` for
+/// object candidates, decoding only the doc nodes the candidate references.
+/// Every value comparison defers to [`serde_contains`], so the result is
+/// identical to fully decoding the doc — only the irrelevant-key decode is saved.
+fn jsonb_contains_blob(doc: &[u8], cand: &serde_json::Value) -> Result<bool, DbError> {
+    match cand {
+        serde_json::Value::Object(cmap) => {
+            let dr = JsonbRef::new(doc);
+            // A candidate object is contained only in a doc object (serde's
+            // (Object, Object) arm; any other doc shape falls to `d == c` = false).
+            if dr.is_scalar() || dr.is_array() {
+                return Ok(false);
+            }
+            for (k, cv) in cmap {
+                match dr.get_key(k)? {
+                    Some(dv) => {
+                        if !jsonbvalue_contains(&dv, cv)? {
+                            return Ok(false);
+                        }
+                    }
+                    None => return Ok(false),
+                }
+            }
+            Ok(true)
+        }
+        // Array/scalar candidate: the rare/small cases — decode the doc node and
+        // defer wholesale to the serde reference.
+        _ => {
+            let doc_v = JsonbDecoder::decode(doc)?;
+            Ok(serde_contains(&doc_v, cand))
+        }
+    }
+}
+
+/// Recursion step: a doc value (already navigated) against a candidate node.
+/// Stays binary only when both sides are objects (the common nested case);
+/// otherwise decodes the doc node (small) and uses the serde reference.
+fn jsonbvalue_contains(dv: &JsonbValue, cv: &serde_json::Value) -> Result<bool, DbError> {
+    match (dv, cv) {
+        (JsonbValue::Container(sub), serde_json::Value::Object(_)) => {
+            jsonb_contains_blob(sub, cv)
+        }
+        _ => Ok(serde_contains(&dv.to_serde(), cv)),
+    }
 }
 
 fn serde_contains(doc: &serde_json::Value, candidate: &serde_json::Value) -> bool {
@@ -738,6 +785,73 @@ mod tests {
 
     fn rt(v: serde_json::Value) -> serde_json::Value {
         dec(&enc(v))
+    }
+
+    #[test]
+    fn jsonb_contains_matches_serde_reference() {
+        use serde_json::json;
+        let doc = json!({
+            "id": 7, "active": 1, "name": "alice", "score": 3.5, "flag": true,
+            "none": null, "profile": {"plan": "pro", "country": "US"},
+            "tags": ["web", "paid"], "nested": {"a": {"b": 2}}
+        });
+        let doc_blob = enc(doc.clone());
+        let cands = [
+            json!({"active": 1}),                        // scalar hit
+            json!({"active": 0}),                        // value mismatch
+            json!({"missing": 1}),                       // key miss
+            json!({"name": "alice", "active": 1}),       // multi-key
+            json!({"profile": {"plan": "pro"}}),         // nested object subset
+            json!({"profile": {"plan": "free"}}),        // nested mismatch
+            json!({"profile": {"plan": "pro", "x": 1}}), // nested key miss
+            json!({"tags": ["web"]}),                    // array subset
+            json!({"tags": ["nope"]}),                   // array element miss
+            json!({"tags": ["web", "paid"]}),            // full array
+            json!({"nested": {"a": {"b": 2}}}),          // deep nested
+            json!({"score": 3.5}),                       // float eq
+            json!({"flag": true}),                       // bool
+            json!({"none": null}),                       // null value
+            json!({"active": "1"}),                      // type mismatch (str vs int)
+            json!([1, 2]),                               // array candidate vs object doc
+            json!(1),                                    // scalar candidate vs object doc
+            json!({}),                                   // empty object → always contained
+        ];
+        for cand in &cands {
+            assert_eq!(
+                jsonb_contains(&doc_blob, &enc(cand.clone())).unwrap(),
+                serde_contains(&doc, cand),
+                "cand={cand}",
+            );
+        }
+    }
+
+    #[test]
+    fn jsonb_contains_array_and_scalar_docs() {
+        use serde_json::json;
+        let arr = json!([{"k": 1}, 2, "x"]);
+        let arr_blob = enc(arr.clone());
+        for cand in [
+            json!([2]),
+            json!([{"k": 1}]),
+            json!([3]),
+            json!([{"k": 2}]),
+            json!({"k": 1}), // object candidate vs array doc → false
+        ] {
+            assert_eq!(
+                jsonb_contains(&arr_blob, &enc(cand.clone())).unwrap(),
+                serde_contains(&arr, &cand),
+                "arr cand={cand}",
+            );
+        }
+        let sc = json!(5);
+        let sc_blob = enc(sc.clone());
+        for cand in [json!(5), json!(6), json!({"a": 1})] {
+            assert_eq!(
+                jsonb_contains(&sc_blob, &enc(cand.clone())).unwrap(),
+                serde_contains(&sc, &cand),
+                "scalar cand={cand}",
+            );
+        }
     }
 
     #[test]
