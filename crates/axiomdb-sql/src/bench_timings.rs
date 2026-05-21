@@ -101,8 +101,12 @@ pub fn bump_rows(_n: u64) {}
 #[derive(Default, Clone, Copy, Debug)]
 pub struct SelectPhaseTimings {
     pub clone_ns: u128,
+    pub resolve_ns: u128,
+    pub stats_ns: u128,
     pub plan_ns: u128,
     pub lookup_ns: u128,
+    pub where_ns: u128,
+    pub colmeta_ns: u128,
     pub exec_ns: u128,
     pub calls: u64,
 }
@@ -111,7 +115,8 @@ pub struct SelectPhaseTimings {
 thread_local! {
     pub static SELECT_TIMINGS: RefCell<SelectPhaseTimings> =
         const { RefCell::new(SelectPhaseTimings {
-            clone_ns: 0, plan_ns: 0, lookup_ns: 0, exec_ns: 0, calls: 0,
+            clone_ns: 0, resolve_ns: 0, stats_ns: 0, plan_ns: 0,
+            lookup_ns: 0, where_ns: 0, colmeta_ns: 0, exec_ns: 0, calls: 0,
         }) };
 }
 

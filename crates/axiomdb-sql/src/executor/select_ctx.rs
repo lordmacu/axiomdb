@@ -107,7 +107,10 @@ fn execute_select_ctx(
 
     if stmt.joins.is_empty() {
         // Single-table path — use cache.
-        let resolved = resolve_table_cached(storage, txn, ctx, conn_txn, &from_table_ref)?;
+        let resolved = crate::time_select_phase!(
+            resolve_ns,
+            resolve_table_cached(storage, txn, ctx, conn_txn, &from_table_ref)?
+        );
         let snap = if let Some(ct) = conn_txn {
             txn.active_snapshot(ct)
         } else {
@@ -218,10 +221,10 @@ fn execute_select_ctx(
 
         // ── Query planner: pick the best access method ────────────────────
         // Load per-column statistics for cost-based index selection (Phase 6.10).
-        let table_stats: Vec<axiomdb_catalog::StatsDef> = {
+        let table_stats: Vec<axiomdb_catalog::StatsDef> = crate::time_select_phase!(stats_ns, {
             let mut reader = CatalogReader::new(storage, snap.clone())?;
             reader.list_stats(resolved.def.id).unwrap_or_default()
-        };
+        });
         // Collect SELECT column indices for index-only scan detection (Phase 6.13).
         // Returns empty slice for SELECT * (wildcard) → conservative, no index-only.
         let select_col_idxs: Vec<u16> = collect_select_col_idxs(&stmt);
@@ -1082,7 +1085,7 @@ fn execute_select_ctx(
         }
 
         // ── EXISTS decorrelation fast-path ────────────────────────────────────
-        let mut combined_rows: Vec<Row> = if !where_already_applied {
+        let mut combined_rows: Vec<Row> = crate::time_select_phase!(where_ns, if !where_already_applied {
             if let Some(ref wc) = stmt.where_clause {
                 if let Some(decorr) = try_extract_exists_decorrelation(wc) {
                     apply_exists_semijoin(raw_rows, &decorr, exec_ctx.storage(), exec_ctx.coord())?
@@ -1116,7 +1119,7 @@ fn execute_select_ctx(
             }
         } else {
             raw_rows.into_iter().map(|(_rid, v)| v).collect()
-        };
+        });
 
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
             // Single-table path: choose sorted strategy when the access method
@@ -1150,7 +1153,10 @@ fn execute_select_ctx(
             }
         }
 
-        let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
+        let out_cols = crate::time_select_phase!(
+            colmeta_ns,
+            build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?
+        );
         // Fast path: a bare `SELECT *` is the identity projection over the
         // already-decoded rows. `project_rows_with_window_support` would clone
         // every row — and every heap value in it (Strings, arrays) — a SECOND

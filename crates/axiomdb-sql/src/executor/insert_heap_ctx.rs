@@ -25,7 +25,7 @@ fn execute_insert_ctx(
     // table_id confirms we are targeting the same table, and since all B-tree
     // writes are deferred to COMMIT in this path, the catalog entry (including
     // root_page_id) is unchanged since the batch was created.
-    let resolved: ResolvedTable = 'resolve: {
+    let resolved: Arc<ResolvedTable> = 'resolve: {
         if ctx.in_explicit_txn
             && stmt.returning.is_empty()
             && matches!(stmt.source, InsertSource::Values(_))
@@ -38,17 +38,16 @@ fn execute_insert_ctx(
                     .unwrap_or_else(|| ctx.effective_database())
                     .to_string();
                 let cached = if let Some(schema) = stmt.table.schema.as_deref() {
-                    ctx.get_table(&database, schema, &stmt.table.name)
+                    ctx.get_table_arc(&database, schema, &stmt.table.name)
                         .filter(|rt| rt.def.id == bid)
-                        .cloned()
                 } else {
                     let n = ctx.search_path.len();
                     let mut found = None;
                     for i in 0..n {
                         let schema = ctx.search_path[i].clone();
-                        if let Some(rt) = ctx.get_table(&database, &schema, &stmt.table.name) {
+                        if let Some(rt) = ctx.get_table_arc(&database, &schema, &stmt.table.name) {
                             if rt.def.id == bid {
-                                found = Some(rt.clone());
+                                found = Some(rt);
                                 break;
                             }
                         }

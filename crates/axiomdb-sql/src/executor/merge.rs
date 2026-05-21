@@ -210,7 +210,7 @@ fn merge_unique_lookup_access(
 #[allow(clippy::too_many_arguments)]
 fn execute_merge_with_unique_lookup(
     stmt: MergeStmt,
-    resolved: ResolvedTable,
+    resolved: Arc<ResolvedTable>,
     mut secondary_indexes: Vec<IndexDef>,
     compiled_preds: Vec<Option<Expr>>,
     compiled_index_exprs: Vec<Vec<Option<Expr>>>,

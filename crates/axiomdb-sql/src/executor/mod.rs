@@ -35,6 +35,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::HashMap as StdHashMap;
+use std::sync::Arc;
 
 use axiomdb_catalog::{
     schema::{

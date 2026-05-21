@@ -27,7 +27,7 @@ fn execute_clustered_insert_ctx(
     exec_ctx: &ExecutionContext,
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
-    resolved: ResolvedTable,
+    resolved: Arc<ResolvedTable>,
 ) -> Result<QueryResult, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
@@ -347,7 +347,7 @@ fn enqueue_clustered_insert_ctx(
     exec_ctx: &ExecutionContext,
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
-    resolved: ResolvedTable,
+    resolved: Arc<ResolvedTable>,
 ) -> Result<QueryResult, DbError> {
     if stmt.replace {
         return Err(DbError::NotImplemented {

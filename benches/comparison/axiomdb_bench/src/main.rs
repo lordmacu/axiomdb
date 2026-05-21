@@ -1381,18 +1381,26 @@ fn diagnose_point(data_dir: &Path, n_rows: usize) {
         let s = axiomdb_sql::bench_timings::snapshot_select_timings();
         let n = s.calls.max(1) as f64;
         let clone = s.clone_ns as f64 / n;
+        let resolve = s.resolve_ns as f64 / n;
+        let stats = s.stats_ns as f64 / n;
         let plan = s.plan_ns as f64 / n;
         let lookup = s.lookup_ns as f64 / n;
+        let where_eval = s.where_ns as f64 / n;
+        let colmeta = s.colmeta_ns as f64 / n;
         let exec = s.exec_ns as f64 / n;
-        println!("    ├─ clone AST:           {clone:.0} ns");
-        println!("    ├─ planner:             {plan:.0} ns");
+        let rest = exec - resolve - stats - plan - lookup - where_eval - colmeta;
+        println!("    ├─ clone AST:              {clone:.0} ns");
+        println!("    ├─ resolve_table:         {resolve:.0} ns  (deep-clone ResolvedTable)");
+        println!("    ├─ list_stats (catalog):  {stats:.0} ns  (heap scan → usually empty)");
+        println!("    ├─ planner:               {plan:.0} ns");
         println!(
-            "    ├─ lookup (B-tree+decode): {lookup:.0} ns  (irreducible ≈ SQLite seek+extract)"
+            "    ├─ lookup (B-tree+decode):  {lookup:.0} ns  (irreducible ≈ SQLite seek+extract)"
         );
         println!(
-            "    └─ executor setup+project: {:.0} ns  (resolve_table, col-meta, caches, result)",
-            exec - plan - lookup
+            "    ├─ WHERE re-eval:           {where_eval:.0} ns  (skippable if key covers predicate)"
         );
+        println!("    ├─ build_column_meta:     {colmeta:.0} ns  (ColumnMeta + name clones)");
+        println!("    └─ project+result+rest:   {rest:.0} ns");
     }
 }
 
