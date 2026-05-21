@@ -1003,7 +1003,9 @@ mod ffi {
             Err(_) => return std::ptr::null_mut(),
         };
         let buf = match db.run(sql) {
-            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => pack_rows(&columns, rows),
+            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => {
+                pack_rows(&columns, rows)
+            }
             Ok(_) => pack_rows(&[], Vec::new()),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1556,7 +1558,7 @@ mod ffi {
             assert_eq!(read_u32(&buf, &mut off), PACKED_MAGIC);
             assert_eq!(read_u32(&buf, &mut off), 2); // n_cols
             assert_eq!(read_u64(&buf, &mut off), 0); // n_rows
-            // col 0 name
+                                                     // col 0 name
             let l0 = read_u32(&buf, &mut off) as usize;
             assert_eq!(&buf[off..off + l0], b"id");
             off += l0;

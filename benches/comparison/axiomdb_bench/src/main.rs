@@ -1356,6 +1356,8 @@ fn diagnose_point(data_dir: &Path, n_rows: usize) {
     let stmt = db
         .prepare("SELECT * FROM bench_users WHERE id = ?")
         .expect("prepare");
+    #[cfg(feature = "bench-timings")]
+    axiomdb_sql::bench_timings::reset_select_timings();
     let t0 = Instant::now();
     for _ in 0..loops {
         for &i in &ids {
@@ -1371,7 +1373,27 @@ fn diagnose_point(data_dir: &Path, n_rows: usize) {
         ids.len()
     );
     println!("  db.query  (parse + run_cached plan-cache):   {q_ns:.0} ns/lookup");
-    println!("  prepared  (clone AST + execute_with_ctx):    {p_ns:.0} ns/lookup");
+    println!("  prepared  (clone AST + execute):             {p_ns:.0} ns/lookup");
+
+    // Phase breakdown of the prepared path (needs --features bench-timings).
+    #[cfg(feature = "bench-timings")]
+    {
+        let s = axiomdb_sql::bench_timings::snapshot_select_timings();
+        let n = s.calls.max(1) as f64;
+        let clone = s.clone_ns as f64 / n;
+        let plan = s.plan_ns as f64 / n;
+        let lookup = s.lookup_ns as f64 / n;
+        let exec = s.exec_ns as f64 / n;
+        println!("    ├─ clone AST:           {clone:.0} ns");
+        println!("    ├─ planner:             {plan:.0} ns");
+        println!(
+            "    ├─ lookup (B-tree+decode): {lookup:.0} ns  (irreducible ≈ SQLite seek+extract)"
+        );
+        println!(
+            "    └─ executor setup+project: {:.0} ns  (resolve_table, col-meta, caches, result)",
+            exec - plan - lookup
+        );
+    }
 }
 
 fn main() {
@@ -1568,7 +1590,7 @@ fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
     );
     eprintln!("║                                                                  ║");
 
-    let mut sorted: Vec<_> = measured.iter().copied().collect();
+    let mut sorted: Vec<_> = measured.to_vec();
     sorted.sort_by_key(|(_, ns)| std::cmp::Reverse(*ns));
     eprintln!("║  Top 3 phases:                                                   ║");
     for (i, (name, ns)) in sorted.iter().take(3).enumerate() {

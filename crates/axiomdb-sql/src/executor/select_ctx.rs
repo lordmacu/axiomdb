@@ -228,15 +228,18 @@ fn execute_select_ctx(
 
         // Compute collation before the mutable borrow of ctx.stats below.
         let effective_coll = ctx.effective_collation();
-        let mut access_method = crate::planner::plan_select_ctx(
-            stmt.where_clause.as_ref(),
-            &resolved.indexes,
-            &resolved.columns,
-            resolved.def.id,
-            &table_stats,
-            &mut ctx.stats,
-            &select_col_idxs,
-            effective_coll,
+        let mut access_method = crate::time_select_phase!(
+            plan_ns,
+            crate::planner::plan_select_ctx(
+                stmt.where_clause.as_ref(),
+                &resolved.indexes,
+                &resolved.columns,
+                resolved.def.id,
+                &table_stats,
+                &mut ctx.stats,
+                &select_col_idxs,
+                effective_coll,
+            )
         );
         if let Some(hinted_index) =
             stmt.hinted_index_name_for_table(&from_table_ref, &resolved.def.table_name)?
@@ -657,14 +660,18 @@ fn execute_select_ctx(
                 // Direct B-tree search returns full row inline — no heap fetch.
                 // Attack 5: pass the session's leaf hint so consecutive PK
                 // lookups in the same leaf skip the descent.
-                match crate::table::lookup_clustered_row_with_hint(
-                    storage,
-                    &resolved.def,
-                    &resolved.columns,
-                    key,
-                    snap,
-                    Some(ctx.clustered_leaf_hint_slot()),
-                )? {
+                let looked_up = crate::time_select_phase!(
+                    lookup_ns,
+                    crate::table::lookup_clustered_row_with_hint(
+                        storage,
+                        &resolved.def,
+                        &resolved.columns,
+                        key,
+                        snap,
+                        Some(ctx.clustered_leaf_hint_slot()),
+                    )?
+                );
+                match looked_up {
                     Some(pair) => vec![pair],
                     None => vec![],
                 }

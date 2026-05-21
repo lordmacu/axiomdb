@@ -87,3 +87,72 @@ pub fn bump_rows(n: u64) {
 
 #[cfg(not(feature = "bench-timings"))]
 pub fn bump_rows(_n: u64) {}
+
+// ── SELECT / point-lookup phase timings (--diagnose-point) ────────────────────
+
+/// Per-phase nanosecond accumulators for the prepared-SELECT execute path.
+///
+/// `clone_ns`: `substitute_params(self.analyzed.clone())`. `plan_ns`: the
+/// `plan_select_ctx` planner run. `exec_ns`: the whole executor call (includes
+/// `plan_ns`); so `exec_ns - plan_ns` ≈ lookup + decode + setup. Used to decide
+/// whether the prepared-execute gap is removable (clone + plan) vs irreducible
+/// (lookup + decode), i.e. whether the SQLite compiled-VDBE "B1" rework pays off.
+#[cfg(feature = "bench-timings")]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct SelectPhaseTimings {
+    pub clone_ns: u128,
+    pub plan_ns: u128,
+    pub lookup_ns: u128,
+    pub exec_ns: u128,
+    pub calls: u64,
+}
+
+#[cfg(feature = "bench-timings")]
+thread_local! {
+    pub static SELECT_TIMINGS: RefCell<SelectPhaseTimings> =
+        const { RefCell::new(SelectPhaseTimings {
+            clone_ns: 0, plan_ns: 0, lookup_ns: 0, exec_ns: 0, calls: 0,
+        }) };
+}
+
+#[cfg(feature = "bench-timings")]
+pub fn reset_select_timings() {
+    SELECT_TIMINGS.with(|t| *t.borrow_mut() = SelectPhaseTimings::default());
+}
+
+#[cfg(feature = "bench-timings")]
+pub fn snapshot_select_timings() -> SelectPhaseTimings {
+    SELECT_TIMINGS.with(|t| *t.borrow())
+}
+
+#[cfg(feature = "bench-timings")]
+pub fn bump_select_calls(n: u64) {
+    SELECT_TIMINGS.with(|t| t.borrow_mut().calls += n);
+}
+
+#[cfg(not(feature = "bench-timings"))]
+pub fn bump_select_calls(_n: u64) {}
+
+/// Macro: time a block and add the elapsed ns to a named `SelectPhaseTimings`
+/// field. Compiles to just the expression when `bench-timings` is off.
+#[cfg(feature = "bench-timings")]
+#[macro_export]
+macro_rules! time_select_phase {
+    ($field:ident, $body:expr) => {{
+        let __t0 = std::time::Instant::now();
+        let __result = { $body };
+        let __ns = __t0.elapsed().as_nanos();
+        $crate::bench_timings::SELECT_TIMINGS.with(|t| {
+            t.borrow_mut().$field += __ns;
+        });
+        __result
+    }};
+}
+
+#[cfg(not(feature = "bench-timings"))]
+#[macro_export]
+macro_rules! time_select_phase {
+    ($field:ident, $body:expr) => {
+        $body
+    };
+}

@@ -846,11 +846,31 @@ is representative of bare-metal deployment.
   native PyO3 extension (compiled CPython module, as SQLite/DuckDB/polars do),
   optionally a batch-buffer FFI as an interim step.
 
-### Remaining read work
+### Remaining read work — point_lookup phase attribution
 
-- **point_lookup (~2×):** `PreparedStatement::execute` still clones the analyzed
-  AST and re-runs the planner per call. Next lever ("B1"): cache the resolved
-  `AccessMethod` in the prepared statement and dispatch the lookup without cloning
-  — SQLite's compiled-VDBE "compile once, bind + step" model. Target: parity or
-  faster (the engine lookup itself is already ~2–3 µs).
+`--diagnose-point --features bench-timings` splits the prepared point-lookup
+execute into phases (per lookup, macOS, 10K rows):
+
+| Phase | ns | share | removable? |
+|---|---:|---:|---|
+| clone analyzed AST | ~277 | 6% | yes |
+| planner (`plan_select_ctx`) | ~194 | 4% | yes |
+| lookup (B-tree descent + decode) | ~1066 | 22% | no — already ≈ SQLite seek+extract |
+| **executor setup + project** | **~2937** | **60%** | **partly — this is the gap** |
+
+**Conclusion: the "B1" idea (cache plan + skip AST clone) is NOT worth it** — it
+only removes ~470 ns (10%). The real lookup work is already fast (~1066 ns, ahead
+of SQLite). The gap is the **general executor's per-statement setup** in
+`execute_select_ctx` / `execute_read_only_with_ctx`: resolving the table, a
+catalog `list_stats` read for the planner cost gate, allocating the four
+subquery-cache `HashMap`s, building `ColumnMeta`, and constructing the result
+`Vec` — work SQLite avoids with a compiled VDBE program + pre-allocated registers.
+
+Next lever: trim that setup for the simple single-table case — skip the stats
+catalog read when the plan is a PK lookup, lazily allocate the subquery caches
+(only when the query has subqueries), and reuse result/column-meta buffers. This
+helps every small-result query, not just point lookups. (Attribution infra:
+`crates/axiomdb-sql/src/bench_timings.rs` `SelectPhaseTimings`, feature
+`bench-timings`.)
+
 - **Writes:** insert path (WAL per-row) and the structural `DELETE`-all gap.
