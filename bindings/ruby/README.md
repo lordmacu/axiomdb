@@ -47,6 +47,21 @@ The remaining gap vs the `sqlite3` gem (a native C extension that builds Ruby
 objects in C) is the text-column slicing + the FFI round-trip, both largely
 irreducible without a native extension.
 
+### Ruby version
+
+The binding is version-agnostic (Fiddle is stdlib on every Ruby; no
+version-specific code). Newer Ruby + YJIT helps a little:
+
+| Ruby | columnar ratio |
+|---|---|
+| 2.6 (system) | ~1.37× |
+| 3.4 + `--yjit` | ~1.28× |
+
+The difference is small because the columnar parser is already mostly bulk
+C-level work (`unpack`/`transpose`), leaving little interpreted code for YJIT to
+accelerate. (Results that contain NULLs use the per-cell 'M' path, where YJIT
+helps more — so the win is larger on null-heavy data than this null-free bench.)
+
 ## Parity path (deferred)
 
 To match the `sqlite3` gem (~1.0×) would require a **native Ruby C extension**
