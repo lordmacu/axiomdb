@@ -21,6 +21,7 @@ use crate::{
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
     page_lock::PageLockTable,
+    wal_frame::{FrameLog, WalIndex},
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -136,6 +137,17 @@ pub struct MmapStorage {
     /// User-space clock-sweep page cache. Served on `read_page` hits (no mmap
     /// lock / copy / CRC); invalidated on `write_page` and page reuse.
     buffer_pool: BufferPool,
+    /// Page-image redo log (project B, subphase 3). `None` ⇒ write-ahead disabled
+    /// ⇒ `read_page`/`write_page` behave exactly as before. Lock-free append, so
+    /// it is NOT wrapped in a `Mutex`.
+    frame_log: Option<FrameLog>,
+    /// Live page → latest-appended-frame index (16-way sharded). Empty until a
+    /// frame is appended; consulted by `read_page` only on a buffer-pool miss when
+    /// the log is enabled.
+    wal_index: WalIndex,
+    /// Monotonic LSN stamped into each written page's header (`PageHeader.lsn`).
+    /// `0` while redo is disabled; set past the log's highest LSN on enable.
+    frame_lsn: AtomicU64,
 }
 
 impl Drop for MmapStorage {
@@ -221,6 +233,9 @@ impl MmapStorage {
             extension_waiters: AtomicU32::new(0),
             clean_shutdown_on_open: true,
             buffer_pool: BufferPool::new(),
+            frame_log: None,
+            wal_index: WalIndex::default(),
+            frame_lsn: AtomicU64::new(0),
         })
     }
 
@@ -314,6 +329,9 @@ impl MmapStorage {
             extension_waiters: AtomicU32::new(0),
             clean_shutdown_on_open,
             buffer_pool: BufferPool::new(),
+            frame_log: None,
+            wal_index: WalIndex::default(),
+            frame_lsn: AtomicU64::new(0),
         };
         storage.write_clean_shutdown_flag(false)?;
         storage
@@ -922,6 +940,40 @@ impl StorageEngine for MmapStorage {
 // ── Public MmapStorage helpers (non-trait) ────────────────────────────────────
 
 impl MmapStorage {
+    /// Enables the page-image redo log (project B, subphase 3). Opens (or creates)
+    /// the frame log next to the db file (`<db>.wf`), advances the LSN counter past
+    /// the highest LSN already logged, and routes future writes through it.
+    ///
+    /// Opt-in in subphase 3 (default OFF ⇒ behavior is byte-for-byte unchanged).
+    /// Call right after `create`/`open`, before the storage is shared.
+    pub fn enable_redo_log(&mut self, db_path: &Path) -> Result<(), DbError> {
+        let wf_path = db_path.with_extension("wf");
+        let log = if wf_path.exists() {
+            FrameLog::open(&wf_path)?
+        } else {
+            FrameLog::create(&wf_path)?
+        };
+        let max_lsn = log.scan()?.iter().map(|f| f.lsn).max().unwrap_or(0);
+        self.frame_lsn.store(max_lsn + 1, Ordering::Relaxed);
+        self.frame_log = Some(log);
+        Ok(())
+    }
+
+    /// Whether the page-image redo log is active.
+    pub fn redo_enabled(&self) -> bool {
+        self.frame_log.is_some()
+    }
+
+    /// (diag/test) number of pages currently in the live wal-index.
+    pub fn wal_index_len(&self) -> usize {
+        self.wal_index.len()
+    }
+
+    /// (diag/test) current value of the frame LSN counter (next LSN to assign).
+    pub fn current_frame_lsn(&self) -> u64 {
+        self.frame_lsn.load(Ordering::Acquire)
+    }
+
     /// Returns the number of currently free pages.
     pub fn free_count(&self) -> u64 {
         self.freelist
@@ -1168,5 +1220,20 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "duplicate page IDs allocated");
+    }
+
+    #[test]
+    fn enable_redo_log_is_additive() {
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        assert!(!s.redo_enabled(), "redo off by default");
+        s.enable_redo_log(&path).unwrap();
+        assert!(s.redo_enabled());
+        assert_eq!(s.wal_index_len(), 0, "index empty until a frame is appended");
+        assert_eq!(s.current_frame_lsn(), 1, "fresh log ⇒ first LSN is 1");
+        // Empty index ⇒ reads fall through to mmap exactly as before.
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let got = s.read_page(pid).unwrap();
+        assert_eq!(got.header().page_id, pid);
     }
 }
