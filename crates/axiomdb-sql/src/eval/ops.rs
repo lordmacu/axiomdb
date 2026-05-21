@@ -445,6 +445,12 @@ fn eval_jsonb_path_extract(left: Value, right: Value, as_text: bool) -> Result<V
         return Ok(Value::Null);
     }
     let parts = jsonb_path_segments(right)?;
+    // Fast path: navigate the binary JSONB directly, decoding only the target
+    // node instead of the whole document. The serde path below decodes every
+    // row's full blob into a serde_json tree, which dominates JSONB scan cost.
+    if let Value::Jsonb(blob) = &left {
+        return jsonb_extract_binary(blob, &parts, as_text);
+    }
     let doc = value_to_serde_json(left)?;
     let target = match descend_serde(&doc, &parts) {
         Some(v) => v.clone(),
@@ -458,6 +464,70 @@ fn eval_jsonb_path_extract(left: Value, right: Value, as_text: bool) -> Result<V
     } else {
         let blob = axiomdb_types::jsonb::JsonbEncoder::encode(&target)?;
         Ok(Value::Jsonb(std::sync::Arc::new(blob)))
+    }
+}
+
+/// Binary JSONB path extraction for `->`/`->>` on a `Value::Jsonb` operand.
+///
+/// Walks the blob with `JsonbRef` (O(log k) key lookups, O(1) array index) and
+/// decodes only the target node via `JsonbValue::to_serde`. The tail conversion
+/// is identical to the serde path in [`eval_jsonb_path_extract`], so results
+/// match exactly — only the per-row full-document decode is avoided.
+fn jsonb_extract_binary(blob: &[u8], parts: &[String], as_text: bool) -> Result<Value, DbError> {
+    use axiomdb_types::{JsonbRef, JsonbValue};
+
+    let target: serde_json::Value = if parts.is_empty() {
+        axiomdb_types::jsonb::JsonbDecoder::decode(blob)?
+    } else {
+        // `held` keeps the current container blob alive while descending: the top
+        // level borrows `blob`; each descent stores the sub-container's `Arc`
+        // (a refcount bump, never a deep copy).
+        let mut held: Option<std::sync::Arc<Vec<u8>>> = None;
+        let mut found: Option<JsonbValue> = None;
+        for (i, p) in parts.iter().enumerate() {
+            let cur: &[u8] = match &held {
+                Some(arc) => arc.as_slice(),
+                None => blob,
+            };
+            let r = JsonbRef::new(cur);
+            // Mirror `descend_serde`: array container indexes by integer segment
+            // (negative counts from the end); otherwise look the segment up as a
+            // key. A scalar yields `None` from both `get_index`/`get_key`.
+            let got = if r.is_array() {
+                match p.parse::<i64>() {
+                    Ok(idx) => r.get_index(idx)?,
+                    Err(_) => return Ok(Value::Null),
+                }
+            } else {
+                r.get_key(p)?
+            };
+            let Some(val) = got else {
+                return Ok(Value::Null);
+            };
+            if i + 1 == parts.len() {
+                found = Some(val);
+                break;
+            }
+            match val {
+                JsonbValue::Container(sub) => held = Some(sub),
+                // Scalar with path segments still to consume → no match.
+                _ => return Ok(Value::Null),
+            }
+        }
+        match found {
+            Some(v) => v.to_serde(),
+            None => return Ok(Value::Null),
+        }
+    };
+
+    if as_text {
+        match target {
+            serde_json::Value::String(s) => Ok(Value::Text(s)),
+            other => Ok(Value::Text(other.to_string())),
+        }
+    } else {
+        let out = axiomdb_types::jsonb::JsonbEncoder::encode(&target)?;
+        Ok(Value::Jsonb(std::sync::Arc::new(out)))
     }
 }
 
@@ -1848,5 +1918,93 @@ fn compare_money(lm: i128, ls: u8, rm: i128, rs: u8) -> std::cmp::Ordering {
     } else {
         let factor = 10i128.pow((rs - ls) as u32);
         lm.saturating_mul(factor).cmp(&rm)
+    }
+}
+
+#[cfg(test)]
+mod jsonb_extract_binary_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn blob_of(doc: &str) -> Vec<u8> {
+        let sj: serde_json::Value = serde_json::from_str(doc).unwrap();
+        axiomdb_types::jsonb::JsonbEncoder::encode(&sj).unwrap()
+    }
+
+    fn segs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Reference walk: the pre-optimization serde path (decode the whole blob,
+    /// then `descend_serde`). It runs on the SAME blob as the binary navigator,
+    /// so JSONB key ordering matches on both sides and every case — including
+    /// object/array results serialized as text — is directly comparable.
+    fn extract_via_serde(blob: &[u8], parts: &[String], as_text: bool) -> Value {
+        let doc = axiomdb_types::jsonb::JsonbDecoder::decode(blob).unwrap();
+        let target = match descend_serde(&doc, parts) {
+            Some(v) => v.clone(),
+            None => return Value::Null,
+        };
+        if as_text {
+            match target {
+                serde_json::Value::String(s) => Value::Text(s),
+                other => Value::Text(other.to_string()),
+            }
+        } else {
+            let b = axiomdb_types::jsonb::JsonbEncoder::encode(&target).unwrap();
+            Value::Jsonb(Arc::new(b))
+        }
+    }
+
+    fn check(doc: &str, parts: &[&str]) {
+        let blob = blob_of(doc);
+        let p = segs(parts);
+        for as_text in [true, false] {
+            assert_eq!(
+                jsonb_extract_binary(&blob, &p, as_text).unwrap(),
+                extract_via_serde(&blob, &p, as_text),
+                "doc={doc} parts={parts:?} as_text={as_text}",
+            );
+        }
+    }
+
+    #[test]
+    fn binary_matches_serde_reference() {
+        let doc = r#"{"id":7,"active":1,"name":"alice","score":3.5,"flag":true,"none":null,"profile":{"plan":"pro","country":"US"},"tags":["web","paid"]}"#;
+        // scalars of each type
+        check(doc, &["id"]);
+        check(doc, &["active"]);
+        check(doc, &["name"]);
+        check(doc, &["score"]);
+        check(doc, &["flag"]);
+        check(doc, &["none"]);
+        // nested object + whole sub-object
+        check(doc, &["profile", "plan"]);
+        check(doc, &["profile", "country"]);
+        check(doc, &["profile"]);
+        // arrays: whole, positive index, negative index
+        check(doc, &["tags"]);
+        check(doc, &["tags", "0"]);
+        check(doc, &["tags", "1"]);
+        check(doc, &["tags", "-1"]);
+        // misses
+        check(doc, &["missing"]);
+        check(doc, &["profile", "missing"]);
+        check(doc, &["tags", "9"]);
+        check(doc, &["active", "x"]); // descend into a scalar → no match
+        // whole document
+        check(doc, &[]);
+    }
+
+    #[test]
+    fn binary_explicit_values() {
+        let blob = blob_of(r#"{"active":1,"name":"alice","profile":{"plan":"pro"},"tags":["web","paid"]}"#);
+        let t = |parts: &[&str]| jsonb_extract_binary(&blob, &segs(parts), true).unwrap();
+        assert_eq!(t(&["active"]), Value::Text("1".into()));
+        assert_eq!(t(&["name"]), Value::Text("alice".into()));
+        assert_eq!(t(&["profile", "plan"]), Value::Text("pro".into()));
+        assert_eq!(t(&["tags", "0"]), Value::Text("web".into()));
+        assert_eq!(t(&["tags", "-1"]), Value::Text("paid".into()));
+        assert_eq!(t(&["missing"]), Value::Null);
     }
 }

@@ -17,9 +17,10 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
             match json_val {
                 Value::Null => Ok(Value::Null),
                 Value::Jsonb(ref blob) => {
-                    let sj = jsonb_to_serde(blob)?;
-                    let result = extract_path(&sj, &path)?;
-                    Ok(serde_json_to_sql_value(result))
+                    // Navigate the binary blob to the target node (decode only it)
+                    // instead of decoding the whole document to serde per row.
+                    let node = jsonb_extract_path_node(blob, &path)?;
+                    Ok(serde_json_to_sql_value(node.as_ref()))
                 }
                 Value::Json(ref s) | Value::Text(ref s) => {
                     let parsed = parse_json(s)?;
@@ -1829,6 +1830,72 @@ fn extract_path<'a>(
         }
     }
     Ok(Some(current))
+}
+
+/// Binary equivalent of [`extract_path`] for a `Value::Jsonb` blob: navigates
+/// with `JsonbRef` (O(log k) key lookup, O(1) array index) and decodes ONLY the
+/// target node, instead of decoding the whole document to `serde_json` per row.
+///
+/// Mirrors `extract_path`'s component logic exactly (dot-split, then bracket
+/// indices), so for any given blob the resulting node is identical — only the
+/// per-row full-document decode is avoided. Returns `None` if the path misses.
+fn jsonb_extract_path_node(
+    blob: &[u8],
+    path: &str,
+) -> Result<Option<serde_json::Value>, DbError> {
+    use axiomdb_types::JsonbValue;
+
+    let components = normalized_path_components(path)?;
+    if components.is_empty() {
+        return Ok(Some(jsonb_to_serde(blob)?));
+    }
+    // `node` is the current cursor: `None` means "still at the top-level blob".
+    // After each step it holds the navigated `JsonbValue`; a scalar cannot be
+    // descended further (mirrors `extract_path`'s `_ => return Ok(None)`).
+    let mut node: Option<JsonbValue> = None;
+    for segment in components.split('.') {
+        let (key, indices) = split_key_indices(segment);
+        if !key.is_empty() {
+            let bytes: &[u8] = match &node {
+                None => blob,
+                Some(JsonbValue::Container(sub)) => sub.as_slice(),
+                Some(_) => return Ok(None),
+            };
+            let r = JsonbRef::new(bytes);
+            let got = if r.is_array() {
+                match key.parse::<usize>() {
+                    Ok(i) => r.get_index(i as i64)?,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                r.get_key(key)?
+            };
+            match got {
+                Some(v) => node = Some(v),
+                None => return Ok(None),
+            }
+        }
+        for idx_str in &indices {
+            let idx: usize = match idx_str.parse() {
+                Ok(i) => i,
+                Err(_) => return Ok(None),
+            };
+            let bytes: &[u8] = match &node {
+                None => blob,
+                Some(JsonbValue::Container(sub)) => sub.as_slice(),
+                Some(_) => return Ok(None),
+            };
+            let r = JsonbRef::new(bytes);
+            match r.get_index(idx as i64)? {
+                Some(v) => node = Some(v),
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(match node {
+        Some(v) => v.to_serde(),
+        None => jsonb_to_serde(blob)?,
+    }))
 }
 
 /// Split `key[0][1]` into `("key", ["0", "1"])`.
@@ -3688,5 +3755,78 @@ fn json_array_insert_at(
     if let serde_json::Value::Array(a) = target {
         let at = idx.min(a.len());
         a.insert(at, val);
+    }
+}
+
+#[cfg(test)]
+mod jsonb_extract_path_tests {
+    use super::*;
+
+    fn blob_of(doc: &str) -> Vec<u8> {
+        let sj: serde_json::Value = serde_json::from_str(doc).unwrap();
+        JsonbEncoder::encode(&sj).unwrap()
+    }
+
+    /// Reference: the pre-optimization path (decode the whole blob, then the
+    /// serde `extract_path` walk), on the SAME blob — so JSONB key ordering
+    /// matches and object/array results serialized as text compare equal.
+    fn extract_reference(blob: &[u8], path: &str) -> Value {
+        let sj = jsonb_to_serde(blob).unwrap();
+        let node = extract_path(&sj, path).unwrap();
+        serde_json_to_sql_value(node)
+    }
+
+    fn binary(blob: &[u8], path: &str) -> Value {
+        let node = jsonb_extract_path_node(blob, path).unwrap();
+        serde_json_to_sql_value(node.as_ref())
+    }
+
+    fn check(doc: &str, path: &str) {
+        let blob = blob_of(doc);
+        assert_eq!(
+            binary(&blob, path),
+            extract_reference(&blob, path),
+            "doc={doc} path={path}",
+        );
+    }
+
+    #[test]
+    fn binary_path_matches_serde_reference() {
+        let doc = r#"{"id":7,"active":1,"name":"alice","score":3.5,"flag":true,"none":null,"profile":{"plan":"pro","country":"US"},"tags":["web","paid"],"matrix":[[1,2],[3,4]]}"#;
+        for p in [
+            "$.id",
+            "$.active",
+            "$.name",
+            "$.score",
+            "$.flag",
+            "$.none",
+            "$.profile",
+            "$.profile.plan",
+            "$.profile.country",
+            "$.tags",
+            "$.tags[0]",
+            "$.tags[1]",
+            "$.matrix",
+            "$.matrix[1]",
+            "$.matrix[1][0]",
+            "$.missing",
+            "$.profile.missing",
+            "$.tags[9]",
+            "$.active.x",
+            "$",
+        ] {
+            check(doc, p);
+        }
+    }
+
+    #[test]
+    fn binary_path_explicit_values() {
+        let blob =
+            blob_of(r#"{"active":1,"name":"alice","profile":{"plan":"pro"},"tags":["web","paid"]}"#);
+        assert_eq!(binary(&blob, "$.active"), Value::Int(1));
+        assert_eq!(binary(&blob, "$.name"), Value::Text("alice".into()));
+        assert_eq!(binary(&blob, "$.profile.plan"), Value::Text("pro".into()));
+        assert_eq!(binary(&blob, "$.tags[0]"), Value::Text("web".into()));
+        assert_eq!(binary(&blob, "$.missing"), Value::Null);
     }
 }
