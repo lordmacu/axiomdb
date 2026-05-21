@@ -437,24 +437,27 @@ fn build_row_into(
                 write_lenenc_str(buf, if *b { b"1" } else { b"0" });
             }
             Value::Real(f) => {
-                let s = if f.abs() < 1e15 && (f.abs() > 1e-4 || *f == 0.0) {
+                if f.abs() < 1e15 && (f.abs() > 1e-4 || *f == 0.0) {
                     use std::io::Write;
-                    let len = write!(&mut num_buf[..], "{f}").ok().map(|_| {
-                        num_buf
-                            .iter()
-                            .position(|&b| b == 0)
-                            .unwrap_or(num_buf.len())
-                    });
-                    if let Some(l) = len {
-                        write_lenenc_str(buf, &num_buf[..l]);
-                        num_buf = [0u8; 32];
+                    // `num_buf` is reused across columns; a prior column (e.g. an
+                    // INT) leaves stale bytes behind. Compute the exact number of
+                    // bytes written from the advanced slice instead of scanning
+                    // for a NUL terminator. Rust prints whole floats without a
+                    // fractional part ("100.0" -> "100"), so a shorter float
+                    // after a longer prior value would otherwise pick up leftover
+                    // digits — e.g. id=1000 then score=100.0 serialized as "1000".
+                    let cap = num_buf.len();
+                    let mut slice: &mut [u8] = &mut num_buf;
+                    let ok = write!(slice, "{f}").is_ok();
+                    let written = cap - slice.len();
+                    if ok {
+                        write_lenenc_str(buf, &num_buf[..written]);
                         continue;
                     }
-                    format!("{f}")
+                    write_lenenc_str(buf, format!("{f}").as_bytes());
                 } else {
-                    format!("{f:e}")
-                };
-                write_lenenc_str(buf, s.as_bytes());
+                    write_lenenc_str(buf, format!("{f:e}").as_bytes());
+                }
             }
             // Text: skip charset encoding for ASCII-only (common case).
             Value::Text(s) => {

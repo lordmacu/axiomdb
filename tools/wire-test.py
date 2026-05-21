@@ -5789,6 +5789,28 @@ ok("[24.2 float] FLOAT8 alias stores as f64", abs(_ff[1] - 1.5) < 1e-13, _ff[1])
 cur.execute("DROP TABLE IF EXISTS _wire_float")
 cur.execute("DROP TABLE IF EXISTS _wire_float4f8")
 
+# Regression: whole-number REAL serialized AFTER a wider column in the same row.
+# The text-protocol row writer reused num_buf and detected the float length by
+# scanning for a NUL byte; Rust prints whole floats without a fraction
+# ("100.0" -> "100"), so a shorter float after a longer prior value (e.g. id=1000)
+# read the leftover digit and emitted "1000". SELECT score alone was correct,
+# SELECT id,score / SELECT * were not.
+cur.execute("DROP TABLE IF EXISTS _wire_real_ser")
+cur.execute("CREATE TABLE _wire_real_ser (id INT PRIMARY KEY, score REAL, email TEXT)")
+cur.execute("INSERT INTO _wire_real_ser VALUES (1000, 100.0, 'a')")
+cur.execute("INSERT INTO _wire_real_ser VALUES (7, 100.0, 'b')")
+cur.execute("SELECT score FROM _wire_real_ser WHERE id = 1000")
+ok("[24.2 float] whole REAL alone correct", abs(float(cur.fetchone()[0]) - 100.0) < 1e-5)
+cur.execute("SELECT id, score FROM _wire_real_ser WHERE id = 1000")
+_rs = cur.fetchone()
+ok("[24.2 float] whole REAL after INT not corrupted",
+   abs(float(_rs[1]) - 100.0) < 1e-5, _rs)
+cur.execute("SELECT * FROM _wire_real_ser WHERE id = 1000")
+_rs2 = cur.fetchone()
+ok("[24.2 float] whole REAL in SELECT * not corrupted",
+   abs(float(_rs2[1]) - 100.0) < 1e-5, _rs2)
+cur.execute("DROP TABLE IF EXISTS _wire_real_ser")
+
 # ── 24.3 Exact DECIMAL(p,s) ───────────────────────────────────────────────────
 
 cur.execute("DROP TABLE IF EXISTS _wire_decimal")

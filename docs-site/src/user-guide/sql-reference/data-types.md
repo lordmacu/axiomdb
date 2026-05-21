@@ -66,6 +66,10 @@ CREATE TABLE page_views (
 > **NaN is forbidden.** The row codec rejects `NaN` values at encode time.
 > IEEE 754 infinities are also not accepted by default.
 
+> **Whole-number floats render exactly over the wire.** A `REAL`/`DOUBLE` whose
+> value has no fractional part (e.g. `100.0`) is serialized correctly in every
+> column position, including in multi-column projections and `SELECT *`.
+
 ```sql
 -- Geospatial coordinates (4-byte precision is sufficient)
 CREATE TABLE locations (
