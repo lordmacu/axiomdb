@@ -416,12 +416,17 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
                 buf.push(*s);
             }
             Value::Text(s) => {
-                // Phase 11.2e: NFC-normalize all Text before storage.
-                // 'café' (NFD: 6 bytes) and 'café' (NFC: 5 bytes) become identical,
-                // making '=' always correct for visually identical strings.
-                // DuckDB does this; no other OLTP database does.
+                // Phase 11.2e: NFC-normalize all Text before storage so 'café'
+                // (NFD) and 'café' (NFC) compare equal. ASCII is invariant under
+                // NFC, so for the common ASCII case skip the normalization + the
+                // per-row String allocation and borrow the bytes directly — the
+                // encoded bytes are byte-identical to the NFC path.
                 use unicode_normalization::UnicodeNormalization;
-                let normalized: String = s.nfc().collect();
+                let normalized: std::borrow::Cow<str> = if s.is_ascii() {
+                    std::borrow::Cow::Borrowed(s.as_str())
+                } else {
+                    std::borrow::Cow::Owned(s.nfc().collect())
+                };
                 let bytes = normalized.as_bytes();
                 if bytes.len() > MAX_INLINE_LEN {
                     return Err(DbError::ValueTooLarge {
@@ -444,8 +449,14 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>, DbEr
             }
             Value::Json(s) => {
                 // Phase 11.4: JSON stored as validated UTF-8 text (same wire format as Text).
+                // ASCII is NFC-invariant → skip normalization + the String alloc for
+                // ASCII JSON (byte-identical); validation still runs either way.
                 use unicode_normalization::UnicodeNormalization;
-                let normalized: String = s.nfc().collect();
+                let normalized: std::borrow::Cow<str> = if s.is_ascii() {
+                    std::borrow::Cow::Borrowed(s.as_str())
+                } else {
+                    std::borrow::Cow::Owned(s.nfc().collect())
+                };
                 serde_json::from_str::<serde_json::Value>(&normalized).map_err(|e| {
                     DbError::InvalidValue {
                         reason: format!("invalid JSON: {e}"),
@@ -1393,5 +1404,45 @@ mod tests {
         let predicted = encoded_len(&values);
         let actual = encode_row(&values, schema).unwrap().len();
         assert_eq!(predicted, actual);
+    }
+
+    // ── NFC ASCII fast-path (must be byte-identical to the NFC path) ─────────────
+
+    #[test]
+    fn test_text_ascii_nfc_fastpath_byte_identical() {
+        use unicode_normalization::UnicodeNormalization;
+        let schema = &[DataType::Text];
+        for s in ["", "user_000001", "u1@b.local", "Hello, World! 123"] {
+            let via_fast = encode_row(&[Value::Text(s.into())], schema).unwrap();
+            let via_nfc = encode_row(&[Value::Text(s.nfc().collect::<String>())], schema).unwrap();
+            assert_eq!(
+                via_fast, via_nfc,
+                "ASCII fast-path differs from NFC for {s:?}"
+            );
+            // Round-trips back to the original.
+            assert_eq!(
+                decode_row(&via_fast, schema).unwrap(),
+                vec![Value::Text(s.into())]
+            );
+        }
+    }
+
+    #[test]
+    fn test_text_non_ascii_still_nfc_normalized() {
+        // Non-ASCII must keep going through NFC: the NFD form ('e' + U+0301) and
+        // the precomposed NFC form ('é', U+00E9) must encode identically.
+        let schema = &[DataType::Text];
+        let nfd = "e\u{0301}";
+        let nfc = "\u{e9}";
+        let enc_nfd = encode_row(&[Value::Text(nfd.into())], schema).unwrap();
+        let enc_nfc = encode_row(&[Value::Text(nfc.into())], schema).unwrap();
+        assert_eq!(
+            enc_nfd, enc_nfc,
+            "NFD and NFC forms must encode identically"
+        );
+        assert_eq!(
+            decode_row(&enc_nfd, schema).unwrap(),
+            vec![Value::Text(nfc.into())]
+        );
     }
 }

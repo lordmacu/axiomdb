@@ -955,10 +955,24 @@ The remaining insert gap is now execute-dominated (~60%), not parse.
 </div>
 </div>
 
+### Codec — NFC ASCII fast-path
+
+`encode_row` NFC-normalizes every `Text`/`Json` value so visually-identical strings
+compare equal. ASCII is invariant under NFC, so for ASCII (the common case) the
+encoder now borrows the bytes via `Cow` instead of allocating a normalized `String`
+per value — byte-identical output, fewer per-row allocations on every write path that
+stores text. Non-ASCII still normalizes.
+
 ### Next levers (post-parser cost model)
 
-Per-row ~8.3 µs vs SQLite ~1.8 µs. Ranked: (1) the batch **commit/WAL** (~32 ms/10K
-— exceeds SQLite's *entire* batch ~18 ms; likely data-page flush we could defer to
-a background checkpoint), (2) the **execute codec** (`prepare_row`: per-row
-`column_data_types` alloc, `encode_row` buffer), (3) **lex** `StringLit`
-allocation, (4) **analyze**. See `docs/checkpoint-sqlite-parity.md`.
+Per-row ~8.3 µs vs SQLite ~1.8 µs. Measured with `--diagnose-wrapper`: the `Db::run`
+wrapper adds **0** overhead (the earlier "~2µs" was a cross-harness artifact), and
+the COMMIT (~36 ms/10K, ~43% of the row) is **not** fsync — at `synchronous=NORMAL`
+(no fsync) it costs the same as Strict. Root cause: **transactional INSERT staging
+(Phase 5.21)** defers the real B-tree + WAL + index apply to COMMIT. So the real
+insert levers are: (1) the **staged-flush B-tree bulk apply** at commit (sort +
+clustered insert + WAL — the biggest; SQLite defers data pages to a background
+checkpoint), (2) the **codec** (NFC fast-path done above; the rest is small),
+(3) lex `StringLit`, (4) analyze. Caveat: `--diagnose-insert/-deep` over-report
+(per-phase `Instant::now()` overhead); trust one-timer-per-loop diagnostics. See
+`docs/checkpoint-sqlite-parity.md`.

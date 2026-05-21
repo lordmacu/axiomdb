@@ -1539,6 +1539,8 @@ fn main() {
         diagnose_insert_deep(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-parse".to_string()) {
         diagnose_parse(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-wrapper".to_string()) {
+        diagnose_wrapper(&data_dir, n_rows);
     } else {
         run_scenario(&scenario, n_rows, &data_dir);
     }
@@ -1703,6 +1705,111 @@ fn diagnose_insert_deep(_data_dir: &Path, _n_rows: usize) {
 }
 
 // ── Diagnostic: timing breakdown per phase ────────────────────────────────────
+
+// ── Wrapper A/B: Db::run (run_inner) vs direct execute_with_ctx ────────────────
+// Same N INSERTs, per-row, EXCLUDING commit, in one process. Isolates the real
+// per-statement overhead of the embedded Db wrapper vs the raw executor path —
+// settles whether the ~2µs "wrapper gap" (a cross-harness subtraction) is real.
+fn diagnose_wrapper(data_dir: &Path, n_rows: usize) {
+    use axiomdb_catalog::bootstrap::CatalogBootstrap;
+    use axiomdb_sql::{
+        analyze_cached, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode, SchemaCache,
+        SessionContext,
+    };
+    use axiomdb_storage::MmapStorage;
+    use axiomdb_wal::TxnManager;
+
+    let create = "CREATE TABLE bench_users (id INT NOT NULL, name TEXT NOT NULL, \
+        age INT NOT NULL, active BOOL NOT NULL, score REAL NOT NULL, \
+        email TEXT NOT NULL, PRIMARY KEY (id))";
+    let sqls = gen_inserts(n_rows.max(2));
+
+    // ── Path A: direct parse + analyze + execute_with_ctx ──
+    let dir_a = data_dir.join("diag_wrap_a");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let storage = MmapStorage::create(&dir_a.join("a.db")).unwrap();
+    CatalogBootstrap::init(&storage).unwrap();
+    let txn = TxnManager::create(&dir_a.join("a.wal")).unwrap();
+    let bloom = BloomRegistry::new();
+    let mut sc = SchemaCache::new();
+    let mut sess = SessionContext::default();
+    let sql_mode = sess.sql_mode_flags();
+
+    macro_rules! direct {
+        ($sql:expr) => {{
+            let stmt = parse_with_sql_mode($sql, None, sql_mode).unwrap();
+            let snap = if let Some(ref ct) = sess.conn_txn {
+                txn.active_snapshot(ct)
+            } else {
+                txn.snapshot()
+            };
+            let analyzed = analyze_cached(stmt, &storage, snap, &mut sc).unwrap();
+            execute_with_ctx(analyzed, &storage, &txn, &bloom, &mut sess).unwrap();
+        }};
+    }
+    direct!(create);
+    direct!("BEGIN");
+    direct!(&sqls[0]); // warmup
+    let t0 = Instant::now();
+    for sql in &sqls[1..] {
+        direct!(sql);
+    }
+    let direct_ns = t0.elapsed().as_nanos();
+    let t0 = Instant::now();
+    direct!("COMMIT");
+    let commit_strict_ns = t0.elapsed().as_nanos();
+
+    // ── Path B: Db::run wrapper (NORMAL, matching --compare) ──
+    let dir_b = data_dir.join("diag_wrap_b");
+    let _ = std::fs::remove_dir_all(&dir_b);
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let mut db = Db::open(dir_b.join("b.db")).unwrap();
+    db.run("SET synchronous = 'NORMAL'").unwrap();
+    db.run(create).unwrap();
+    db.run("BEGIN").unwrap();
+    db.run(&sqls[0]).unwrap(); // warmup
+    let t0 = Instant::now();
+    for sql in &sqls[1..] {
+        db.run(sql).unwrap();
+    }
+    let wrap_ns = t0.elapsed().as_nanos();
+    let t0 = Instant::now();
+    db.run("COMMIT").unwrap();
+    let commit_normal_ns = t0.elapsed().as_nanos();
+
+    let m = (sqls.len() - 1) as u128;
+    let us = |ns: u128| ns as f64 / 1000.0 / m as f64;
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════╗");
+    eprintln!(
+        "║  Db::run vs direct execute_with_ctx — {} rows (per-row, excl COMMIT)",
+        m
+    );
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!(
+        "║  direct (parse+analyze+execute_with_ctx)  {:>8.2} µs/row        ║",
+        us(direct_ns)
+    );
+    eprintln!(
+        "║  Db::run wrapper (run_inner)              {:>8.2} µs/row        ║",
+        us(wrap_ns)
+    );
+    eprintln!(
+        "║  wrapper overhead                         {:>8.2} µs/row        ║",
+        us(wrap_ns.saturating_sub(direct_ns))
+    );
+    eprintln!(
+        "║  COMMIT Path A (default Strict, fsync)    {:>8.2} ms total      ║",
+        commit_strict_ns as f64 / 1_000_000.0
+    );
+    eprintln!(
+        "║  COMMIT Path B (NORMAL, flush_no_sync)    {:>8.2} ms total      ║",
+        commit_normal_ns as f64 / 1_000_000.0
+    );
+    eprintln!("╚══════════════════════════════════════════════════════════════════╝");
+    eprintln!();
+}
 
 fn diagnose(data_dir: &Path, n_rows: usize) {
     let mut db = db_open(data_dir);
