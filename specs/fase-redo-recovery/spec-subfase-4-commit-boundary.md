@@ -4,7 +4,7 @@ Phase: redo-recovery (project B) — subphase 4
 Task: make each frame carry its writing `txn_id`, and make the frame log durable at
 the commit boundary, so subphase 5's recovery can REDO committed txns and discard
 in-flight ones — under **multi-writer**.
-Status: approved
+Status: implemented (executor txn_id threading exercised end-to-end in subphase 5)
 Effort: **max** (durability contract; data-loss surface).
 
 ## Context

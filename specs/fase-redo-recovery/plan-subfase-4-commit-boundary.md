@@ -3,7 +3,7 @@
 Phase: redo-recovery (project B) — subphase 4
 Task: per-frame txn_id + durable frame log at commit
 Spec: specs/fase-redo-recovery/spec-subfase-4-commit-boundary.md
-Status: draft
+Status: done (4a–4c committed; 4d closing; threading validated in subphase 5)
 
 ## Summary
 

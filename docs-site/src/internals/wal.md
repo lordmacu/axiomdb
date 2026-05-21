@@ -815,16 +815,36 @@ redo log — adapted to our atomic-offset + <code>pwrite</code> model.
 </div>
 </div>
 
+### Subphase 4 — commit boundary (durably-correct frames)
+
+So recovery can tell a committed txn's frames from an in-flight one's, **each frame
+carries the `txn_id` that wrote it** (header 32 → 36 B; `commit_marker u32` →
+`txn_id u64`). SQLite needs no such field because it is single-writer — all frames
+between two commits belong to one txn; AxiomDB is multi-writer, so frames interleave
+and must self-identify. Recovery (subphase 5) keeps a frame iff its `txn_id` has a
+`Commit` in the logical WAL — `build_index` takes that committed predicate.
+
+`write_page` stamps the `txn_id` from a **thread-local** (`set_current_txn`), set per
+statement by the executor — correct under multi-writer because a statement runs
+synchronously on one thread. Nested sub-transactions (a `nextval`/cron sub-txn inside a
+statement, which commits independently of its parent) use a **save/restore RAII guard**
+so their frames carry their own id and then restore the parent's.
+
+A commit goes through `commit_durable`, which **`fsync`s the frame log before the
+logical `Commit` record** (write-ahead order: data durable before the commit marker).
+
+This subphase is **additive**: dual-write + the per-commit flush stay, so durability is
+unchanged and `t0_…` is still RED.
+
 <div class="callout callout-design">
 <span class="callout-icon">🧭</span>
 <div class="callout-body">
 <span class="callout-label">Status</span>
-The read/write path is now frame-aware. Remaining: subphase 4 (commit boundary —
-frame-only writes, drop the per-commit main-file <code>fsync</code>, and track the
-contiguous durable prefix for concurrent appends), subphase 5 (recovery rebuilds the
-wal-index from committed frames — the <code>t0_…</code> regression flips green),
-subphase 6 (checkpoint copies frames to the main file), and subphase 7 (the full
-crash suite). Until then the per-commit flush stays and <code>t0_…</code> is
-<code>#[ignore]</code>d.
+Frames are durably correct at commit. Remaining: subphase 5 (recovery rebuilds the
+wal-index from committed frames on open — the <code>t0_…</code> regression flips green),
+subphase 6 (drop the per-commit flush + frame-only writes + the contiguous durable
+prefix for concurrent appends + checkpoint copies frames to the main file), and
+subphase 7 (the full crash suite). Until subphase 6 the per-commit flush stays and
+<code>t0_…</code> is <code>#[ignore]</code>d.
 </div>
 </div>
