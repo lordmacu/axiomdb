@@ -541,12 +541,14 @@ pub enum Token<'src> {
 
     /// Single-quoted string literal with escape processing.
     /// `''` inside the string is the SQL-standard doubled-quote escape.
-    ///
-    /// Also handles hex byte-string `x'AABB'` / `X'AABB'` (4.2e):
-    /// decoded as UTF-8 when valid, latin-1 otherwise.
     #[regex(r"'([^'\\]|\\.|'')*'", |lex| process_string_literal(lex.slice()))]
-    #[regex(r"[xX]'[0-9a-fA-F]*'", |lex| decode_hex_string_literal(lex.slice()))]
     StringLit(String),
+
+    /// MySQL hex byte-string literal `x'AABB'` / `X'AABB'` (4.2e).
+    /// Per MySQL a hex literal is a binary string (BLOB-typed), so it decodes to
+    /// raw bytes and the parser wraps it in `Value::Bytes` — never `Value::Text`.
+    #[regex(r"[xX]'[0-9a-fA-F]*'", |lex| decode_hex_bytes_literal(lex.slice()))]
+    BytesLit(Vec<u8>),
 
     // ── Identifiers ───────────────────────────────────────────────────────────
     /// Unquoted identifier: does not match any keyword.
@@ -717,21 +719,21 @@ pub enum Token<'src> {
 
 // ── String escape processing ──────────────────────────────────────────────────
 
-/// Decodes a MySQL hex byte-string literal `x'AABB'` / `X'AABB'` (4.2e).
+/// Decodes a MySQL hex byte-string literal `x'AABB'` / `X'AABB'` (4.2e) to raw bytes.
 ///
-/// Returns the decoded bytes as a `String`:
-/// - If the bytes are valid UTF-8, returns `from_utf8` directly.
-/// - Otherwise, maps each byte to its latin-1 char equivalent (MySQL behavior).
-pub(crate) fn decode_hex_string_literal(raw: &str) -> Option<String> {
+/// Per MySQL semantics a hex literal is a binary string (BLOB-typed); the parser
+/// wraps the returned bytes in `Value::Bytes`. Returns `None` for an odd number
+/// of hex digits (the regex already guarantees each digit is `[0-9a-fA-F]`).
+pub(crate) fn decode_hex_bytes_literal(raw: &str) -> Option<Vec<u8>> {
     // Strip the leading `x'` / `X'` and trailing `'`.
     let inner = &raw[2..raw.len() - 1];
     if inner.is_empty() {
-        return Some(String::new());
+        return Some(Vec::new());
     }
     if !inner.len().is_multiple_of(2) {
         return None; // Odd hex digits are invalid.
     }
-    let bytes: Option<Vec<u8>> = inner
+    inner
         .as_bytes()
         .chunks(2)
         .map(|chunk| {
@@ -739,12 +741,7 @@ pub(crate) fn decode_hex_string_literal(raw: &str) -> Option<String> {
             let lo = (chunk[1] as char).to_digit(16)?;
             Some((hi * 16 + lo) as u8)
         })
-        .collect();
-    let bytes = bytes?;
-    Some(
-        String::from_utf8(bytes.clone())
-            .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect()),
-    )
+        .collect()
 }
 
 /// Processes escape sequences in a raw single-quoted SQL string literal.
@@ -1325,18 +1322,26 @@ mod tests {
 
     #[test]
     fn test_hex_string_literal_ascii() {
-        // x'48656c6c6f' = b"Hello"
-        assert_eq!(tok("x'48656c6c6f'")[0], Token::StringLit("Hello".into()));
+        // x'48656c6c6f' = b"Hello" → BLOB-typed raw bytes (MySQL binary string).
+        assert_eq!(tok("x'48656c6c6f'")[0], Token::BytesLit(b"Hello".to_vec()));
     }
 
     #[test]
     fn test_hex_string_literal_uppercase_x() {
-        assert_eq!(tok("X'48656c6c6f'")[0], Token::StringLit("Hello".into()));
+        assert_eq!(tok("X'48656c6c6f'")[0], Token::BytesLit(b"Hello".to_vec()));
     }
 
     #[test]
     fn test_hex_string_literal_empty() {
-        assert_eq!(tok("x''")[0], Token::StringLit(String::new()));
+        assert_eq!(tok("x''")[0], Token::BytesLit(Vec::new()));
+    }
+
+    #[test]
+    fn test_hex_string_literal_non_utf8_roundtrip() {
+        // Non-UTF-8 bytes must survive verbatim. The old String-typed decoder
+        // round-tripped through latin-1, corrupting x'ff' into [0xc3, 0xbf].
+        assert_eq!(tok("x'ff'")[0], Token::BytesLit(vec![0xff]));
+        assert_eq!(tok("X'010203'")[0], Token::BytesLit(vec![1, 2, 3]));
     }
 
     // ── Version-conditional comments (4.1f) ───────────────────────────────────

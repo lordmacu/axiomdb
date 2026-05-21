@@ -712,6 +712,7 @@ pub(crate) fn literal_token_to_expr(tok: Token<'_>) -> Option<Expr> {
         }
         Token::Float(f) => Expr::Literal(Value::Real(f)),
         Token::StringLit(s) => Expr::Literal(Value::Text(s)),
+        Token::BytesLit(b) => Expr::Literal(Value::Bytes(b)),
         Token::True => Expr::Literal(Value::Bool(true)),
         Token::False => Expr::Literal(Value::Bool(false)),
         Token::Null => Expr::Literal(Value::Null),
@@ -732,6 +733,7 @@ fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
             | Token::Integer(_)
             | Token::Float(_)
             | Token::StringLit(_)
+            | Token::BytesLit(_)
             | Token::True
             | Token::False
             | Token::Null

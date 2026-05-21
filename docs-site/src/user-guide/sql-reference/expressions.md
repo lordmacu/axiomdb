@@ -78,6 +78,32 @@ explicitly enables <code>ANSI_QUOTES</code>.
 </div>
 </div>
 
+### Hex byte-string literals
+
+A hex byte-string literal `x'AABB'` / `X'AABB'` produces a **`BLOB`** value (raw
+bytes), not text. Each pair of hex digits is one byte, the digits are
+case-insensitive, and the empty literal `x''` is a zero-length blob:
+
+```sql
+SELECT X'010203';             -- BLOB: bytes [0x01, 0x02, 0x03]
+SELECT HEX(x'deadbeef');      -- 'DEADBEEF'
+SELECT OCTET_LENGTH(X'FF');   -- 1
+```
+
+Assigning a hex literal to a `TEXT`/`VARCHAR` column converts it to text via a
+lossy UTF-8 decode; assigning it to a `BLOB` column stores the bytes verbatim.
+
+<div class="callout callout-design">
+<span class="callout-icon">📐</span>
+<div class="callout-body">
+<span class="callout-label">Design — MySQL-aligned binary typing</span>
+Like MySQL, AxiomDB types <code>x'…'</code> as a binary string (BLOB), so a bare
+<code>SELECT X'010203'</code> returns a blob and non-ASCII bytes round-trip
+exactly — <code>X'FF'</code> is the single byte <code>0xFF</code>, never a
+re-encoded multi-byte sequence.
+</div>
+</div>
+
 ---
 
 ## JSON Operators

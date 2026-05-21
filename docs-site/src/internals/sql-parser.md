@@ -100,6 +100,7 @@ pub enum Token<'src> {
     DqIdent(String),            // ANSI_QUOTES-delimited identifier
     // Literals
     IntLit(i64), FloatLit(f64), StringLit(String), HexLit(Vec<u8>),
+    BytesLit(Vec<u8>),          // x'AABB' hex byte-string → BLOB (Value::Bytes)
     TrueLit, FalseLit, NullLit,
     // Punctuation
     LParen, RParen, Comma, Semicolon, Dot, Star, Eq, Ne, Lt, Le, Gt, Ge,
@@ -241,7 +242,7 @@ element through the full precedence chain above (≈12 nested calls plus a per-a
 token clone in `parse_atom`) dominated INSERT parse cost — ~76% of parse time, the
 bulk of a per-row insert. `parse_value_expr` (in `parser/dml.rs`) short-circuits it:
 when the next token is a bare literal (`Integer`/`Float`/`HexLit`/`StringLit`/
-`TRUE`/`FALSE`/`NULL`) **and** the token after it is `,` or `)`, it builds the
+`BytesLit`/`TRUE`/`FALSE`/`NULL`) **and** the token after it is `,` or `)`, it builds the
 `Expr::Literal` directly via the shared `literal_token_to_expr` (the same converter
 `parse_atom` uses, so the AST is byte-identical) and skips the ladder entirely.
 

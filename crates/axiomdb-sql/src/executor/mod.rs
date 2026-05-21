@@ -266,6 +266,31 @@ mod tests {
         }
     }
 
+    /// Regression: a bare hex byte-string literal `X'...'` in a no-FROM SELECT
+    /// must come back as a BLOB (`Value::Bytes`), not Text. The lexer used to
+    /// decode `x'...'` into a `StringLit` token, so the projection mistyped it as
+    /// Text; only INSERT worked, because column coercion converted Text→Bytes.
+    #[test]
+    fn test_select_blob_literal_without_from_returns_bytes() {
+        use axiomdb_storage::MemoryStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = MemoryStorage::new();
+        let txn = TxnManager::create(&dir.path().join("blob-literal.wal")).unwrap();
+
+        let stmt = crate::parser::parse("SELECT X'010203'", None).unwrap();
+        let result = execute(stmt, &storage, &txn).unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 1, "expected a single projected column");
+                assert_eq!(columns[0].data_type, DataType::Bytes);
+                assert_eq!(rows, vec![vec![Value::Bytes(vec![1, 2, 3])]]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_expr_column_name_alias_wins() {
         let expr = Expr::Literal(Value::Int(1));

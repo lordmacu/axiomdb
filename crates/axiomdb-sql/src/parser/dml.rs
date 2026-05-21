@@ -1830,6 +1830,7 @@ fn parse_value_expr(p: &mut Parser) -> Result<Expr, DbError> {
                 | Token::Integer(_)
                 | Token::Float(_)
                 | Token::StringLit(_)
+                | Token::BytesLit(_)
                 | Token::True
                 | Token::False
                 | Token::Null
