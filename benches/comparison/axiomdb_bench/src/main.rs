@@ -755,6 +755,39 @@ impl SqliteDb {
         n
     }
 
+    /// Point lookups via ONE parameterized prepared statement, bound per id —
+    /// matches AxiomDB's prepared+bind path for a fair engine comparison
+    /// (no per-call re-prepare). Materializes every column like `sql_count`.
+    fn point_lookups(&self, ids: &[i64]) {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM bench_users WHERE id = ?")
+            .expect("prepare");
+        let ncol = stmt.column_count();
+        for &id in ids {
+            let mut rows = stmt.query([id]).expect("query");
+            while let Some(row) = rows.next().expect("next") {
+                for i in 0..ncol {
+                    match row.get_ref(i).expect("get_ref") {
+                        rusqlite::types::ValueRef::Text(t) => {
+                            std::hint::black_box(std::str::from_utf8(t).expect("utf8").to_string());
+                        }
+                        rusqlite::types::ValueRef::Integer(v) => {
+                            std::hint::black_box(v);
+                        }
+                        rusqlite::types::ValueRef::Real(v) => {
+                            std::hint::black_box(v);
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => {
+                            std::hint::black_box(b.len());
+                        }
+                        rusqlite::types::ValueRef::Null => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn reset(&self) {
         self.sql("DROP TABLE IF EXISTS bench_users");
         self.sql(
@@ -903,10 +936,13 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
 
         "point_lookup" => {
             sqlite_load(db, &inserts);
+            let ids: Vec<i64> = (1..=n_rows)
+                .step_by(step)
+                .take(100)
+                .map(|i| i as i64)
+                .collect();
             measure(|| {
-                for i in (1..=n_rows).step_by(step).take(100) {
-                    db.sql_count(&format!("SELECT * FROM bench_users WHERE id = {i}"));
-                }
+                db.point_lookups(&ids);
             })
         }
 
@@ -1160,9 +1196,15 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
 
         "point_lookup" => {
             load_batch(db, &inserts);
+            // One parameterized prepared statement, bound per id (the OLTP pattern;
+            // matches SQLite's prepared+bind below). Measures engine lookup, not parse.
+            let stmt = db
+                .prepare("SELECT * FROM bench_users WHERE id = ?")
+                .expect("prepare point_lookup");
             measure(|| {
                 for i in (1..=n_rows).step_by(step).take(100) {
-                    db_sql_count(db, &format!("SELECT * FROM bench_users WHERE id = {i}"));
+                    stmt.execute(db, &[axiomdb_types::Value::Int(i as i32)])
+                        .expect("point_lookup exec");
                 }
             })
         }
@@ -1179,8 +1221,13 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
 
         "count_star" => {
             load_batch(db, &inserts);
+            // Prepared once (matches SQLite's prepare_cached reuse) — measures the
+            // engine count path, not per-call parse.
+            let stmt = db
+                .prepare("SELECT COUNT(*) FROM bench_users")
+                .expect("prepare count_star");
             measure(|| {
-                db_sql(db, "SELECT COUNT(*) FROM bench_users");
+                stmt.execute(db, &[]).expect("count_star exec");
             })
         }
 
@@ -1273,6 +1320,60 @@ fn diagnose_scan(data_dir: &Path, n_rows: usize) {
     println!("  (≈0 faults/scan ⇒ warm scan served from buffer pool, NOT mmap)");
 }
 
+/// Isolate the per-lookup cost of the two AxiomDB point-lookup paths in steady
+/// state: `db.query` (re-parse + run_cached plan cache) vs `PreparedStatement`
+/// (clone analyzed AST + execute_with_ctx, no plan cache). Pinpoints why
+/// "prepared" is slower than the cached query path for point lookups.
+fn diagnose_point(data_dir: &Path, n_rows: usize) {
+    let mut db = db_open(data_dir);
+    reset(&mut db);
+    let inserts = gen_inserts(n_rows);
+    load_batch(&mut db, &inserts);
+    let step = (n_rows / 100).max(1);
+    let ids: Vec<usize> = (1..=n_rows).step_by(step).take(100).collect();
+
+    for _ in 0..3 {
+        for &i in &ids {
+            let _ = db
+                .query(&format!("SELECT * FROM bench_users WHERE id = {i}"))
+                .expect("warm");
+        }
+    }
+
+    let loops = 200usize;
+    let total = loops * ids.len();
+
+    let t0 = Instant::now();
+    for _ in 0..loops {
+        for &i in &ids {
+            let _ = db
+                .query(&format!("SELECT * FROM bench_users WHERE id = {i}"))
+                .expect("q");
+        }
+    }
+    let q_ns = t0.elapsed().as_secs_f64() * 1e9 / total as f64;
+
+    let stmt = db
+        .prepare("SELECT * FROM bench_users WHERE id = ?")
+        .expect("prepare");
+    let t0 = Instant::now();
+    for _ in 0..loops {
+        for &i in &ids {
+            let _ = stmt
+                .execute(&mut db, &[axiomdb_types::Value::Int(i as i32)])
+                .expect("p");
+        }
+    }
+    let p_ns = t0.elapsed().as_secs_f64() * 1e9 / total as f64;
+
+    println!(
+        "── point_lookup diagnose ({n_rows} rows, {loops}×{} lookups) ──",
+        ids.len()
+    );
+    println!("  db.query  (parse + run_cached plan-cache):   {q_ns:.0} ns/lookup");
+    println!("  prepared  (clone AST + execute_with_ctx):    {p_ns:.0} ns/lookup");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -1326,6 +1427,8 @@ fn main() {
 
     if args.contains(&"--diagnose-scan".to_string()) {
         diagnose_scan(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-point".to_string()) {
+        diagnose_point(&data_dir, n_rows);
     } else if args.contains(&"--diagnose".to_string()) {
         diagnose(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-insert".to_string()) {
