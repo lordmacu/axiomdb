@@ -1,157 +1,172 @@
-//! User-space LRU buffer pool for page caching (Phase 11.8).
+//! User-space clock-sweep buffer pool for page caching (Phase 11.8, wired into
+//! `read_page` in perf-sqlite-gap).
 //!
-//! Layers on top of mmap: captures `PageRef` copies from `read_page()` and
-//! serves subsequent reads from the cache. 16-shard partitioned LRU reduces
-//! lock contention to match CPU cache line parallelism.
+//! Layers on top of mmap: `read_page` populates the pool on a cold miss and
+//! serves every subsequent read as an `Arc::clone` of the cached `Arc<Page>` —
+//! no mmap lock, no 16 KB copy, no CRC re-check (verify-once-then-serve). A
+//! 16-shard partition keeps lock contention near CPU-cache-line parallelism.
 //!
-//! ## InnoDB reference (buf0buf.cc)
+//! ## Replacement: clock-sweep (PostgreSQL `bufmgr.c` reference)
 //!
-//! InnoDB uses a hash table + doubly-linked LRU with young/old split (25%
-//! boundary). New pages start "old"; promoted to "young" on second access
-//! within a time window. This prevents sequential scans from evicting the
-//! working set.
+//! Each shard is a fixed array of slots with a circulating "hand". A slot has a
+//! reference bit set on every hit. On insertion the hand advances: a slot with
+//! its reference bit set gets the bit cleared and a second chance; the first
+//! slot with a clear bit **and** no external owner is evicted. This makes both
+//! `get` and `insert` O(1) (amortized) — unlike a `VecDeque` LRU whose
+//! move-to-MRU is O(capacity) per hit and would regress sequential scans.
 //!
-//! ## PostgreSQL reference (bufmgr.c)
+//! ## Liveness via `Arc::strong_count` (no manual pin/unpin)
 //!
-//! PostgreSQL uses clock-sweep replacement: a linear buffer array with
-//! `usage_count` per slot. Clock hand decrements counts; evicts first slot
-//! reaching zero. Simpler than LRU linked-list.
+//! A page is "in use" iff some reader still holds a `PageRef`/`Arc<Page>` clone,
+//! i.e. `Arc::strong_count > 1` (the pool holds one reference). The sweep never
+//! evicts such a slot — it skips it. This replaces the old explicit pin/unpin
+//! API, which was error-prone across the many `read_page` call sites.
 //!
-//! ## AxiomDB design
+//! ## InnoDB / PostgreSQL note
 //!
-//! Simple LRU with 16 shards. No young/old split in Phase 11.8 (add in
-//! future if scan pollution observed). Pin count prevents eviction of
-//! in-flight pages.
+//! InnoDB uses a hash table + young/old LRU split to resist scan pollution;
+//! PostgreSQL uses this same clock-sweep. We start without a young/old split;
+//! add midpoint admission only if a scan-heavy regression is observed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::page_ref::PageRef;
+use crate::page::Page;
 
 const NUM_SHARDS: usize = 16;
 const DEFAULT_CAPACITY: usize = 1024; // pages (16 MB at 16 KB/page)
 
-/// Per-shard cached page entry.
-struct CacheEntry {
-    page_ref: Arc<PageRef>,
-    pin_count: u32,
+/// One cached page plus its clock reference bit.
+struct Slot {
+    page_id: u64,
+    page: Arc<Page>,
+    referenced: bool,
 }
 
-/// One shard of the partitioned buffer pool.
+/// What the clock hand should do with the slot under inspection.
+enum SweepAction {
+    /// Empty slot — reuse it directly.
+    Free,
+    /// Reference bit set — clear it and give a second chance.
+    ClearAndAdvance,
+    /// Externally referenced (`strong_count > 1`) — skip, never evict.
+    Skip,
+    /// Unreferenced and unpinned — evict it.
+    Evict,
+}
+
+/// One shard: a fixed slot array with a circulating clock hand.
 struct CacheShard {
-    entries: HashMap<u64, CacheEntry>,
-    lru_order: VecDeque<u64>,
-    capacity: usize,
+    /// Slot array; grows only transiently when every slot is externally pinned.
+    slots: Vec<Option<Slot>>,
+    /// page_id → slot index.
+    index: HashMap<u64, usize>,
+    /// Clock hand position into `slots`.
+    hand: usize,
     hits: u64,
     misses: u64,
 }
 
 impl CacheShard {
     fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            entries: HashMap::with_capacity(capacity),
-            lru_order: VecDeque::with_capacity(capacity),
-            capacity,
+            slots: (0..capacity).map(|_| None).collect(),
+            index: HashMap::with_capacity(capacity),
+            hand: 0,
             hits: 0,
             misses: 0,
         }
     }
 
-    /// Looks up a page. Returns Some on hit (moves to MRU end).
-    fn get(&mut self, page_id: u64) -> Option<Arc<PageRef>> {
-        if let Some(entry) = self.entries.get_mut(&page_id) {
+    /// Hit → set reference bit and clone the `Arc`; miss → `None`.
+    fn get(&mut self, page_id: u64) -> Option<Arc<Page>> {
+        if let Some(&idx) = self.index.get(&page_id) {
+            let slot = self.slots[idx].as_mut().expect("indexed slot present");
+            slot.referenced = true;
             self.hits += 1;
-            entry.pin_count += 1;
-            // Move to MRU end.
-            if let Some(pos) = self.lru_order.iter().position(|&id| id == page_id) {
-                self.lru_order.remove(pos);
-            }
-            self.lru_order.push_back(page_id);
-            Some(Arc::clone(&entry.page_ref))
+            Some(Arc::clone(&slot.page))
         } else {
             self.misses += 1;
             None
         }
     }
 
-    /// Inserts a page into the cache. Evicts LRU if over capacity.
-    fn insert(&mut self, page_id: u64, page_ref: PageRef) -> Arc<PageRef> {
-        let arc = Arc::new(page_ref);
-        self.entries.insert(
+    /// Inserts (or refreshes) a page; returns an `Arc` clone for the caller.
+    fn insert(&mut self, page_id: u64, page: Arc<Page>) -> Arc<Page> {
+        let arc = Arc::clone(&page);
+        if let Some(&idx) = self.index.get(&page_id) {
+            // Already resident (cold-miss race or post-write reload): refresh.
+            self.slots[idx] = Some(Slot {
+                page_id,
+                page,
+                referenced: false,
+            });
+            return arc;
+        }
+        let idx = self.free_slot();
+        self.slots[idx] = Some(Slot {
             page_id,
-            CacheEntry {
-                page_ref: Arc::clone(&arc),
-                pin_count: 1,
-            },
-        );
-        self.lru_order.push_back(page_id);
-        self.evict_if_needed();
+            page,
+            referenced: false,
+        });
+        self.index.insert(page_id, idx);
+        self.hand = idx + 1; // resume the sweep past the freshly filled slot
         arc
     }
 
-    /// Decrements pin count for a page.
-    fn unpin(&mut self, page_id: u64) {
-        if let Some(entry) = self.entries.get_mut(&page_id) {
-            entry.pin_count = entry.pin_count.saturating_sub(1);
-        }
-    }
-
-    /// Invalidates a page (remove from cache). Called after write_page
-    /// to ensure next read sees fresh data.
+    /// Drops a cached entry. Idempotent.
     fn invalidate(&mut self, page_id: u64) {
-        self.entries.remove(&page_id);
-        if let Some(pos) = self.lru_order.iter().position(|&id| id == page_id) {
-            self.lru_order.remove(pos);
+        if let Some(idx) = self.index.remove(&page_id) {
+            self.slots[idx] = None;
         }
     }
 
-    fn evict_if_needed(&mut self) {
-        while self.entries.len() > self.capacity {
-            let candidates = self.lru_order.len();
-            let mut scanned = 0usize;
-            let mut evicted = false;
-
-            // A shard can temporarily exceed capacity when every candidate is
-            // pinned. Scan the current LRU set once, then stop instead of
-            // cycling pinned pages forever.
-            if let Some(victim_id) = self.lru_order.pop_front() {
-                if let Some(entry) = self.entries.get(&victim_id) {
-                    if entry.pin_count == 0 {
-                        self.entries.remove(&victim_id);
-                        evicted = true;
-                    } else {
-                        self.lru_order.push_back(victim_id);
-                    }
-                }
-                scanned += 1;
-            }
-
-            while !evicted && scanned < candidates {
-                let Some(victim_id) = self.lru_order.pop_front() else {
-                    break;
-                };
-                if let Some(entry) = self.entries.get(&victim_id) {
-                    if entry.pin_count == 0 {
-                        self.entries.remove(&victim_id);
-                        evicted = true;
-                    } else {
-                        self.lru_order.push_back(victim_id);
-                    }
-                }
-                scanned += 1;
-            }
-
-            if !evicted {
+    /// Returns the index of a usable slot, evicting via clock-sweep if needed.
+    ///
+    /// Bounds the walk to two revolutions: one to clear reference bits, one to
+    /// evict. If every slot is externally pinned, grows by one slot rather than
+    /// block or evict an in-use page (transient over-capacity).
+    fn free_slot(&mut self) -> usize {
+        let max_steps = self.slots.len().saturating_mul(2).saturating_add(1);
+        for _ in 0..=max_steps {
+            if self.slots.is_empty() {
                 break;
             }
+            let i = self.hand % self.slots.len();
+            let action = match &self.slots[i] {
+                None => SweepAction::Free,
+                Some(s) if s.referenced => SweepAction::ClearAndAdvance,
+                Some(s) if Arc::strong_count(&s.page) > 1 => SweepAction::Skip,
+                Some(_) => SweepAction::Evict,
+            };
+            match action {
+                SweepAction::Free => return i,
+                SweepAction::ClearAndAdvance => {
+                    self.slots[i].as_mut().expect("some").referenced = false;
+                    self.hand = i + 1;
+                }
+                SweepAction::Skip => {
+                    self.hand = i + 1;
+                }
+                SweepAction::Evict => {
+                    let pid = self.slots[i].as_ref().expect("some").page_id;
+                    self.index.remove(&pid);
+                    self.slots[i] = None;
+                    return i;
+                }
+            }
         }
+        // Everything pinned/referenced — grow rather than evict an in-use page.
+        self.slots.push(None);
+        self.slots.len() - 1
     }
 }
 
-/// 16-shard partitioned LRU buffer pool.
+/// 16-shard partitioned clock-sweep buffer pool.
 ///
-/// Thread-safe: each shard has its own `Mutex`. Two threads accessing
-/// different shards (different page_ids) never contend.
+/// Thread-safe: each shard has its own `Mutex`. Two threads touching different
+/// shards (different page_ids) never contend.
 pub struct BufferPool {
     shards: Box<[Mutex<CacheShard>]>,
 }
@@ -178,27 +193,28 @@ impl BufferPool {
         (page_id as usize) & (NUM_SHARDS - 1)
     }
 
-    /// Looks up a cached page. Returns None on miss.
-    pub fn get(&self, page_id: u64) -> Option<Arc<PageRef>> {
-        let mut shard = self.shards[Self::shard_idx(page_id)].lock().unwrap();
+    /// Looks up a cached page. `None` on miss.
+    pub fn get(&self, page_id: u64) -> Option<Arc<Page>> {
+        let mut shard = self.shards[Self::shard_idx(page_id)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         shard.get(page_id)
     }
 
-    /// Inserts a page into the cache. Returns an Arc for the caller to use.
-    pub fn insert(&self, page_id: u64, page_ref: PageRef) -> Arc<PageRef> {
-        let mut shard = self.shards[Self::shard_idx(page_id)].lock().unwrap();
-        shard.insert(page_id, page_ref)
+    /// Inserts a freshly-loaded (already CRC-verified) page. Returns an `Arc`
+    /// clone for the caller to use.
+    pub fn insert(&self, page_id: u64, page: Arc<Page>) -> Arc<Page> {
+        let mut shard = self.shards[Self::shard_idx(page_id)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        shard.insert(page_id, page)
     }
 
-    /// Decrements pin count. Call when done reading the page.
-    pub fn unpin(&self, page_id: u64) {
-        let mut shard = self.shards[Self::shard_idx(page_id)].lock().unwrap();
-        shard.unpin(page_id);
-    }
-
-    /// Invalidates a cached page (e.g., after write_page).
+    /// Invalidates a cached page (after `write_page` or page free/reuse).
     pub fn invalidate(&self, page_id: u64) {
-        let mut shard = self.shards[Self::shard_idx(page_id)].lock().unwrap();
+        let mut shard = self.shards[Self::shard_idx(page_id)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         shard.invalidate(page_id);
     }
 
@@ -207,7 +223,7 @@ impl BufferPool {
         let mut hits = 0u64;
         let mut misses = 0u64;
         for shard in self.shards.iter() {
-            let s = shard.lock().unwrap();
+            let s = shard.lock().unwrap_or_else(|e| e.into_inner());
             hits += s.hits;
             misses += s.misses;
         }
@@ -226,77 +242,78 @@ mod tests {
     use super::*;
     use crate::page::{Page, PageType};
 
-    fn make_page(page_id: u64) -> PageRef {
-        let page = Page::new(PageType::Data, page_id);
-        PageRef::new(Box::new(page))
+    fn make_page(page_id: u64) -> Page {
+        Page::new(PageType::Data, page_id)
     }
 
     #[test]
-    fn test_cache_hit() {
+    fn hit_returns_shared_page() {
         let pool = BufferPool::with_capacity(16);
-        let pr = make_page(42);
-        pool.insert(42, pr);
-
-        let cached = pool.get(42);
-        assert!(cached.is_some());
-
-        let (hits, misses) = pool.stats();
-        assert_eq!(hits, 1);
-        assert_eq!(misses, 0);
+        pool.insert(42, Arc::new(make_page(42)));
+        let got = pool.get(42).expect("hit");
+        assert_eq!(got.header().page_id, 42);
+        assert_eq!(pool.stats(), (1, 0));
     }
 
     #[test]
-    fn test_cache_miss() {
+    fn miss_counts() {
         let pool = BufferPool::with_capacity(16);
-        let cached = pool.get(99);
-        assert!(cached.is_none());
-
-        let (_, misses) = pool.stats();
-        assert_eq!(misses, 1);
+        assert!(pool.get(99).is_none());
+        assert_eq!(pool.stats(), (0, 1));
     }
 
     #[test]
-    fn test_eviction() {
-        // Capacity 2 per shard. Insert 3 pages to same shard → 1 evicted.
+    fn clock_sweep_evicts_unreferenced_only() {
+        // capacity 2 per shard; pages 0, 16, 32 all map to shard 0.
         let pool = BufferPool::with_capacity(NUM_SHARDS * 2);
-
-        // Pages 0, 16, 32 all map to shard 0 (page_id % 16 == 0).
-        pool.insert(0, make_page(0));
-        pool.unpin(0);
-        pool.insert(16, make_page(16));
-        pool.unpin(16);
-        pool.insert(32, make_page(32));
-        pool.unpin(32);
-
-        // Page 0 should have been evicted (LRU).
-        assert!(pool.get(0).is_none());
-        assert!(pool.get(16).is_some());
-        assert!(pool.get(32).is_some());
+        pool.insert(0, Arc::new(make_page(0)));
+        pool.insert(16, Arc::new(make_page(16)));
+        let _keep = pool.get(0); // reference bit on 0 → second chance
+        pool.insert(32, Arc::new(make_page(32)));
+        assert!(pool.get(0).is_some(), "referenced page survived");
+        assert!(pool.get(32).is_some(), "newest present");
+        assert!(pool.get(16).is_none(), "unreferenced page evicted");
     }
 
     #[test]
-    fn test_pinned_not_evicted() {
+    fn never_evicts_externally_referenced() {
+        // 1 slot per shard; the held Arc keeps page 0 from being evicted.
         let pool = BufferPool::with_capacity(NUM_SHARDS);
-
-        // Insert page 0 (pinned by default).
-        pool.insert(0, make_page(0));
-        // DON'T unpin — it's still pinned.
-
-        // Insert page 16 (same shard, should try to evict 0 but can't).
-        pool.insert(16, make_page(16));
-
-        // Both should be present (0 is pinned, 16 is newest).
-        assert!(pool.get(0).is_some());
-        assert!(pool.get(16).is_some());
+        let live = pool.insert(0, Arc::new(make_page(0))); // strong_count == 2
+        pool.insert(16, Arc::new(make_page(16))); // would evict 0, but it's pinned
+        assert!(pool.get(0).is_some(), "pinned page not evicted");
+        assert!(pool.get(16).is_some(), "new page admitted via growth");
+        drop(live);
     }
 
     #[test]
-    fn test_invalidate() {
+    fn invalidate_removes() {
         let pool = BufferPool::with_capacity(16);
-        pool.insert(42, make_page(42));
-        assert!(pool.get(42).is_some());
+        pool.insert(7, Arc::new(make_page(7)));
+        pool.invalidate(7);
+        assert!(pool.get(7).is_none());
+        pool.invalidate(7); // idempotent
+    }
 
-        pool.invalidate(42);
-        assert!(pool.get(42).is_none());
+    #[test]
+    fn fills_capacity_without_premature_eviction() {
+        // capacity 4 in one shard: 4 distinct same-shard ids all fit.
+        let pool = BufferPool::with_capacity(NUM_SHARDS * 4);
+        for k in 0..4u64 {
+            pool.insert(k * 16, Arc::new(make_page(k * 16)));
+        }
+        for k in 0..4u64 {
+            assert!(pool.get(k * 16).is_some(), "page {} present", k * 16);
+        }
+    }
+
+    #[test]
+    fn reload_after_invalidate_serves_fresh() {
+        let pool = BufferPool::with_capacity(16);
+        pool.insert(5, Arc::new(make_page(5)));
+        pool.invalidate(5);
+        // Re-insert with a fresh page; get returns it.
+        pool.insert(5, Arc::new(make_page(5)));
+        assert!(pool.get(5).is_some());
     }
 }

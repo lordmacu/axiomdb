@@ -786,6 +786,21 @@ heap-allocated `PageRef`, verifies the CRC32c checksum, and returns the owned co
 The copy cost (~0.5 us from L2/L3 cache) is the same price PostgreSQL pays when
 copying a buffer pool page into backend-local memory.
 
+### Buffer pool: clock-sweep page cache
+
+On top of the mmap sits a user-space buffer pool (16 shards) that holds verified
+pages as `Arc<Page>`. Replacement is **clock-sweep** (PostgreSQL `bufmgr.c`
+style): each slot carries a reference bit set on every hit; a circulating hand
+clears the bit on first encounter (second chance) and evicts the first slot
+whose bit is clear. This keeps both lookup and admission O(1) — unlike a
+move-to-front LRU, whose per-hit reordering is O(capacity) and would slow
+sequential scans.
+
+A page is considered in use while any reader still holds a clone of its
+`Arc<Page>` (`strong_count > 1`); the sweep never evicts such a slot, so there is
+no explicit pin/unpin bookkeeping. When every slot is pinned, the shard grows by
+one slot rather than block — a transient, self-correcting over-capacity.
+
 ### Write path: pwrite() to file descriptor
 
 `write_page(page_id, page)` calls `pwrite()` on the underlying file descriptor at
