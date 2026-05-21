@@ -340,6 +340,18 @@ The iterator stays lazy: it keeps only the current leaf page id, slot index,
 bound copies, and snapshot. It does not materialize the whole range into a
 temporary vector.
 
+#### Exact bounds + covered-predicate skip (SQL planner)
+
+The storage range layer takes `Bound::Included`/`Bound::Excluded`, so the SQL
+planner preserves a range predicate's strictness end to end: the
+`AccessMethod::IndexRange` access method carries `lo_inclusive`/`hi_inclusive`
+(an exclusive `<`/`>` is honored exactly, not widened to inclusive and
+re-filtered) plus a `covers_predicate` flag. When the bounds reproduce the entire
+`WHERE` (a pure clustered-PK range), the executor skips the per-row `WHERE`
+re-evaluation entirely. This mirrors SQLite's `OP_SeekGE/GT/LE/LT` (exact seek
+boundaries) and `disableTerm`/`TERM_CODED` (index-covered constraints are not
+re-checked; only residual terms are).
+
 <div class="callout callout-design">
 <span class="callout-icon">⚙️</span>
 <div class="callout-body">

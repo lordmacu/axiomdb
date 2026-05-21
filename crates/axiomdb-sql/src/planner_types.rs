@@ -30,14 +30,25 @@ pub enum AccessMethod {
     },
 
     /// Range scan: iterate over B-Tree entries between `lo` and `hi`
-    /// (both inclusive; `None` means unbounded).
+    /// (`None` means unbounded). Strictness is carried explicitly so an
+    /// exclusive `<`/`>` bound is honored exactly (SQLite `OP_SeekGT`/`SeekLT`)
+    /// instead of being widened to inclusive and re-filtered per row.
     IndexRange {
         /// The index to use.
         index_def: IndexDef,
-        /// Lower bound key (inclusive, already encoded).
+        /// Lower bound key (already encoded).
         lo: Option<Vec<u8>>,
-        /// Upper bound key (inclusive, already encoded).
+        /// Upper bound key (already encoded).
         hi: Option<Vec<u8>>,
+        /// Lower bound is inclusive (`>=`) when true, exclusive (`>`) when false.
+        lo_inclusive: bool,
+        /// Upper bound is inclusive (`<=`) when true, exclusive (`<`) when false.
+        hi_inclusive: bool,
+        /// True when these bounds reproduce the ENTIRE WHERE predicate, so the
+        /// executor may skip the per-row WHERE re-evaluation (SQLite
+        /// `disableTerm`/`TERM_CODED`). Only the pure-range SELECT planner rules
+        /// set this; everything else leaves it `false` (conservative).
+        covers_predicate: bool,
     },
 
     /// Index-only scan: all needed columns are in the index key columns or

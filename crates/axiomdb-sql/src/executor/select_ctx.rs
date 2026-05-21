@@ -707,7 +707,7 @@ fn execute_select_ctx(
                     result
                 }
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
                 if resolved.def.is_clustered() && index_def.is_primary =>
             {
                 // ── Clustered PK range scan (Phase 39.15) ────────────────────
@@ -721,7 +721,7 @@ fn execute_select_ctx(
                     snap,
                 )?
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
                 if resolved.def.is_clustered() =>
             {
                 clustered_secondary_rows_for_range(
@@ -733,7 +733,7 @@ fn execute_select_ctx(
                     snap,
                 )?
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } => {
                 // Range scan: B-Tree entries → batch heap reads by page.
                 // Inspired by PostgreSQL's BitmapHeapScan: collect RIDs, group by
                 // page_id, read each heap page ONCE, extract all matching rows.

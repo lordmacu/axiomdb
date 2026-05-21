@@ -341,7 +341,7 @@ fn execute_select(
                     result
                 }
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
                 if resolved.def.is_clustered() && index_def.is_primary =>
             {
                 // Clustered PK range scan (non-ctx path).
@@ -354,7 +354,7 @@ fn execute_select(
                     snap,
                 )?
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi }
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
                 if resolved.def.is_clustered() =>
             {
                 clustered_secondary_rows_for_range(
@@ -366,7 +366,7 @@ fn execute_select(
                     snap,
                 )?
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } => {
                 // Range scan: iterate B-Tree entries → heap reads.
                 let (lo_adjusted, hi_adjusted);
                 let (lo_ref, hi_ref) = if index_def.is_unique {

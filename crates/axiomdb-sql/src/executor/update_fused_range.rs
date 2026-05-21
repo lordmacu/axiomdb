@@ -195,6 +195,9 @@ fn normalize_clustered_update_access_method(
                     index_def,
                     lo: Some(lo),
                     hi,
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                    covers_predicate: false,
                 }
             }
         }

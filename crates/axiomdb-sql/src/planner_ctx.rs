@@ -132,6 +132,9 @@ pub fn plan_delete_candidates(
                 index_def,
                 lo: Some(lo),
                 hi,
+                lo_inclusive: true,
+                hi_inclusive: true,
+                covers_predicate: false,
             },
             other => other,
         };
@@ -155,6 +158,9 @@ pub fn plan_delete_candidates(
                         index_def: idx.clone(),
                         lo: Some(key),
                         hi: Some(hi),
+                        lo_inclusive: true,
+                        hi_inclusive: true,
+                        covers_predicate: false,
                     };
                 }
             }
@@ -172,6 +178,9 @@ pub fn plan_delete_candidates(
             index_def: idx.clone(),
             lo,
             hi,
+            lo_inclusive: true,
+            hi_inclusive: true,
+            covers_predicate: false,
         };
     }
 
@@ -200,6 +209,9 @@ pub fn plan_update_candidates(
                 index_def,
                 lo: Some(lo),
                 hi,
+                lo_inclusive: true,
+                hi_inclusive: true,
+                covers_predicate: false,
             },
             other => other,
         };
@@ -220,6 +232,9 @@ pub fn plan_update_candidates(
                         index_def: idx.clone(),
                         lo: Some(key),
                         hi: Some(hi),
+                        lo_inclusive: true,
+                        hi_inclusive: true,
+                        covers_predicate: false,
                     };
                 }
             }
@@ -235,6 +250,9 @@ pub fn plan_update_candidates(
             index_def: idx.clone(),
             lo,
             hi,
+            lo_inclusive: true,
+            hi_inclusive: true,
+            covers_predicate: false,
         };
     }
 

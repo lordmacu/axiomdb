@@ -421,6 +421,9 @@ fn normalize_clustered_delete_access_method(
                     index_def,
                     lo: Some(lo),
                     hi,
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                    covers_predicate: false,
                 }
             }
         }
@@ -632,7 +635,7 @@ fn collect_clustered_delete_candidates(
                 snap,
             )?);
         }
-        crate::planner::AccessMethod::IndexRange { index_def, lo, hi } if index_def.is_primary => {
+        crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } if index_def.is_primary => {
             let iter = axiomdb_storage::clustered_tree::range(
                 storage,
                 Some(root_pid),
@@ -644,7 +647,7 @@ fn collect_clustered_delete_candidates(
                 raw_rows.push(row?);
             }
         }
-        crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+        crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } => {
             raw_rows.extend(clustered_rows_for_secondary_delete_access(
                 storage,
                 root_pid,
@@ -810,7 +813,7 @@ fn collect_delete_candidates(
             Ok(result)
         }
 
-        AccessMethod::IndexRange { index_def, lo, hi } => {
+        AccessMethod::IndexRange { index_def, lo, hi, .. } => {
             // Range scan via B-Tree → batch heap read → WHERE recheck.
             let (lo_adj, hi_adj);
             let (lo_ref, hi_ref) = if index_def.is_unique {

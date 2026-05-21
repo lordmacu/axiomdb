@@ -100,7 +100,7 @@ fn collect_clustered_update_candidates(
                 snap,
             )?);
         }
-        crate::planner::AccessMethod::IndexRange { index_def, lo, hi } if index_def.is_primary => {
+        crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } if index_def.is_primary => {
             let iter = axiomdb_storage::clustered_tree::range(
                 storage,
                 Some(root_pid),
@@ -112,7 +112,7 @@ fn collect_clustered_update_candidates(
                 raw_rows.push(row?);
             }
         }
-        crate::planner::AccessMethod::IndexRange { index_def, lo, hi } => {
+        crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } => {
             raw_rows.extend(clustered_rows_for_secondary_access(
                 storage,
                 root_pid,

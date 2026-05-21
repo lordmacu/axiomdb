@@ -91,6 +91,9 @@ pub fn plan_select(
                             index_def: idx.clone(),
                             lo: Some(key),
                             hi: Some(hi),
+                            lo_inclusive: true,
+                            hi_inclusive: true,
+                            covers_predicate: false,
                         };
                     }
                 }
@@ -111,6 +114,9 @@ pub fn plan_select(
                 index_def: idx.clone(),
                 lo: lo_key,
                 hi: hi_key,
+                lo_inclusive: true,
+                hi_inclusive: true,
+                covers_predicate: false,
             };
         }
     }
@@ -142,6 +148,9 @@ pub fn plan_select(
                 index_def: idx.clone(),
                 lo,
                 hi,
+                lo_inclusive: true,
+                hi_inclusive: true,
+                covers_predicate: false,
             };
         }
     }
@@ -174,6 +183,9 @@ pub fn plan_select(
                     index_def: idx.clone(),
                     lo,
                     hi,
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                    covers_predicate: false,
                 };
             }
         }
@@ -579,6 +591,9 @@ fn plan_composite_eq(
                     index_def: idx.clone(),
                     lo: Some(key.clone()),
                     hi: Some(key),
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                    covers_predicate: false,
                 });
             }
         }

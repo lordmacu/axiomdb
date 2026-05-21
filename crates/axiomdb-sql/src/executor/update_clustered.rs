@@ -78,7 +78,7 @@ fn execute_clustered_update(
             crate::planner::AccessMethod::IndexLookup { index_def, key } if index_def.is_primary => {
                 Some((Bound::Included(key.clone()), Bound::Included(key.clone())))
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi } if index_def.is_primary => {
+            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } if index_def.is_primary => {
                 Some((
                     lo.clone().map_or(Bound::Unbounded, Bound::Included),
                     hi.clone().map_or(Bound::Unbounded, Bound::Included),

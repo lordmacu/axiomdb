@@ -171,7 +171,7 @@ fn execute_update_ctx(
             effective_coll,
         );
 
-        if let crate::planner::AccessMethod::IndexRange { ref index_def, ref lo, ref hi } = update_access {
+        if let crate::planner::AccessMethod::IndexRange { ref index_def, ref lo, ref hi, .. } = update_access {
             let has_affected_secondary = secondary_indexes.iter().any(|i| !i.is_primary);
             if !want_returning && index_def.is_primary && field_patch_eligible && !has_affected_secondary {
                 return fused_index_range_patch(
