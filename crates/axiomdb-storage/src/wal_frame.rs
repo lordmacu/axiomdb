@@ -7,8 +7,11 @@
 //!
 //! Format borrows SQLite `wal.c` (file header + per-frame header + page), adapted to
 //! our explicit `lsn`:
-//! - **commit_marker** (SQLite's `nTruncate` idea): 0 on a non-commit frame; nonzero
-//!   (the committing `txn_id`) on the LAST frame of a committed txn.
+//! - **txn_id** the transaction that wrote this frame (`0` = non-transactional /
+//!   system write). Unlike SQLite's single end-of-txn commit marker (SQLite is
+//!   single-writer), AxiomDB is multi-writer so frames from different txns interleave;
+//!   each frame self-identifies. Recovery treats a frame as committed iff its `txn_id`
+//!   has a `Commit` in the logical WAL (`build_index` takes that predicate).
 //! - **salt** copied from the file header into every frame — frames whose salt ≠ the
 //!   run's salt are stale (a previous WAL run) and end the valid prefix.
 //! - **frame_crc** (crc32c over the frame header sans crc ++ page bytes): a torn /
@@ -31,10 +34,10 @@ const VERSION: u32 = 1;
 
 /// File header: magic(8) version(4) page_size(4) salt(8) header_crc(4) _pad(4).
 const FILE_HDR_SIZE: u64 = 32;
-/// Frame header: page_id(8) lsn(8) commit_marker(4) salt(8) frame_crc(4).
-const FRAME_HDR_SIZE: usize = 32;
-/// crc covers the first 28 header bytes (everything but the crc field) ++ page.
-const FRAME_HDR_CRC_PREFIX: usize = 28;
+/// Frame header: page_id(8) lsn(8) txn_id(8) salt(8) frame_crc(4).
+const FRAME_HDR_SIZE: usize = 36;
+/// crc covers the first 32 header bytes (everything but the crc field) ++ page.
+const FRAME_HDR_CRC_PREFIX: usize = 32;
 /// One frame on disk: header + a full page image.
 const FRAME_SIZE: u64 = FRAME_HDR_SIZE as u64 + PAGE_SIZE as u64;
 
@@ -54,8 +57,8 @@ fn frame_crc(hdr_prefix: &[u8], page: &[u8]) -> u32 {
 pub struct FrameRef {
     pub page_id: u64,
     pub lsn: u64,
-    /// 0 = non-commit frame; nonzero = committing txn_id (last frame of the txn).
-    pub commit_marker: u32,
+    /// Transaction that wrote this frame (`0` = non-transactional / system write).
+    pub txn_id: u64,
     /// Byte offset of the frame header in the log file.
     pub offset: u64,
 }
@@ -70,7 +73,7 @@ const WAL_INDEX_SHARDS: usize = 16;
 /// Two distinct uses: (1) the **live** index, updated on every [`record`](Self::record)
 /// as frames are appended in-session (a superset that includes the uncommitted tail);
 /// (2) the **rebuilt** index from [`FrameLog::build_index`], which excludes frames
-/// after the last commit marker (recovery).
+/// whose `txn_id` did not commit (recovery supplies the committed predicate).
 #[derive(Debug)]
 pub struct WalIndex {
     shards: Box<[Mutex<HashMap<u64, FrameRef>>]>,
@@ -228,16 +231,16 @@ impl FrameLog {
         &self,
         page_id: u64,
         lsn: u64,
-        commit_marker: u32,
+        txn_id: u64,
         page: &[u8; PAGE_SIZE],
     ) -> Result<u64, DbError> {
         let mut hdr = [0u8; FRAME_HDR_SIZE];
         hdr[0..8].copy_from_slice(&page_id.to_le_bytes());
         hdr[8..16].copy_from_slice(&lsn.to_le_bytes());
-        hdr[16..20].copy_from_slice(&commit_marker.to_le_bytes());
-        hdr[20..28].copy_from_slice(&self.salt.to_le_bytes());
+        hdr[16..24].copy_from_slice(&txn_id.to_le_bytes());
+        hdr[24..32].copy_from_slice(&self.salt.to_le_bytes());
         let crc = frame_crc(&hdr[0..FRAME_HDR_CRC_PREFIX], page);
-        hdr[28..32].copy_from_slice(&crc.to_le_bytes());
+        hdr[32..36].copy_from_slice(&crc.to_le_bytes());
 
         // Lock-free: reserve this frame's slot, then pwrite into it. Two writers get
         // disjoint offsets, so the writes never overlap and need no lock.
@@ -283,18 +286,18 @@ impl FrameLog {
                 .read_exact_at(&mut buf, offset)
                 .map_err(|e| classify_io(e, "frame log scan read"))?;
             let (hdr, page) = buf.split_at(FRAME_HDR_SIZE);
-            let salt = le_u64(&hdr[20..28]);
+            let salt = le_u64(&hdr[24..32]);
             if salt != self.salt {
                 break; // stale frame from a previous run
             }
-            let stored_crc = le_u32(&hdr[28..32]);
+            let stored_crc = le_u32(&hdr[32..36]);
             if frame_crc(&hdr[0..FRAME_HDR_CRC_PREFIX], page) != stored_crc {
                 break; // torn / corrupt frame — end of valid prefix
             }
             frames.push(FrameRef {
                 page_id: le_u64(&hdr[0..8]),
                 lsn: le_u64(&hdr[8..16]),
-                commit_marker: le_u32(&hdr[16..20]),
+                txn_id: le_u64(&hdr[16..24]),
                 offset,
             });
             offset += FRAME_SIZE;
@@ -302,20 +305,21 @@ impl FrameLog {
         Ok(frames)
     }
 
-    /// Builds the page → latest-committed-frame index. Frames after the last commit
-    /// marker (an unfinished txn's tail) are excluded.
-    pub fn build_index(&self) -> Result<WalIndex, DbError> {
+    /// Builds the page → latest-committed-frame index. A frame counts only if
+    /// `is_committed(frame.txn_id)` — i.e. its transaction has a `Commit` in the
+    /// logical WAL (recovery supplies the predicate). Frames written by in-flight
+    /// (uncommitted-at-crash) transactions are skipped, wherever they sit in the log.
+    pub fn build_index(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<WalIndex, DbError> {
         let frames = self.scan()?;
-        // Find the last committed frame (highest offset with commit_marker != 0).
-        let last_commit_pos = frames.iter().rposition(|f| f.commit_marker != 0);
         let index = WalIndex::default();
-        let Some(end) = last_commit_pos else {
-            return Ok(index); // nothing committed yet
-        };
-        for f in &frames[..=end] {
-            index.record(*f); // latest wins (in-order scan)
+        let mut max_committed_lsn = 0u64;
+        for f in &frames {
+            if is_committed(f.txn_id) {
+                index.record(*f); // latest wins (in-order scan)
+                max_committed_lsn = max_committed_lsn.max(f.lsn);
+            }
         }
-        index.set_last_commit_lsn(frames[end].lsn);
+        index.set_last_commit_lsn(max_committed_lsn);
         Ok(index)
     }
 
@@ -374,19 +378,18 @@ mod tests {
         let frames = log.scan().unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].page_id, 2);
-        assert_eq!(frames[1].commit_marker, 5);
+        assert_eq!(frames[1].txn_id, 5);
     }
 
     #[test]
     fn index_keeps_latest_committed_per_page() {
         let (_d, path) = tmp("idx.wf");
         let log = FrameLog::create(&path).unwrap();
-        // txn1 commits: page 2 (v1) + page 3 (v1), commit on the last frame.
-        log.append(2, 1, 0, &page(0x10)).unwrap();
-        log.append(3, 2, 11, &page(0x20)).unwrap();
-        // txn2 commits: page 2 again (v2).
-        let off_p2_v2 = log.append(2, 3, 12, &page(0x11)).unwrap();
-        let idx = log.build_index().unwrap();
+        // txn 7 writes page 2 (v1) + page 3; txn 8 rewrites page 2 (v2). Both commit.
+        log.append(2, 1, 7, &page(0x10)).unwrap();
+        log.append(3, 2, 7, &page(0x20)).unwrap();
+        let off_p2_v2 = log.append(2, 3, 8, &page(0x11)).unwrap();
+        let idx = log.build_index(&|_| true).unwrap();
         assert_eq!(idx.len(), 2);
         assert_eq!(idx.latest(2).unwrap().offset, off_p2_v2); // latest wins
         assert_eq!(idx.latest(2).unwrap().lsn, 3);
@@ -395,15 +398,16 @@ mod tests {
     }
 
     #[test]
-    fn index_excludes_uncommitted_tail() {
+    fn build_index_excludes_uncommitted_txns() {
         let (_d, path) = tmp("uncommitted.wf");
         let log = FrameLog::create(&path).unwrap();
-        log.append(2, 1, 9, &page(1)).unwrap(); // committed txn (marker on its frame)
-        log.append(3, 2, 0, &page(2)).unwrap(); // uncommitted: no commit marker after it
-        let idx = log.build_index().unwrap();
-        assert_eq!(idx.len(), 1, "only the committed page is indexed");
+        log.append(2, 1, 9, &page(1)).unwrap(); // txn 9 (will be committed)
+        log.append(3, 2, 7, &page(2)).unwrap(); // txn 7 (in-flight at crash)
+                                                // Recovery's predicate: only txn 9 committed.
+        let idx = log.build_index(&|t| t == 9).unwrap();
+        assert_eq!(idx.len(), 1, "only the committed txn's page is indexed");
         assert!(idx.latest(2).is_some());
-        assert!(idx.latest(3).is_none(), "uncommitted tail page excluded");
+        assert!(idx.latest(3).is_none(), "uncommitted txn's page excluded");
         assert_eq!(idx.last_commit_lsn(), 1);
     }
 
@@ -494,7 +498,7 @@ mod tests {
                     index.record(FrameRef {
                         page_id: pid,
                         lsn: pid + 1,
-                        commit_marker: 0,
+                        txn_id: 0,
                         offset: pid * 64,
                     });
                 }

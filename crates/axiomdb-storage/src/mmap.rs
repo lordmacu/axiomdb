@@ -491,11 +491,12 @@ impl MmapStorage {
             buf.copy_from_slice(page.as_bytes());
             buf[LSN_OFFSET..LSN_OFFSET + 8].copy_from_slice(&lsn.to_le_bytes());
             self.pwrite_bytes(page_id * PAGE_SIZE as u64, &buf)?;
+            // txn_id placeholder (0); subphase 4b stamps the real current_txn.
             let offset = frame_log.append(page_id, lsn, 0, &buf)?;
             self.wal_index.record(FrameRef {
                 page_id,
                 lsn,
-                commit_marker: 0,
+                txn_id: 0,
                 offset,
             });
             let stamped = Page::from_bytes(buf)?;
