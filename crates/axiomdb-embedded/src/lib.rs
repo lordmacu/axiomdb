@@ -1026,6 +1026,300 @@ mod ffi {
         }
     }
 
+    // ── Cursor API (zero-copy over the materialized result, Tier 1) ───────────
+    //
+    // Keeps the engine's `Vec<Vec<Value>>` AS-IS — no second pass into
+    // `CellValue`/`CString` like `axiomdb_query` does. Text/blob accessors return
+    // pointers directly into the live `Value`, so reading text costs no
+    // allocation. Memory is still O(n) (full streaming is the deeper Approach B).
+    // Mirrors SQLite's `sqlite3_step` + `sqlite3_column_*` model.
+
+    /// A forward-only cursor over a materialized result set.
+    pub struct AxiomCursor {
+        col_names: Vec<CString>,
+        rows: Vec<Vec<Value>>,
+        /// Current row index; `usize::MAX` before the first `step`.
+        pos: usize,
+        /// Scratch buffer for text accessors on values that need formatting
+        /// (Uuid/Jsonb/Array/Range/Composite). Valid until the next such access.
+        scratch: Vec<u8>,
+    }
+
+    /// Type code for a [`Value`] — mirrors `CellValue::type_code`.
+    fn value_type_code(v: &Value) -> c_int {
+        match v {
+            Value::Null => AXIOMDB_TYPE_NULL,
+            Value::Bool(_)
+            | Value::Int(_)
+            | Value::BigInt(_)
+            | Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_) => AXIOMDB_TYPE_INTEGER,
+            Value::Real(_) | Value::Decimal(..) => AXIOMDB_TYPE_REAL,
+            Value::Bytes(_) => AXIOMDB_TYPE_BLOB,
+            _ => AXIOMDB_TYPE_TEXT,
+        }
+    }
+
+    fn format_uuid(u: &[u8; 16]) -> String {
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            u32::from_be_bytes([u[0], u[1], u[2], u[3]]),
+            u16::from_be_bytes([u[4], u[5]]),
+            u16::from_be_bytes([u[6], u[7]]),
+            u16::from_be_bytes([u[8], u[9]]),
+            {
+                let mut buf = [0u8; 8];
+                buf[2..].copy_from_slice(&u[10..16]);
+                u64::from_be_bytes(buf)
+            }
+        )
+    }
+
+    /// Opens a forward-only cursor over the result of `sql`.
+    ///
+    /// Returns NULL on error (see `axiomdb_last_error`). Non-row statements
+    /// yield an empty cursor. Free with `axiomdb_cursor_close`.
+    ///
+    /// # Safety
+    /// `db` from `axiomdb_open`; `sql` a valid non-null UTF-8 C string.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_open(
+        db: *mut Db,
+        sql: *const c_char,
+    ) -> *mut AxiomCursor {
+        if db.is_null() || sql.is_null() {
+            return std::ptr::null_mut();
+        }
+        let db = &mut *db;
+        let sql = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match db.run(sql) {
+            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => {
+                let col_names = columns
+                    .into_iter()
+                    .map(|c| CString::new(c.name).unwrap_or_else(|_| CString::new("").unwrap()))
+                    .collect();
+                Box::into_raw(Box::new(AxiomCursor {
+                    col_names,
+                    rows,
+                    pos: usize::MAX,
+                    scratch: Vec::new(),
+                }))
+            }
+            Ok(_) => Box::into_raw(Box::new(AxiomCursor {
+                col_names: Vec::new(),
+                rows: Vec::new(),
+                pos: usize::MAX,
+                scratch: Vec::new(),
+            })),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Advances to the next row. Returns 1 if a row is available, 0 at end.
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_step(cur: *mut AxiomCursor) -> c_int {
+        if cur.is_null() {
+            return 0;
+        }
+        let cur = &mut *cur;
+        cur.pos = cur.pos.wrapping_add(1);
+        c_int::from(cur.pos < cur.rows.len())
+    }
+
+    /// Returns the number of columns.
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_columns(cur: *const AxiomCursor) -> c_int {
+        if cur.is_null() {
+            return 0;
+        }
+        let cur = &*cur;
+        cur.col_names.len() as c_int
+    }
+
+    /// Returns the null-terminated name of column `col`, or NULL if out of range.
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_column_name(
+        cur: *const AxiomCursor,
+        col: c_int,
+    ) -> *const c_char {
+        if cur.is_null() || col < 0 {
+            return std::ptr::null();
+        }
+        let cur = &*cur;
+        match cur.col_names.get(col as usize) {
+            Some(n) => n.as_ptr(),
+            None => std::ptr::null(),
+        }
+    }
+
+    /// Returns the type code of the current row's cell `col`.
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_type(cur: *const AxiomCursor, col: c_int) -> c_int {
+        if cur.is_null() || col < 0 {
+            return AXIOMDB_TYPE_NULL;
+        }
+        let cur = &*cur;
+        cur.rows
+            .get(cur.pos)
+            .and_then(|r| r.get(col as usize))
+            .map(value_type_code)
+            .unwrap_or(AXIOMDB_TYPE_NULL)
+    }
+
+    /// Returns the integer value of the current row's cell `col` (0 otherwise).
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_int(cur: *const AxiomCursor, col: c_int) -> i64 {
+        if cur.is_null() || col < 0 {
+            return 0;
+        }
+        let cur = &*cur;
+        match cur.rows.get(cur.pos).and_then(|r| r.get(col as usize)) {
+            Some(Value::Bool(b)) => *b as i64,
+            Some(Value::Int(i)) => *i as i64,
+            Some(Value::BigInt(i)) => *i,
+            Some(Value::Date(d)) => *d as i64,
+            Some(Value::Timestamp(t)) | Some(Value::TimestampTz(t)) => *t,
+            _ => 0,
+        }
+    }
+
+    /// Returns the floating-point value of the current row's cell `col`.
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_double(cur: *const AxiomCursor, col: c_int) -> f64 {
+        if cur.is_null() || col < 0 {
+            return 0.0;
+        }
+        let cur = &*cur;
+        match cur.rows.get(cur.pos).and_then(|r| r.get(col as usize)) {
+            Some(Value::Real(f)) => *f,
+            Some(Value::Decimal(m, s)) => *m as f64 / 10f64.powi(*s as i32),
+            _ => 0.0,
+        }
+    }
+
+    /// Returns a pointer to the current row's text cell `col` and writes its
+    /// byte length to `*len`. The pointer is **not** null-terminated and is
+    /// valid until the next `axiomdb_cursor_step` or `axiomdb_cursor_close`.
+    /// Returns NULL for non-text cells.
+    ///
+    /// # Safety
+    /// `cur` from `axiomdb_cursor_open`; `len` a valid non-null pointer.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_text(
+        cur: *mut AxiomCursor,
+        col: c_int,
+        len: *mut usize,
+    ) -> *const c_char {
+        let set_len = |n: usize| {
+            if !len.is_null() {
+                *len = n;
+            }
+        };
+        if cur.is_null() || col < 0 {
+            set_len(0);
+            return std::ptr::null();
+        }
+        let cur = &mut *cur;
+        // Zero-copy for plain text; format the rest into the scratch buffer.
+        let formatted: Option<String> =
+            match cur.rows.get(cur.pos).and_then(|r| r.get(col as usize)) {
+                Some(Value::Text(s)) | Some(Value::Json(s)) => {
+                    set_len(s.len());
+                    // SAFETY: the pointer aliases the live `String` in `rows`,
+                    // which is not mutated until step/close (documented contract).
+                    return s.as_ptr() as *const c_char;
+                }
+                Some(Value::Uuid(u)) => Some(format_uuid(u)),
+                Some(Value::Jsonb(b)) => Some(
+                    axiomdb_types::JsonbDecoder::to_string(b.as_ref())
+                        .unwrap_or_else(|_| "null".to_string()),
+                ),
+                Some(v @ (Value::Array(_) | Value::Range(_) | Value::Composite(_))) => {
+                    Some(v.to_string())
+                }
+                _ => None,
+            };
+        match formatted {
+            Some(s) => {
+                cur.scratch.clear();
+                cur.scratch.extend_from_slice(s.as_bytes());
+                set_len(cur.scratch.len());
+                cur.scratch.as_ptr() as *const c_char
+            }
+            None => {
+                set_len(0);
+                std::ptr::null()
+            }
+        }
+    }
+
+    /// Returns a pointer to the current row's blob cell `col` and writes its
+    /// length to `*len`. Zero-copy; valid until the next step or close.
+    ///
+    /// # Safety
+    /// `cur` from `axiomdb_cursor_open`; `len` a valid non-null pointer.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_blob(
+        cur: *const AxiomCursor,
+        col: c_int,
+        len: *mut usize,
+    ) -> *const u8 {
+        let set_len = |n: usize| {
+            if !len.is_null() {
+                *len = n;
+            }
+        };
+        if cur.is_null() || col < 0 {
+            set_len(0);
+            return std::ptr::null();
+        }
+        let cur = &*cur;
+        match cur.rows.get(cur.pos).and_then(|r| r.get(col as usize)) {
+            Some(Value::Bytes(b)) => {
+                set_len(b.len());
+                b.as_ptr()
+            }
+            _ => {
+                set_len(0);
+                std::ptr::null()
+            }
+        }
+    }
+
+    /// Closes the cursor and frees its result set.
+    ///
+    /// # Safety
+    /// `cur` must be a valid pointer from `axiomdb_cursor_open` (or NULL), and
+    /// must not be used after this call.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_cursor_close(cur: *mut AxiomCursor) {
+        if !cur.is_null() {
+            drop(Box::from_raw(cur));
+        }
+    }
+
     /// Closes the database and frees all resources.
     ///
     /// # Safety
@@ -1625,6 +1919,113 @@ mod ffi {
             assert_eq!(buf[off], 4); // BLOB
             off += 1;
             assert_eq!(read_u32(&buf, &mut off), 0); // empty len
+        }
+    }
+
+    // ── Cursor API tests ──────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod cursor_tests {
+        use super::*;
+
+        unsafe fn open_mem_db() -> *mut Db {
+            Box::into_raw(Box::new(Db::open_memory().unwrap()))
+        }
+        unsafe fn exec(db: *mut Db, sql: &str) {
+            let c = CString::new(sql).unwrap();
+            assert!(axiomdb_execute(db, c.as_ptr()) >= 0, "exec failed: {sql}");
+        }
+
+        #[test]
+        fn cursor_basic_roundtrip() {
+            unsafe {
+                let db = open_mem_db();
+                exec(db, "CREATE TABLE t (id INT, name TEXT, score REAL)");
+                exec(db, "INSERT INTO t VALUES (1, 'alice', 3.5)");
+                exec(db, "INSERT INTO t VALUES (2, 'béta', 2.0)");
+                let sql = CString::new("SELECT id, name, score FROM t ORDER BY id").unwrap();
+                let cur = axiomdb_cursor_open(db, sql.as_ptr());
+                assert!(!cur.is_null());
+                assert_eq!(axiomdb_cursor_columns(cur), 3);
+
+                // row 1
+                assert_eq!(axiomdb_cursor_step(cur), 1);
+                assert_eq!(axiomdb_cursor_int(cur, 0), 1);
+                let mut len = 0usize;
+                let p = axiomdb_cursor_text(cur, 1, &mut len);
+                assert_eq!(std::slice::from_raw_parts(p as *const u8, len), b"alice");
+                assert_eq!(axiomdb_cursor_double(cur, 2), 3.5);
+
+                // row 2 — non-ASCII text zero-copy
+                assert_eq!(axiomdb_cursor_step(cur), 1);
+                assert_eq!(axiomdb_cursor_int(cur, 0), 2);
+                let p2 = axiomdb_cursor_text(cur, 1, &mut len);
+                let s2 = std::slice::from_raw_parts(p2 as *const u8, len);
+                assert_eq!(std::str::from_utf8(s2).unwrap(), "béta");
+
+                // end is idempotent
+                assert_eq!(axiomdb_cursor_step(cur), 0);
+                assert_eq!(axiomdb_cursor_step(cur), 0);
+
+                axiomdb_cursor_close(cur);
+                axiomdb_close(db);
+            }
+        }
+
+        #[test]
+        fn cursor_null_blob_and_empty() {
+            unsafe {
+                let db = open_mem_db();
+                exec(db, "CREATE TABLE t (id INT, maybe INT, b BLOB)");
+                exec(db, "INSERT INTO t VALUES (1, NULL, NULL)");
+                let sql = CString::new("SELECT id, maybe FROM t").unwrap();
+                let cur = axiomdb_cursor_open(db, sql.as_ptr());
+                assert_eq!(axiomdb_cursor_step(cur), 1);
+                assert_eq!(axiomdb_cursor_type(cur, 1), AXIOMDB_TYPE_NULL);
+                assert_eq!(axiomdb_cursor_int(cur, 1), 0);
+                axiomdb_cursor_close(cur);
+
+                // empty result → first step is 0
+                let sql2 = CString::new("SELECT id FROM t WHERE id = 999").unwrap();
+                let cur2 = axiomdb_cursor_open(db, sql2.as_ptr());
+                assert_eq!(axiomdb_cursor_step(cur2), 0);
+                axiomdb_cursor_close(cur2);
+                axiomdb_close(db);
+            }
+        }
+
+        #[test]
+        fn cursor_matches_percell_values() {
+            // The cursor must return the same data as the legacy per-cell path.
+            unsafe {
+                let db = open_mem_db();
+                exec(db, "CREATE TABLE t (id INT, name TEXT)");
+                for i in 0..50 {
+                    exec(db, &format!("INSERT INTO t VALUES ({i}, 'u{i}')"));
+                }
+                let q = CString::new("SELECT id, name FROM t ORDER BY id").unwrap();
+
+                let cur = axiomdb_cursor_open(db, q.as_ptr());
+                let mut got = Vec::new();
+                while axiomdb_cursor_step(cur) == 1 {
+                    let id = axiomdb_cursor_int(cur, 0);
+                    let mut len = 0usize;
+                    let p = axiomdb_cursor_text(cur, 1, &mut len);
+                    let name =
+                        std::str::from_utf8(std::slice::from_raw_parts(p as *const u8, len))
+                            .unwrap()
+                            .to_string();
+                    got.push((id, name));
+                }
+                axiomdb_cursor_close(cur);
+
+                assert_eq!(got.len(), 50);
+                for (i, (id, name)) in got.iter().enumerate() {
+                    assert_eq!(*id, i as i64);
+                    assert_eq!(name, &format!("u{i}"));
+                }
+                axiomdb_close(db);
+            }
         }
     }
 }

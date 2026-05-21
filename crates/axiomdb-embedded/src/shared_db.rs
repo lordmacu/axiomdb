@@ -29,13 +29,8 @@ use std::sync::{Arc, RwLock};
 use axiomdb_catalog::bootstrap::CatalogBootstrap;
 use axiomdb_core::{error::DbError, parse_dsn, ParsedDsn};
 use axiomdb_sql::{
-    analyze_cached,
-    ast::Stmt,
-    bloom::BloomRegistry,
-    execute_with_ctx,
-    parse_with_sql_mode,
-    result::QueryResult,
-    verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
+    analyze_cached, ast::Stmt, bloom::BloomRegistry, execute_with_ctx, parse_with_sql_mode,
+    result::QueryResult, verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
 };
 use axiomdb_storage::MmapStorage;
 use axiomdb_types::Value;
@@ -258,8 +253,7 @@ impl Connection {
         } else {
             self.inner.txn.snapshot()
         };
-        let analyzed =
-            analyze_cached(stmt, &self.inner.storage, snap, &mut self.schema_cache)?;
+        let analyzed = analyze_cached(stmt, &self.inner.storage, snap, &mut self.schema_cache)?;
 
         // DDL: hold catalog write lock for the duration of schema mutation so
         // concurrent connections do not see a half-applied schema.
@@ -314,10 +308,7 @@ impl Connection {
     }
 
     /// Executes a SQL SELECT. Returns column names and rows.
-    pub fn query_with_columns(
-        &mut self,
-        sql: &str,
-    ) -> Result<(Vec<String>, Vec<Row>), DbError> {
+    pub fn query_with_columns(&mut self, sql: &str) -> Result<(Vec<String>, Vec<Row>), DbError> {
         let result = self.run_inner(sql)?;
         Ok(match result {
             QueryResult::Rows { columns, rows } => {
@@ -413,9 +404,7 @@ fn resolve_local_dsn_path(dsn: &str) -> Result<PathBuf, DbError> {
             if !local.query.is_empty() {
                 let params = local.query.keys().cloned().collect::<Vec<_>>().join(", ");
                 return Err(DbError::InvalidDsn {
-                    reason: format!(
-                        "embedded DSN does not support query parameters: {params}"
-                    ),
+                    reason: format!("embedded DSN does not support query parameters: {params}"),
                 });
             }
             Ok(local.path)
