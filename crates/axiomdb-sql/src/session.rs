@@ -1060,6 +1060,13 @@ pub struct SessionContext {
     /// `Some` when a transaction is open (explicit or autocommit-implicit).
     /// `None` between transactions.
     pub conn_txn: Option<ConnectionTxn>,
+    /// Snapshot of the statement currently executing, set by the entry points
+    /// that `take()` `conn_txn` out of this context (so it is `None` during
+    /// `execute_select_ctx`). Catalog reads performed *during* expression
+    /// evaluation (e.g. `IS_BUSINESS_DAY`, `CONVERT`) must use this so they see
+    /// the connection's own uncommitted writes — a fresh `txn.snapshot()` would
+    /// miss read-your-own-writes (cf. lessons #9 / #12).
+    pub eval_snapshot: Option<axiomdb_core::TransactionSnapshot>,
     /// Pending deferred commit txn_id from the last `commit()` call in
     /// pipeline mode (Phase 40.10).
     ///
@@ -1143,6 +1150,7 @@ impl SessionContext {
             lock_timeout_secs: 30,
             savepoints: Vec::new(),
             conn_txn: None,
+            eval_snapshot: None,
             pending_deferred_txn_id: None,
             deferred_fk_constraint_ids: Vec::new(),
             pending_notifications: Vec::new(),

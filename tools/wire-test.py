@@ -3331,9 +3331,9 @@ cjpath.execute(
     "CAST('{\"xs\":[10,20,30]}' AS JSONB) #- CAST('[\"xs\",1]' AS JSONB)"
 )
 row = cjpath.fetchone()
-ok("[11.18c] #> extracts subtree as JSON text over wire", row[0] == b'{"b":1}', row)
+ok("[11.18c] #> extracts subtree as JSON text over wire", row[0] == '{"b":1}', row)
 ok("[11.18c] #>> extracts scalar text over wire", row[1] == "hello", row)
-ok("[11.18c] #- deletes nested array index over wire", row[2] == b'{"xs":[10,30]}', row)
+ok("[11.18c] #- deletes nested array index over wire", row[2] == '{"xs":[10,30]}', row)
 conn_jpath.close()
 
 # ── Phase 11.21h — JSONPath planner pushdown ────────────────────────────────
@@ -4441,7 +4441,7 @@ conn.commit()
 cur.execute("SELECT id, amount FROM view20_alice_orders ORDER BY id")
 rows = cur.fetchall()
 ok("[20.1 regular views] SELECT from view returns filtered rows",
-   rows == (('10', '100'), ('11', '200')),
+   rows == ((10, 100), (11, 200)),  # direct INT projection → INT over wire (MySQL-correct)
    rows)
 
 cur.execute(
@@ -4485,7 +4485,7 @@ conn.commit()
 cur.execute("SELECT id FROM view20_alice_orders ORDER BY id")
 rows = cur.fetchall()
 ok("[20.1 regular views] CREATE OR REPLACE VIEW updates definition",
-   rows == (('10',), ('11',)),
+   rows == ((10,), (11,)),  # direct INT projection → INT over wire (MySQL-correct)
    rows)
 
 cur.execute("DROP VIEW view20_alice_orders, view20_summary")

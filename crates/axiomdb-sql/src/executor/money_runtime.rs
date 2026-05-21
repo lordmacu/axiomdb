@@ -161,7 +161,15 @@ fn get_or_load_exchange_rate(
     if let Some(&cached) = runner.ctx.exchange_rate_cache.get(&key) {
         return Ok(cached);
     }
-    let snap = runner.txn.snapshot();
+    // Statement snapshot (stashed by the entry point) so an exchange rate created
+    // earlier in the same uncommitted transaction is visible. `conn_txn` is taken
+    // out of `ctx` during SELECT execution, so a fresh `txn.snapshot()` would miss
+    // read-your-own-writes (cf. lessons #9 / #12).
+    let snap = runner
+        .ctx
+        .eval_snapshot
+        .clone()
+        .unwrap_or_else(|| runner.txn.snapshot());
     let mut reader = CatalogReader::new(runner.storage, snap)?;
     let def = reader.get_exchange_rate(from, to)?.ok_or_else(|| DbError::InvalidValue {
         reason: format!("no exchange rate registered for '{from}' → '{to}'"),

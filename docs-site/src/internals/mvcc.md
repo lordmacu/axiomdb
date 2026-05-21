@@ -45,6 +45,20 @@ A row version is visible when:
 - and `txn_id_deleted == 0`, or `txn_id_deleted >= snapshot_id` and the delete
   was not performed by `current_txn_id`
 
+#### Read-your-own-writes during expression evaluation
+
+A statement's snapshot is derived from its connection transaction
+(`active_snapshot(conn_txn)`) so it sees that transaction's own uncommitted
+writes. Some scalar functions read the **catalog** *while a SELECT is being
+evaluated* — e.g. `IS_BUSINESS_DAY` / `NEXT_BUSINESS_DAY` (holiday calendars) and
+`CONVERT` (exchange rates). The SELECT entry point `take()`s `conn_txn` out of the
+session context for the duration of execution, so those reads cannot recompute
+the active snapshot themselves; if they fell back to a fresh `txn.snapshot()`
+(latest committed only) they would miss a calendar or rate created earlier in the
+same uncommitted transaction. The entry point therefore stashes the statement
+snapshot in `SessionContext.eval_snapshot`, and catalog reads during evaluation
+use it — preserving read-your-own-writes for autocommit-off connections.
+
 ---
 
 ## RowHeader — Per-Row Versioning

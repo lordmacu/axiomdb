@@ -159,6 +159,9 @@ fn execute_select_ctx(
             && stmt.group_by.is_empty()
             && stmt.having.is_none()
             && stmt.columns.len() == 1
+            // TABLESAMPLE must actually sample — skip the count fast path so the
+            // query falls through to the sampled scan below (Phase 20.11).
+            && from_table_ref.tablesample.is_none()
         {
             if let Some(crate::ast::SelectItem::Expr {
                 expr: crate::expr::Expr::Function { ref name, ref args },
@@ -841,6 +844,25 @@ fn execute_select_ctx(
                 query_terms,
             } => gin_scan_rows(storage, &resolved, index_def, query_terms, snap.clone())?,
         };
+
+        // ── Phase 20.11: TABLESAMPLE — sample the scanned base rows ────────────
+        // The ctx executor (wire path) previously ignored TABLESAMPLE entirely,
+        // so SYSTEM(0) returned every row. Sample here: 0% → none, 100% → all,
+        // otherwise keep each row with probability `percent/100`. SYSTEM is
+        // applied at row granularity (the same approximation select_core uses for
+        // clustered tables). COUNT(*) reaches this because its fast path is now
+        // skipped when a TABLESAMPLE clause is present.
+        let mut raw_rows = raw_rows;
+        if let Some(s) = &from_table_ref.tablesample {
+            if s.percent <= 0.0 {
+                raw_rows.clear();
+            } else if s.percent < 100.0 {
+                use rand::Rng;
+                let threshold = s.percent / 100.0;
+                let mut rng = rand::thread_rng();
+                raw_rows.retain(|_| rng.gen::<f64>() < threshold);
+            }
+        }
 
         // ── Phase 13.7: SELECT … FOR UPDATE / FOR SHARE row-level locking ──────
         // Handled BEFORE the normal combined_rows pipeline so we can keep RecordIds

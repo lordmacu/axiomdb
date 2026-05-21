@@ -751,21 +751,55 @@ fn serde_to_value_typed(sj: &serde_json::Value, ty: DataType) -> Result<Value, D
 /// executor sites that need `result::ColumnMeta` rather than catalog
 /// `ColumnDef`.
 pub fn column_metas_for_spec(spec: &JsonTableSpec) -> Vec<crate::result::ColumnMeta> {
-    spec.columns
-        .iter()
-        .map(|c| crate::result::ColumnMeta {
-            name: c.name.clone(),
-            data_type: c.ty.clone(),
-            nullable: matches!(
-                c.kind,
-                JsonTableColumnKind::Regular {
-                    on_empty: SqlJsonOnBehavior::Null,
-                    ..
-                }
-            ),
-            table_name: Some(spec.alias.clone()),
-        })
-        .collect()
+    let mut out = Vec::new();
+    collect_column_metas(
+        &spec.columns,
+        &spec.alias,
+        /*inside_nested=*/ false,
+        &mut out,
+    );
+    out
+}
+
+/// Flattens compiled JSON_TABLE columns into leaf `ColumnMeta`s in slot order.
+///
+/// `NESTED PATH` nodes carry no slot of their own — they expand into their
+/// children (`compile_columns_recursive` assigns slots depth-first, in
+/// declaration order). The naive `spec.columns.iter()` emitted a placeholder
+/// `("", BigInt)` meta per nested node and dropped the real child columns, so
+/// the wire column-definition packets carried the wrong types/count and the
+/// client mis-converted values (e.g. int()-parsing a TEXT column). Recursing
+/// here matches the flat row layout produced by [`flatten_defs_recursive`].
+fn collect_column_metas(
+    cols: &[JsonTableColumnSpec],
+    alias: &str,
+    inside_nested: bool,
+    out: &mut Vec<crate::result::ColumnMeta>,
+) {
+    for c in cols {
+        match &c.kind {
+            JsonTableColumnKind::Nested { children, .. } => {
+                collect_column_metas(children, alias, /*inside_nested=*/ true, out);
+            }
+            JsonTableColumnKind::Regular {
+                on_empty, on_error, ..
+            } => out.push(crate::result::ColumnMeta {
+                name: c.name.clone(),
+                data_type: c.ty.clone(),
+                nullable: inside_nested
+                    || matches!(on_empty, SqlJsonOnBehavior::Null)
+                    || matches!(on_error, SqlJsonOnBehavior::Null),
+                table_name: Some(alias.to_string()),
+            }),
+            JsonTableColumnKind::Ordinality { .. } | JsonTableColumnKind::Exists { .. } => out
+                .push(crate::result::ColumnMeta {
+                    name: c.name.clone(),
+                    data_type: c.ty.clone(),
+                    nullable: inside_nested,
+                    table_name: Some(alias.to_string()),
+                }),
+        }
+    }
 }
 
 /// Returns `true` if the expression tree contains any column reference —

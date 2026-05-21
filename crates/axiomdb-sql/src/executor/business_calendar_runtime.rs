@@ -33,7 +33,16 @@ fn get_or_load_holidays(
     if let Some(cached) = runner.ctx.holiday_cache.get(&key) {
         return Ok(std::sync::Arc::clone(cached));
     }
-    let snap = runner.txn.snapshot();
+    // Use the executing statement's snapshot so a calendar created earlier in
+    // the same (uncommitted) transaction is visible. `conn_txn` is taken out of
+    // `ctx` during SELECT execution, so read the snapshot the entry point stashed
+    // in `eval_snapshot`; a fresh `txn.snapshot()` would miss read-your-own-writes
+    // (cf. lessons #9 / #12).
+    let snap = runner
+        .ctx
+        .eval_snapshot
+        .clone()
+        .unwrap_or_else(|| runner.txn.snapshot());
     let mut reader = CatalogReader::new(runner.storage, snap)?;
     let def = reader.get_holiday_calendar(&key)?;
     let set: std::sync::Arc<std::collections::HashSet<i32>> = std::sync::Arc::new(

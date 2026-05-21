@@ -459,9 +459,9 @@ impl MmapStorage {
     }
 
     fn read_page_from_mmap(mmap: &Mmap, page_id: u64) -> Result<crate::page_ref::PageRef, DbError> {
-        Ok(crate::page_ref::PageRef::from_arc(Self::read_arc_from_mmap(
-            mmap, page_id,
-        )?))
+        Ok(crate::page_ref::PageRef::from_arc(
+            Self::read_arc_from_mmap(mmap, page_id)?,
+        ))
     }
 
     /// Reads a page from the mmap straight into an `Arc<Page>` — one heap

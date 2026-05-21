@@ -18,6 +18,19 @@
 ///
 /// Uses `txn` as `&TxnManager` (shared ref) — only calls `snapshot()` and
 /// `active_snapshot()`, never `begin/commit/rollback`.
+/// Snapshot for a statement given its (optional) connection transaction:
+/// `active_snapshot` includes the connection's own uncommitted writes;
+/// `snapshot` is the latest committed view when there is no open transaction.
+fn snapshot_for(
+    txn: &TxnManager,
+    conn: Option<&ConnectionTxn>,
+) -> axiomdb_core::TransactionSnapshot {
+    match conn {
+        Some(c) => txn.active_snapshot(c),
+        None => txn.snapshot(),
+    }
+}
+
 pub fn execute_read_only_with_ctx(
     stmt: Stmt,
     storage: &dyn StorageEngine,
@@ -30,13 +43,17 @@ pub fn execute_read_only_with_ctx(
         Stmt::Select(mut s) => {
             let into_outfile = s.into_outfile.take();
             let conn = ctx.conn_txn.take();
+            let prev_snap = ctx.eval_snapshot.replace(snapshot_for(txn, conn.as_ref()));
             let r = execute_select_ctx(s, &exec_ctx, conn.as_ref(), ctx);
+            ctx.eval_snapshot = prev_snap;
             ctx.conn_txn = conn;
             handle_into_outfile(r, into_outfile)
         }
         Stmt::SetOp { first, rest } => {
             let conn = ctx.conn_txn.take();
+            let prev_snap = ctx.eval_snapshot.replace(snapshot_for(txn, conn.as_ref()));
             let r = execute_set_op(first, rest, &exec_ctx, conn.as_ref(), ctx);
+            ctx.eval_snapshot = prev_snap;
             ctx.conn_txn = conn;
             r
         }

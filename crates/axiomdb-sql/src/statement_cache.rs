@@ -623,7 +623,10 @@ fn expr_is_cache_simple(e: &Expr) -> bool {
 /// their bodies are not part of the shape hash.
 fn from_is_cache_simple(f: &FromClause) -> bool {
     match f {
-        FromClause::Table(_) => true,
+        // TABLESAMPLE percent/method are not part of the shape hash (`hash_from`
+        // only keys on name/schema) and are not extracted as params, so caching
+        // would let `SYSTEM(0)` reuse a `SYSTEM(100)` plan. Fail closed.
+        FromClause::Table(t) => t.tablesample.is_none(),
         FromClause::Unnest(u) => u.exprs.iter().all(expr_is_cache_simple),
         FromClause::GenerateSeries(gs) => {
             expr_is_cache_simple(&gs.start)
