@@ -49,11 +49,14 @@ in phases 40.4–40.12.
 </div>
 </div>
 
-`read_page` returns an owned `PageRef` — a heap-allocated copy of the 16 KB page data.
-This is a deliberate change from the original `&Page` borrow: owned pages survive mmap
-remaps (during `grow()`) and page reuse (after `free_page`), which is essential for
-concurrent read/write access. The copy cost is ~0.5 us from L2/L3 cache — the same cost
-PostgreSQL pays when copying a page from the buffer pool into backend-local memory.
+`read_page` returns a `PageRef` — a reference-counted (`Arc<Page>`) handle to a 16 KB
+page. This is a deliberate change from the original `&Page` borrow: owned pages survive
+mmap remaps (during `grow()`) and page reuse (after `free_page`), which is essential for
+concurrent read/write access. Backing the handle with an `Arc` makes `PageRef::clone`
+O(1) (an atomic refcount bump, no 16 KB copy), so a page can be shared between the buffer
+pool and many readers without re-materializing it. A cold read still copies once out of
+the mmap (~0.5 us from L2/L3 cache) — the same cost PostgreSQL pays when copying a page
+from the buffer pool into backend-local memory.
 
 ---
 

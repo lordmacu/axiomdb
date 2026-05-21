@@ -93,6 +93,7 @@ const _: () = assert!(
 ///
 /// Internally it is a raw buffer `[u8; PAGE_SIZE]`; the header is accessed
 /// via raw pointers to achieve zero-copy access without serialization.
+#[derive(Clone)]
 #[repr(C, align(64))]
 pub struct Page {
     data: [u8; PAGE_SIZE],
