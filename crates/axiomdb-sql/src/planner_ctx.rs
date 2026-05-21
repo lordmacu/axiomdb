@@ -168,8 +168,8 @@ pub fn plan_delete_candidates(
     }
 
     // Rule 2: col > lo AND col < hi (or >=, <=)
-    if let Some((idx, lo_val, hi_val)) =
-        extract_range(where_clause, indexes, columns, Some(where_clause), false)
+    if let Some((idx, (lo_val, _lo_incl), (hi_val, _hi_incl))) =
+        extract_range(where_clause, indexes, columns, Some(where_clause),false)
     {
         // No cost gate for DELETE.
         let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
@@ -241,8 +241,8 @@ pub fn plan_update_candidates(
         }
     }
 
-    if let Some((idx, lo_val, hi_val)) =
-        extract_range(where_clause, indexes, columns, Some(where_clause), true)
+    if let Some((idx, (lo_val, _lo_incl), (hi_val, _hi_incl))) =
+        extract_range(where_clause, indexes, columns, Some(where_clause),true)
     {
         let lo = lo_val.and_then(|v| encode_index_key(&[v]).ok());
         let hi = hi_val.and_then(|v| encode_index_key(&[v]).ok());

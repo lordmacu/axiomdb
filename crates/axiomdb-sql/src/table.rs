@@ -554,22 +554,27 @@ fn decode_with_overflow(
 /// ~2 heap allocations per returned row vs the previous iterator
 /// path. Overflow tails (rare on small rows) still allocate once
 /// to splice inline + overflow into a contiguous buffer.
+#[allow(clippy::too_many_arguments)]
 pub fn range_clustered_table(
     storage: &dyn StorageEngine,
     table_def: &TableDef,
     columns: &[ColumnDef],
     lo: Option<&[u8]>,
     hi: Option<&[u8]>,
+    lo_inclusive: bool,
+    hi_inclusive: bool,
     snap: TransactionSnapshot,
 ) -> Result<Vec<(RecordId, Vec<Value>)>, DbError> {
     use std::ops::Bound;
     let col_types = column_data_types(columns);
     let from = match lo {
-        Some(k) => Bound::Included(k.to_vec()),
+        Some(k) if lo_inclusive => Bound::Included(k.to_vec()),
+        Some(k) => Bound::Excluded(k.to_vec()),
         None => Bound::Unbounded,
     };
     let to = match hi {
-        Some(k) => Bound::Included(k.to_vec()),
+        Some(k) if hi_inclusive => Bound::Included(k.to_vec()),
+        Some(k) => Bound::Excluded(k.to_vec()),
         None => Bound::Unbounded,
     };
     let mut result: Vec<(RecordId, Vec<Value>)> = Vec::new();

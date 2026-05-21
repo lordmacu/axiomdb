@@ -344,13 +344,16 @@ fn execute_select(
             crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
                 if resolved.def.is_clustered() && index_def.is_primary =>
             {
-                // Clustered PK range scan (non-ctx path).
+                // Clustered PK range scan (non-ctx path). Strictness honoring is
+                // wired only on the ctx path (select_ctx); keep inclusive here.
                 crate::table::range_clustered_table(
                     storage,
                     &resolved.def,
                     &resolved.columns,
                     lo.as_deref(),
                     hi.as_deref(),
+                    true,
+                    true,
                     snap,
                 )?
             }

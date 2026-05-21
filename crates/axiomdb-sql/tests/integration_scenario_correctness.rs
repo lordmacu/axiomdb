@@ -353,6 +353,74 @@ fn range_scan_returns_correct_subset_and_respects_boundaries() {
     );
 }
 
+/// A range that also has a non-range residual (`AND active = TRUE`) must still
+/// filter by the residual — `covers_predicate` must NOT be set here, so the
+/// per-row WHERE recheck stays on. Guards against skipping a real residual.
+#[test]
+fn range_with_residual_predicate_still_filters() {
+    const N: usize = 1000;
+    let start = N / 4; // 250
+    let end = start + N / 10; // 350
+    let (mut s, mut txn, mut bloom, mut ctx) = setup_ctx();
+    load_batch(N, &mut s, &mut txn, &mut bloom, &mut ctx);
+
+    // active = TRUE for even ids (load_batch convention). In [250, 350) the
+    // even ids are 250,252,...,348 → 50 rows.
+    let result = rows(ok(
+        &format!(
+            "SELECT id, active FROM bench_users \
+             WHERE id >= {start} AND id < {end} AND active = TRUE"
+        ),
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    ));
+    assert_eq!(
+        result.len(),
+        50,
+        "residual active=TRUE must filter to 50 rows"
+    );
+    for row in &result {
+        let id = match row[0] {
+            Value::Int(v) => v as usize,
+            ref o => panic!("id not Int: {o:?}"),
+        };
+        assert!(id >= start && id < end, "id {id} outside range");
+        assert_eq!(id % 2, 0, "only even ids are active");
+    }
+}
+
+/// Exclusive lower + inclusive upper: `id > 250 AND id <= 350` returns
+/// 251..=350 (250 excluded, 350 included) — verifies bound strictness is
+/// honored in both directions, not widened to inclusive.
+#[test]
+fn range_exclusive_lower_inclusive_upper() {
+    const N: usize = 1000;
+    let lo = N / 4; // 250
+    let hi = lo + N / 10; // 350
+    let (mut s, mut txn, mut bloom, mut ctx) = setup_ctx();
+    load_batch(N, &mut s, &mut txn, &mut bloom, &mut ctx);
+
+    let result = rows(ok(
+        &format!("SELECT id FROM bench_users WHERE id > {lo} AND id <= {hi}"),
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    ));
+    let ids: Vec<i32> = result
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int(v) => v,
+            ref o => panic!("id not Int: {o:?}"),
+        })
+        .collect();
+    assert_eq!(ids.len(), hi - lo, "(lo, hi] has {} rows", hi - lo);
+    assert!(!ids.contains(&(lo as i32)), "exclusive lower excludes {lo}");
+    assert!(ids.contains(&(hi as i32)), "inclusive upper includes {hi}");
+}
+
 // ── 5. count_star ────────────────────────────────────────────────────────────
 
 /// count_star scenario: COUNT(*) must equal the number of loaded rows.

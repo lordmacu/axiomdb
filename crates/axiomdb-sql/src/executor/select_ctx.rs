@@ -707,17 +707,30 @@ fn execute_select_ctx(
                     result
                 }
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
-                if resolved.def.is_clustered() && index_def.is_primary =>
-            {
+            crate::planner::AccessMethod::IndexRange {
+                index_def,
+                lo,
+                hi,
+                lo_inclusive,
+                hi_inclusive,
+                covers_predicate,
+            } if resolved.def.is_clustered() && index_def.is_primary => {
                 // ── Clustered PK range scan (Phase 39.15) ────────────────────
                 // Single pass through clustered leaves. No heap indirection.
+                // Bounds are honored exactly (exclusive `<`/`>` excludes the
+                // boundary key); when the range reproduces the whole WHERE the
+                // per-row recheck below is skipped (SQLite TERM_CODED analog).
+                if *covers_predicate {
+                    where_already_applied = true;
+                }
                 crate::table::range_clustered_table(
                     storage,
                     &resolved.def,
                     &resolved.columns,
                     lo.as_deref(),
                     hi.as_deref(),
+                    *lo_inclusive,
+                    *hi_inclusive,
                     snap,
                 )?
             }

@@ -753,6 +753,23 @@ baseline. Caught only by building the pre-change binary and A/B-testing on the
 same VM — the measurement-methodology lesson in action.
 </div>
 
+### Precise Range Bounds — skip the per-row recheck
+
+A clustered-PK range (`WHERE id >= lo AND id < hi`) used to widen both bounds to
+inclusive and then re-evaluate the full `WHERE` on **every** returned row to drop
+the boundary key — an O(n) recheck to exclude O(1) rows. The planner now carries
+each bound's strictness (`>`/`<` exclusive vs `>=`/`<=` inclusive) and a
+`covers_predicate` flag; when the range reproduces the entire `WHERE`, the
+executor honors the exact bounds (`Bound::Excluded`) and **skips the per-row
+recheck**. A residual term (`… AND active = TRUE`) keeps the recheck — only the
+index-covered part is dropped.
+
+This is SQLite's model: distinct seek opcodes `OP_SeekGE/GT/LE/LT` for exact
+boundaries, and `disableTerm`/`TERM_CODED` so index-covered constraints are not
+re-checked. On macOS-native the clustered range scan moves from ~1.2–1.6× toward
+parity with SQLite; correctness is unchanged (exclusive boundaries already
+returned the right rows via the old recheck — now without the per-row cost).
+
 ### Session COUNT(*) Cache (Attack 17b)
 
 The `SELECT COUNT(*) FROM t` fast path now consults a per-session cache

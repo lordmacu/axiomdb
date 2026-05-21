@@ -391,7 +391,58 @@ mod tests {
             &mut StaleStatsTracker::default(),
             &[],
         );
-        assert!(matches!(am, AccessMethod::IndexRange { .. }));
+        match am {
+            AccessMethod::IndexRange {
+                lo_inclusive,
+                hi_inclusive,
+                covers_predicate,
+                ..
+            } => {
+                assert!(lo_inclusive, ">= is an inclusive lower bound");
+                assert!(!hi_inclusive, "< is an exclusive upper bound");
+                assert!(
+                    covers_predicate,
+                    "a pure two-sided PK range reproduces the whole WHERE"
+                );
+            }
+            other => panic!("expected IndexRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_single_sided_gt_is_exclusive_lower_and_covering() {
+        let cols = vec![make_col("id", 0)];
+        let idxs = vec![make_index("pk", 0, true)];
+        // WHERE id > 50  (single-sided, exclusive lower, open upper)
+        let expr = Expr::BinaryOp {
+            op: BinaryOp::Gt,
+            left: Box::new(col_expr("id")),
+            right: Box::new(Expr::Literal(Value::Int(50))),
+        };
+        let am = plan_select(
+            Some(&expr),
+            &idxs,
+            &cols,
+            1,
+            &[],
+            &mut StaleStatsTracker::default(),
+            &[],
+        );
+        match am {
+            AccessMethod::IndexRange {
+                lo,
+                hi,
+                lo_inclusive,
+                covers_predicate,
+                ..
+            } => {
+                assert!(lo.is_some(), "lower bound present");
+                assert!(hi.is_none(), "open upper bound");
+                assert!(!lo_inclusive, "> is an exclusive lower bound");
+                assert!(covers_predicate, "single-sided range covers the WHERE");
+            }
+            other => panic!("expected IndexRange, got {other:?}"),
+        }
     }
 
     #[test]

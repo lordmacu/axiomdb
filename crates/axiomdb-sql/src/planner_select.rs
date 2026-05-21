@@ -122,7 +122,9 @@ pub fn plan_select(
     }
 
     // ── Rule 2: col > lo AND col < hi (or >=, <=) ─────────────────────────
-    if let Some((idx, lo_val, hi_val)) = extract_range(expr, indexes, columns, Some(expr), true) {
+    if let Some((idx, (lo_val, lo_inclusive), (hi_val, hi_inclusive))) =
+        extract_range(expr, indexes, columns, Some(expr), true)
+    {
         // Cost gate: range scans are even less selective — apply same threshold.
         let use_index =
             idx.is_primary || stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker);
@@ -144,48 +146,43 @@ pub fn plan_select(
                     range_col.map_or(v.clone(), |cn| coerce_literal_to_col_type(v, cn, columns));
                 encode_index_key(&[v]).ok()
             });
+            // The two-sided range IS the entire WHERE (extract_range matched the
+            // whole expr) → covering: executor may skip the per-row recheck.
             return AccessMethod::IndexRange {
                 index_def: idx.clone(),
                 lo,
                 hi,
-                lo_inclusive: true,
-                hi_inclusive: true,
-                covers_predicate: false,
+                lo_inclusive,
+                hi_inclusive,
+                covers_predicate: true,
             };
         }
     }
 
     // ── Rule 2b: single-sided range (col > val, col < val, col >= val, col <= val)
     // Handles predicates like `WHERE id > 50` that are NOT wrapped in AND.
-    if let Some((col_name, bound)) = extract_range_side(expr) {
+    if let Some((col_name, bound, is_lower, inclusive)) = extract_range_side(expr) {
         if let Some(idx) = find_index_on_col(col_name, indexes, columns, Some(expr), true) {
             let use_index = idx.is_primary
                 || stats_cost_gate(idx, columns, table_id, table_stats, stale_tracker);
             if use_index {
-                // Determine if this is a lower or upper bound.
-                let is_lower = matches!(
-                    expr,
-                    Expr::BinaryOp {
-                        op: BinaryOp::Gt | BinaryOp::GtEq,
-                        ..
-                    }
-                );
                 let encoded = bound.and_then(|v| {
                     let v = coerce_literal_to_col_type(v, col_name, columns);
                     encode_index_key(&[v]).ok()
                 });
-                let (lo, hi) = if is_lower {
-                    (encoded, None) // open upper bound
+                // Open end keeps the default-inclusive (unbounded) strictness.
+                let (lo, hi, lo_inclusive, hi_inclusive) = if is_lower {
+                    (encoded, None, inclusive, true)
                 } else {
-                    (None, encoded) // open lower bound
+                    (None, encoded, true, inclusive)
                 };
                 return AccessMethod::IndexRange {
                     index_def: idx.clone(),
                     lo,
                     hi,
-                    lo_inclusive: true,
-                    hi_inclusive: true,
-                    covers_predicate: false,
+                    lo_inclusive,
+                    hi_inclusive,
+                    covers_predicate: true,
                 };
             }
         }
@@ -875,15 +872,19 @@ fn find_index_on_col<'a>(
 
 // ── Helper: extract range predicate ──────────────────────────────────────────
 
-/// Returns `(index, lo_value, hi_value)` if `expr` is `col > lo AND col < hi`
-/// (or with `>=` / `<=`).
+/// One end of a range: the (optional) encoded bound value and whether it is
+/// inclusive (`>=`/`<=`) vs exclusive (`>`/`<`). `None` value = unbounded.
+type RangeBound = (Option<Value>, bool);
+
+/// Returns `(index, lo, hi)` if `expr` is `col > lo AND col < hi` (or with
+/// `>=` / `<=`), where each end carries its inclusive/exclusive strictness.
 fn extract_range<'a>(
     expr: &Expr,
     indexes: &'a [IndexDef],
     columns: &[ColumnDef],
     query_where: Option<&Expr>,
     allow_primary: bool,
-) -> Option<(&'a IndexDef, Option<Value>, Option<Value>)> {
+) -> Option<(&'a IndexDef, RangeBound, RangeBound)> {
     // expr must be `AND(left, right)`.
     let (lhs, rhs) = match expr {
         Expr::BinaryOp {
@@ -894,18 +895,27 @@ fn extract_range<'a>(
         _ => return None,
     };
 
-    // Each side must be a comparison: col >/< literal.
-    let (col1, bound1) = extract_range_side(lhs)?;
-    let (col2, bound2) = extract_range_side(rhs)?;
+    // Each side must be a comparison: `col OP literal` (or mirrored).
+    let (col1, v1, low1, incl1) = extract_range_side(lhs)?;
+    let (col2, v2, low2, incl2) = extract_range_side(rhs)?;
 
     // Both sides must reference the same column.
     if col1 != col2 {
         return None;
     }
 
+    // Assign by bound direction (not position), and require exactly one lower +
+    // one upper. `id < hi AND id >= lo` is the same range as `id >= lo AND id <
+    // hi`; two same-direction bounds (`id >= a AND id >= b`) are not a two-sided
+    // range — bail so the caller falls back (single-sided / scan + recheck).
+    let ((lo_val, lo_incl), (hi_val, hi_incl)) = match (low1, low2) {
+        (true, false) => ((v1, incl1), (v2, incl2)),
+        (false, true) => ((v2, incl2), (v1, incl1)),
+        _ => return None,
+    };
+
     let idx = find_index_on_col(col1, indexes, columns, query_where, allow_primary)?;
-    // bound1 = lo side, bound2 = hi side (order may be loose but correct for 6.3)
-    Some((idx, bound1, bound2))
+    Some((idx, (lo_val, lo_incl), (hi_val, hi_incl)))
 }
 
 /// Coerces a literal value to match the column's stored type so that the
@@ -958,40 +968,36 @@ fn coerce_literal_to_col_type(value: Value, col_name: &str, columns: &[ColumnDef
     coerce(value.clone(), target, CoercionMode::Strict).unwrap_or(value)
 }
 
-/// Returns `(col_name, bound_value)` for range comparison operators.
-fn extract_range_side(expr: &Expr) -> Option<(&str, Option<Value>)> {
-    if let Expr::BinaryOp { op, left, right } = expr {
-        match op {
-            BinaryOp::Gt | BinaryOp::GtEq => {
-                // col > literal  →  lo = literal
-                if let (Expr::Column { name, .. }, Expr::Literal(v)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    return Some((name.as_str(), Some(v.clone())));
-                }
-                // literal < col  →  lo = literal (mirrored)
-                if let (Expr::Literal(v), Expr::Column { name, .. }) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    return Some((name.as_str(), Some(v.clone())));
-                }
-            }
+/// Returns `(col_name, bound_value, is_lower, inclusive)` for a range comparison
+/// of the form `col OP literal` or `literal OP col`.
+///
+/// `is_lower` is true when the bound constrains the column from below
+/// (`col >`/`col >=`, or the mirrored `literal <`/`literal <= col`); `inclusive`
+/// is true for `>=`/`<=` (an exact `OP_SeekGE`/`OP_SeekLE` boundary) and false
+/// for `>`/`<` (exclusive, `OP_SeekGT`/`OP_SeekLT`). Carrying both lets the
+/// planner reproduce the predicate exactly instead of widening to inclusive.
+fn extract_range_side(expr: &Expr) -> Option<(&str, Option<Value>, bool, bool)> {
+    let Expr::BinaryOp { op, left, right } = expr else {
+        return None;
+    };
+    let inclusive = matches!(op, BinaryOp::GtEq | BinaryOp::LtEq);
+    match (left.as_ref(), right.as_ref()) {
+        // `col OP literal`
+        (Expr::Column { name, .. }, Expr::Literal(v)) => match op {
+            BinaryOp::Gt | BinaryOp::GtEq => Some((name.as_str(), Some(v.clone()), true, inclusive)),
             BinaryOp::Lt | BinaryOp::LtEq => {
-                // col < literal  →  hi = literal
-                if let (Expr::Column { name, .. }, Expr::Literal(v)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    return Some((name.as_str(), Some(v.clone())));
-                }
-                // literal > col  →  hi = literal (mirrored)
-                if let (Expr::Literal(v), Expr::Column { name, .. }) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    return Some((name.as_str(), Some(v.clone())));
-                }
+                Some((name.as_str(), Some(v.clone()), false, inclusive))
             }
-            _ => {}
-        }
+            _ => None,
+        },
+        // `literal OP col` — mirrored: `v > col` ≡ `col < v` (upper bound).
+        (Expr::Literal(v), Expr::Column { name, .. }) => match op {
+            BinaryOp::Gt | BinaryOp::GtEq => {
+                Some((name.as_str(), Some(v.clone()), false, inclusive))
+            }
+            BinaryOp::Lt | BinaryOp::LtEq => Some((name.as_str(), Some(v.clone()), true, inclusive)),
+            _ => None,
+        },
+        _ => None,
     }
-    None
 }
