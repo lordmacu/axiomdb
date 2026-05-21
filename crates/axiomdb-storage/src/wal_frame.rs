@@ -109,6 +109,17 @@ impl WalIndex {
             .copied()
     }
 
+    /// Snapshot of every page's recorded frame. Used by REDO recovery to walk all
+    /// committed frames on open; not a hot path. Each shard is locked briefly in turn.
+    pub fn frames(&self) -> Vec<FrameRef> {
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            out.extend(guard.values().copied());
+        }
+        out
+    }
+
     /// Records `frame` as the latest version of its page (live append path).
     /// Locks only that page's shard.
     pub fn record(&self, frame: FrameRef) {
@@ -395,6 +406,19 @@ mod tests {
         assert_eq!(idx.latest(2).unwrap().lsn, 3);
         assert_eq!(idx.latest(3).unwrap().lsn, 2);
         assert_eq!(idx.last_commit_lsn(), 3);
+    }
+
+    #[test]
+    fn frames_returns_every_indexed_page() {
+        let (_d, path) = tmp("frames.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.append(2, 1, 7, &page(0x10)).unwrap();
+        log.append(3, 2, 7, &page(0x20)).unwrap();
+        log.append(2, 3, 8, &page(0x11)).unwrap(); // page 2 latest = lsn 3
+        let idx = log.build_index(&|_| true).unwrap();
+        let mut got: Vec<(u64, u64)> = idx.frames().iter().map(|f| (f.page_id, f.lsn)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(2, 3), (3, 2)]);
     }
 
     #[test]
