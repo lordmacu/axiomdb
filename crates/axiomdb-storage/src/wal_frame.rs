@@ -21,7 +21,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use axiomdb_core::error::{classify_io, DbError};
-use axiomdb_storage::PAGE_SIZE;
+
+use crate::page::PAGE_SIZE;
 
 const MAGIC: u64 = 0x4158_494f_4d5f_5746; // "AXIOM_WF"
 const VERSION: u32 = 1;

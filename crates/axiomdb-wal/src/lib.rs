@@ -16,7 +16,6 @@ mod recovery;
 mod rotation;
 mod sync;
 mod txn;
-pub mod wal_frame;
 mod writer;
 
 pub use checkpoint::Checkpointer;
@@ -31,5 +30,4 @@ pub use txn::{
     decode_physical_loc, ConnectionTxn, IndexUndoRecord, Savepoint, TxnManager, UndoOp,
     PHYSICAL_LOC_LEN,
 };
-pub use wal_frame::{FrameLog, FrameRef, WalIndex};
 pub use writer::{WalWriter, WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
