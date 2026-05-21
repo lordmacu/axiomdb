@@ -661,6 +661,19 @@ impl StorageEngine for MmapStorage {
         if let Some(page) = self.buffer_pool.get(page_id) {
             return Ok(crate::page_ref::PageRef::from_arc(page));
         }
+        // Write-ahead miss path (project B, SQLite walFindFrame ordering): if the
+        // log is enabled and this page has a frame, its latest bytes live in the
+        // frame log — read them there, verify CRC, and cache. An empty index or a
+        // disabled log short-circuits to the mmap path below (= today's behavior),
+        // so warm reads never pay the index lookup.
+        if let Some(frame_log) = &self.frame_log {
+            if let Some(frame) = self.wal_index.latest(page_id) {
+                let bytes = frame_log.read_page_at(frame.offset)?;
+                let arc = Arc::new(Page::from_bytes(*bytes)?);
+                let arc = self.buffer_pool.insert(page_id, arc);
+                return Ok(crate::page_ref::PageRef::from_arc(arc));
+            }
+        }
         // Cold miss: take the mmap read lock, read straight into an Arc<Page>
         // (one alloc, one copy), verify its CRC32c once, then cache it.
         let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
@@ -1004,6 +1017,12 @@ impl MmapStorage {
         self.wal_index.latest(page_id).is_some()
     }
 
+    /// (diag/test) drop a page's cached copy, forcing the next read down the
+    /// miss path (frame log if enabled, else mmap).
+    pub fn evict_from_pool(&self, page_id: u64) {
+        self.buffer_pool.invalidate(page_id);
+    }
+
     /// Returns the number of currently free pages.
     pub fn free_count(&self) -> u64 {
         self.freelist
@@ -1316,5 +1335,61 @@ mod tests {
             0,
             "lsn stays 0 when redo is off"
         );
+    }
+
+    #[test]
+    fn read_after_write_served_from_frame_not_main() {
+        use std::os::unix::fs::FileExt;
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        s.enable_redo_log(&path).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0xD7;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        s.evict_from_pool(pid); // force the miss path
+        // Corrupt the MAIN file's copy of this page. If the read still returns the
+        // correct bytes, they came from the frame log (the mmap copy is now garbage
+        // and would fail its checksum).
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&[0xFFu8; 64], pid * PAGE_SIZE as u64).unwrap();
+        }
+        let got = s.read_page(pid).unwrap();
+        assert_eq!(
+            got.body()[0],
+            0xD7,
+            "served from the frame log, not the corrupt main file"
+        );
+    }
+
+    #[test]
+    fn pool_hit_returns_without_index() {
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        s.enable_redo_log(&path).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x42;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap(); // inserts the stamped page into the pool
+        let (hits_before, _) = s.buffer_pool_stats();
+        let got = s.read_page(pid).unwrap(); // pool hit — no index lookup
+        assert_eq!(got.body()[0], 0x42);
+        let (hits_after, _) = s.buffer_pool_stats();
+        assert_eq!(hits_after, hits_before + 1, "served from the pool (hit)");
+    }
+
+    #[test]
+    fn enabled_unwritten_page_reads_from_mmap() {
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        s.enable_redo_log(&path).unwrap();
+        // alloc_page pwrites a zeroed page but appends no frame in subphase 3.
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        assert!(!s.frame_index_contains(pid), "alloc appends no frame");
+        let got = s.read_page(pid).unwrap(); // index miss → mmap path
+        assert_eq!(got.header().page_id, pid);
     }
 }
