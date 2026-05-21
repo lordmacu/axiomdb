@@ -93,7 +93,7 @@ SIMD vectorization, parallelism, spill-to-disk, embedded C FFI / Python / Node.j
 ### Phase 10 ✅ (8/8) — Embedded: `Db` struct (open/execute/query/begin/commit/rollback), C FFI (15 `#[no_mangle]` functions), cdylib+staticlib, Python ctypes binding, Node.js koffi binding, embedded vs server benchmark (2.7× faster embedded for PK lookups), PreparedStatement Rust API (skip parse+analyze in tight loops)
 
 ### Phase 7 (deferred) — Concurrent embedded connections
-- [ ] 7.1 🔄 `SharedDb` + `Connection` — N concurrent readers, no global lock; MVCC snapshots per-connection; DDL catalog_lock only; spec: `specs/fase-07/spec-concurrent-embedded.md`
+- [x] 7.1 ✅ `SharedDb` + `Connection` — N concurrent readers, no global lock; MVCC snapshots per-connection; DDL catalog_lock only; `Connection::begin/commit/rollback`; schema_version cross-conn invalidation; Drop auto-rollback; 15 tests (8-thread concurrent); `shared_db.rs`
 - [ ] ⚠️ Multi-process embedded — multiple OS processes accessing the same `.db` file simultaneously (like SQLite WAL mode). Requires cross-process WAL coordination (fcntl file locks), shared-memory TxnManager state, and per-process buffer pool invalidation. Estimated 2-3 months. **Architecture answer: use axiomdb-server (wire protocol) for multi-process access.**
 
 ---

@@ -3,7 +3,7 @@
 Phase: 7 (deferred) — Concurrent embedded connections
 Task: SharedDb + Connection (Task 1 of sprint concurrent-embedded)
 Spec: specs/fase-07/spec-concurrent-embedded.md
-Status: in-progress
+Status: done
 
 ## Summary
 
