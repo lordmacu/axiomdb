@@ -1,0 +1,4 @@
+module CAxiomDB {
+    header "caxiomdb.h"
+    export *
+}
