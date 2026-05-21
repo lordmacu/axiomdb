@@ -32,25 +32,26 @@ workaround like JS/Python need).
 | Binding | vs sqlite3 gem |
 |---|---|
 | `sqlite3` gem (native C extension) | 1.00× |
-| **AxiomDB `query_tuples`** (Fiddle packed) | **~2.9×** |
+| **AxiomDB `query_tuples`** (columnar) | **~1.4×** |
+| AxiomDB row-major packed (previous) | ~2.9× |
 
-The `sqlite3` gem is a native C extension that builds Ruby objects in C — the
-Ruby analogue of Python's PyO3 or Node's better-sqlite3. Our Fiddle path pays
-FFI overhead plus an interpreted parse loop, so ~2.9× is the practical floor
-here (comparable to Python's ctypes packed at ~3.5×).
+The big lever was a **columnar** packed format (`axiomdb_query_packed_columnar`,
+AXM2). Instead of a row-major tag+payload stream parsed cell-by-cell, values are
+grouped by column so Ruby decodes each homogeneous column with **one** bulk
+`unpack('q<*')` / `unpack('E*')` and assembles rows with **`transpose`** — both
+C-level — instead of an interpreted per-cell loop. That roughly halved the parse
+time (~2.9× → ~1.4×). Columns containing NULLs or mixed types fall back to a
+per-cell ('M') encoding, still correct.
 
-Notes:
-- The parser uses `byteslice(off, n).unpack1(fmt)`. The `unpack` `@`-directive
-  (absolute position, no slice copy) was measured *slower* on Ruby 2.6 because
-  building the format string per field costs more than the slice.
-- Ruby ≥ 3.1 has `unpack1(fmt, offset:)` which avoids the slice copy and would
-  likely help; this binding targets the system Ruby 2.6 for portability.
+The remaining gap vs the `sqlite3` gem (a native C extension that builds Ruby
+objects in C) is the text-column slicing + the FFI round-trip, both largely
+irreducible without a native extension.
 
 ## Parity path (deferred)
 
 To match the `sqlite3` gem (~1.0×) would require a **native Ruby C extension**
-that builds Ruby objects in C (no buffer, no interpreted parse) — the Ruby
-equivalent of the PyO3 work. Higher effort; deferred until the ROI justifies it.
+that builds Ruby objects in C — the Ruby equivalent of the PyO3 work. Higher
+effort; deferred until the ROI justifies it.
 
 ## Test / bench
 

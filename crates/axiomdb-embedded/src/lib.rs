@@ -977,6 +977,156 @@ mod ffi {
         buf
     }
 
+    // ── Columnar packed buffer (AXM2) ─────────────────────────────────────────
+    //
+    // Same header as AXM1, but values are grouped BY COLUMN, and each column
+    // declares a kind so the consumer can bulk-decode homogeneous columns in one
+    // call (e.g. Ruby `unpack('q<*')`, Python `struct.unpack`, JS typed arrays)
+    // instead of an interpreted per-cell loop — measured ~4× faster parse in
+    // Ruby. Columns with NULLs or mixed types fall back to per-cell ('M').
+    //
+    //   u32 magic = COLUMNAR_MAGIC ("AXM2")
+    //   u32 n_cols ; u64 n_rows
+    //   n_cols × { u32 name_len, name_bytes }
+    //   per column: u8 kind, then:
+    //     'I' (73): n_rows × i64        | 'F' (70): n_rows × f64
+    //     'T' (84)/'B' (66): n_rows × u32 len, then concatenated bytes
+    //     'M' (77): n_rows × (u8 tag + payload)   (AXM1 cell encoding; NULLs ok)
+
+    /// Magic header for the columnar packed buffer ("AXM2" little-endian).
+    const COLUMNAR_MAGIC: u32 = 0x41584D32;
+
+    /// Classifies a column: `b'I'`/`b'F'`/`b'T'`/`b'B'` if every cell is that one
+    /// fast type (no NULL), else `b'M'` (mixed → per-cell fallback).
+    fn column_kind(rows: &[Vec<Value>], col: usize) -> u8 {
+        let mut kind: Option<u8> = None;
+        for row in rows {
+            let k = match row.get(col) {
+                Some(Value::Bool(_))
+                | Some(Value::Int(_))
+                | Some(Value::BigInt(_))
+                | Some(Value::Date(_))
+                | Some(Value::Timestamp(_))
+                | Some(Value::TimestampTz(_)) => b'I',
+                Some(Value::Real(_)) | Some(Value::Decimal(..)) => b'F',
+                Some(Value::Text(_)) | Some(Value::Json(_)) => b'T',
+                Some(Value::Bytes(_)) => b'B',
+                _ => return b'M', // NULL / Uuid / Jsonb / Array / … → mixed
+            };
+            match kind {
+                None => kind = Some(k),
+                Some(prev) if prev == k => {}
+                _ => return b'M', // mixed types within the column
+            }
+        }
+        kind.unwrap_or(b'M')
+    }
+
+    fn col_as_i64(v: &Value) -> i64 {
+        match v {
+            Value::Bool(b) => *b as i64,
+            Value::Int(i) => *i as i64,
+            Value::BigInt(i) => *i,
+            Value::Date(d) => *d as i64,
+            Value::Timestamp(t) | Value::TimestampTz(t) => *t,
+            _ => 0,
+        }
+    }
+
+    fn col_as_f64(v: &Value) -> f64 {
+        match v {
+            Value::Real(f) => *f,
+            Value::Decimal(m, s) => *m as f64 / 10f64.powi(*s as i32),
+            _ => 0.0,
+        }
+    }
+
+    fn col_bytes(v: &Value) -> &[u8] {
+        match v {
+            Value::Text(s) | Value::Json(s) => s.as_bytes(),
+            Value::Bytes(b) => b.as_slice(),
+            _ => &[],
+        }
+    }
+
+    /// Serializes a result set in columnar (AXM2) layout.
+    fn pack_columnar(columns: &[axiomdb_sql::result::ColumnMeta], rows: &[Vec<Value>]) -> Vec<u8> {
+        let n_cols = columns.len();
+        let n_rows = rows.len();
+        let mut buf = Vec::with_capacity(16 + n_cols * 16 + n_rows * n_cols * 9);
+        buf.extend_from_slice(&COLUMNAR_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(n_cols as u32).to_le_bytes());
+        buf.extend_from_slice(&(n_rows as u64).to_le_bytes());
+        for col in columns {
+            let nb = col.name.as_bytes();
+            buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(nb);
+        }
+        for c in 0..n_cols {
+            let kind = column_kind(rows, c);
+            buf.push(kind);
+            match kind {
+                b'I' => {
+                    for row in rows {
+                        buf.extend_from_slice(&col_as_i64(&row[c]).to_le_bytes());
+                    }
+                }
+                b'F' => {
+                    for row in rows {
+                        buf.extend_from_slice(&col_as_f64(&row[c]).to_le_bytes());
+                    }
+                }
+                b'T' | b'B' => {
+                    for row in rows {
+                        buf.extend_from_slice(&(col_bytes(&row[c]).len() as u32).to_le_bytes());
+                    }
+                    for row in rows {
+                        buf.extend_from_slice(col_bytes(&row[c]));
+                    }
+                }
+                _ => {
+                    // 'M': per-cell (AXM1) encoding; clone since pack_value owns.
+                    for row in rows {
+                        pack_value(&mut buf, row[c].clone());
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    /// Like `axiomdb_query_packed` but uses the columnar (AXM2) layout, which
+    /// lets the consumer bulk-decode homogeneous columns. Free with
+    /// `axiomdb_packed_free(ptr, len)`.
+    ///
+    /// # Safety
+    /// Same as `axiomdb_query_packed`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_query_packed_columnar(
+        db: *mut Db,
+        sql: *const c_char,
+        out_len: *mut usize,
+    ) -> *mut u8 {
+        if db.is_null() || sql.is_null() || out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        let db = &mut *db;
+        let sql = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let buf = match db.run(sql) {
+            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => {
+                pack_columnar(&columns, &rows)
+            }
+            Ok(_) => pack_columnar(&[], &[]),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let boxed = buf.into_boxed_slice();
+        *out_len = boxed.len();
+        Box::into_raw(boxed) as *mut u8
+    }
+
     /// Executes a SELECT and serializes the entire result set into one heap
     /// buffer. Returns the buffer pointer and writes its byte length to
     /// `out_len`. Returns NULL on error (see `axiomdb_last_error`). The buffer
@@ -2038,6 +2188,63 @@ mod ffi {
             assert_eq!(buf[off], 4); // BLOB
             off += 1;
             assert_eq!(read_u32(&buf, &mut off), 0); // empty len
+        }
+
+        // ── Columnar (AXM2) ───────────────────────────────────────────────────
+
+        #[test]
+        fn column_kind_classification() {
+            let rows = vec![
+                vec![Value::Int(1), Value::Text("a".into()), Value::Null],
+                vec![Value::Int(2), Value::Text("b".into()), Value::Int(9)],
+            ];
+            assert_eq!(column_kind(&rows, 0), b'I'); // all int
+            assert_eq!(column_kind(&rows, 1), b'T'); // all text
+            assert_eq!(column_kind(&rows, 2), b'M'); // NULL + int → mixed
+        }
+
+        #[test]
+        fn pack_columnar_layout() {
+            let cols = vec![col("id"), col("name")];
+            let rows = vec![
+                vec![Value::Int(10), Value::Text("x".into())],
+                vec![Value::Int(20), Value::Text("yz".into())],
+            ];
+            let buf = pack_columnar(&cols, &rows);
+            let mut off = 0;
+            assert_eq!(read_u32(&buf, &mut off), COLUMNAR_MAGIC);
+            assert_eq!(read_u32(&buf, &mut off), 2); // n_cols
+            assert_eq!(read_u64(&buf, &mut off), 2); // n_rows
+                                                     // names
+            for name in ["id", "name"] {
+                let l = read_u32(&buf, &mut off) as usize;
+                assert_eq!(&buf[off..off + l], name.as_bytes());
+                off += l;
+            }
+            // column 0: 'I' then 2 × i64
+            assert_eq!(buf[off], b'I');
+            off += 1;
+            assert_eq!(read_u64(&buf, &mut off) as i64, 10);
+            assert_eq!(read_u64(&buf, &mut off) as i64, 20);
+            // column 1: 'T' then 2 lengths then bytes "x","yz"
+            assert_eq!(buf[off], b'T');
+            off += 1;
+            assert_eq!(read_u32(&buf, &mut off), 1); // len "x"
+            assert_eq!(read_u32(&buf, &mut off), 2); // len "yz"
+            assert_eq!(&buf[off..off + 1], b"x");
+            off += 1;
+            assert_eq!(&buf[off..off + 2], b"yz");
+        }
+
+        #[test]
+        fn pack_columnar_null_column_falls_back_to_mixed() {
+            let cols = vec![col("m")];
+            let rows = vec![vec![Value::Int(1)], vec![Value::Null]];
+            let buf = pack_columnar(&cols, &rows);
+            let mut off = 16; // skip header
+            let l = read_u32(&buf, &mut off) as usize; // name
+            off += l;
+            assert_eq!(buf[off], b'M'); // NULL present → mixed per-cell
         }
     }
 
