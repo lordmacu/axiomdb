@@ -163,6 +163,7 @@ pub fn truncate_table_unchecked_on_open(
     table: &ResolvedTable,
 ) -> Result<(), DbError> {
     let mut conn_txn = txn.begin()?;
+    let _txn_stamp = TxnStamp::new(storage, conn_txn.txn_id);
     let snap = txn.active_snapshot(&conn_txn);
     let all_indexes: Vec<axiomdb_catalog::IndexDef> = table
         .indexes

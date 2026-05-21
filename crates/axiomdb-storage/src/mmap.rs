@@ -897,6 +897,10 @@ impl StorageEngine for MmapStorage {
         CURRENT_TXN.with(|c| c.set(txn_id));
     }
 
+    fn current_txn(&self) -> u64 {
+        CURRENT_TXN.with(|c| c.get())
+    }
+
     fn sync_frame_log(&self) -> Result<(), DbError> {
         if let Some(fl) = &self.frame_log {
             fl.sync()?;

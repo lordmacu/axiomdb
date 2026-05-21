@@ -68,6 +68,8 @@ fn next_sequence_value(
     name: &str,
 ) -> Result<i64, DbError> {
     let mut conn = txn.begin()?;
+    // Sub-txn: stamp its own id for frame writes; restored to the parent's on drop.
+    let _txn_stamp = TxnStamp::new(storage, conn.txn_id);
     let snap = txn.active_snapshot(&conn);
     let mut reader = CatalogReader::new(storage, snap)?;
     let mut def = reader

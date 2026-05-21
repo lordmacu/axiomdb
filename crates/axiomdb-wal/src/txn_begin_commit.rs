@@ -79,15 +79,6 @@ impl TxnManager {
         })
     }
 
-    /// Commits the transaction: writes the Commit WAL entry, fsyncs (or defers),
-    /// advances `max_committed`, and removes the txn from the active set.
-    ///
-    /// Returns `Some(txn_id)` when the commit is deferred (pipeline mode) and
-    /// the caller must drive the fsync pipeline. Returns `None` for immediate
-    /// commits or read-only transactions.
-    ///
-    /// # Errors
-    /// - I/O errors from WAL write or fsync.
     /// Commits and makes the page-frame redo log durable first (write-ahead order:
     /// the txn's data frames are `fsync`'d BEFORE the logical `Commit` record, so
     /// recovery never sees a committed txn whose frames are missing). This is the
@@ -102,6 +93,15 @@ impl TxnManager {
         self.commit(conn_txn)
     }
 
+    /// Commits the transaction: writes the Commit WAL entry, fsyncs (or defers),
+    /// advances `max_committed`, and removes the txn from the active set.
+    ///
+    /// Returns `Some(txn_id)` when the commit is deferred (pipeline mode) and
+    /// the caller must drive the fsync pipeline. Returns `None` for immediate
+    /// commits or read-only transactions.
+    ///
+    /// # Errors
+    /// - I/O errors from WAL write or fsync.
     pub fn commit(&self, mut conn_txn: ConnectionTxn) -> Result<Option<TxnId>, DbError> {
         let txn_id = conn_txn.txn_id;
 

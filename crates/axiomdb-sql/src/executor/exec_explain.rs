@@ -8,6 +8,8 @@ fn dispatch(
     txn: &TxnManager,
     conn_txn: &mut ConnectionTxn,
 ) -> Result<QueryResult, DbError> {
+    // Stamp the active txn so page frames written by this statement carry it (redo).
+    let _txn_stamp = TxnStamp::new(storage, conn_txn.txn_id);
     match stmt {
         Stmt::Select(s) => execute_select(s, storage, txn, Some(conn_txn)),
         Stmt::SetOp { .. } => Err(DbError::NotImplemented {

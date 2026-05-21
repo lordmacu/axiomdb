@@ -1,3 +1,26 @@
+/// RAII guard that stamps the active transaction id so page-frame writes carry it
+/// (project B REDO). **Save/restore** (not reset-to-0) so a nested sub-transaction
+/// (a `nextval`/cron sub-txn running inside a statement) stamps its own id and then
+/// restores the parent's on drop. Panic-safe (the restore runs on unwind too).
+struct TxnStamp<'a> {
+    storage: &'a dyn StorageEngine,
+    prev: u64,
+}
+
+impl<'a> TxnStamp<'a> {
+    fn new(storage: &'a dyn StorageEngine, txn_id: u64) -> Self {
+        let prev = storage.current_txn();
+        storage.set_current_txn(txn_id);
+        TxnStamp { storage, prev }
+    }
+}
+
+impl Drop for TxnStamp<'_> {
+    fn drop(&mut self) {
+        self.storage.set_current_txn(self.prev);
+    }
+}
+
 /// Routes a statement to its handler using a `SessionContext` for schema caching.
 ///
 /// `ctx.conn_txn` remains the single source of truth for the active connection
@@ -12,6 +35,11 @@ fn dispatch_ctx(
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
     let bloom = exec_ctx.bloom();
+    // Stamp the active txn so page frames written by this statement carry it.
+    let _txn_stamp = ctx
+        .conn_txn
+        .as_ref()
+        .map(|c| TxnStamp::new(storage, c.txn_id));
 
     // Flush staged inserts before any non-INSERT barrier statement.
     // INSERT statements handle same-table vs. different-table flush internally.

@@ -103,6 +103,14 @@ pub trait StorageEngine: Send + Sync {
     /// it to 0 at statement end. `0` = non-transactional / system write. Default no-op.
     fn set_current_txn(&self, _txn_id: u64) {}
 
+    /// Reads the current transaction id (thread-local in `MmapStorage`). The
+    /// executor uses it to save/restore the stamp around nested sub-transactions
+    /// (a `nextval`/cron sub-txn must stamp its own id, then restore the parent's).
+    /// Default `0`.
+    fn current_txn(&self) -> u64 {
+        0
+    }
+
     /// Makes the page-frame redo log durable (fsync) at the commit boundary, before
     /// the logical WAL `Commit` record (write-ahead: data before the commit record).
     /// Default no-op (backend without a redo log).

@@ -60,6 +60,8 @@ fn cron_schedule_fn(
     };
 
     let mut conn = runner.txn.begin()?;
+    // Sub-txn: stamp its own id for frame writes; restored to the parent's on drop.
+    let _txn_stamp = TxnStamp::new(runner.storage, conn.txn_id);
     let mut writer = CatalogWriter::new(runner.storage, runner.txn, &mut conn)?;
     writer.upsert_cron_job(def)?;
     if let Some(txn_id) = runner.txn.commit_durable(conn, runner.storage)? {
@@ -84,6 +86,8 @@ fn cron_unschedule_fn(
     let name = eval_text_arg("cron_unschedule", "name", &args[0], row, runner)?;
 
     let mut conn = runner.txn.begin()?;
+    // Sub-txn: stamp its own id for frame writes; restored to the parent's on drop.
+    let _txn_stamp = TxnStamp::new(runner.storage, conn.txn_id);
     let mut writer = CatalogWriter::new(runner.storage, runner.txn, &mut conn)?;
     let deleted = writer.delete_cron_job(&name)?;
     if let Some(txn_id) = runner.txn.commit_durable(conn, runner.storage)? {
@@ -119,6 +123,8 @@ fn cron_set_enabled_fn(
     def.enabled = enabled;
 
     let mut conn = runner.txn.begin()?;
+    // Sub-txn: stamp its own id for frame writes; restored to the parent's on drop.
+    let _txn_stamp = TxnStamp::new(runner.storage, conn.txn_id);
     let mut writer = CatalogWriter::new(runner.storage, runner.txn, &mut conn)?;
     writer.upsert_cron_job(def)?;
     if let Some(txn_id) = runner.txn.commit_durable(conn, runner.storage)? {
