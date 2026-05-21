@@ -731,3 +731,126 @@ applied as a compiled predicate) lifts <code>SELECT * ... WHERE</code> on a
 clustered table ~2.75× and brings it within ~1.2× of SQLite.
 </div>
 </div>
+
+## SQLite read-parity push (2026-05) — point_lookup, range_scan, count_star
+
+A focused round closing the remaining read gaps vs SQLite, all engine-to-engine
+(pure Rust, SQLite via `rusqlite` `bundled`, same process, both materialize every
+column). **Reported on macOS native** — the deployment-representative host for
+scan perf (see "Where you run matters" below).
+
+### Results — macOS native, median of 5 `--compare --rows 10000`
+
+| Read scenario | Ratio (AxiomDB÷SQLite) | Verdict |
+|---|---:|---|
+| count_star | **0.29×** | 🚀 ~3.4× faster |
+| full_scan | **0.78×** | ✅ faster |
+| range_scan | **0.79×** | ✅ faster (was ~1.3×) |
+| select_where | **0.92×** | ✅ faster |
+| group_by | 1.00× | ✅ parity |
+| crud_flow/select | 1.10× | ~parity |
+| point_lookup | 2.10× | 🔶 behind (was 4.2×; ~2× remains) |
+
+Writes remain a separate frontier: insert ~4–8×, `crud_flow/delete` ~230×
+(structural — SQLite's `DELETE`-all is an O(1) truncate).
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Advantage — parity-or-faster on every read except point_lookup</span>
+On native hardware AxiomDB matches or beats SQLite on full_scan, range_scan,
+select_where, group_by and count_star (3.4× faster). The one remaining read gap
+is the single-row point lookup (~2×).
+</div>
+</div>
+
+### What changed (and the SQLite technique behind each)
+
+1. **Buffer-pool page cache → point_lookup ~10×.** A 16-shard clock-sweep
+   `BufferPool` wired into `MmapStorage::read_page`; hits return an `Arc::clone`
+   of the cached `Arc<Page>` (no mmap lock / 16 KB copy / CRC). The hot upper
+   B-tree pages (root + internals) stop being re-materialized per lookup.
+   SQLite analog: `pcache` zero-copy `PgHdr` reuse. Code: `crates/axiomdb-storage/src/{buffer_pool,page_ref,mmap}.rs`.
+2. **Precise range bounds + skip covered re-eval → range_scan ~1.3×→0.79×.**
+   The planner now carries each bound's inclusive/exclusive strictness plus a
+   `covers_predicate` flag; the clustered range scan honors `Bound::Excluded`,
+   and the executor skips the per-row `WHERE` recheck when the range reproduces
+   the whole predicate. SQLite analog: `OP_SeekGE/GT/LE/LT` (exact boundaries) +
+   `disableTerm`/`TERM_CODED` (index-covered terms not re-checked). Code:
+   `crates/axiomdb-sql/src/{planner_select,planner_types,table}.rs`,
+   `executor/select_ctx.rs`.
+3. **Read-only snapshot path for autocommit SELECTs → count_star 1.2×→0.29×,
+   point_lookup 4.2×→2.1×.** An autocommit `SELECT` used to open+commit a write
+   `ConnectionTxn` around a read (pure overhead). It now runs from a snapshot via
+   the read-only executor when there is no open `conn_txn` (no staged writes to
+   miss); the write-capable path is kept inside explicit transactions. SQLite
+   analog: a SELECT runs in a read transaction (no journal/WAL write). Code:
+   `crates/axiomdb-embedded/src/lib.rs` (`run_inner` + `PreparedStatement::execute`).
+4. **13 wire-protocol correctness fixes** (JSON_TABLE NESTED metadata, TABLESAMPLE
+   SYSTEM(0), holiday-calendar / exchange-rate read-your-own-writes, stale view /
+   JSONB test expectations) — see `docs/checkpoint-sqlite-parity.md`.
+
+### How to measure (exact commands)
+
+```bash
+# Build the comparison harness. For SCAN perf, build + run on macOS NATIVE
+# (not Lima — see below); for point_lookup/writes/correctness Lima is fine.
+cargo build --release -p axiomdb-bench-comparison
+
+# Full table vs SQLite (both materialize; count_star + point_lookup use prepared
+# statements on both engines — apples-to-apples). macOS is ±60% noisy: run ~5×.
+target/release/axiomdb_bench --compare --rows 10000
+
+# Steady-state diagnostics (load once, loop the op, sample /proc page faults):
+target/release/axiomdb_bench --scenario full_scan   --diagnose-scan  --rows 10000
+target/release/axiomdb_bench --scenario point_lookup --diagnose-point --rows 10000
+```
+
+`--diagnose-scan` prints per-row ns + minor/major page faults per scan
+(≈0 faults ⇒ the warm scan is served from the buffer pool, never touching mmap).
+`--diagnose-point` prints per-lookup ns for both AxiomDB paths (`db.query`
+re-parse vs `PreparedStatement` reuse).
+
+### Where you run matters — macOS native vs Lima VM
+
+| | full_scan AxiomDB | full_scan SQLite |
+|---|---:|---:|
+| macOS native | ~9–10M ops/s | ~7.7M |
+| Lima VM | ~3M ops/s | ~8M |
+
+<div class="callout callout-design">
+<span class="callout-icon">⚙️</span>
+<div class="callout-body">
+<span class="callout-label">Measure scans on macOS native, not in the VM</span>
+In the Lima VM, AxiomDB <em>scans</em> run ~3× slower than native while SQLite is
+unchanged — a host-dependent effect, <strong>mechanism unconfirmed (NOT mmap):</strong>
+<code>--diagnose-scan</code> shows the warm scan is a buffer-pool hit with
+<strong>0 page faults</strong>, so faults/mmap are not the cause (candidates:
+allocator / atomics / memory bandwidth under virtualization). Use Lima for
+point_lookup, writes and correctness; use macOS native for scan throughput, which
+is representative of bare-metal deployment.
+</div>
+</div>
+
+### Rust API vs Python API
+
+- **Rust embedded API** (`axiomdb-embedded` `Db` / `PreparedStatement`): the
+  numbers above. For repeated queries use **prepared statements** (`Db::prepare`
+  + `execute`) — they skip per-call parse, matching SQLite's `prepare`/`step`.
+  Raw `db.query(sql)` re-parses every call (it stays ~parse-bound: point_lookup
+  ~10 µs vs ~4 µs prepared).
+- **Python API** (`bindings/python/axiomdb.py`, `ctypes`): **still ~3–14× slower
+  than SQLite — NOT the engine.** `query()` makes ~2 ctypes calls per cell
+  (~120K FFI crossings for a 10K×6 result) → ~37× binding overhead vs the engine.
+  This is the biggest embedded-Python lever and is **not yet done**; the fix is a
+  native PyO3 extension (compiled CPython module, as SQLite/DuckDB/polars do),
+  optionally a batch-buffer FFI as an interim step.
+
+### Remaining read work
+
+- **point_lookup (~2×):** `PreparedStatement::execute` still clones the analyzed
+  AST and re-runs the planner per call. Next lever ("B1"): cache the resolved
+  `AccessMethod` in the prepared statement and dispatch the lookup without cloning
+  — SQLite's compiled-VDBE "compile once, bind + step" model. Target: parity or
+  faster (the engine lookup itself is already ~2–3 µs).
+- **Writes:** insert path (WAL per-row) and the structural `DELETE`-all gap.
