@@ -179,11 +179,21 @@ fn execute_create_index(
     let snap = txn.active_snapshot(conn_txn);
 
     // 1. Resolve table definition + column list.
-    let (table_def, col_defs) = {
+    let (mut table_def, col_defs) = {
         let mut resolver = make_resolver_with_database(storage, txn, Some(conn_txn), database)?;
         let resolved = resolver.resolve_table(Some(schema), &stmt.table.name)?;
         (resolved.def.clone(), resolved.columns.clone())
     };
+    // Clustered tables track the live root page in memory; the catalog
+    // `root_page_id` lags after page splits. The bulk-build scan below MUST start
+    // from the live root, or it scans a stale (pre-split) root and indexes zero
+    // rows. Mirror the connection-local lookup used by clustered DML/DELETE.
+    if table_def.is_clustered() {
+        table_def.root_page_id = txn
+            .clustered_root_for_conn(conn_txn, table_def.id)
+            .or_else(|| txn.clustered_root(table_def.id))
+            .unwrap_or(table_def.root_page_id);
+    }
     // 2. Check for a duplicate index name on this table.
     {
         let mut reader = CatalogReader::new(storage, snap.clone())?;

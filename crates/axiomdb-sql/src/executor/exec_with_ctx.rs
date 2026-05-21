@@ -165,7 +165,19 @@ pub fn execute_with_ctx_locked(
                 ctx.close_all_cursors();
                 ctx.savepoints.clear();
                 let pre_tid = ctx.conn_txn.as_ref().expect("conn_txn: checked by is_some() guard").txn_id;
-            commit_active_txn(txn, storage, bloom, ctx)?;
+            let pre_ddl_pending = commit_active_txn(txn, storage, bloom, ctx)?;
+            // DDL is a hard commit boundary: the statement below runs in a fresh
+            // transaction (started further down) and must observe the rows just
+            // committed — e.g. CREATE INDEX bulk-builds over existing rows. In
+            // deferred (group-commit) mode the commit above removes the txn from
+            // the active set but does NOT advance `max_committed`; that is
+            // normally driven by the network layer only AFTER this call returns.
+            // Drive it here so the new DDL snapshot sees the pre-DDL writes.
+            if let Some(pending) = pre_ddl_pending {
+                txn.wal_flush_and_fsync()?;
+                txn.advance_committed_single(pending);
+                txn.release_committed_frees(storage, &[pending])?;
+            }
             txn.release_immediate_committed_frees(storage, pre_tid)?;
             txn.drain_committed_page_batches(storage)?;
             if let Some(lm) = lock_mgr { lm.release_all_for_txn(pre_tid); }
