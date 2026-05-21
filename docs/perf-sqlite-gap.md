@@ -1727,3 +1727,59 @@ path; the macOS bench just couldn't show it.
 - **Lesson 2:** don't conclude "neutral" from a noisy host. The macOS-native
   wire bench (±60%) hid a real 1.78×; the Lima VM showed it cleanly. Match the
   benchmark host to the signal size.
+
+## Embedded scan engine vs SQLite — fair measurement + scan Tier 1 (2026-05-20)
+
+### The ctypes binding, not the engine, was the embedded bottleneck
+
+The Python embedded bench (`benches/sqlite_vs_axiomdb/bench.py`) showed AxiomDB
+full-scan at ~120K rows/s vs SQLite ~1.3M (~11×). Measured **engine-to-engine**
+in pure Rust (`axiomdb_bench --compare`; SQLite via `rusqlite`), the AxiomDB
+engine scans at ~4M rows/s — the `ctypes` binding adds ~37× overhead vs the
+`sqlite3` C extension's ~9×. For the embedded-Python use case the binding
+(a PyO3 native module / batched row transfer across the FFI) is the #1 lever,
+not the engine.
+
+### Benchmark fairness: materialize on both sides
+
+The Rust `--compare` originally counted SQLite rows by stepping
+(`rows.next()`) without extracting columns. SQLite's lazy `OP_Column` never
+materializes unaccessed TEXT, so the scan was "SQLite-lazy-step vs
+AxiomDB-eager-materialize." `SqliteDb::sql_count` now extracts every column
+(owned `String` for TEXT), matching `db.query() -> Vec<Row>`.
+
+### Scan Tier 1 + fair comparison: full scan now ties SQLite
+
+Tier 1 (skip the `SELECT *` projection double-clone in `execute_select_ctx` —
+the wildcard arm cloned every already-decoded row a second time) lifted the
+engine full-scan from ~2.5M to ~4.0M rows/s. With the fair (materialize-both)
+comparison:
+
+| Scenario | AxiomDB | SQLite | Ratio |
+|---|---:|---:|---:|
+| full_scan | 3.92M | 3.84M | **0.98× (AxiomDB faster)** |
+| crud_flow/select | 3.24M | 3.92M | 1.21× |
+| count_star | 127K | 170K | 1.34× |
+| group_by | 548 | 720 | 1.31× |
+| range_scan | 1.87M | 3.64M | 1.95× |
+| select_where | 2.14M | 7.37M | 3.45× |
+| point_lookup | 16.3K | 117K | 7.23× |
+
+Reads are now competitive (full scan wins; count/group/crud-select within 1.3×).
+Remaining read gaps and the SQLite technique each needs:
+
+- **select_where (3.45×)** — SQLite materializes only the rows that pass the
+  predicate; AxiomDB decodes ALL rows then `retain`-filters, wasting String
+  allocs on rejected rows. Adopt lazy/filtered decode (technique #4: decode the
+  predicate column first, filter, materialize survivors only).
+- **point_lookup (7.23×)** — fixed per-query overhead (parse + analyze +
+  ResolvedTable build + execute setup) dominates a 1-row query; SQLite's
+  prepared-statement + tight VDBE pays far less. Target the per-query setup.
+- **range_scan (1.95×)** — between full_scan and select_where.
+
+Write paths (insert 5–37×, delete 74×) are a separate investigation.
+
+- **Lesson 3:** an unfair benchmark sends you optimizing the wrong thing. Verify
+  both engines do the SAME work (here: both must materialize columns) before
+  trusting a ratio. The scan engine was never 11× behind — that was the binding
+  plus a lazy-vs-eager mismatch.

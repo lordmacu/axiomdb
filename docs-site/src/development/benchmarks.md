@@ -676,3 +676,36 @@ SRFs, JOINs, LIMIT, and OFFSET are restored correctly on cache hits.
 After A23b, both the embedded <code>Db</code> API and MySQL wire clients share the same statement-cache fast path. A repeated <code>SELECT * FROM t WHERE pk = ?</code> over the wire pays only for: network parse, one literal extraction, one shape hash, one epoch check, and the B-Tree descent — no CatalogReader, no HeapChain scan per query.
 </div>
 </div>
+
+## Embedded scan vs SQLite — engine, binding, and fair measurement
+
+Two corrections to earlier embedded numbers:
+
+1. **The ctypes Python binding, not the engine, dominated the embedded gap.**
+   Engine-to-engine (pure Rust, SQLite via `rusqlite`), AxiomDB scans at ~4M
+   rows/s; the `ctypes` binding throttles it to ~120K (~37× overhead). For the
+   embedded-Python use case, a native (PyO3) binding is the biggest lever.
+
+2. **Fair comparison: both engines must materialize columns.** The harness
+   originally let SQLite step rows without extracting columns (its lazy
+   `OP_Column` skips unaccessed TEXT). With both materializing:
+
+   | Scenario | AxiomDB | SQLite | Ratio |
+   |---|---:|---:|---:|
+   | full_scan | 3.92M | 3.84M | **0.98× (faster)** |
+   | crud_flow/select | 3.24M | 3.92M | 1.21× |
+   | count_star | 127K | 170K | 1.34× |
+   | range_scan | 1.87M | 3.64M | 1.95× |
+   | select_where | 2.14M | 7.37M | 3.45× |
+   | point_lookup | 16.3K | 117K | 7.23× |
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Advantage — Full-scan engine parity with SQLite</span>
+After the scan Tier 1 optimization (skipping the redundant <code>SELECT *</code>
+projection clone), AxiomDB's full-table-scan engine throughput (~3.9M rows/s)
+matches SQLite's when both engines materialize every column. The remaining read
+gaps are point lookups (per-query overhead) and filtered scans (decode-then-filter).
+</div>
+</div>

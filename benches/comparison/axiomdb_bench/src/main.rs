@@ -723,9 +723,33 @@ impl SqliteDb {
 
     fn sql_count(&self, q: &str) -> usize {
         let mut stmt = self.conn.prepare_cached(q).expect("prepare");
+        let ncol = stmt.column_count();
         let mut rows = stmt.query([]).expect("query");
         let mut n = 0usize;
-        while rows.next().expect("next").is_some() {
+        // Materialize EVERY column per row (owned String for TEXT) so this is
+        // apples-to-apples with AxiomDB's `db.query()` -> Vec<Row>, which decodes
+        // and allocates all columns. Without this, SQLite's lazy OP_Column never
+        // touches the TEXT columns when we only step+count, making the scan
+        // comparison unfair (it would measure SQLite-lazy-step vs AxiomDB-eager).
+        while let Some(row) = rows.next().expect("next") {
+            for i in 0..ncol {
+                match row.get_ref(i).expect("get_ref") {
+                    rusqlite::types::ValueRef::Text(t) => {
+                        let s = std::str::from_utf8(t).expect("utf8").to_string();
+                        std::hint::black_box(s);
+                    }
+                    rusqlite::types::ValueRef::Integer(v) => {
+                        std::hint::black_box(v);
+                    }
+                    rusqlite::types::ValueRef::Real(v) => {
+                        std::hint::black_box(v);
+                    }
+                    rusqlite::types::ValueRef::Blob(b) => {
+                        std::hint::black_box(b.len());
+                    }
+                    rusqlite::types::ValueRef::Null => {}
+                }
+            }
             n += 1;
         }
         n

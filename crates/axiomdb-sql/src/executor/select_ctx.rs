@@ -1077,24 +1077,37 @@ fn execute_select_ctx(
         }
 
         let out_cols = build_select_column_meta(&stmt.columns, &resolved.columns, &resolved.def)?;
-        let mut proj_cache_ctx: SubqueryCache = HashMap::new();
-        let mut proj_in_set_ctx: InSetCache = HashMap::new();
-        let mut proj_corr_ctx: CorrelatedCache = HashMap::new();
-        let mut proj_mat_ctx: MaterializedCache = HashMap::new();
-        let mut rows = project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, v| {
-            let mut runner = ExecSubqueryRunner {
-                storage: exec_ctx.storage(),
-                txn: exec_ctx.coord(),
-                bloom: exec_ctx.bloom(),
-                ctx,
-                outer_row: v,
-                cache: Some(&mut proj_cache_ctx),
-                in_set_cache: Some(&mut proj_in_set_ctx),
-                correlated_cache: Some(&mut proj_corr_ctx),
-                materialized: Some(&mut proj_mat_ctx),
-            };
-            eval_with(expr, v, &mut runner)
-        })?;
+        // Fast path: a bare `SELECT *` is the identity projection over the
+        // already-decoded rows. `project_rows_with_window_support` would clone
+        // every row — and every heap value in it (Strings, arrays) — a SECOND
+        // time via `extend_from_slice` (see shared.rs). Skip it entirely and
+        // move `combined_rows` straight through. Saves ~1 Vec + N heap-value
+        // clones per row on the hot full-scan / range-scan path.
+        let mut rows = if stmt.columns.len() == 1
+            && matches!(stmt.columns[0], SelectItem::Wildcard)
+        {
+            combined_rows
+        } else {
+            let mut proj_cache_ctx: SubqueryCache = HashMap::new();
+            let mut proj_in_set_ctx: InSetCache = HashMap::new();
+            let mut proj_corr_ctx: CorrelatedCache = HashMap::new();
+            let mut proj_mat_ctx: MaterializedCache = HashMap::new();
+            project_rows_with_window_support(&stmt.columns, &combined_rows, |expr, v| {
+                let mut runner = ExecSubqueryRunner {
+                    storage: exec_ctx.storage(),
+                    txn: exec_ctx.coord(),
+                    bloom: exec_ctx.bloom(),
+                    ctx,
+                    outer_row: v,
+                    cache: Some(&mut proj_cache_ctx),
+                    in_set_cache: Some(&mut proj_in_set_ctx),
+                    correlated_cache: Some(&mut proj_corr_ctx),
+                    materialized: Some(&mut proj_mat_ctx),
+                };
+                eval_with(expr, v, &mut runner)
+            })?
+        };
+        // No-op for a bare wildcard (no UNNEST items); kept for the else branch.
         rows = expand_unnest_rows(&stmt.columns, rows);
 
         if stmt.distinct {
