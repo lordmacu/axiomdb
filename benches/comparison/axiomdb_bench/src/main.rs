@@ -1214,6 +1214,65 @@ fn fmt_ops_s(n: usize, s: f64) -> String {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+/// Diagnose where a WARM full_scan spends time, and whether it touches mmap.
+/// Loads once, warms the buffer pool, then loops the scan while sampling
+/// minor/major page faults from /proc/self/stat. ≈0 faults/scan ⇒ the warm
+/// scan is served from the buffer pool (no mmap) ⇒ the cost is CPU/memory, not
+/// page faults.
+fn diagnose_scan(data_dir: &Path, n_rows: usize) {
+    fn read_faults() -> (u64, u64) {
+        // /proc/self/stat: after the `comm` field (in parens), token[7] = minflt,
+        // token[9] = majflt (0-based, counting from the first field after `)`).
+        let s = match std::fs::read_to_string("/proc/self/stat") {
+            Ok(s) => s,
+            Err(_) => return (0, 0),
+        };
+        let rp = match s.rfind(')') {
+            Some(i) => i,
+            None => return (0, 0),
+        };
+        let rest: Vec<&str> = s[rp + 1..].split_whitespace().collect();
+        let minflt = rest.get(7).and_then(|x| x.parse().ok()).unwrap_or(0);
+        let majflt = rest.get(9).and_then(|x| x.parse().ok()).unwrap_or(0);
+        (minflt, majflt)
+    }
+
+    let mut db = db_open(data_dir);
+    reset(&mut db);
+    let inserts = gen_inserts(n_rows);
+    load_batch(&mut db, &inserts);
+
+    for _ in 0..3 {
+        let _ = db.query("SELECT * FROM bench_users").expect("warmup scan");
+    }
+
+    let loops = 500usize;
+    let (min0, maj0) = read_faults();
+    let t0 = Instant::now();
+    let mut total_rows = 0usize;
+    for _ in 0..loops {
+        total_rows += db.query("SELECT * FROM bench_users").expect("scan").len();
+    }
+    let elapsed = t0.elapsed();
+    let (min1, maj1) = read_faults();
+
+    let per_scan_us = elapsed.as_secs_f64() * 1e6 / loops as f64;
+    let per_row_ns = elapsed.as_secs_f64() * 1e9 / total_rows as f64;
+    println!("── full_scan diagnose (WARM, {n_rows} rows, {loops} loops) ──");
+    println!("  rows/scan:         {}", total_rows / loops);
+    println!("  per-scan:          {per_scan_us:.1} µs");
+    println!("  per-row:           {per_row_ns:.2} ns");
+    println!(
+        "  minor faults/scan: {:.3}",
+        (min1.saturating_sub(min0)) as f64 / loops as f64
+    );
+    println!(
+        "  major faults/scan: {:.3}",
+        (maj1.saturating_sub(maj0)) as f64 / loops as f64
+    );
+    println!("  (≈0 faults/scan ⇒ warm scan served from buffer pool, NOT mmap)");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -1265,7 +1324,9 @@ fn main() {
         }
     }
 
-    if args.contains(&"--diagnose".to_string()) {
+    if args.contains(&"--diagnose-scan".to_string()) {
+        diagnose_scan(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose".to_string()) {
         diagnose(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-insert".to_string()) {
         diagnose_insert(&data_dir, n_rows);
