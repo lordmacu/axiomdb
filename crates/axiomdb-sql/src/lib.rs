@@ -47,6 +47,7 @@ pub mod trigram;
 pub mod unnest;
 pub mod vacuum;
 pub mod values_clause;
+#[cfg(feature = "xml")]
 pub mod xml_table;
 
 pub use ast::{

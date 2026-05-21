@@ -101,20 +101,40 @@ fn dispatch_ctx(
         }
         // Phase 20.5: COPY FROM / TO
         Stmt::CopyFrom(s) => {
-            let mut conn = ctx.conn_txn.take().expect("conn_txn set");
-            let r = execute_copy_from(s, exec_ctx, &mut conn, ctx);
-            ctx.conn_txn = Some(conn);
-            let result = r?;
-            // COPY FROM inserts rows and may cause B-tree root splits;
-            // clear epoch marks so the next access re-validates.
-            ctx.clear_table_epoch_cache();
-            Ok(result)
+            #[cfg(not(feature = "import-export"))]
+            {
+                let _ = s;
+                return Err(DbError::NotImplemented {
+                    feature: "COPY FROM (compile with import-export feature to enable)".into(),
+                });
+            }
+            #[cfg(feature = "import-export")]
+            {
+                let mut conn = ctx.conn_txn.take().expect("conn_txn set");
+                let r = execute_copy_from(s, exec_ctx, &mut conn, ctx);
+                ctx.conn_txn = Some(conn);
+                let result = r?;
+                // COPY FROM inserts rows and may cause B-tree root splits;
+                // clear epoch marks so the next access re-validates.
+                ctx.clear_table_epoch_cache();
+                Ok(result)
+            }
         }
         Stmt::CopyTo(s) => {
-            let conn_opt = ctx.conn_txn.take();
-            let r = execute_copy_to(s, exec_ctx, conn_opt.as_ref(), ctx);
-            ctx.conn_txn = conn_opt;
-            r
+            #[cfg(not(feature = "import-export"))]
+            {
+                let _ = s;
+                return Err(DbError::NotImplemented {
+                    feature: "COPY TO (compile with import-export feature to enable)".into(),
+                });
+            }
+            #[cfg(feature = "import-export")]
+            {
+                let conn_opt = ctx.conn_txn.take();
+                let r = execute_copy_to(s, exec_ctx, conn_opt.as_ref(), ctx);
+                ctx.conn_txn = conn_opt;
+                r
+            }
         }
         Stmt::CreateTable(mut s) => {
             ctx.invalidate_all();

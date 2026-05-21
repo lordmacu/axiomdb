@@ -499,65 +499,87 @@ fn bound_from_clause(
         }
         // Phase 20.6 — READ_PARQUET('path') TVF: schema discovery at bind time.
         FromClause::ReadParquet(rp) => {
-            let cols = parquet_schema_to_column_defs(&rp.path, &rp.column_aliases)?;
-            let n = cols.len();
-            let alias = rp.alias.clone().unwrap_or_else(|| "read_parquet".into());
-            let bound = BoundTable {
-                alias: Some(alias.clone()),
-                name: alias,
-                columns: cols,
-                col_offset: *col_offset,
-            };
-            *col_offset += n;
-            Ok(vec![bound])
+            #[cfg(not(feature = "import-export"))]
+            {
+                let _ = rp;
+                return Err(DbError::NotImplemented {
+                    feature: "READ_PARQUET (compile with import-export feature to enable)".into(),
+                });
+            }
+            #[cfg(feature = "import-export")]
+            {
+                let cols = parquet_schema_to_column_defs(&rp.path, &rp.column_aliases)?;
+                let n = cols.len();
+                let alias = rp.alias.clone().unwrap_or_else(|| "read_parquet".into());
+                let bound = BoundTable {
+                    alias: Some(alias.clone()),
+                    name: alias,
+                    columns: cols,
+                    col_offset: *col_offset,
+                };
+                *col_offset += n;
+                Ok(vec![bound])
+            }
         }
         // Phase 20.20 — XMLTABLE virtual table.
         FromClause::XmlTable(xt) => {
-            let spec = crate::xml_table::compile_xml_table(xt)?;
-            let metas = crate::xml_table::column_metas_for_spec(&spec);
-            let virtual_cols: Vec<axiomdb_catalog::schema::ColumnDef> = metas
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    let col_type = crate::json_table::datatype_to_column_type_pub(&m.data_type)
-                        .unwrap_or(axiomdb_catalog::schema::ColumnType::Text);
-                    axiomdb_catalog::schema::ColumnDef {
-                        table_id: 0,
-                        col_idx: i as u16,
-                        name: m.name.clone(),
-                        col_type,
-                        nullable: true,
-                        auto_increment: false,
-                        type_len: 0,
-                        is_fixed_len: false,
-                        default_expr: None,
-                        on_update_expr: None,
-                        generated_expr: None,
-                        collation: None,
-                        generated_stored: false,
-                        enum_type_name: None,
-                        array_element_type: None,
-                        array_ndims: None,
-                        identity_kind: axiomdb_catalog::IdentityKind::None,
-                    }
-                })
-                .collect();
-            let n = virtual_cols.len();
-            let alias = xt.alias.clone().unwrap_or_else(|| "xmltable".into());
-            let bound = BoundTable {
-                alias: Some(alias.clone()),
-                name: alias,
-                columns: virtual_cols,
-                col_offset: *col_offset,
-            };
-            *col_offset += n;
-            Ok(vec![bound])
+            #[cfg(not(feature = "xml"))]
+            {
+                let _ = xt;
+                return Err(DbError::NotImplemented {
+                    feature: "XMLTABLE (compile with xml feature to enable)".into(),
+                });
+            }
+            #[cfg(feature = "xml")]
+            {
+                let spec = crate::xml_table::compile_xml_table(xt)?;
+                let metas = crate::xml_table::column_metas_for_spec(&spec);
+                let virtual_cols: Vec<axiomdb_catalog::schema::ColumnDef> = metas
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let col_type =
+                            crate::json_table::datatype_to_column_type_pub(&m.data_type)
+                                .unwrap_or(axiomdb_catalog::schema::ColumnType::Text);
+                        axiomdb_catalog::schema::ColumnDef {
+                            table_id: 0,
+                            col_idx: i as u16,
+                            name: m.name.clone(),
+                            col_type,
+                            nullable: true,
+                            auto_increment: false,
+                            type_len: 0,
+                            is_fixed_len: false,
+                            default_expr: None,
+                            on_update_expr: None,
+                            generated_expr: None,
+                            collation: None,
+                            generated_stored: false,
+                            enum_type_name: None,
+                            array_element_type: None,
+                            array_ndims: None,
+                            identity_kind: axiomdb_catalog::IdentityKind::None,
+                        }
+                    })
+                    .collect();
+                let n = virtual_cols.len();
+                let alias = xt.alias.clone().unwrap_or_else(|| "xmltable".into());
+                let bound = BoundTable {
+                    alias: Some(alias.clone()),
+                    name: alias,
+                    columns: virtual_cols,
+                    col_offset: *col_offset,
+                };
+                *col_offset += n;
+                Ok(vec![bound])
+            }
         }
     }
 }
 
 /// Open a Parquet file, read its schema, and produce a `ColumnDef` list.
 /// Called at bind time so the analyzer knows column names + types before execution.
+#[cfg(feature = "import-export")]
 fn parquet_schema_to_column_defs(
     path: &str,
     column_aliases: &[String],
@@ -655,6 +677,7 @@ fn parquet_schema_to_column_defs(
     Ok(cols)
 }
 
+#[cfg(feature = "import-export")]
 fn parquet_type_to_column_type(
     physical: parquet::basic::Type,
     logical: Option<&parquet::basic::LogicalType>,
@@ -956,7 +979,10 @@ fn srf_wildcard_columns(
         // Phase 20.6 — READ_PARQUET: re-read schema from metadata (file exists
         // because bind already validated it; metadata read is fast).
         Some(crate::ast::FromClause::ReadParquet(rp)) => {
-            parquet_schema_to_column_defs(&rp.path, &rp.column_aliases).ok()
+            #[cfg(feature = "import-export")]
+            { parquet_schema_to_column_defs(&rp.path, &rp.column_aliases).ok() }
+            #[cfg(not(feature = "import-export"))]
+            { let _ = rp; None }
         }
         _ => None,
     }

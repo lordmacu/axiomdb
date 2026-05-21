@@ -2853,6 +2853,7 @@ fn validate_with_root(
             }
         }
         if let Some(p) = obj.get("pattern").and_then(|v| v.as_str()) {
+            #[cfg(feature = "regexp")]
             match regex::Regex::new(p) {
                 Ok(re) => {
                     if !re.is_match(s) {
@@ -2861,6 +2862,8 @@ fn validate_with_root(
                 }
                 Err(_) => return false,
             }
+            #[cfg(not(feature = "regexp"))]
+            let _ = p;
         }
         if let Some(fmt) = obj.get("format").and_then(|v| v.as_str()) {
             if !schema_format_matches(fmt, s) {
@@ -2929,10 +2932,16 @@ fn validate_with_root(
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
+        #[cfg(feature = "regexp")]
         let compiled_pp: Vec<(regex::Regex, serde_json::Value)> = pattern_props
             .iter()
             .filter_map(|(k, v)| regex::Regex::new(k).ok().map(|re| (re, v.clone())))
             .collect();
+        #[cfg(not(feature = "regexp"))]
+        let compiled_pp: Vec<(String, serde_json::Value)> = {
+            let _ = pattern_props;
+            vec![]
+        };
 
         for (k, sub) in props {
             if let Some(v) = map.get(k) {
@@ -2942,16 +2951,22 @@ fn validate_with_root(
             }
         }
         for (k, v) in map {
+            #[cfg(feature = "regexp")]
             for (re, sub) in &compiled_pp {
                 if re.is_match(k) && !validate_with_root(sub, v, root, depth + 1) {
                     return false;
                 }
             }
+            #[cfg(not(feature = "regexp"))]
+            let _ = (k, v, &compiled_pp);
         }
         if let Some(ap) = obj.get("additionalProperties") {
+            #[cfg(feature = "regexp")]
             let is_additional = |k: &str| {
                 !props.contains_key(k) && !compiled_pp.iter().any(|(re, _)| re.is_match(k))
             };
+            #[cfg(not(feature = "regexp"))]
+            let is_additional = |k: &str| !props.contains_key(k);
             match ap {
                 serde_json::Value::Bool(false) => {
                     for k in map.keys() {
@@ -3169,6 +3184,7 @@ fn collect_schema_errors(
             }
         }
         if let Some(p) = obj.get("pattern").and_then(|v| v.as_str()) {
+            #[cfg(feature = "regexp")]
             match regex::Regex::new(p) {
                 Ok(re) => {
                     if !re.is_match(s) {
@@ -3177,6 +3193,8 @@ fn collect_schema_errors(
                 }
                 Err(e) => push_error(errors, &path, "pattern", format!("invalid regex: {e}")),
             }
+            #[cfg(not(feature = "regexp"))]
+            let _ = p;
         }
         if let Some(fmt) = obj.get("format").and_then(|v| v.as_str()) {
             if !schema_format_matches(fmt, s) {
@@ -3249,10 +3267,16 @@ fn collect_schema_errors(
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
+        #[cfg(feature = "regexp")]
         let compiled_pp: Vec<(regex::Regex, serde_json::Value)> = pattern_props
             .iter()
             .filter_map(|(k, v)| regex::Regex::new(k).ok().map(|re| (re, v.clone())))
             .collect();
+        #[cfg(not(feature = "regexp"))]
+        let compiled_pp: Vec<(String, serde_json::Value)> = {
+            let _ = pattern_props;
+            vec![]
+        };
 
         for (k, sub) in props {
             if let Some(v) = map.get(k) {
@@ -3261,17 +3285,23 @@ fn collect_schema_errors(
             }
         }
         for (k, v) in map {
+            #[cfg(feature = "regexp")]
             for (re, sub) in &compiled_pp {
                 if re.is_match(k) {
                     let sub_path = format!("{path}/{k}");
                     collect_schema_errors(sub, v, root, depth + 1, sub_path, errors);
                 }
             }
+            #[cfg(not(feature = "regexp"))]
+            let _ = (k, v, &compiled_pp);
         }
         if let Some(ap) = obj.get("additionalProperties") {
+            #[cfg(feature = "regexp")]
             let is_additional = |k: &str| {
                 !props.contains_key(k) && !compiled_pp.iter().any(|(re, _)| re.is_match(k))
             };
+            #[cfg(not(feature = "regexp"))]
+            let is_additional = |k: &str| !props.contains_key(k);
             match ap {
                 serde_json::Value::Bool(false) => {
                     for k in map.keys() {
@@ -3388,6 +3418,18 @@ fn resolve_json_pointer<'a>(
 }
 
 fn schema_format_matches(fmt: &str, s: &str) -> bool {
+    // When regexp feature is disabled, format validation falls back to
+    // Draft-07 default: formats are annotations (advisory), always pass.
+    #[cfg(not(feature = "regexp"))]
+    {
+        match fmt {
+            "ipv4" => s.parse::<std::net::Ipv4Addr>().is_ok(),
+            "ipv6" => s.parse::<std::net::Ipv6Addr>().is_ok(),
+            "uri" => s.contains("://") && !s.contains(' '),
+            _ => true,
+        }
+    }
+    #[cfg(feature = "regexp")]
     match fmt {
         "email" => regex::Regex::new(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
             .map(|re| re.is_match(s))

@@ -138,8 +138,11 @@ include!("ddl_fdw.rs");
 include!("ddl_holiday_calendar.rs");
 include!("ddl_exchange_rate.rs");
 include!("fdw_http.rs");
+#[cfg(feature = "import-export")]
 include!("copy_from.rs");
+#[cfg(feature = "import-export")]
 include!("copy_to.rs");
+#[cfg(feature = "import-export")]
 include!("parquet_read.rs");
 include!("select_into_outfile.rs");
 include!("ddl_show.rs");

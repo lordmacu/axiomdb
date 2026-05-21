@@ -34,7 +34,9 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 #
 [features]
 # ── Preset profiles ────────────────────────────────────────────────────────────
-default    = ["desktop"]
+# Default = full featured (import-export, xml, regexp, crypto all on).
+# For a minimal binary use: --no-default-features --features desktop
+default    = ["desktop", "full-sql"]
 
 desktop    = ["sync-api", "c-ffi"]         # mmap + sync Rust API + C exports
 async-api  = ["sync-api", "dep:tokio"]     # adds tokio async on top of sync-api
@@ -51,6 +53,34 @@ sync-api   = [
 ]
 c-ffi      = ["sync-api"]   # enables #[no_mangle] C exports
 
+# ── Optional sql feature bundles ───────────────────────────────────────────────
+# full-sql: all optional SQL subsystems (~3 MB of additional deps).
+# Included in the default build; omit for a minimal binary.
+#
+#   Full (default):
+#     cargo build -p axiomdb-embedded --release               → ~7 MB
+#
+#   Minimal (~4 MB, no COPY/XMLTABLE/REGEXP/hash functions):
+#     cargo build -p axiomdb-embedded --release \
+#       --no-default-features --features desktop
+#
+#   Minimal + regexp only:
+#     cargo build -p axiomdb-embedded --release \
+#       --no-default-features --features "desktop,sql-regexp"
+#
+full-sql = [
+    "axiomdb-sql/import-export",
+    "axiomdb-sql/xml",
+    "axiomdb-sql/regexp",
+    "axiomdb-sql/crypto-fns",
+]
+
+# Re-export individual sql features for fine-grained control.
+sql-import-export = ["axiomdb-sql/import-export"]
+sql-xml           = ["axiomdb-sql/xml"]
+sql-regexp        = ["axiomdb-sql/regexp"]
+sql-crypto        = ["axiomdb-sql/crypto-fns"]
+
 # ── Future optional extras ─────────────────────────────────────────────────────
 # full-text  = ["sync-api"]              # tokenizer + inverted index (Phase 10)
 # vectors    = ["sync-api"]              # HNSW + distance ops (Phase 14)
@@ -63,7 +93,7 @@ axiomdb-types   = { workspace = true, optional = true }
 axiomdb-storage = { workspace = true, optional = true }
 axiomdb-wal     = { workspace = true, optional = true }
 axiomdb-catalog = { workspace = true, optional = true }
-axiomdb-sql     = { path = "../axiomdb-sql", optional = true }
+axiomdb-sql     = { path = "../axiomdb-sql", optional = true, default-features = false }
 tokio           = { workspace = true, optional = true }
 thiserror       = { workspace = true }
 tempfile        = { workspace = true }

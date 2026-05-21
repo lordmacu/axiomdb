@@ -367,12 +367,24 @@ pub(super) fn eval(name: &str, args: &[Expr], row: &[Value]) -> Result<Value, Db
 
         // ── Cryptographic hashes (Phase 24.5) ────────────────────────────────
         // MD5(text|bytea) → TEXT (hex). MySQL/PG-compatible.
+        #[cfg(feature = "crypto-fns")]
         "md5" => hash_to_hex_text(args, row, HashAlgo::Md5),
+        #[cfg(feature = "crypto-fns")]
         "sha1" => hash_to_hex_text(args, row, HashAlgo::Sha1),
+        #[cfg(feature = "crypto-fns")]
         "sha224" => hash_to_hex_text(args, row, HashAlgo::Sha224),
+        #[cfg(feature = "crypto-fns")]
         "sha256" => hash_to_hex_text(args, row, HashAlgo::Sha256),
+        #[cfg(feature = "crypto-fns")]
         "sha384" => hash_to_hex_text(args, row, HashAlgo::Sha384),
+        #[cfg(feature = "crypto-fns")]
         "sha512" => hash_to_hex_text(args, row, HashAlgo::Sha512),
+        #[cfg(not(feature = "crypto-fns"))]
+        "md5" | "sha1" | "sha224" | "sha256" | "sha384" | "sha512" => {
+            Err(DbError::NotImplemented {
+                feature: "crypto hash functions (compile with crypto-fns feature to enable)".into(),
+            })
+        }
 
         // Phase 11.2c: MIME_TYPE(blob_col) → detect content type from magic bytes.
         "mime_type" => {
@@ -528,6 +540,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 // ── Hashing (Phase 24.5) ────────────────────────────────────────────────────
 
 /// Cryptographic-hash family covered by MD5/SHA-1/SHA-2 SQL functions.
+#[cfg(feature = "crypto-fns")]
 #[derive(Clone, Copy)]
 enum HashAlgo {
     Md5,
@@ -539,6 +552,7 @@ enum HashAlgo {
 }
 
 /// Common dispatch for hash functions: NULL → NULL, Text/Bytes/Uuid → hex digest.
+#[cfg(feature = "crypto-fns")]
 fn hash_to_hex_text(args: &[Expr], row: &[Value], algo: HashAlgo) -> Result<Value, DbError> {
     let arg = args.first().ok_or_else(|| DbError::TypeMismatch {
         expected: "1 arg".into(),
@@ -561,6 +575,7 @@ fn hash_to_hex_text(args: &[Expr], row: &[Value], algo: HashAlgo) -> Result<Valu
 
 /// Hex-encoded digest of `bytes` under `algo`. Pure-Rust implementations from
 /// `md-5` / `sha1` / `sha2` keep the dependency footprint small.
+#[cfg(feature = "crypto-fns")]
 fn compute_hash(bytes: &[u8], algo: HashAlgo) -> String {
     use sha1::Digest as _;
     match algo {

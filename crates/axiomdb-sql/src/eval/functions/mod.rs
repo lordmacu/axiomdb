@@ -16,6 +16,7 @@ mod sql_json_query;
 mod string;
 mod system;
 mod uuid;
+#[cfg(feature = "xml")]
 pub(crate) mod xml;
 
 pub(crate) use json::{
@@ -69,8 +70,14 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         | "quote" | "field" | "elt" => string::eval(lower.as_str(), args, row),
 
         // Phase 20.15 — PostgreSQL regex scalar functions
+        #[cfg(feature = "regexp")]
         "regexp_like" => string::eval_regexp_like(args, row),
+        #[cfg(feature = "regexp")]
         "regexp_replace" => string::eval_regexp_replace(args, row),
+        #[cfg(not(feature = "regexp"))]
+        "regexp_like" | "regexp_replace" => Err(DbError::NotImplemented {
+            feature: "REGEXP functions (compile with regexp feature to enable)".into(),
+        }),
 
         "now" | "current_timestamp" | "getdate" | "sysdate" | "current_date" | "curdate"
         | "today" | "unix_timestamp" | "year" | "month" | "day" | "hour" | "minute" | "second"
@@ -178,7 +185,12 @@ pub(super) fn eval_function(name: &str, args: &[Expr], row: &[Value]) -> Result<
         }
 
         // Phase 20.20: XML scalar functions.
+        #[cfg(feature = "xml")]
         "xml_is_well_formed" => xml::eval_is_well_formed(args, row),
+        #[cfg(not(feature = "xml"))]
+        "xml_is_well_formed" => Err(DbError::NotImplemented {
+            feature: "XML functions (compile with xml feature to enable)".into(),
+        }),
 
         _ => Err(DbError::NotImplemented {
             feature: format!("function '{name}' — add to Phase 4.19 eval.rs"),

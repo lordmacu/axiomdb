@@ -3,6 +3,7 @@ use axiomdb_types::Value;
 
 use crate::expr::Expr;
 
+#[cfg(feature = "regexp")]
 pub(super) fn eval_regexp_like(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(DbError::InvalidValue {
@@ -56,6 +57,7 @@ pub(super) fn eval_regexp_like(args: &[Expr], row: &[Value]) -> Result<Value, Db
     Ok(Value::Bool(re.is_match(&text)))
 }
 
+#[cfg(feature = "regexp")]
 pub(super) fn eval_regexp_replace(args: &[Expr], row: &[Value]) -> Result<Value, DbError> {
     if args.len() < 3 || args.len() > 4 {
         return Err(DbError::InvalidValue {

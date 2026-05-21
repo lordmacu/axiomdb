@@ -1183,28 +1183,38 @@ fn eval_int_div(l: Value, r: Value) -> Result<Value, DbError> {
 /// `text REGEXP pattern` — evaluates the regex against the text.
 /// Returns Bool or propagates NULL.
 fn eval_regexp(l: Value, r: Value) -> Result<Value, DbError> {
-    let text = match l {
-        Value::Text(s) => s,
-        other => {
-            return Err(DbError::TypeMismatch {
-                expected: "Text".into(),
-                got: other.variant_name().into(),
-            })
-        }
-    };
-    let pattern = match r {
-        Value::Text(s) => s,
-        other => {
-            return Err(DbError::TypeMismatch {
-                expected: "Text".into(),
-                got: other.variant_name().into(),
-            })
-        }
-    };
-    let re = regex::Regex::new(&pattern).map_err(|e| DbError::InvalidValue {
-        reason: format!("invalid REGEXP pattern: {e}"),
-    })?;
-    Ok(Value::Bool(re.is_match(&text)))
+    #[cfg(not(feature = "regexp"))]
+    {
+        let _ = (l, r);
+        return Err(DbError::NotImplemented {
+            feature: "REGEXP operator (compile with regexp feature to enable)".into(),
+        });
+    }
+    #[cfg(feature = "regexp")]
+    {
+        let text = match l {
+            Value::Text(s) => s,
+            other => {
+                return Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                })
+            }
+        };
+        let pattern = match r {
+            Value::Text(s) => s,
+            other => {
+                return Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                })
+            }
+        };
+        let re = regex::Regex::new(&pattern).map_err(|e| DbError::InvalidValue {
+            reason: format!("invalid REGEXP pattern: {e}"),
+        })?;
+        Ok(Value::Bool(re.is_match(&text)))
+    }
 }
 
 // ── PostgreSQL tilde regex operators (Phase 20.15) ────────────────────────────
@@ -1217,31 +1227,41 @@ fn eval_regexp_tilde(
     case_insensitive: bool,
     negate: bool,
 ) -> Result<Value, DbError> {
-    let text = match l {
-        Value::Text(s) => s,
-        other => {
-            return Err(DbError::TypeMismatch {
-                expected: "Text".into(),
-                got: other.variant_name().into(),
-            })
-        }
-    };
-    let pattern = match r {
-        Value::Text(s) => s,
-        other => {
-            return Err(DbError::TypeMismatch {
-                expected: "Text".into(),
-                got: other.variant_name().into(),
-            })
-        }
-    };
-    let re = regex::RegexBuilder::new(&pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map_err(|e| DbError::InvalidValue {
-            reason: format!("invalid regex pattern: {e}"),
-        })?;
-    Ok(Value::Bool(re.is_match(&text) ^ negate))
+    #[cfg(not(feature = "regexp"))]
+    {
+        let _ = (l, r, case_insensitive, negate);
+        return Err(DbError::NotImplemented {
+            feature: "REGEXP tilde operators (compile with regexp feature to enable)".into(),
+        });
+    }
+    #[cfg(feature = "regexp")]
+    {
+        let text = match l {
+            Value::Text(s) => s,
+            other => {
+                return Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                })
+            }
+        };
+        let pattern = match r {
+            Value::Text(s) => s,
+            other => {
+                return Err(DbError::TypeMismatch {
+                    expected: "Text".into(),
+                    got: other.variant_name().into(),
+                })
+            }
+        };
+        let re = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|e| DbError::InvalidValue {
+                reason: format!("invalid regex pattern: {e}"),
+            })?;
+        Ok(Value::Bool(re.is_match(&text) ^ negate))
+    }
 }
 
 // ── JSONB containment: @> (Phase 11.17) ──────────────────────────────────────

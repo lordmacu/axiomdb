@@ -6,7 +6,29 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-default = []
+# All optional features on by default so existing users of axiomdb-sql
+# (axiomdb-cli, axiomdb-network, axiomdb-server) keep full functionality.
+# The embedded crate uses `default-features = false` + explicit opt-in to
+# build a minimal library without these heavy deps.
+default = ["import-export", "xml", "regexp", "crypto-fns"]
+
+# COPY FROM/TO CSV and COPY FROM/TO PARQUET support.
+# Pulls in: parquet (~1.5 MB) + csv (~200 KB).
+import-export = ["dep:parquet", "dep:csv"]
+
+# XMLTABLE() table-valued function and XML scalar functions.
+# Pulls in: roxmltree (~100 KB).
+xml = ["dep:roxmltree"]
+
+# REGEXP / REGEXP_LIKE / REGEXP_REPLACE operators and JSON Schema
+# `pattern` / `patternProperties` validation.
+# Pulls in: regex (~400 KB).
+regexp = ["dep:regex"]
+
+# MD5 / SHA1 / SHA224 / SHA256 / SHA384 / SHA512 SQL hash functions.
+# Pulls in: md-5 + sha1 + sha2 (~300 KB total).
+crypto-fns = ["dep:md-5", "dep:sha1", "dep:sha2"]
+
 # Enables thread-local timing accumulators in the INSERT path for the
 # `axiomdb_bench --diagnose-insert-deep` diagnostic. ZERO cost when disabled.
 bench-timings = []
@@ -35,7 +57,7 @@ wide            = { workspace = true }
 rayon           = { workspace = true }
 lz4_flex        = { workspace = true }
 serde_json      = { workspace = true }
-csv             = { workspace = true }
+csv             = { workspace = true, optional = true }
 hashbrown       = { workspace = true }
 url             = { workspace = true }
 tempfile        = { workspace = true }
@@ -46,14 +68,14 @@ unicode-normalization = "0.1"
 # so default builds stay lean.
 icu_collator         = { version = "2.2", optional = true, default-features = false, features = ["compiled_data"] }
 icu_locale           = { version = "2.0", optional = true }
-regex                 = { workspace = true }
-parquet               = { version = "54", default-features = false, features = ["snap"] }
-roxmltree             = { workspace = true }
+regex                 = { workspace = true, optional = true }
+parquet               = { version = "54", default-features = false, features = ["snap"], optional = true }
+roxmltree             = { workspace = true, optional = true }
 rust_decimal          = { version = "1", default-features = false, features = ["maths"] }
 # Phase 24.5: cryptographic hashes for MD5/SHA-1/SHA-2 SQL functions.
-md-5                  = { version = "0.10", default-features = false }
-sha1                  = { version = "0.10", default-features = false }
-sha2                  = { version = "0.10", default-features = false }
+md-5                  = { version = "0.10", default-features = false, optional = true }
+sha1                  = { version = "0.10", default-features = false, optional = true }
+sha2                  = { version = "0.10", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion    = { workspace = true }

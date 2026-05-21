@@ -104,13 +104,27 @@ fn execute_select(
     }
 
     // Phase 20.6 — READ_PARQUET TVF in FROM.
+    #[cfg(feature = "import-export")]
     if matches!(stmt.from, Some(FromClause::ReadParquet(_))) {
         return execute_select_read_parquet_source(stmt, storage, txn, conn_txn);
     }
+    #[cfg(not(feature = "import-export"))]
+    if matches!(stmt.from, Some(FromClause::ReadParquet(_))) {
+        return Err(DbError::NotImplemented {
+            feature: "READ_PARQUET (compile with import-export feature to enable)".into(),
+        });
+    }
 
     // Phase 20.20 — XMLTABLE TVF in FROM.
+    #[cfg(feature = "xml")]
     if matches!(stmt.from, Some(FromClause::XmlTable(_))) {
         return execute_select_xmltable_source(stmt, storage, txn, conn_txn);
+    }
+    #[cfg(not(feature = "xml"))]
+    if matches!(stmt.from, Some(FromClause::XmlTable(_))) {
+        return Err(DbError::NotImplemented {
+            feature: "XMLTABLE (compile with xml feature to enable)".into(),
+        });
     }
 
     // Extract the FROM table reference.
@@ -952,6 +966,7 @@ fn execute_select_json_table_source(
 }
 
 /// Phase 20.20 — SELECT whose FROM clause is XMLTABLE.
+#[cfg(feature = "xml")]
 fn execute_select_xmltable_source(
     mut stmt: SelectStmt,
     storage: &dyn StorageEngine,
