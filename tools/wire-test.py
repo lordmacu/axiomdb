@@ -6035,6 +6035,52 @@ conn.commit()
 
 
 
+# ── perf-sqlite-gap [page-cache] — clustered point lookup correctness ────────
+# Guards that the buffer pool serves correct bytes on cache hits: repeated PK
+# lookups must return identical, correct rows (id + TEXT + whole/fractional REAL).
+
+cur.execute("DROP TABLE IF EXISTS wire_pagecache")
+cur.execute("CREATE TABLE wire_pagecache (id INT PRIMARY KEY, name TEXT, score REAL)")
+for i in range(1, 51):
+    cur.execute(f"INSERT INTO wire_pagecache VALUES ({i}, 'user{i}', {float(i) * 1.5})")
+conn.commit()
+
+# Point lookups across several keys — exact id + TEXT + REAL match. Keys include
+# i=2 (score 3.0) and i=42 (score 63.0): whole-number REALs guard the wire REAL bug.
+expected = {i: (i, f"user{i}", float(i) * 1.5) for i in range(1, 51)}
+pc_all_ok = True
+for k in (1, 2, 7, 25, 42, 50):
+    cur.execute(f"SELECT id, name, score FROM wire_pagecache WHERE id = {k}")
+    if cur.fetchone() != expected[k]:
+        pc_all_ok = False
+ok("[page-cache] PK point lookups return exact id+TEXT+REAL", pc_all_ok)
+
+# Repeated lookup of the same key — exercises the buffer-pool hit path.
+prev, pc_repeat_ok = None, True
+for _ in range(5):
+    cur.execute("SELECT id, name, score FROM wire_pagecache WHERE id = 25")
+    row = cur.fetchone()
+    if prev is not None and row != prev:
+        pc_repeat_ok = False
+    prev = row
+ok("[page-cache] repeated PK lookup (cache hit) is consistent",
+   pc_repeat_ok and prev == (25, "user25", 37.5))
+
+# Missing key → no rows.
+cur.execute("SELECT id FROM wire_pagecache WHERE id = 9999")
+ok("[page-cache] missing key returns no rows", cur.fetchone() is None)
+
+# Read after a write to the same table must see fresh bytes (cache invalidation).
+cur.execute("UPDATE wire_pagecache SET name = 'updated25' WHERE id = 25")
+conn.commit()
+cur.execute("SELECT name FROM wire_pagecache WHERE id = 25")
+ok("[page-cache] read after update sees fresh bytes (invalidation)",
+   cur.fetchone()[0] == 'updated25')
+
+cur.execute("DROP TABLE IF EXISTS wire_pagecache")
+conn.commit()
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 conn.close()

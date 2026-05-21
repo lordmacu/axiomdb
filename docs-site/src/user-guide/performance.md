@@ -723,6 +723,36 @@ the concurrent read path keeps its pure-snapshot reader (avoids a
 read-your-own-commit race). See <code>docs/perf-sqlite-gap.md</code>.
 </div>
 
+### Buffer Pool Page Cache — point_lookup beats SQLite
+
+Every `read_page` previously copied 16 KB out of the mmap and recomputed the
+CRC32c **on every B-tree level, on every query**. A point lookup descends
+root → internal → leaf, so the same hot upper pages were re-materialized each
+time. Wiring a user-space clock-sweep buffer pool into `read_page` (see
+[storage internals](../internals/storage.md#buffer-pool-clock-sweep-page-cache))
+serves a hit as an `Arc::clone` — no mmap lock, no copy, no CRC re-check
+(verify-once-then-serve, the model SQLite uses for everything but journal frames).
+
+Engine A/B on the Lima VM (same VM, interleaved runs; ratios are the reliable
+signal since absolute ops/s swing with host load):
+
+| Engine scenario (10K rows) | Before | After | vs SQLite (after) |
+|---|---:|---:|---:|
+| `point_lookup` | ~19K ops/s | **~187K ops/s** | **0.72–0.79× — AxiomDB faster** |
+
+That is ~10× on the worst read gap, flipping it from ~6× *slower* to ~1.3×
+*faster* than SQLite. `full_scan`, `select_where`, `range_scan` and `count_star`
+are unchanged within noise — the cache is pure upside on the OLTP path.
+
+<div class="callout-advantage">
+A naive first cut cached pages by reading into a <code>PageRef</code> then
+<code>into_page() + Arc::new()</code> — a redundant unwrap/rewrap costing a second
+16 KB allocation that regressed full scans ~3×. The fix reads mmap bytes straight
+into an <code>Arc&lt;Page&gt;</code> in one allocation; full_scan returned to
+baseline. Caught only by building the pre-change binary and A/B-testing on the
+same VM — the measurement-methodology lesson in action.
+</div>
+
 ### Session COUNT(*) Cache (Attack 17b)
 
 The `SELECT COUNT(*) FROM t` fast path now consults a per-session cache
