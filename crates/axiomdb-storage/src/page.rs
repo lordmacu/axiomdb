@@ -226,6 +226,19 @@ impl Page {
     pub fn clear_all_visible(&mut self) {
         self.header_mut().flags &= !PAGE_FLAG_ALL_VISIBLE;
     }
+
+    /// Log Sequence Number stamped in the page header (`PageHeader.lsn`).
+    /// REDO recovery's idempotence guard compares it against a frame's lsn
+    /// (`frame.lsn > page.lsn` ⇒ apply); see project B subphase 5.
+    pub fn lsn(&self) -> u64 {
+        self.header().lsn
+    }
+
+    /// Sets the page LSN. The lsn lives in the header, outside the
+    /// checksum-covered body, so this never invalidates the checksum.
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.header_mut().lsn = lsn;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -248,6 +261,20 @@ mod tests {
         assert_eq!(page.header().page_id, 42);
         assert_eq!(page.header().page_type, PageType::Data as u8);
         assert!(page.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn lsn_roundtrips_and_does_not_disturb_checksum() {
+        let mut page = Page::new(PageType::Data, 7);
+        page.body_mut()[0] = 0xAB;
+        page.update_checksum();
+        page.verify_checksum().unwrap();
+        assert_eq!(page.lsn(), 0, "a fresh page has lsn 0");
+        page.set_lsn(42);
+        assert_eq!(page.lsn(), 42);
+        // lsn lives in the header, outside the checksum-covered body.
+        page.verify_checksum()
+            .expect("set_lsn must not invalidate the checksum");
     }
 
     #[test]
