@@ -137,6 +137,31 @@ ENGINE_CONFIGS = {
     ),
 }
 
+# Per-engine connection overrides via environment variables. Defaults above are
+# used when the matching env var is unset, so the harness can target whatever
+# local instances you already run (no Docker, any ports). Examples:
+#   MARIADB_PORT=3310 PG_USER=postgres PG_PASSWORD=bench python3 local_bench.py ...
+# Recognized suffixes per engine prefix: _HOST _PORT _USER _PASSWORD _DB
+# Prefixes: MARIADB_, MYSQL_, AXIOMDB_, PG_
+_ENV_PREFIX = {"mariadb": "MARIADB", "mysql": "MYSQL", "axiomdb": "AXIOMDB", "postgres": "PG"}
+for _eng in list(ENGINE_CONFIGS):
+    _p = _ENV_PREFIX[_eng]
+    _label, _cfg = ENGINE_CONFIGS[_eng]
+    if f"{_p}_HOST" in os.environ:
+        _cfg["host"] = os.environ[f"{_p}_HOST"]
+    if f"{_p}_PORT" in os.environ:
+        _cfg["port"] = int(os.environ[f"{_p}_PORT"])
+    if f"{_p}_USER" in os.environ:
+        _cfg["user"] = os.environ[f"{_p}_USER"]
+    if f"{_p}_PASSWORD" in os.environ:
+        _cfg["password"] = os.environ[f"{_p}_PASSWORD"]
+    if f"{_p}_DB" in os.environ:
+        # PostgreSQL config uses the psycopg2 key "dbname"; MySQL uses "database".
+        _cfg["dbname" if "dbname" in _cfg else "database"] = os.environ[f"{_p}_DB"]
+    if f"{_p}_LABEL" in os.environ:
+        _label = os.environ[f"{_p}_LABEL"]
+    ENGINE_CONFIGS[_eng] = (_label, _cfg)
+
 DEFAULT_ENGINES = ["mariadb", "mysql", "axiomdb"]
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
