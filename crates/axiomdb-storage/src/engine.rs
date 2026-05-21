@@ -118,6 +118,18 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// REDO: apply every committed frame to its page so committed data survives a
+    /// crash (project B subphase 5). For each page with a committed frame (latest
+    /// wins), if `frame.lsn > page.lsn` the frame's bytes are written to the page
+    /// **directly** — no new frame is appended. `is_committed(txn_id)` selects
+    /// committed frames; recovery passes the logical WAL's committed-txn set.
+    /// Returns the number of pages redone. Called once, on open, after the UNDO pass.
+    /// Default: no-op (backend without a redo log).
+    fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        let _ = is_committed;
+        Ok(0)
+    }
+
     /// Returns the number of pages currently waiting in the deferred-free queue.
     /// Useful for diagnostics and tests. Default: 0.
     fn deferred_free_count(&self) -> usize {
@@ -207,6 +219,13 @@ pub mod tests {
         storage.prefetch_hint(0, 64);
         storage.prefetch_hint(9_999_999, 64);
         storage.prefetch_hint(u64::MAX, u64::MAX);
+    }
+
+    #[test]
+    fn redo_is_noop_without_a_frame_log() {
+        use crate::MemoryStorage;
+        let storage = MemoryStorage::new();
+        assert_eq!(storage.redo_committed_frames(&|_| true).unwrap(), 0);
     }
 
     /// Generic test suite for any StorageEngine implementation.
