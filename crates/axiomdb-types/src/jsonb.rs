@@ -528,6 +528,96 @@ impl<'a> JsonbRef<'a> {
         Ok(Some(self.decode_element(i as usize)?))
     }
 
+    /// Binary-search an object for `key` and return the JEntry index of its
+    /// VALUE (not the key), or `None` if absent / not an object. The index can
+    /// then be read with [`element_container_bytes`](Self::element_container_bytes)
+    /// or [`scalar_element_eq`](Self::scalar_element_eq) without allocating.
+    pub fn find_value_index(&self, key: &str) -> Result<Option<usize>, DbError> {
+        if self.is_array() || self.is_scalar() {
+            return Ok(None);
+        }
+        let n = self.element_count();
+        if n == 0 {
+            return Ok(None);
+        }
+        let needle = key.as_bytes();
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let k = self.element_data(mid)?;
+            match Self::key_cmp(k, needle) {
+                std::cmp::Ordering::Equal => return Ok(Some(n + mid)),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    /// If the element at JEntry `idx` is a container, return its raw sub-blob
+    /// bytes (borrowed, zero-copy) for recursion; otherwise `None`.
+    pub fn element_container_bytes(&self, idx: usize) -> Result<Option<&[u8]>, DbError> {
+        if self.jentry_raw(idx) & JENTRY_TYPE_MASK == JENTRY_ISCONTAINER {
+            Ok(Some(self.element_data(idx)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Compare the scalar at JEntry `idx` to a serde scalar `cv` WITHOUT
+    /// allocating (PostgreSQL's `equalsJsonbScalarValue` technique). Returns
+    /// `Ok(None)` if the element is a container (a scalar candidate can't equal
+    /// it). The result is identical to `decode_element(idx).to_serde() == *cv`,
+    /// including serde's int/float number equality.
+    pub fn scalar_element_eq(
+        &self,
+        idx: usize,
+        cv: &serde_json::Value,
+    ) -> Result<Option<bool>, DbError> {
+        let jtype = self.jentry_raw(idx) & JENTRY_TYPE_MASK;
+        let eq = match jtype {
+            JENTRY_ISNULL => cv.is_null(),
+            JENTRY_ISTRUE => cv.as_bool() == Some(true),
+            JENTRY_ISFALSE => cv.as_bool() == Some(false),
+            JENTRY_ISSTRING => match cv.as_str() {
+                Some(s) => self.element_data(idx)? == s.as_bytes(),
+                None => false,
+            },
+            JENTRY_ISNUMERIC => {
+                if !cv.is_number() {
+                    return Ok(Some(false));
+                }
+                let bytes = self.element_data(idx)?;
+                let s = std::str::from_utf8(bytes).map_err(|_| DbError::ParseError {
+                    message: format!("JSONB numeric at JEntry {idx} invalid UTF-8"),
+                    position: None,
+                })?;
+                // Reconstruct the serde Number exactly as decode_element + to_serde
+                // would (int first, then float), so equality matches the serde walk.
+                let elem: serde_json::Value = if let Ok(i) = s.parse::<i64>() {
+                    serde_json::Value::from(i)
+                } else if let Ok(f) = s.parse::<f64>() {
+                    serde_json::Value::from(f)
+                } else {
+                    return Err(DbError::ParseError {
+                        message: format!("JSONB numeric at JEntry {idx} invalid: {s}"),
+                        position: None,
+                    });
+                };
+                elem == *cv
+            }
+            JENTRY_ISCONTAINER => return Ok(None),
+            _ => {
+                return Err(DbError::ParseError {
+                    message: format!("JSONB unknown type at JEntry {idx}: {:#010x}", jtype),
+                    position: None,
+                })
+            }
+        };
+        Ok(Some(eq))
+    }
+
     /// Return all keys in an object (in sorted order).
     pub fn object_keys(&self) -> Result<Vec<Arc<str>>, DbError> {
         if self.is_array() || self.is_scalar() {
@@ -684,13 +774,28 @@ fn jsonb_contains_blob(doc: &[u8], cand: &serde_json::Value) -> Result<bool, DbE
                 return Ok(false);
             }
             for (k, cv) in cmap {
-                match dr.get_key(k)? {
-                    Some(dv) => {
-                        if !jsonbvalue_contains(&dv, cv)? {
-                            return Ok(false);
-                        }
-                    }
-                    None => return Ok(false),
+                let Some(vidx) = dr.find_value_index(k)? else {
+                    return Ok(false);
+                };
+                let contained = match cv {
+                    // Nested object: recurse binary on the zero-copy sub-blob.
+                    serde_json::Value::Object(_) => match dr.element_container_bytes(vidx)? {
+                        Some(sub) => jsonb_contains_blob(sub, cv)?,
+                        None => false, // a scalar value can't contain an object
+                    },
+                    // Array: decode just this sub-node and defer to the reference.
+                    serde_json::Value::Array(_) => match dr.element_container_bytes(vidx)? {
+                        Some(sub) => serde_contains(&JsonbDecoder::decode(sub)?, cv),
+                        None => false,
+                    },
+                    // Scalar: compare raw element bytes — no decode, no allocation.
+                    _ => match dr.scalar_element_eq(vidx, cv)? {
+                        Some(eq) => eq,
+                        None => false, // a container can't equal a scalar
+                    },
+                };
+                if !contained {
+                    return Ok(false);
                 }
             }
             Ok(true)
@@ -701,16 +806,6 @@ fn jsonb_contains_blob(doc: &[u8], cand: &serde_json::Value) -> Result<bool, DbE
             let doc_v = JsonbDecoder::decode(doc)?;
             Ok(serde_contains(&doc_v, cand))
         }
-    }
-}
-
-/// Recursion step: a doc value (already navigated) against a candidate node.
-/// Stays binary only when both sides are objects (the common nested case);
-/// otherwise decodes the doc node (small) and uses the serde reference.
-fn jsonbvalue_contains(dv: &JsonbValue, cv: &serde_json::Value) -> Result<bool, DbError> {
-    match (dv, cv) {
-        (JsonbValue::Container(sub), serde_json::Value::Object(_)) => jsonb_contains_blob(sub, cv),
-        _ => Ok(serde_contains(&dv.to_serde(), cv)),
     }
 }
 
@@ -810,6 +905,8 @@ mod tests {
             json!({"flag": true}),                       // bool
             json!({"none": null}),                       // null value
             json!({"active": "1"}),                      // type mismatch (str vs int)
+            json!({"active": 1.0}),                       // int element vs float candidate
+            json!({"score": 3}),                         // float element vs int candidate
             json!([1, 2]),                               // array candidate vs object doc
             json!(1),                                    // scalar candidate vs object doc
             json!({}),                                   // empty object → always contained
