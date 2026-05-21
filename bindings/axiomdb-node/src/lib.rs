@@ -97,7 +97,15 @@ fn pack_value(buf: &mut Vec<u8>, v: &Value) {
             buf.push(2);
             buf.extend_from_slice(&(*m as f64 / 10f64.powi(*s as i32)).to_le_bytes());
         }
-        Value::Text(s) | Value::Json(s) => pack_text(buf, s.as_bytes()),
+        // Tag 5 (ASCII) lets JS decode with latin1 (no UTF-8 validation, ~20%
+        // faster string creation); tag 3 stays UTF-8 for everything else.
+        Value::Text(s) | Value::Json(s) => {
+            if s.is_ascii() {
+                pack_ascii(buf, s.as_bytes());
+            } else {
+                pack_text(buf, s.as_bytes());
+            }
+        }
         Value::Bytes(b) => {
             buf.push(4);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -116,6 +124,13 @@ fn pack_value(buf: &mut Vec<u8>, v: &Value) {
 
 fn pack_text(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.push(3);
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// ASCII text — tag 5; the JS side decodes with latin1.
+fn pack_ascii(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.push(5);
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
 }

@@ -15,6 +15,28 @@ where PyO3 native construction wins.
 | napi per-value (`queryTuples`, build JS in Rust) | ~9.2 ms | ~2.7× |
 | koffi per-cell (original, ~2 FFI calls/cell) | ~28 ms | ~8.9× |
 
+### Where the JS parse time actually goes (10K×6, ~2.2 ms)
+
+Decomposed by zeroing out parts of the parser:
+
+| Part | time | share |
+|---|---|---|
+| Row-array assembly (`rows[r][c] = …`) | ~0.11 ms | 5% |
+| **Text decode (`buf.toString` × 20K strings)** | **~1.70 ms** | **76%** |
+| Integer decode (40K cells) | ~0.42 ms | 19% |
+
+**Creating JS strings dominates** — and it is largely irreducible (you must
+materialize the strings; better-sqlite3 pays the same cost in C++). So columnar
+numeric layouts help little here; the levers are the string and integer decode.
+
+### Parser optimization — ASCII text via latin1 (tag 5)
+
+`buf.toString('latin1')` skips UTF-8 validation and is ~20% faster than
+`'utf8'` for ASCII (~0.4 ms on this workload). The Rust serializer checks
+`s.is_ascii()` and emits **tag 5** for ASCII strings (JS decodes with latin1);
+non-ASCII stays **tag 3** (utf8), so `'héllo'`/`'日本'` round-trip correctly.
+Real but small; end-to-end it sits near the macOS noise floor (~1.35×).
+
 ### Parser optimization — avoid per-cell BigInt
 
 The packed-buffer paths first read INT cells as `Number(buf.readBigInt64LE(off))`,

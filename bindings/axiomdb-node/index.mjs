@@ -36,6 +36,7 @@ function parsePacked(buf) {
       // (~33% faster parse). Exact for integers in the ±2^53 safe range; values
       // beyond it are approximated, same as Number(BigInt).
       if (tag === 1) { row[c] = buf.readUInt32LE(off) + buf.readInt32LE(off + 4) * 4294967296; off += 8; }
+      else if (tag === 5) { const l = buf.readUInt32LE(off); off += 4; row[c] = buf.toString('latin1', off, off + l); off += l; } // ASCII fast path
       else if (tag === 3) { const l = buf.readUInt32LE(off); off += 4; row[c] = buf.toString('utf8', off, off + l); off += l; }
       else if (tag === 2) { row[c] = buf.readDoubleLE(off); off += 8; }
       else if (tag === 4) { const l = buf.readUInt32LE(off); off += 4; row[c] = Buffer.from(buf.subarray(off, off + l)); off += l; }
