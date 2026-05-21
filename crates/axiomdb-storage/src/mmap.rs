@@ -3,7 +3,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Mutex, RwLock,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -14,6 +14,7 @@ use memmap2::Mmap;
 use tracing::{debug, info, warn};
 
 use crate::{
+    buffer_pool::BufferPool,
     dirty::PageDirtyTracker,
     doublewrite::DoublewriteBuffer,
     engine::StorageEngine,
@@ -132,6 +133,9 @@ pub struct MmapStorage {
     /// Snapshot of the clean-shutdown flag as it was found on disk at open
     /// time, before this process marked the database as running/dirty.
     clean_shutdown_on_open: bool,
+    /// User-space clock-sweep page cache. Served on `read_page` hits (no mmap
+    /// lock / copy / CRC); invalidated on `write_page` and page reuse.
+    buffer_pool: BufferPool,
 }
 
 impl Drop for MmapStorage {
@@ -216,6 +220,7 @@ impl MmapStorage {
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
             clean_shutdown_on_open: true,
+            buffer_pool: BufferPool::new(),
         })
     }
 
@@ -308,6 +313,7 @@ impl MmapStorage {
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
             clean_shutdown_on_open,
+            buffer_pool: BufferPool::new(),
         };
         storage.write_clean_shutdown_flag(false)?;
         storage
@@ -444,6 +450,10 @@ impl MmapStorage {
             }
         }
         self.pwrite_page(page_id, page)?;
+        // Drop any stale cached copy so the next read reloads the new bytes.
+        // Public `write_page` holds the page X-latch across this, serializing
+        // with S-latch readers' miss-path inserts.
+        self.buffer_pool.invalidate(page_id);
         self.dirty.mark(page_id);
         Ok(())
     }
@@ -550,6 +560,19 @@ impl MmapStorage {
     pub fn clean_shutdown_on_open(&self) -> bool {
         self.clean_shutdown_on_open
     }
+
+    /// (hits, misses) of the page buffer pool — for diagnostics and tests.
+    pub fn buffer_pool_stats(&self) -> (u64, u64) {
+        self.buffer_pool.stats()
+    }
+
+    /// Drops cached entries for a batch of (re)allocated page ids so a realloc
+    /// never serves stale bytes before the caller writes the page.
+    fn invalidate_cached(&self, ids: &[u64]) {
+        for &id in ids {
+            self.buffer_pool.invalidate(id);
+        }
+    }
 }
 
 // ── StorageEngine impl ────────────────────────────────────────────────────────
@@ -560,9 +583,22 @@ impl StorageEngine for MmapStorage {
         if page_id >= self.page_count.load(Ordering::Acquire) {
             return Err(DbError::PageNotFound { page_id });
         }
-        // Acquire mmap read lock (shared — multiple concurrent reads proceed in parallel).
+        // Buffer-pool hit: share the cached page — no mmap lock, no 16 KB copy,
+        // no CRC re-check (the page was verified when it was first loaded).
+        if let Some(page) = self.buffer_pool.get(page_id) {
+            return Ok(crate::page_ref::PageRef::from_arc(page));
+        }
+        // Cold miss: take the mmap read lock, copy the page, verify its CRC32c
+        // once, then cache it. `into_page()` here is a sole-owner move (the
+        // PageRef from `read_page_from_mmap` was just built), so there is no
+        // extra copy before wrapping it in the shared `Arc`.
         let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
-        Self::read_page_from_mmap(&mmap, page_id)
+        let page_ref = Self::read_page_from_mmap(&mmap, page_id)?;
+        drop(mmap);
+        let arc = self
+            .buffer_pool
+            .insert(page_id, Arc::new(page_ref.into_page()));
+        Ok(crate::page_ref::PageRef::from_arc(arc))
     }
 
     fn read_page_raw(&self, page_id: u64) -> Result<[u8; crate::PAGE_SIZE], DbError> {
@@ -623,6 +659,8 @@ impl StorageEngine for MmapStorage {
         let _page_guard = self.page_locks.write(page_id);
         let new_page = Page::new(page_type, page_id);
         self.pwrite_page(page_id, &new_page)?;
+        // Reused id: drop any stale cached entry from before this page was freed.
+        self.buffer_pool.invalidate(page_id);
         self.dirty.mark(page_id);
         Ok(page_id)
     }
@@ -788,6 +826,7 @@ impl StorageEngine for MmapStorage {
         }
         if out.len() == n {
             self.freelist_dirty.store(true, Ordering::Relaxed);
+            self.invalidate_cached(&out);
             return Ok(out);
         }
 
@@ -802,6 +841,7 @@ impl StorageEngine for MmapStorage {
 
         if out.len() == n {
             self.freelist_dirty.store(true, Ordering::Relaxed);
+            self.invalidate_cached(&out);
             return Ok(out);
         }
 
@@ -829,6 +869,7 @@ impl StorageEngine for MmapStorage {
             return Err(DbError::StorageFull);
         }
         self.freelist_dirty.store(true, Ordering::Relaxed);
+        self.invalidate_cached(&out);
         Ok(out)
     }
 
@@ -900,6 +941,49 @@ mod tests {
         }
         let storage = MmapStorage::open(&path).unwrap();
         assert_eq!(storage.page_count(), GROW_PAGES);
+    }
+
+    #[test]
+    fn buffer_pool_second_read_is_hit() {
+        let s = MmapStorage::create(&tmp_path()).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let _ = s.read_page(pid).unwrap(); // cold miss → populates the pool
+        let (h0, _) = s.buffer_pool_stats();
+        let _ = s.read_page(pid).unwrap(); // warm hit
+        let (h1, _) = s.buffer_pool_stats();
+        assert_eq!(h1, h0 + 1, "second read of the same page must hit the pool");
+    }
+
+    #[test]
+    fn buffer_pool_write_then_read_sees_fresh_bytes() {
+        let s = MmapStorage::create(&tmp_path()).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let _ = s.read_page(pid).unwrap(); // cache the freshly-alloc'd contents
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0xAB;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap(); // must invalidate the cached copy
+        let got = s.read_page(pid).unwrap();
+        assert_eq!(got.body()[0], 0xAB, "read after write must see the new bytes");
+    }
+
+    #[test]
+    fn buffer_pool_free_then_realloc_does_not_serve_stale() {
+        let s = MmapStorage::create(&tmp_path()).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0xCC; // distinctive marker
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        let _ = s.read_page(pid).unwrap(); // cache the marked page
+        s.free_page(pid).unwrap();
+        s.release_deferred_frees(u64::MAX).unwrap();
+        let pid2 = s.alloc_page(PageType::Data).unwrap(); // fresh page (body zeroed)
+        let got = s.read_page(pid2).unwrap();
+        if pid2 == pid {
+            assert_eq!(got.body()[0], 0x00, "must not serve the stale cached page");
+        }
+        assert_eq!(got.header().page_id, pid2);
     }
 
     #[test]

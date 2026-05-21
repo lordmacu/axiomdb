@@ -779,12 +779,19 @@ Physical file (axiomdb.db):
                                   write_page(3): pwrite() to file descriptor
 ```
 
-### Read path: mmap + PageRef copy
+### Read path: buffer pool → mmap fallback
 
-`read_page(page_id)` computes `mmap_ptr + page_id * 16384`, copies 16 KB into a
-heap-allocated `PageRef`, verifies the CRC32c checksum, and returns the owned copy.
-The copy cost (~0.5 us from L2/L3 cache) is the same price PostgreSQL pays when
-copying a buffer pool page into backend-local memory.
+`read_page(page_id)` first consults the [buffer pool](#buffer-pool-clock-sweep-page-cache).
+On a hit it returns an `Arc::clone` of the cached page — no mmap lock, no 16 KB
+copy, no CRC re-check. On a miss it takes the mmap read lock, computes
+`mmap_ptr + page_id * 16384`, copies 16 KB into a `PageRef`, verifies the CRC32c
+checksum **once**, inserts the verified page into the pool, and returns it. The
+cold-miss copy (~0.5 us from L2/L3 cache) is the same price PostgreSQL pays when
+copying a buffer pool page into backend-local memory; warm hits avoid it entirely.
+
+This is a verify-once-then-serve model: every page resident in the pool has
+already passed CRC verification, so re-checking on each hit would be redundant —
+the same reason SQLite checksums journal frames but not normal page reads.
 
 ### Buffer pool: clock-sweep page cache
 
@@ -804,9 +811,14 @@ one slot rather than block — a transient, self-correcting over-capacity.
 ### Write path: pwrite() to file descriptor
 
 `write_page(page_id, page)` calls `pwrite()` on the underlying file descriptor at
-offset `page_id * 16384`. The mmap (MAP_SHARED) automatically reflects the change
-on subsequent reads. Note that a 16 KB `pwrite()` is **not** crash-atomic on 4 KB-block
-filesystems — the [Doublewrite Buffer](#doublewrite-buffer) protects against torn pages.
+offset `page_id * 16384`, then invalidates the page's buffer-pool entry so the next
+read reloads the new bytes. The public `write_page` holds the page X-latch across
+the pwrite + invalidate, serializing it against the S-latch a reader holds during a
+miss-path insert, so a stale entry can never be re-cached. The mmap (MAP_SHARED)
+automatically reflects the change on subsequent reads. Page reuse (`alloc_page`
+on a recycled id) invalidates the same way. Note that a 16 KB `pwrite()` is **not**
+crash-atomic on 4 KB-block filesystems — the [Doublewrite Buffer](#doublewrite-buffer)
+protects against torn pages.
 
 ### Flush: doublewrite + fsync
 
