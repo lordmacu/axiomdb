@@ -929,6 +929,16 @@ pub struct SessionContext {
     /// callers don't have to touch this cache; correctness falls
     /// out of the comparison on lookup.
     count_star_cache: HashMap<u32, (u64, u64, u64)>,
+    /// Per-table catalog statistics cache, keyed by `table_id`, storing the
+    /// `schema_version` the stats were loaded at plus a shared `Arc` of the
+    /// `StatsDef` list. The planner reads these once per statement for
+    /// cost-based index selection; without this cache every SELECT rebuilds a
+    /// `CatalogReader` and rescans the stats heap (≈580 ns) only to usually get
+    /// the same advisory data back. Invalidated by `schema_version` mismatch
+    /// (DDL — e.g. `CREATE INDEX` bumps it) and by `invalidate_table` (which
+    /// `ANALYZE` calls after rewriting stats). Mirrors SQLite, which loads
+    /// `sqlite_stat1` into the in-memory schema once, not per query.
+    stats_cache: HashMap<u32, (u64, Arc<Vec<axiomdb_catalog::StatsDef>>)>,
     /// A.2 optimization: session-level catalog epoch. Incremented by
     /// `invalidate_all()` whenever DDL executes (the DDL fence path) or a
     /// database/schema switch happens. When `table_epoch_cache[table_id] ==
@@ -1132,6 +1142,7 @@ impl SessionContext {
             statement_lru_seq: 0,
             clustered_leaf_hint: None,
             count_star_cache: HashMap::new(),
+            stats_cache: HashMap::new(),
             catalog_epoch: 0,
             table_epoch_cache: HashMap::new(),
             auto_vacuum_enabled: true,
@@ -1451,6 +1462,36 @@ impl SessionContext {
         arc
     }
 
+    /// Returns the cached catalog `StatsDef` list for `table_id` iff it was
+    /// loaded at `schema_version` (DDL bumps the version → miss → reload).
+    /// `None` on miss or version mismatch.
+    pub fn get_stats_cached(
+        &self,
+        table_id: u32,
+        schema_version: u64,
+    ) -> Option<Arc<Vec<axiomdb_catalog::StatsDef>>> {
+        match self.stats_cache.get(&table_id) {
+            Some((ver, stats)) if *ver == schema_version => Some(Arc::clone(stats)),
+            _ => None,
+        }
+    }
+
+    /// Inserts the catalog `StatsDef` list for `table_id` (tagged with the
+    /// `schema_version` it was read at) and returns the shared `Arc`. ANALYZE
+    /// rewrites stats without bumping `schema_version`, so it must drop the
+    /// entry via [`Self::invalidate_table`]; DDL invalidates via the version tag.
+    pub fn cache_stats(
+        &mut self,
+        table_id: u32,
+        schema_version: u64,
+        stats: Vec<axiomdb_catalog::StatsDef>,
+    ) -> Arc<Vec<axiomdb_catalog::StatsDef>> {
+        let arc = Arc::new(stats);
+        self.stats_cache
+            .insert(table_id, (schema_version, Arc::clone(&arc)));
+        arc
+    }
+
     /// A.2 optimization: returns `true` when the cached entry for `table_id`
     /// was validated at the current catalog epoch, meaning no DDL has run since
     /// the last resolution and the catalog probe can be skipped entirely.
@@ -1521,6 +1562,10 @@ impl SessionContext {
             // tag would catch it on next lookup anyway, but evicting now
             // keeps the HashMap small after a DDL on an unrelated session.
             self.count_star_cache.remove(&table_id);
+            // Drop cached catalog stats: ANALYZE rewrites them without bumping
+            // schema_version, and ANALYZE calls this path, so this is the hook
+            // that keeps the stats cache fresh after a (re)ANALYZE.
+            self.stats_cache.remove(&table_id);
             // A.2: remove epoch entry so next lookup re-validates.
             self.table_epoch_cache.remove(&table_id);
         }
@@ -1538,6 +1583,8 @@ impl SessionContext {
         // is the DDL-fence path — schema_version may have bumped across
         // many tables. Drop the lot.
         self.count_star_cache.clear();
+        // DDL fence: drop all cached catalog stats too.
+        self.stats_cache.clear();
         // A.2: bump epoch so `try_cached_with_version` re-validates all tables
         // on the next lookup. table_epoch_cache is cleared so no stale epoch
         // entries survive. The epoch is monotonically increasing; it never

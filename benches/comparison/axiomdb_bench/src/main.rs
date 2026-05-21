@@ -1390,8 +1390,8 @@ fn diagnose_point(data_dir: &Path, n_rows: usize) {
         let exec = s.exec_ns as f64 / n;
         let rest = exec - resolve - stats - plan - lookup - where_eval - colmeta;
         println!("    ├─ clone AST:              {clone:.0} ns");
-        println!("    ├─ resolve_table:         {resolve:.0} ns  (deep-clone ResolvedTable)");
-        println!("    ├─ list_stats (catalog):  {stats:.0} ns  (heap scan → usually empty)");
+        println!("    ├─ resolve_table:         {resolve:.0} ns  (Arc cache hit + key build)");
+        println!("    ├─ list_stats (catalog):  {stats:.0} ns  (cached by schema_version)");
         println!("    ├─ planner:               {plan:.0} ns");
         println!(
             "    ├─ lookup (B-tree+decode):  {lookup:.0} ns  (irreducible ≈ SQLite seek+extract)"

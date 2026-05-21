@@ -875,19 +875,30 @@ in its schema hash and never copies the struct per query
 
 Result (macOS, prepared, 10K rows): `resolve_table` **~837 → ~499 ns** (the
 residual is the `format!` cache-key build + `search_path`/db `String` clones, not
-the clone), total prepared point-lookup **~4290 → ~3870 ns (~10%)**. The win
-scales with table width — a 5-column bench table clones little; real 20+ column
-schemas clone far more. The same change also turns the clustered-INSERT batch
-fast-path (which deep-cloned `ResolvedTable` per row inside an explicit txn) into
-an `Arc` clone, a bonus for batch-insert throughput.
+the clone). The win scales with table width — a 5-column bench table clones
+little; real 20+ column schemas clone far more. The same change also turns the
+clustered-INSERT batch fast-path (which deep-cloned `ResolvedTable` per row inside
+an explicit txn) into an `Arc` clone, a bonus for batch-insert throughput.
 
-Next levers, in order of size: skip the `list_stats` catalog read when the plan
-is a PK lookup (or cache stats per table, SQLite-style, in the schema entry);
-cache `ColumnMeta` for the bare-`SELECT *` shape; intern the cache key / avoid the
-per-call `String` allocs in resolve; set `where_already_applied` for an exact-PK
+**Landed: per-table catalog stats cache.** The planner reads `list_stats` once
+per statement for cost-based index selection, but it rebuilt a `CatalogReader`
+and rescanned the stats heap every time — ≈580 ns to usually return the same
+advisory data (empty without `ANALYZE`). `SessionContext` now caches the
+`StatsDef` list behind `Arc`, keyed by `(table_id, schema_version)`. DDL bumps
+`schema_version` (e.g. `CREATE INDEX`) → version miss → reload; `ANALYZE` rewrites
+stats without a version bump but already calls `invalidate_table`, which now drops
+the stats entry too. Mirrors SQLite loading `sqlite_stat1` into the in-memory
+schema once, not per query. Result: `list_stats` **~579 → ~43 ns**.
+
+Cumulative (macOS, prepared, 10K rows): total point-lookup **~4290 → ~3300 ns
+(~23%)**.
+
+Next levers, in order of size: cache `ColumnMeta` for the bare-`SELECT *` shape
+(~390 ns); intern the cache key / avoid the per-call `String` allocs that now
+dominate resolve (~500 ns residual); set `where_already_applied` for an exact-PK
 `IndexLookup` (the `covers_predicate` analog already used for ranges) to skip the
-WHERE re-eval. Each helps every small-result query, not just point lookups.
-(Attribution infra: `crates/axiomdb-sql/src/bench_timings.rs` `SelectPhaseTimings`,
-feature `bench-timings`.)
+WHERE re-eval (~165 ns). Each helps every small-result query, not just point
+lookups. (Attribution infra: `crates/axiomdb-sql/src/bench_timings.rs`
+`SelectPhaseTimings`, feature `bench-timings`.)
 
 - **Writes:** insert path (WAL per-row) and the structural `DELETE`-all gap.

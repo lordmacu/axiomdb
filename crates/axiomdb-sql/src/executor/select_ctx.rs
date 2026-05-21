@@ -221,10 +221,23 @@ fn execute_select_ctx(
 
         // ── Query planner: pick the best access method ────────────────────
         // Load per-column statistics for cost-based index selection (Phase 6.10).
-        let table_stats: Vec<axiomdb_catalog::StatsDef> = crate::time_select_phase!(stats_ns, {
-            let mut reader = CatalogReader::new(storage, snap.clone())?;
-            reader.list_stats(resolved.def.id).unwrap_or_default()
-        });
+        // Per-table stats cache: the planner reads these once per statement for
+        // cost-based index selection, but they change only on ANALYZE / DDL.
+        // Cache by (table_id, schema_version) so warm queries skip rebuilding a
+        // CatalogReader + rescanning the stats heap (≈580 ns). ANALYZE drops the
+        // entry via invalidate_table; DDL bumps schema_version → version miss.
+        let table_stats: Arc<Vec<axiomdb_catalog::StatsDef>> =
+            crate::time_select_phase!(stats_ns, {
+                let tid = resolved.def.id;
+                let ver = resolved.def.schema_version;
+                if let Some(cached) = ctx.get_stats_cached(tid, ver) {
+                    cached
+                } else {
+                    let mut reader = CatalogReader::new(storage, snap.clone())?;
+                    let stats = reader.list_stats(tid).unwrap_or_default();
+                    ctx.cache_stats(tid, ver, stats)
+                }
+            });
         // Collect SELECT column indices for index-only scan detection (Phase 6.13).
         // Returns empty slice for SELECT * (wildcard) → conservative, no index-only.
         let select_col_idxs: Vec<u16> = collect_select_col_idxs(&stmt);
