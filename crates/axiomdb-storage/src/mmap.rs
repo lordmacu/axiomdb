@@ -47,6 +47,15 @@ const CHECKSUM_OFFSET: usize = 12;
 // only the body [HEADER_SIZE..], so stamping the lsn here never invalidates it.
 const LSN_OFFSET: usize = 24;
 
+thread_local! {
+    /// Current transaction id used to stamp page frames (project B, subphase 4).
+    /// Set per statement by the executor via `set_current_txn`; read by `write_page`
+    /// on the redo path. A thread-local is correct under multi-writer because a
+    /// statement runs synchronously on one thread (no `spawn_blocking`/rayon between
+    /// `set_current_txn` and the statement's `write_page`s). `0` = system write.
+    static CURRENT_TXN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // ── DbFileMeta ────────────────────────────────────────────────────────────────
 
 /// File metadata stored in the body of page 0.
@@ -491,12 +500,15 @@ impl MmapStorage {
             buf.copy_from_slice(page.as_bytes());
             buf[LSN_OFFSET..LSN_OFFSET + 8].copy_from_slice(&lsn.to_le_bytes());
             self.pwrite_bytes(page_id * PAGE_SIZE as u64, &buf)?;
-            // txn_id placeholder (0); subphase 4b stamps the real current_txn.
-            let offset = frame_log.append(page_id, lsn, 0, &buf)?;
+            // Stamp the writing txn (thread-local, set per statement by the executor).
+            // 0 = non-transactional/system write (e.g. bootstrap); recovery treats
+            // such frames per the committed predicate in subphase 5.
+            let txn_id = CURRENT_TXN.with(|c| c.get());
+            let offset = frame_log.append(page_id, lsn, txn_id, &buf)?;
             self.wal_index.record(FrameRef {
                 page_id,
                 lsn,
-                txn_id: 0,
+                txn_id,
                 offset,
             });
             let stamped = Page::from_bytes(buf)?;
@@ -881,6 +893,17 @@ impl StorageEngine for MmapStorage {
             .store(snapshot_id, Ordering::Release);
     }
 
+    fn set_current_txn(&self, txn_id: u64) {
+        CURRENT_TXN.with(|c| c.set(txn_id));
+    }
+
+    fn sync_frame_log(&self) -> Result<(), DbError> {
+        if let Some(fl) = &self.frame_log {
+            fl.sync()?;
+        }
+        Ok(())
+    }
+
     fn deferred_free_count(&self) -> usize {
         self.deferred_frees
             .lock()
@@ -1016,6 +1039,11 @@ impl MmapStorage {
     /// (diag/test) whether the live wal-index has a frame for `page_id`.
     pub fn frame_index_contains(&self, page_id: u64) -> bool {
         self.wal_index.latest(page_id).is_some()
+    }
+
+    /// (diag/test) txn_id stamped on the live frame for `page_id`, if any.
+    pub fn frame_txn_id(&self, page_id: u64) -> Option<u64> {
+        self.wal_index.latest(page_id).map(|f| f.txn_id)
     }
 
     /// (diag/test) drop a page's cached copy, forcing the next read down the
@@ -1401,5 +1429,25 @@ mod tests {
         assert!(!s.frame_index_contains(pid), "alloc appends no frame");
         let got = s.read_page(pid).unwrap(); // index miss → mmap path
         assert_eq!(got.header().page_id, pid);
+    }
+
+    #[test]
+    fn write_stamps_current_txn_into_frame() {
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        s.enable_redo_log(&path).unwrap();
+        s.set_current_txn(42);
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x09;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        assert_eq!(
+            s.frame_txn_id(pid),
+            Some(42),
+            "frame stamped with current txn"
+        );
+        s.sync_frame_log().unwrap(); // fsync the frame log (commit-boundary primitive)
+        s.set_current_txn(0); // reset for this thread
     }
 }

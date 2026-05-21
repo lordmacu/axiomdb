@@ -101,13 +101,13 @@ stamping the wrong id and corrupting recovery):
 
 - **Panic-safe reset:** the executor sets/clears the txn via an **RAII guard** (reset to
   0 on drop, including on error/panic unwind), never a bare set + manual reset.
-- **`debug_assert` guard:** when redo is enabled and a *transactional data page* is
-  written, assert `CURRENT_TXN != 0` — turns the silent-corruption case into a loud
-  test failure. (System/bootstrap writes legitimately have `txn_id == 0`; the assert is
-  scoped to the transactional write path.)
+- **Threading test (not a universal assert):** `write_page` cannot tell a transactional
+  write from a system write (both arrive as `&Page`), and system writes legitimately
+  carry `txn_id == 0`, so a universal `debug_assert(txn != 0)` would false-positive.
+  Instead an integration test asserts that a real txn's frames carry its id.
 - **Documented invariant:** "no `spawn_blocking`/rayon between `set_current_txn` and the
   txn's `write_page`s; if a write path is ever parallelized, the `txn_id` must be passed
-  explicitly there."
+  explicitly there." (Breaking it would silently stamp `txn_id = 0`.)
 
 ### Commit boundary: fsync the frame log (write-ahead order)
 
@@ -147,8 +147,8 @@ is an *extra* fsync on top of the still-present WAL fsync + conditional main flu
       `txn_id` (thread-local isolation). Concurrency test with 2+ threads.
 - [ ] RAII guard resets `CURRENT_TXN` to 0 at statement end AND on error/panic unwind
       (no stale `txn_id` leaks to the next statement on the same thread).
-- [ ] `debug_assert` fires if a transactional data-page `write_page` runs with
-      `CURRENT_TXN == 0` (catches a broken thread-local invariant loudly).
+- [ ] Integration test asserts a real txn's frames carry its `txn_id` (threading works
+      end-to-end through the executor).
 - [ ] Same txn writes many pages → all frames carry that `txn_id`.
 - [ ] Autocommit statement → its own `txn_id` set/reset per statement.
 - [ ] `txn_id = 0` (no current txn) → frame stamped 0 (bootstrap/system write).

@@ -96,6 +96,20 @@ pub trait StorageEngine: Send + Sync {
     /// unreachable. Implementations that do not defer frees may ignore this.
     fn set_current_snapshot(&self, _snapshot_id: u64) {}
 
+    /// Tells the storage the current transaction's id so `write_page` can stamp it
+    /// into page frames (project B REDO recovery). `MmapStorage` keeps it in a
+    /// **thread-local** (correct under multi-writer: each statement runs
+    /// synchronously on one thread); the executor sets it per statement and resets
+    /// it to 0 at statement end. `0` = non-transactional / system write. Default no-op.
+    fn set_current_txn(&self, _txn_id: u64) {}
+
+    /// Makes the page-frame redo log durable (fsync) at the commit boundary, before
+    /// the logical WAL `Commit` record (write-ahead: data before the commit record).
+    /// Default no-op (backend without a redo log).
+    fn sync_frame_log(&self) -> Result<(), DbError> {
+        Ok(())
+    }
+
     /// Returns the number of pages currently waiting in the deferred-free queue.
     /// Useful for diagnostics and tests. Default: 0.
     fn deferred_free_count(&self) -> usize {

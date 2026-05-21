@@ -191,7 +191,7 @@ feat(redo-recovery): executor threads txn_id + commit fsyncs the frame log (4c)
 
 ### Against spec done-criteria
 - [ ] frame has txn_id; build_index(predicate); set_current_txn + sync_frame_log
-- [ ] RAII guard resets on error/panic; debug_assert present
+- [ ] RAII guard resets on error/panic; threading integration test asserts per-txn ids
 - [ ] concurrency test: 2+ threads stamp correct per-txn ids
 - [ ] additive: dual-write + per-commit flush intact; **T0 still RED**
 
