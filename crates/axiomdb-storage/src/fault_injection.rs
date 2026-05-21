@@ -265,6 +265,37 @@ impl StorageEngine for FaultInjectionStorage {
         }
     }
 
+    fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        let Some(frame_log) = &self.frame_log else {
+            return Ok(0);
+        };
+        let index = frame_log.build_index(is_committed)?;
+        let mut redone = 0usize;
+        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        // One deref to &mut State so `current` and `durable` are disjoint field borrows.
+        let st = &mut *guard;
+        for frame in index.frames() {
+            let idx = frame.page_id as usize;
+            let page_lsn = if idx < st.current.pages.len() && st.current.allocated[idx] {
+                st.current.pages[idx].lsn()
+            } else {
+                0 // page lost on crash (allocated after the last flush) ⇒ apply.
+            };
+            if frame.lsn > page_lsn {
+                let page = Page::from_bytes(*frame_log.read_page_at(frame.offset)?)?;
+                // Redo into BOTH layers so the restored page is itself durable
+                // (a later power loss must not lose it again).
+                for layer in [&mut st.current, &mut st.durable] {
+                    layer.ensure_capacity(frame.page_id);
+                    layer.pages[idx] = page.clone();
+                    layer.allocated[idx] = true;
+                }
+                redone += 1;
+            }
+        }
+        Ok(redone)
+    }
+
     fn page_count(&self) -> u64 {
         self.state
             .read()
@@ -391,5 +422,39 @@ mod tests {
         assert_eq!(storage.read_page(id).unwrap().body()[0], 0xAA);
         // … but the fsync'd frame for txn 5 is still in the (separate) frame log.
         assert!(storage.frame_log_has_committed(id, &|t| t == 5));
+    }
+
+    #[test]
+    fn redo_restores_committed_row_after_power_loss_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = FaultInjectionStorage::new();
+        storage.enable_redo_log(&dir.path().join("fi.wf")).unwrap();
+
+        let id = storage.alloc_page(PageType::Data).unwrap();
+        storage.write_page(id, &data_page(id, 0xAA)).unwrap(); // baseline txn 0
+        storage.flush().unwrap();
+
+        storage.set_current_txn(5);
+        storage.write_page(id, &data_page(id, 0xBB)).unwrap(); // committed row
+        storage.sync_frame_log().unwrap();
+        storage.set_current_txn(0);
+        storage.simulate_power_loss();
+        assert_eq!(
+            storage.read_page(id).unwrap().body()[0],
+            0xAA,
+            "the committed row was lost on the crash"
+        );
+
+        // REDO restores it.
+        assert_eq!(storage.redo_committed_frames(&|t| t == 5).unwrap(), 1);
+        assert_eq!(
+            storage.read_page(id).unwrap().body()[0],
+            0xBB,
+            "committed row restored by REDO"
+        );
+        // Crash *during* recovery: a second pass is a no-op (pageLSN guard).
+        assert_eq!(storage.redo_committed_frames(&|t| t == 5).unwrap(), 0);
+        // An uncommitted txn's frame is never applied.
+        assert_eq!(storage.redo_committed_frames(&|_| false).unwrap(), 0);
     }
 }
