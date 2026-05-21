@@ -23,9 +23,10 @@ Usage:
 import ctypes
 import os
 import platform
+import struct
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ── Library loading ──────────────────────────────────────────────────────────
 
@@ -72,6 +73,68 @@ TYPE_REAL = 2
 TYPE_TEXT = 3
 TYPE_BLOB = 4
 
+# ── Packed buffer format (must match crates/axiomdb-embedded/src/lib.rs) ───────
+
+_PACKED_MAGIC = 0x41584D31  # "AXM1"
+_U32 = struct.Struct("<I")
+_U64 = struct.Struct("<Q")
+_I64 = struct.Struct("<q")
+_F64 = struct.Struct("<d")
+
+
+def _parse_packed(buf: bytes) -> Tuple[List[str], List[tuple]]:
+    """Parses a packed result buffer into (column_names, rows-as-tuples).
+
+    Single pass over the buffer; all per-cell work stays in this loop. Hot-path
+    locals are bound up front to avoid attribute lookups inside the loop.
+    """
+    u32_from = _U32.unpack_from
+    i64_from = _I64.unpack_from
+    f64_from = _F64.unpack_from
+
+    magic = u32_from(buf, 0)[0]
+    if magic != _PACKED_MAGIC:
+        raise AxiomDBError(f"corrupt packed buffer (magic={magic:#x})")
+    n_cols = u32_from(buf, 4)[0]
+    n_rows = _U64.unpack_from(buf, 8)[0]
+    off = 16
+
+    col_names: List[str] = []
+    for _ in range(n_cols):
+        ln = u32_from(buf, off)[0]
+        off += 4
+        col_names.append(buf[off:off + ln].decode("utf-8"))
+        off += ln
+
+    # Hot loop: slicing a `bytes` object (`buf[a:b]`) and `.decode()` are both
+    # C-implemented and measured ~13% faster here than a memoryview + str().
+    rows: List[tuple] = []
+    append = rows.append
+    for _ in range(n_rows):
+        row = [None] * n_cols
+        for c in range(n_cols):
+            tag = buf[off]
+            off += 1
+            if tag == TYPE_INTEGER:
+                row[c] = i64_from(buf, off)[0]
+                off += 8
+            elif tag == TYPE_TEXT:
+                ln = u32_from(buf, off)[0]
+                off += 4
+                row[c] = buf[off:off + ln].decode("utf-8")
+                off += ln
+            elif tag == TYPE_REAL:
+                row[c] = f64_from(buf, off)[0]
+                off += 8
+            elif tag == TYPE_BLOB:
+                ln = u32_from(buf, off)[0]
+                off += 4
+                row[c] = buf[off:off + ln]
+                off += ln
+            # tag == TYPE_NULL → leave None
+        append(tuple(row))
+    return col_names, rows
+
 # ── C function signatures ───────────────────────────────────────────────────
 
 _lib.axiomdb_open.argtypes = [ctypes.c_char_p]
@@ -115,6 +178,18 @@ _lib.axiomdb_rows_free.restype = None
 
 _lib.axiomdb_last_error.argtypes = [ctypes.c_void_p]
 _lib.axiomdb_last_error.restype = ctypes.c_char_p
+
+# ── Packed result buffer (single-FFI-call materialization) ────────────────────
+# axiomdb_query_packed serializes the whole result into ONE contiguous buffer so
+# the binding crosses the FFI boundary once per query instead of ~2× per cell.
+
+_lib.axiomdb_query_packed.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)
+]
+_lib.axiomdb_query_packed.restype = ctypes.c_void_p
+
+_lib.axiomdb_packed_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_lib.axiomdb_packed_free.restype = None
 
 # ── Appender FFI (Attack 8) ──────────────────────────────────────────────────
 
@@ -201,55 +276,54 @@ class AxiomDB:
             raise AxiomDBError(self._last_error() or "execute failed")
         return result
 
+    def _query_packed(self, sql: str) -> Tuple[List[str], List[tuple]]:
+        """Run a query and materialize it via the packed buffer (one FFI call).
+
+        Returns (column_names, rows-as-tuples). Internal — used by `query`,
+        `query_tuples`, and `query_with_columns`.
+        """
+        self._check_open()
+        length = ctypes.c_size_t(0)
+        ptr = _lib.axiomdb_query_packed(
+            self._ptr, sql.encode("utf-8"), ctypes.byref(length)
+        )
+        if not ptr:
+            raise AxiomDBError(self._last_error() or "query failed")
+        try:
+            # One copy of the whole buffer into a Python bytes object, then a
+            # single Python-side parse loop (no per-cell FFI crossings).
+            buf = ctypes.string_at(ptr, length.value)
+        finally:
+            _lib.axiomdb_packed_free(ptr, length.value)
+        return _parse_packed(buf)
+
     def query(self, sql: str) -> List[Dict[str, Any]]:
-        """Execute a SELECT and return rows as list of dicts.
+        """Execute a SELECT and return rows as a list of dicts.
 
         Each dict maps column name → Python value.
         Types: int, float, str, bytes, None (NULL).
+
+        Uses the packed-buffer path (one FFI call); for the fastest
+        materialization use `query_tuples` (skips dict construction).
         """
-        self._check_open()
-        rows_ptr = _lib.axiomdb_query(self._ptr, sql.encode("utf-8"))
-        if not rows_ptr:
-            raise AxiomDBError(self._last_error() or "query failed")
+        col_names, rows = self._query_packed(sql)
+        return [dict(zip(col_names, r)) for r in rows]
 
-        try:
-            n_rows = _lib.axiomdb_rows_count(rows_ptr)
-            n_cols = _lib.axiomdb_rows_columns(rows_ptr)
+    def query_tuples(self, sql: str) -> List[tuple]:
+        """Execute a SELECT and return rows as a list of tuples.
 
-            # Column names
-            col_names = []
-            for c in range(n_cols):
-                name = _lib.axiomdb_rows_column_name(rows_ptr, c)
-                col_names.append(name.decode("utf-8") if name else f"col_{c}")
+        Fastest materialization path — matches `sqlite3.Cursor.fetchall()`
+        shape (positional tuples, no column-name dict construction).
+        """
+        _col_names, rows = self._query_packed(sql)
+        return rows
 
-            # Extract rows
-            result = []
-            for r in range(n_rows):
-                row = {}
-                for c in range(n_cols):
-                    typ = _lib.axiomdb_rows_type(rows_ptr, r, c)
-                    if typ == TYPE_NULL:
-                        row[col_names[c]] = None
-                    elif typ == TYPE_INTEGER:
-                        row[col_names[c]] = _lib.axiomdb_rows_get_int(rows_ptr, r, c)
-                    elif typ == TYPE_REAL:
-                        row[col_names[c]] = _lib.axiomdb_rows_get_double(rows_ptr, r, c)
-                    elif typ == TYPE_TEXT:
-                        val = _lib.axiomdb_rows_get_text(rows_ptr, r, c)
-                        row[col_names[c]] = val.decode("utf-8") if val else None
-                    elif typ == TYPE_BLOB:
-                        length = ctypes.c_size_t(0)
-                        ptr = _lib.axiomdb_rows_get_blob(rows_ptr, r, c, ctypes.byref(length))
-                        if ptr:
-                            row[col_names[c]] = ctypes.string_at(ptr, length.value)
-                        else:
-                            row[col_names[c]] = None
-                    else:
-                        row[col_names[c]] = None
-                result.append(row)
-            return result
-        finally:
-            _lib.axiomdb_rows_free(rows_ptr)
+    def query_with_columns(self, sql: str) -> Tuple[List[str], List[tuple]]:
+        """Execute a SELECT and return (column_names, rows-as-tuples).
+
+        Use when you need both the column names and the fast tuple shape.
+        """
+        return self._query_packed(sql)
 
     def last_error(self) -> Optional[str]:
         """Return the last error message, or None if no error."""

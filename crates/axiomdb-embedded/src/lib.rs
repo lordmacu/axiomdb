@@ -508,16 +508,28 @@ mod db {
             }
 
             // Clone the analyzed AST and substitute Param nodes with Literal values.
-            let stmt = substitute_params(self.analyzed.clone(), params)?;
+            let stmt = axiomdb_sql::time_select_phase!(
+                clone_ns,
+                substitute_params(self.analyzed.clone(), params)?
+            );
+            axiomdb_sql::bench_timings::bump_select_calls(1);
 
             // Read-only fast path: a SELECT in autocommit (no staged writes in an
             // open txn) is served from a snapshot — skips the per-statement
             // write-txn begin/commit that `execute_with_ctx` does for SELECT.
-            if matches!(stmt, Stmt::Select(_)) && db.session.conn_txn.is_none() {
-                execute_read_only_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
-            } else {
-                execute_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
-            }
+            axiomdb_sql::time_select_phase!(exec_ns, {
+                if matches!(stmt, Stmt::Select(_)) && db.session.conn_txn.is_none() {
+                    execute_read_only_with_ctx(
+                        stmt,
+                        &db.storage,
+                        &db.txn,
+                        &db.bloom,
+                        &mut db.session,
+                    )
+                } else {
+                    execute_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
+                }
+            })
         }
 
         /// Returns the number of `?` parameters in this prepared statement.
@@ -893,6 +905,122 @@ mod ffi {
                 }))
             }
             Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    // ── Packed result buffer (single-FFI-call materialization) ────────────────
+    //
+    // The per-cell accessors above cross the FFI boundary ~2× per cell, which
+    // dominates Python-binding latency (~120K ctypes calls for a 10K×6 result).
+    // `axiomdb_query_packed` serializes the whole result into one contiguous
+    // buffer so the binding crosses the boundary exactly once. Format (LE):
+    //
+    //   u32 magic = PACKED_MAGIC ("AXM1")
+    //   u32 n_cols
+    //   u64 n_rows
+    //   n_cols × { u32 name_len, name_bytes (UTF-8) }
+    //   n_rows × n_cols × cell:
+    //     u8 tag (0=NULL,1=INT i64,2=REAL f64,3=TEXT,4=BLOB)
+    //     payload: INT→i64 | REAL→f64 | TEXT/BLOB→ u32 len + bytes | NULL→∅
+    //
+    // Type mapping reuses `value_to_cell`, so the packed path is byte-for-byte
+    // consistent with the per-cell accessors.
+
+    /// Magic header identifying a packed result buffer ("AXM1" little-endian).
+    const PACKED_MAGIC: u32 = 0x41584D31;
+
+    /// Serializes one value into `buf` using the packed cell encoding.
+    fn pack_value(buf: &mut Vec<u8>, v: Value) {
+        match value_to_cell(v) {
+            CellValue::Null => buf.push(0),
+            CellValue::Integer(n) => {
+                buf.push(1);
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            CellValue::Real(f) => {
+                buf.push(2);
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            CellValue::Text(s) => {
+                let b = s.as_bytes();
+                buf.push(3);
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+            CellValue::Blob(b) => {
+                buf.push(4);
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&b);
+            }
+        }
+    }
+
+    /// Serializes a full result set (column names + cells) into a packed buffer.
+    fn pack_rows(columns: &[axiomdb_sql::result::ColumnMeta], rows: Vec<Vec<Value>>) -> Vec<u8> {
+        let n_cols = columns.len();
+        let n_rows = rows.len();
+        // Rough pre-size: header + names + ~12 bytes/cell average.
+        let mut buf = Vec::with_capacity(16 + n_cols * 16 + n_rows * n_cols * 12);
+        buf.extend_from_slice(&PACKED_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(n_cols as u32).to_le_bytes());
+        buf.extend_from_slice(&(n_rows as u64).to_le_bytes());
+        for col in columns {
+            let nb = col.name.as_bytes();
+            buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(nb);
+        }
+        for row in rows {
+            for v in row {
+                pack_value(&mut buf, v);
+            }
+        }
+        buf
+    }
+
+    /// Executes a SELECT and serializes the entire result set into one heap
+    /// buffer. Returns the buffer pointer and writes its byte length to
+    /// `out_len`. Returns NULL on error (see `axiomdb_last_error`). The buffer
+    /// must be freed with `axiomdb_packed_free(ptr, len)`.
+    ///
+    /// Non-row statements (DDL/DML) yield an empty (0-row, 0-col) buffer.
+    ///
+    /// # Safety
+    /// `db` must be a valid pointer from `axiomdb_open`. `sql` must be a valid
+    /// non-null null-terminated UTF-8 string. `out_len` must be a valid
+    /// non-null pointer to a `usize`.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_query_packed(
+        db: *mut Db,
+        sql: *const c_char,
+        out_len: *mut usize,
+    ) -> *mut u8 {
+        if db.is_null() || sql.is_null() || out_len.is_null() {
+            return std::ptr::null_mut();
+        }
+        let db = &mut *db;
+        let sql = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let buf = match db.run(sql) {
+            Ok(axiomdb_sql::result::QueryResult::Rows { columns, rows }) => pack_rows(&columns, rows),
+            Ok(_) => pack_rows(&[], Vec::new()),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let boxed = buf.into_boxed_slice();
+        *out_len = boxed.len();
+        Box::into_raw(boxed) as *mut u8
+    }
+
+    /// Frees a buffer returned by `axiomdb_query_packed`.
+    ///
+    /// # Safety
+    /// `ptr` and `len` must be exactly the values produced by a single
+    /// `axiomdb_query_packed` call, and must not have been freed already.
+    #[no_mangle]
+    pub unsafe extern "C" fn axiomdb_packed_free(ptr: *mut u8, len: usize) {
+        if !ptr.is_null() {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
         }
     }
 
@@ -1389,6 +1517,113 @@ mod ffi {
         r.cells
             .get(row as usize)
             .and_then(|row| row.get(col as usize))
+    }
+
+    // ── Packed buffer tests ───────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod packed_tests {
+        use super::*;
+        use axiomdb_sql::result::ColumnMeta;
+        use axiomdb_types::DataType;
+
+        fn col(name: &str) -> ColumnMeta {
+            ColumnMeta {
+                name: name.to_string(),
+                data_type: DataType::Int,
+                nullable: true,
+                table_name: None,
+            }
+        }
+
+        /// Minimal reader mirroring the Python parser — validates the layout.
+        fn read_u32(buf: &[u8], off: &mut usize) -> u32 {
+            let v = u32::from_le_bytes(buf[*off..*off + 4].try_into().unwrap());
+            *off += 4;
+            v
+        }
+        fn read_u64(buf: &[u8], off: &mut usize) -> u64 {
+            let v = u64::from_le_bytes(buf[*off..*off + 8].try_into().unwrap());
+            *off += 8;
+            v
+        }
+
+        #[test]
+        fn pack_header_and_names() {
+            let cols = vec![col("id"), col("name")];
+            let buf = pack_rows(&cols, Vec::new());
+            let mut off = 0;
+            assert_eq!(read_u32(&buf, &mut off), PACKED_MAGIC);
+            assert_eq!(read_u32(&buf, &mut off), 2); // n_cols
+            assert_eq!(read_u64(&buf, &mut off), 0); // n_rows
+            // col 0 name
+            let l0 = read_u32(&buf, &mut off) as usize;
+            assert_eq!(&buf[off..off + l0], b"id");
+            off += l0;
+            let l1 = read_u32(&buf, &mut off) as usize;
+            assert_eq!(&buf[off..off + l1], b"name");
+        }
+
+        #[test]
+        fn pack_all_cell_types_roundtrip() {
+            let cols = vec![col("a"), col("b"), col("c"), col("d"), col("e")];
+            let rows = vec![vec![
+                Value::Int(42),
+                Value::Real(3.5),
+                Value::Text("héllo".to_string()),
+                Value::Bytes(vec![1, 2, 3]),
+                Value::Null,
+            ]];
+            let buf = pack_rows(&cols, rows);
+            let mut off = 4 + 4 + 8; // skip magic + n_cols + n_rows
+                                     // skip 5 column names (each: u32 len + bytes, all 1 char)
+            for _ in 0..5 {
+                let l = read_u32(&buf, &mut off) as usize;
+                off += l;
+            }
+            // cell a: INT 42
+            assert_eq!(buf[off], 1);
+            off += 1;
+            assert_eq!(read_u64(&buf, &mut off) as i64, 42);
+            // cell b: REAL 3.5
+            assert_eq!(buf[off], 2);
+            off += 1;
+            let f = f64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            off += 8;
+            assert_eq!(f, 3.5);
+            // cell c: TEXT "héllo"
+            assert_eq!(buf[off], 3);
+            off += 1;
+            let tl = read_u32(&buf, &mut off) as usize;
+            assert_eq!(&buf[off..off + tl], "héllo".as_bytes());
+            off += tl;
+            // cell d: BLOB [1,2,3]
+            assert_eq!(buf[off], 4);
+            off += 1;
+            let bl = read_u32(&buf, &mut off) as usize;
+            assert_eq!(&buf[off..off + bl], &[1, 2, 3]);
+            off += bl;
+            // cell e: NULL
+            assert_eq!(buf[off], 0);
+        }
+
+        #[test]
+        fn pack_empty_string_and_blob() {
+            let cols = vec![col("a"), col("b")];
+            let rows = vec![vec![Value::Text(String::new()), Value::Bytes(Vec::new())]];
+            let buf = pack_rows(&cols, rows);
+            let mut off = 16;
+            for _ in 0..2 {
+                let l = read_u32(&buf, &mut off) as usize;
+                off += l;
+            }
+            assert_eq!(buf[off], 3); // TEXT
+            off += 1;
+            assert_eq!(read_u32(&buf, &mut off), 0); // empty len
+            assert_eq!(buf[off], 4); // BLOB
+            off += 1;
+            assert_eq!(read_u32(&buf, &mut off), 0); // empty len
+        }
     }
 }
 
