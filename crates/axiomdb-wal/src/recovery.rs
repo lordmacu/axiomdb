@@ -91,6 +91,9 @@ pub struct RecoveryResult {
     pub max_committed: TxnId,
     /// Number of in-progress transactions that were undone.
     pub undone_txns: u32,
+    /// Number of committed page frames physically redone (project B subphase 5).
+    /// `0` on a backend without a redo log.
+    pub redone_pages: usize,
     /// The checkpoint LSN used as the scan start point (`0` = scanned from beginning).
     pub checkpoint_lsn: u64,
     /// Final clustered root per table after crash recovery finishes.
@@ -168,6 +171,9 @@ impl CrashRecovery {
 
         let mut max_committed = 0u64;
         let mut active_txns: HashSet<u64> = HashSet::new();
+        // Committed-txn set for the physical REDO pass (project B subphase 5): a page
+        // frame is replayed iff its writing txn has a `Commit` in the logical WAL.
+        let mut committed: HashSet<u64> = HashSet::new();
         let mut recovery_timeline: Vec<(TxnId, RecoveryOp)> = Vec::new();
         let mut clustered_root_timeline: Vec<(TxnId, u32, u64)> = Vec::new();
         let mut active_clustered_roots: HashMap<u64, HashMap<u32, u64>> = HashMap::new();
@@ -189,6 +195,7 @@ impl CrashRecovery {
                 }
                 EntryType::Commit => {
                     max_committed = max_committed.max(entry.txn_id);
+                    committed.insert(entry.txn_id);
                     active_txns.remove(&entry.txn_id);
                     if let Some(roots) = active_clustered_roots.remove(&entry.txn_id) {
                         for (table_id, root_pid) in roots {
@@ -541,12 +548,19 @@ impl CrashRecovery {
             }
         }
 
+        // ── Phase: REDO (physical, committed) ─────────────────────────────────
+        // Hybrid recovery: UNDO logical (uncommitted) above, then REDO physical
+        // (committed) here — restores committed pages whose data never reached the
+        // main file. No-op on a backend without a redo log (returns 0).
+        let redone_pages = storage.redo_committed_frames(&|t| committed.contains(&t))?;
+
         // Flush all corrected pages to disk — makes recovery durable.
         storage.flush()?;
 
         Ok(RecoveryResult {
             max_committed,
             undone_txns,
+            redone_pages,
             checkpoint_lsn,
             clustered_roots: current_clustered_roots,
         })
@@ -637,6 +651,29 @@ mod tests {
         let result = CrashRecovery::recover(&mut storage, &wal).unwrap();
         assert_eq!(result.max_committed, 2);
         assert_eq!(result.undone_txns, 0);
+    }
+
+    #[test]
+    fn recover_reports_zero_redone_without_a_frame_log() {
+        // MemoryStorage has no redo log, so the new REDO pass in recover() is a no-op.
+        // Existing UNDO behavior is unchanged (the crashed insert is still undone).
+        let (_dir, wal) = temp_setup();
+        let mut storage = MemoryStorage::new();
+        let page_id = fresh_data_page(&mut storage);
+        let mgr = TxnManager::create(&wal).unwrap();
+
+        let mut conn = mgr.begin().unwrap();
+        let page_bytes = *storage.read_page(page_id).unwrap().as_bytes();
+        let mut page = Page::from_bytes(page_bytes).unwrap();
+        let slot_id = insert_tuple(&mut page, b"x", conn.txn_id).unwrap();
+        storage.write_page(page_id, &page).unwrap();
+        mgr.record_insert(&mut conn, 1, b"k", b"x", page_id, slot_id)
+            .unwrap();
+        drop(mgr); // crash, uncommitted
+
+        let result = CrashRecovery::recover(&mut storage, &wal).unwrap();
+        assert_eq!(result.undone_txns, 1, "the crashed insert is undone");
+        assert_eq!(result.redone_pages, 0, "MemoryStorage has no frame log");
     }
 
     // ── recover: undo INSERT ──────────────────────────────────────────────────
