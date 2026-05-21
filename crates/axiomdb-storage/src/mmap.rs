@@ -21,7 +21,7 @@ use crate::{
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
     page_lock::PageLockTable,
-    wal_frame::{FrameLog, WalIndex},
+    wal_frame::{FrameLog, FrameRef, WalIndex},
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -42,6 +42,10 @@ const PAGE_COUNT_OFFSET: usize = HEADER_SIZE + 8 + 4 + 4;
 const CLEAN_SHUTDOWN_OFFSET: usize = HEADER_SIZE + crate::meta::CLEAN_SHUTDOWN_BODY_OFFSET;
 // Offset of the `checksum` field inside PageHeader.
 const CHECKSUM_OFFSET: usize = 12;
+// Offset of the `lsn` field inside PageHeader: magic(8)+page_type(1)+flags(1)
+// +item_count(2)+checksum(4)+page_id(8) = 24. The checksum (offset 12) covers
+// only the body [HEADER_SIZE..], so stamping the lsn here never invalidates it.
+const LSN_OFFSET: usize = 24;
 
 // ── DbFileMeta ────────────────────────────────────────────────────────────────
 
@@ -477,11 +481,32 @@ impl MmapStorage {
                 }
             }
         }
-        self.pwrite_page(page_id, page)?;
-        // Drop any stale cached copy so the next read reloads the new bytes.
-        // Public `write_page` holds the page X-latch across this, serializing
-        // with S-latch readers' miss-path inserts.
-        self.buffer_pool.invalidate(page_id);
+        if let Some(frame_log) = &self.frame_log {
+            // Write-ahead (subphase 3 = dual-write): stamp the page LSN, write the
+            // main file (still authoritative until subphase 4), append a page frame,
+            // record it in the live index, and cache the stamped bytes so a
+            // read-after-write is a pool hit (no frame pread).
+            let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
+            let mut buf = [0u8; PAGE_SIZE];
+            buf.copy_from_slice(page.as_bytes());
+            buf[LSN_OFFSET..LSN_OFFSET + 8].copy_from_slice(&lsn.to_le_bytes());
+            self.pwrite_bytes(page_id * PAGE_SIZE as u64, &buf)?;
+            let offset = frame_log.append(page_id, lsn, 0, &buf)?;
+            self.wal_index.record(FrameRef {
+                page_id,
+                lsn,
+                commit_marker: 0,
+                offset,
+            });
+            let stamped = Page::from_bytes(buf)?;
+            self.buffer_pool.insert(page_id, Arc::new(stamped));
+        } else {
+            self.pwrite_page(page_id, page)?;
+            // Drop any stale cached copy so the next read reloads the new bytes.
+            // Public `write_page` holds the page X-latch across this, serializing
+            // with S-latch readers' miss-path inserts.
+            self.buffer_pool.invalidate(page_id);
+        }
         self.dirty.mark(page_id);
         Ok(())
     }
@@ -974,6 +999,11 @@ impl MmapStorage {
         self.frame_lsn.load(Ordering::Acquire)
     }
 
+    /// (diag/test) whether the live wal-index has a frame for `page_id`.
+    pub fn frame_index_contains(&self, page_id: u64) -> bool {
+        self.wal_index.latest(page_id).is_some()
+    }
+
     /// Returns the number of currently free pages.
     pub fn free_count(&self) -> u64 {
         self.freelist
@@ -1235,5 +1265,56 @@ mod tests {
         let pid = s.alloc_page(PageType::Data).unwrap();
         let got = s.read_page(pid).unwrap();
         assert_eq!(got.header().page_id, pid);
+    }
+
+    #[test]
+    fn write_appends_frame_and_records_index_when_enabled() {
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        s.enable_redo_log(&path).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x7C;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        assert!(s.frame_index_contains(pid), "page recorded in the live index");
+        assert!(s.current_frame_lsn() >= 2, "lsn advanced past the write");
+        assert_eq!(s.read_page(pid).unwrap().body()[0], 0x7C);
+    }
+
+    #[test]
+    fn lsn_stamp_does_not_break_page_checksum() {
+        let path = tmp_path();
+        let mut s = MmapStorage::create(&path).unwrap();
+        s.enable_redo_log(&path).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x5A;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        // Read raw from the MAIN file and parse: the stamped lsn must be non-zero
+        // and the body checksum must still verify (lsn lives outside the body).
+        let raw = s.read_page_raw(pid).unwrap();
+        let parsed = Page::from_bytes(raw).expect("checksum valid after lsn stamp");
+        assert_ne!(parsed.header().lsn, 0, "PageHeader.lsn was stamped");
+    }
+
+    #[test]
+    fn write_disabled_is_byte_identical() {
+        let path = tmp_path();
+        let s = MmapStorage::create(&path).unwrap(); // redo OFF
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x33;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        assert_eq!(s.wal_index_len(), 0, "no frames recorded when disabled");
+        assert_eq!(s.read_page(pid).unwrap().body()[0], 0x33);
+        let raw = s.read_page_raw(pid).unwrap();
+        assert_eq!(
+            Page::from_bytes(raw).unwrap().header().lsn,
+            0,
+            "lsn stays 0 when redo is off"
+        );
     }
 }
