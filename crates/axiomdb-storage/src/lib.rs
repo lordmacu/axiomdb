@@ -10,6 +10,8 @@ pub mod config;
 pub mod dirty;
 pub mod doublewrite;
 pub mod engine;
+#[cfg(any(test, feature = "testing"))]
+pub mod fault_injection;
 pub mod freelist;
 pub mod heap;
 pub mod heap_chain;

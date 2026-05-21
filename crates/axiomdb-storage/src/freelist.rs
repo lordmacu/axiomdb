@@ -19,7 +19,7 @@ pub const BITMAP_CAPACITY: u64 = (BITMAP_BODY_BYTES * 8) as u64;
 ///
 /// `alloc` uses `u64::trailing_zeros()` on the inverted word to find
 /// the first free bit in O(1) per word, O(n/64) total.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FreeList {
     words: Vec<u64>,
     total_pages: u64,

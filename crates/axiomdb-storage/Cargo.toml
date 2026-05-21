@@ -18,6 +18,11 @@ toml         = { workspace = true }
 libc         = "0.2"
 crossbeam-queue = { workspace = true }
 
+[features]
+# Exposes test-only infrastructure (e.g. FaultInjectionStorage) to other crates'
+# dev-dependencies. Never enabled in release builds.
+testing = []
+
 [dev-dependencies]
 tempfile  = "3"
 criterion = { workspace = true }
