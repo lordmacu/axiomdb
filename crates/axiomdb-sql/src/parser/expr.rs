@@ -696,49 +696,57 @@ fn parse_postfix(p: &mut Parser) -> Result<Expr, DbError> {
 
 // ── Atom ──────────────────────────────────────────────────────────────────────
 
+/// Converts a bare literal token to its `Expr::Literal`, or `None` for any
+/// non-literal token. Single source of truth for the literal mapping, shared by
+/// `parse_atom` and the INSERT `VALUES` fast-path (`parse_value_expr`); the
+/// `values_fastpath_equals_parse_expr` test asserts the two paths agree.
+pub(crate) fn literal_token_to_expr(tok: Token<'_>) -> Option<Expr> {
+    Some(match tok {
+        Token::HexLit(n) => Expr::Literal(Value::BigInt(n)),
+        Token::Integer(n) => {
+            if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                Expr::Literal(Value::Int(n as i32))
+            } else {
+                Expr::Literal(Value::BigInt(n))
+            }
+        }
+        Token::Float(f) => Expr::Literal(Value::Real(f)),
+        Token::StringLit(s) => Expr::Literal(Value::Text(s)),
+        Token::True => Expr::Literal(Value::Bool(true)),
+        Token::False => Expr::Literal(Value::Bool(false)),
+        Token::Null => Expr::Literal(Value::Null),
+        _ => return None,
+    })
+}
+
 fn parse_atom(p: &mut Parser) -> Result<Expr, DbError> {
     let pos = p.current_pos();
 
-    match p.peek().clone() {
+    let tok = p.peek().clone();
+    // Fast literal terminals (shared with the INSERT VALUES fast-path). One
+    // discriminant check, then the shared converter — keeps `parse_atom` and
+    // `parse_value_expr` byte-identical without re-listing the mapping.
+    if matches!(
+        tok,
+        Token::HexLit(_)
+            | Token::Integer(_)
+            | Token::Float(_)
+            | Token::StringLit(_)
+            | Token::True
+            | Token::False
+            | Token::Null
+    ) {
+        p.advance();
+        return Ok(literal_token_to_expr(tok).expect("matches! guarantees a literal token"));
+    }
+
+    match tok {
         // `?` — positional prepared-statement parameter placeholder.
         Token::Question => {
             p.advance();
             let idx = p.param_count;
             p.param_count += 1;
             Ok(Expr::Param { idx })
-        }
-
-        Token::HexLit(n) => {
-            p.advance();
-            Ok(Expr::Literal(Value::BigInt(n)))
-        }
-        Token::Integer(n) => {
-            p.advance();
-            if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
-                Ok(Expr::Literal(Value::Int(n as i32)))
-            } else {
-                Ok(Expr::Literal(Value::BigInt(n)))
-            }
-        }
-        Token::Float(f) => {
-            p.advance();
-            Ok(Expr::Literal(Value::Real(f)))
-        }
-        Token::StringLit(s) => {
-            p.advance();
-            Ok(Expr::Literal(Value::Text(s)))
-        }
-        Token::True => {
-            p.advance();
-            Ok(Expr::Literal(Value::Bool(true)))
-        }
-        Token::False => {
-            p.advance();
-            Ok(Expr::Literal(Value::Bool(false)))
-        }
-        Token::Null => {
-            p.advance();
-            Ok(Expr::Literal(Value::Null))
         }
         Token::Default => {
             p.advance();

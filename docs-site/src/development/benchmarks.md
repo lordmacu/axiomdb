@@ -918,3 +918,47 @@ of `String` allocs. Both help every small-result query, not just point lookups.
 feature `bench-timings`.)
 
 - **Writes:** insert path (WAL per-row) and the structural `DELETE`-all gap.
+
+## Faster INSERT parser — VALUES literal fast-path (2026-05)
+
+The fair `insert_batch` scenario (both engines run `BEGIN; N parsed INSERTs;
+COMMIT` at `synchronous=NORMAL`) was ~5.3× behind SQLite. Per-row diagnosis
+(`axiomdb_bench --diagnose-insert` / `--diagnose-parse`) split the ~7.1 µs/row as
+parse 3.3 µs (45%) + execute 3.2 µs (45%) + analyze 0.67 µs — and **parse is 76%
+AST construction**, not lexing. SQLite parses the same INSERT in ~0.5 µs.
+
+Fix: a `VALUES` literal fast-path in the parser (see
+[internals/sql-parser.md](../internals/sql-parser.md)) — a bare-literal element
+followed by `,`/`)` builds `Expr::Literal` directly, skipping the precedence
+ladder, with byte-identical AST.
+
+### Results — macOS native (medians)
+
+| Metric | Before | After |
+|---|---:|---:|
+| AST-build (`--diagnose-parse`) | ~2.6 µs/row | **0.62 µs/row** (4.2×) |
+| full parse | ~3.4 µs/row | **1.55 µs/row** |
+| insert_batch (`--compare`) | 92.6K / 5.31× | **120K / ~4.6×** (+30%) |
+| crud_flow/insert | 90.0K / 5.75× | **119K / ~4.6×** |
+
+No read regression — full_scan / select_where / count_star still faster,
+crud_flow/select unchanged. 4600 workspace tests green; clippy + fmt clean.
+
+<div class="callout callout-design">
+<span class="callout-icon">🎯</span>
+<div class="callout-body">
+<span class="callout-label">Design — match SQLite's cheap literal path</span>
+SQLite's grammar reads `VALUES` literals directly rather than through the general
+expression machinery. AxiomDB now does the same for the common bare-literal case
+(falling back to the full parser for anything compound), cutting AST-build 4.2×.
+The remaining insert gap is now execute-dominated (~60%), not parse.
+</div>
+</div>
+
+### Next levers (post-parser cost model)
+
+Per-row ~8.3 µs vs SQLite ~1.8 µs. Ranked: (1) the batch **commit/WAL** (~32 ms/10K
+— exceeds SQLite's *entire* batch ~18 ms; likely data-page flush we could defer to
+a background checkpoint), (2) the **execute codec** (`prepare_row`: per-row
+`column_data_types` alloc, `encode_row` buffer), (3) **lex** `StringLit`
+allocation, (4) **analyze**. See `docs/checkpoint-sqlite-parity.md`.

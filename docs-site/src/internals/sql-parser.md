@@ -234,6 +234,24 @@ parse_expr()           (entry point — calls parse_or)
 Each level calls the next level to parse its right-hand side, naturally implementing
 left-to-right associativity and the correct precedence hierarchy.
 
+### INSERT `VALUES` literal fast-path
+
+`INSERT ... VALUES (...)` rows are almost always bare literals, yet routing each
+element through the full precedence chain above (≈12 nested calls plus a per-atom
+token clone in `parse_atom`) dominated INSERT parse cost — ~76% of parse time, the
+bulk of a per-row insert. `parse_value_expr` (in `parser/dml.rs`) short-circuits it:
+when the next token is a bare literal (`Integer`/`Float`/`HexLit`/`StringLit`/
+`TRUE`/`FALSE`/`NULL`) **and** the token after it is `,` or `)`, it builds the
+`Expr::Literal` directly via the shared `literal_token_to_expr` (the same converter
+`parse_atom` uses, so the AST is byte-identical) and skips the ladder entirely.
+
+The `,`/`)` look-ahead is the correctness guard: with a delimiter immediately after
+the literal, no binary operator, postfix `[…]`, `::` cast, or `AT TIME ZONE` can
+follow — so the full parser would have produced exactly the same `Expr::Literal`.
+Anything else (`1 + 2`, `-5`, `f(x)`, `col`, `DEFAULT`, `?`, subqueries) falls back
+to `parse_expr`. Measured: AST-build 2.6 µs → 0.62 µs per row, full parse 3.4 µs →
+1.55 µs (SQLite reads `VALUES` literals directly via its grammar too).
+
 ### DDL Grammar Sketch
 
 ```

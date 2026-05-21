@@ -138,7 +138,6 @@ impl<'src> Parser<'src> {
     }
 
     /// Look-ahead by `offset` positions. Returns `&Token::Eof` past end.
-    #[allow(dead_code)]
     pub(crate) fn peek_at(&self, offset: usize) -> &Token<'src> {
         self.tokens
             .get(self.pos + offset)

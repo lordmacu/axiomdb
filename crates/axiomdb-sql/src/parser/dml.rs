@@ -1816,6 +1816,32 @@ pub(crate) fn parse_do_expr(p: &mut Parser) -> Result<Expr, DbError> {
 
 // ── INSERT / REPLACE ──────────────────────────────────────────────────────────
 
+/// Parse one `VALUES` element. Fast-path: a bare literal token immediately
+/// followed by `,` or `)` becomes `Expr::Literal` directly, skipping the full
+/// precedence-climbing `parse_expr`. The `,`/`)` guard guarantees no operator,
+/// postfix (`[…]`), cast (`::`), or `AT TIME ZONE` can follow, so the result is
+/// byte-identical to `parse_expr` for these inputs. Everything else (compound
+/// exprs, `-5`, functions, columns, `DEFAULT`, `?`, subqueries) falls back.
+fn parse_value_expr(p: &mut Parser) -> Result<Expr, DbError> {
+    if matches!(p.peek_at(1), Token::Comma | Token::RParen)
+        && matches!(
+            p.peek(),
+            Token::HexLit(_)
+                | Token::Integer(_)
+                | Token::Float(_)
+                | Token::StringLit(_)
+                | Token::True
+                | Token::False
+                | Token::Null
+        )
+    {
+        let tok = p.peek().clone();
+        p.advance();
+        return Ok(super::expr::literal_token_to_expr(tok).expect("guarded literal token"));
+    }
+    parse_expr(p)
+}
+
 fn parse_insert(p: &mut Parser) -> Result<Stmt, DbError> {
     parse_insert_body(p, /*is_replace=*/ false)
 }
@@ -1891,13 +1917,18 @@ fn parse_insert_body(p: &mut Parser, is_replace: bool) -> Result<Stmt, DbError> 
         Token::Values => {
             p.advance();
             let mut rows: Vec<Vec<Expr>> = Vec::new();
+            // All VALUES rows share one arity; size each row from the previous
+            // one to avoid 1→N regrowth. First row uses a small default.
+            let mut arity_hint = 8usize;
             loop {
                 p.expect(&Token::LParen)?;
-                let mut row = vec![parse_expr(p)?];
+                let mut row = Vec::with_capacity(arity_hint);
+                row.push(parse_value_expr(p)?);
                 while p.eat(&Token::Comma) {
-                    row.push(parse_expr(p)?);
+                    row.push(parse_value_expr(p)?);
                 }
                 p.expect(&Token::RParen)?;
+                arity_hint = row.len();
                 rows.push(row);
                 if !p.eat(&Token::Comma) {
                     break;
@@ -2656,4 +2687,129 @@ pub(crate) fn parse_restore(p: &mut Parser) -> Result<Stmt, DbError> {
     }
     let dest_path = p.parse_string_literal()?;
     Ok(Stmt::Restore(RestoreStmt { source, dest_path }))
+}
+
+#[cfg(test)]
+mod insert_fastpath_tests {
+    use crate::ast::{InsertSource, Stmt};
+    use crate::expr::Expr;
+    use crate::parse;
+    use crate::parser::parse_expr_only;
+
+    /// Parse `INSERT INTO t VALUES (...)` and return the first row's elements.
+    fn first_row(sql: &str) -> Vec<Expr> {
+        match parse(sql, None).expect("parse insert") {
+            Stmt::Insert(s) => match s.source {
+                InsertSource::Values(mut rows) => rows.remove(0),
+                other => panic!("expected VALUES source, got {other:?}"),
+            },
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
+    /// The VALUES fast-path must produce the exact same `Expr` as the full
+    /// expression parser (`parse_expr`, reached via `parse_expr_only`) for a
+    /// single element — the byte-identical-AST guarantee.
+    fn assert_value_matches_parse_expr(value_sql: &str) {
+        let row = first_row(&format!("INSERT INTO t VALUES ({value_sql})"));
+        assert_eq!(row.len(), 1, "expected one element for {value_sql:?}");
+        let want = parse_expr_only(value_sql).expect("parse expr");
+        assert_eq!(
+            row[0], want,
+            "VALUES element != parse_expr for {value_sql:?}"
+        );
+    }
+
+    #[test]
+    fn fastpath_bare_literals_match_parse_expr() {
+        for v in [
+            "1",
+            "18",
+            "0",
+            "2147483647",
+            "2147483648",
+            "0xFF",
+            "1.5",
+            "100.1",
+            "'a'",
+            "'user_000001'",
+            "'a''b'",
+            "TRUE",
+            "FALSE",
+            "NULL",
+        ] {
+            assert_value_matches_parse_expr(v);
+        }
+    }
+
+    #[test]
+    fn fallback_compound_exprs_match_parse_expr() {
+        for v in [
+            "1 + 2",
+            "-5",
+            "~1",
+            "CONCAT('a', 'b')",
+            "col",
+            "1::bigint",
+            "(SELECT 1)",
+        ] {
+            assert_value_matches_parse_expr(v);
+        }
+    }
+
+    #[test]
+    fn fastpath_multi_row_each_element_identical() {
+        match parse("INSERT INTO t VALUES (1, 'a'), (2, 'b')", None).unwrap() {
+            Stmt::Insert(s) => match s.source {
+                InsertSource::Values(rows) => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(
+                        rows[0],
+                        vec![
+                            parse_expr_only("1").unwrap(),
+                            parse_expr_only("'a'").unwrap()
+                        ]
+                    );
+                    assert_eq!(
+                        rows[1],
+                        vec![
+                            parse_expr_only("2").unwrap(),
+                            parse_expr_only("'b'").unwrap()
+                        ]
+                    );
+                }
+                _ => panic!("expected VALUES"),
+            },
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    #[test]
+    fn fallback_param_placeholder_parses() {
+        let row = first_row("INSERT INTO t VALUES (?, 1)");
+        assert_eq!(row.len(), 2);
+        assert!(matches!(row[0], Expr::Param { .. }));
+        assert_eq!(row[1], parse_expr_only("1").unwrap());
+    }
+
+    #[test]
+    fn fallback_default_keyword_parses() {
+        let row = first_row("INSERT INTO t VALUES (DEFAULT, 1)");
+        assert_eq!(row.len(), 2);
+        assert!(matches!(row[0], Expr::Default));
+        assert_eq!(row[1], parse_expr_only("1").unwrap());
+    }
+
+    #[test]
+    fn fastpath_full_benchmark_shape() {
+        // The exact shape gen_inserts() emits — the insert_batch perf target.
+        let row = first_row(
+            "INSERT INTO bench_users VALUES (1, 'user_000001', 18, TRUE, 100.1, 'u1@b.local')",
+        );
+        let want: Vec<Expr> = ["1", "'user_000001'", "18", "TRUE", "100.1", "'u1@b.local'"]
+            .iter()
+            .map(|s| parse_expr_only(s).unwrap())
+            .collect();
+        assert_eq!(row, want);
+    }
 }

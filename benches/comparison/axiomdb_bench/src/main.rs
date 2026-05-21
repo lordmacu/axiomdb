@@ -694,6 +694,78 @@ fn diagnose_insert(data_dir: &Path, n_rows: usize) {
     eprintln!();
 }
 
+// ── Parse breakdown: lex (tokenize) vs AST-build (recursive descent) ───────────
+// Splits parse_with_sql_mode into its two halves so we know whether the INSERT
+// parse cost is dominated by the logos lexer or by AST construction. Decides
+// faster-parser vs pre-parse-cache strategy.
+fn diagnose_parse(_data_dir: &Path, n_rows: usize) {
+    use axiomdb_sql::{parse_with_sql_mode, tokenize_with_sql_mode, SessionContext};
+    use std::hint::black_box;
+
+    let sql_mode = SessionContext::default().sql_mode_flags();
+    let sqls = gen_inserts(n_rows.max(1));
+
+    // Warmup (branch predictor, icache, allocator).
+    for sql in sqls.iter().take(200) {
+        let _ = black_box(tokenize_with_sql_mode(sql, None, sql_mode).map(|t| t.len()));
+        let _ = black_box(parse_with_sql_mode(sql, None, sql_mode).is_ok());
+    }
+
+    // Phase 1: lex only.
+    let t0 = Instant::now();
+    for sql in &sqls {
+        let toks = tokenize_with_sql_mode(sql, None, sql_mode).expect("lex");
+        black_box(toks.len());
+    }
+    let lex_ns = t0.elapsed().as_nanos();
+
+    // Phase 2: full parse (lex + AST build).
+    let t0 = Instant::now();
+    for sql in &sqls {
+        let stmt = parse_with_sql_mode(sql, None, sql_mode).expect("parse");
+        black_box(&stmt);
+    }
+    let parse_ns = t0.elapsed().as_nanos();
+
+    let rows = sqls.len() as u128;
+    let lex_per = lex_ns / rows;
+    let parse_per = parse_ns / rows;
+    let ast_per = parse_per.saturating_sub(lex_per);
+    let us = |ns: u128| ns as f64 / 1000.0;
+    let pct = |part: u128| {
+        if parse_per == 0 {
+            0.0
+        } else {
+            part as f64 / parse_per as f64 * 100.0
+        }
+    };
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════╗");
+    eprintln!(
+        "║  AxiomDB PARSE breakdown — {} INSERT rows                      ",
+        rows
+    );
+    eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+    eprintln!(
+        "║  lex (tokenize)            {:>8.2} µs/row   {:>5.1}%               ║",
+        us(lex_per),
+        pct(lex_per)
+    );
+    eprintln!(
+        "║  ast-build (parse - lex)   {:>8.2} µs/row   {:>5.1}%               ║",
+        us(ast_per),
+        pct(ast_per)
+    );
+    eprintln!("║  ────────────────────────────────────────────────────────────    ║");
+    eprintln!(
+        "║  full parse                {:>8.2} µs/row                        ║",
+        us(parse_per)
+    );
+    eprintln!("╚══════════════════════════════════════════════════════════════════╝");
+    eprintln!();
+}
+
 // ── SQLite wrapper ────────────────────────────────────────────────────────────
 
 struct SqliteDb {
@@ -1465,6 +1537,8 @@ fn main() {
         diagnose_insert(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-insert-deep".to_string()) {
         diagnose_insert_deep(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-parse".to_string()) {
+        diagnose_parse(&data_dir, n_rows);
     } else {
         run_scenario(&scenario, n_rows, &data_dir);
     }
