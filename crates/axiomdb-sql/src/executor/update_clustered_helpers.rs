@@ -222,6 +222,12 @@ fn apply_clustered_secondary_update(
         if let (Some(terms), Some(pk_key)) = (new_terms.as_ref(), new_pk_key.as_ref()) {
             for term in terms {
                 let key = crate::index_maintenance::gin_clustered_key(term, pk_key);
+                // Clear any stale entry left by a previous MVCC-deferred delete at
+                // this same PK before re-inserting. A new-only term whose key was
+                // left behind by an earlier DELETE (entries are kept for VACUUM)
+                // would otherwise collide and return DuplicateKey, since the
+                // clustered GIN key [term][0x00][pk_key] carries no row version.
+                let _ = BTree::delete_in(storage, sec_root, &key)?;
                 BTree::insert_in(
                     storage,
                     sec_root,

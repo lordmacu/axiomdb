@@ -122,6 +122,14 @@ fn maintain_clustered_secondary_inserts_impl(
             let root_pid = std::sync::atomic::AtomicU64::new(idx.root_page_id);
             for term in &terms {
                 let key = crate::index_maintenance::gin_clustered_key(term, &pk_key);
+                // Clear any stale entry left by a previous MVCC-deferred delete at
+                // this same PK. DELETE leaves clustered secondary entries in place
+                // for VACUUM (see execute_clustered_delete), and the clustered GIN
+                // key [term][0x00][pk_key] is identical across the dead and the
+                // re-inserted row, so insert_in would otherwise hit the leftover
+                // entry and return DuplicateKey. Mirrors the regular clustered
+                // secondary path (ClusteredSecondaryLayout::insert_row_maybe_visible).
+                let _ = BTree::delete_in(storage, &root_pid, &key)?;
                 BTree::insert_in(
                     storage,
                     &root_pid,

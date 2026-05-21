@@ -707,6 +707,125 @@ fn setup_gin_table(
     );
 }
 
+/// Regression: DELETE a row by PK then re-INSERT the same PK on a clustered
+/// table with a JSONB GIN index must not fail with `DuplicateKey`
+/// ("duplicate key in index").
+///
+/// The clustered DELETE leaves secondary entries in place for MVCC-deferred
+/// VACUUM, and the clustered GIN key `[term][0x00][pk_key]` is identical across
+/// the dead and the re-inserted row (it carries no row version). The re-insert
+/// must therefore clear the stale entry before inserting, exactly as the regular
+/// clustered-secondary path does.
+#[test]
+fn test_gin_delete_then_reinsert_same_pk_no_duplicate_key() {
+    let (mut storage, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (id INT NOT NULL, data JSONB NOT NULL, PRIMARY KEY(id))",
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        r#"INSERT INTO t (id, data) VALUES (1, '{"a":1}')"#,
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        r#"INSERT INTO t (id, data) VALUES (2, '{"b":2}')"#,
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        "CREATE INDEX gt ON t USING GIN (data)",
+        &mut storage,
+        &mut txn,
+    );
+
+    common::run(
+        r#"INSERT INTO t (id, data) VALUES (90000001, '{"z":1}')"#,
+        &mut storage,
+        &mut txn,
+    );
+    let deleted = common::affected_count(common::run(
+        "DELETE FROM t WHERE id = 90000001",
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(deleted, 1, "expected exactly one row deleted");
+
+    // Before the fix this returned DbError::DuplicateKey from BTree::insert_in,
+    // because the stale GIN entry from the deleted row was still present.
+    let res = common::run_result(
+        r#"INSERT INTO t (id, data) VALUES (90000001, '{"z":1}')"#,
+        &mut storage,
+        &mut txn,
+    );
+    assert!(
+        res.is_ok(),
+        "re-insert of a deleted PK on a GIN-indexed clustered table must succeed, got {res:?}"
+    );
+
+    // The GIN search must find exactly the re-inserted row: no missing entry and
+    // no stale false positive.
+    let ids = int_ids(rows(
+        r#"SELECT id FROM t WHERE data @> '{"z":1}'"#,
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(ids, vec![90000001]);
+}
+
+/// Regression: a clustered JSONB GIN index must tolerate an UPDATE that adds a
+/// term whose key was left stale by an earlier DELETE + re-INSERT cycle.
+///
+/// Row 7 first has term `y` and is deleted (leaving `[y][pk7]` for VACUUM), then
+/// re-inserted without `y`, so `[y][pk7]` stays stale. The later UPDATE re-adds
+/// `y` as a new-only term whose clustered GIN key collides with the leftover
+/// entry — the insert must clear it first.
+#[test]
+fn test_gin_update_adds_term_left_stale_by_prior_delete() {
+    let (mut storage, mut txn) = common::setup();
+    common::run(
+        "CREATE TABLE t (id INT NOT NULL, data JSONB NOT NULL, PRIMARY KEY(id))",
+        &mut storage,
+        &mut txn,
+    );
+    common::run(
+        "CREATE INDEX gt ON t USING GIN (data)",
+        &mut storage,
+        &mut txn,
+    );
+
+    common::run(
+        r#"INSERT INTO t (id, data) VALUES (7, '{"y":2}')"#,
+        &mut storage,
+        &mut txn,
+    );
+    common::run("DELETE FROM t WHERE id = 7", &mut storage, &mut txn);
+    // Re-insert the same PK WITHOUT term y; the stale [y][pk7] entry survives.
+    common::run(
+        r#"INSERT INTO t (id, data) VALUES (7, '{"x":1}')"#,
+        &mut storage,
+        &mut txn,
+    );
+
+    let res = common::run_result(
+        r#"UPDATE t SET data = '{"x":1,"y":2}' WHERE id = 7"#,
+        &mut storage,
+        &mut txn,
+    );
+    assert!(
+        res.is_ok(),
+        "UPDATE adding a previously-stale GIN term must succeed, got {res:?}"
+    );
+
+    let ids = int_ids(rows(
+        r#"SELECT id FROM t WHERE data @> '{"y":2}'"#,
+        &mut storage,
+        &mut txn,
+    ));
+    assert_eq!(ids, vec![7]);
+}
+
 #[test]
 fn test_gin_index_created() {
     let (mut storage, mut txn) = common::setup();
