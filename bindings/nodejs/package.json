@@ -1,16 +1,22 @@
 {
-  "name": "nodejs",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "name": "axiomdb",
+  "version": "0.1.0",
+  "description": "AxiomDB embedded database — Node.js binding (koffi FFI, packed-buffer materialization)",
+  "type": "module",
+  "main": "axiomdb.mjs",
+  "exports": {
+    ".": "./axiomdb.mjs"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "scripts": {
+    "test": "node test.mjs",
+    "bench": "node bench.mjs"
+  },
+  "keywords": ["database", "embedded", "sql", "axiomdb"],
+  "license": "MIT OR Apache-2.0",
   "dependencies": {
-    "koffi": "^2.15.2"
+    "koffi": "^2.16.2"
+  },
+  "devDependencies": {
+    "better-sqlite3": "^12.10.0"
   }
 }
