@@ -2,7 +2,13 @@
 
 Phase: redo-recovery (project B) — Lever 2 / Task 3, step T1
 Spec: specs/fase-redo-recovery/spec-frame-log-reuse-recycle.md
-Status: in-progress
+Status: done
+
+> **DONE (2026-05-22).** Step 1 `bdb0e6ac` (RecycleMode + non-truncating recycle +
+> migrate callers/tests), steps 2-4 `135c8fef` (reuse-correctness + crash-idempotence
+> tests + integration verify). storage 376/376, axiomdb-wal 216/216, network crash
+> guardian green, clippy --workspace + fmt clean. **Next sprint task: T2** (chunked
+> pre-growth) — option B agreed in brainstorm.
 
 ## Summary
 
