@@ -127,6 +127,10 @@ pub struct MmapStorage {
     /// Prevents concurrent file extension (grow). Held only when the freelist
     /// is exhausted and the file must be extended.
     grow_lock: Mutex<()>,
+    /// Excludes frame appends during a checkpoint's log recycle (subphase 6b). Frame
+    /// appends take the read side; `checkpoint_frames` takes the write side so the
+    /// recycle (truncate + fresh salt) never races an in-flight append.
+    checkpoint_lock: RwLock<()>,
     /// Authoritative page count. `AtomicU64` avoids acquiring the mmap read
     /// lock on every `read_page` call (hot path).
     page_count: AtomicU64,
@@ -235,6 +239,7 @@ impl MmapStorage {
             dw_buffer: Mutex::new(dw_buffer),
             page_locks: PageLockTable::new(),
             grow_lock: Mutex::new(()),
+            checkpoint_lock: RwLock::new(()),
             page_count: AtomicU64::new(GROW_PAGES),
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
@@ -331,6 +336,7 @@ impl MmapStorage {
             dw_buffer: Mutex::new(dw_buffer),
             page_locks: PageLockTable::new(),
             grow_lock: Mutex::new(()),
+            checkpoint_lock: RwLock::new(()),
             page_count: AtomicU64::new(db_page_count),
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
@@ -568,6 +574,9 @@ impl MmapStorage {
             // main file (still authoritative until subphase 4), append a page frame,
             // record it in the live index, and cache the stamped bytes so a
             // read-after-write is a pool hit (no frame pread).
+            // Hold the checkpoint read-guard across the append so a checkpoint's log
+            // recycle (write-guard) never races it (subphase 6b).
+            let _ck = self.checkpoint_lock.read().unwrap_or_else(|e| e.into_inner());
             let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
             let mut buf = [0u8; PAGE_SIZE];
             buf.copy_from_slice(page.as_bytes());
@@ -987,6 +996,22 @@ impl StorageEngine for MmapStorage {
         // Recovery REDO shares the apply with the checkpoint (grow-on-redo + freelist
         // reload). On open, this materializes committed frames into the main file.
         self.apply_committed_frames(is_committed)
+    }
+
+    fn checkpoint_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        if self.frame_log.is_none() {
+            return Ok(0);
+        }
+        // Exclusive guard (model A): drains in-flight frame appends and blocks new ones
+        // until the recycle completes, so the truncate never races an append.
+        let _ckpt = self.checkpoint_lock.write().unwrap_or_else(|e| e.into_inner());
+        // Ordering invariant: apply committed frames → fsync main → recycle the log.
+        let applied = self.apply_committed_frames(is_committed)?;
+        self.flush()?; // applied pages are durable in the main file before the recycle
+        if let Some(frame_log) = &self.frame_log {
+            frame_log.recycle()?;
+        }
+        Ok(applied)
     }
 
     fn deferred_free_count(&self) -> usize {
@@ -1626,5 +1651,59 @@ mod tests {
             row,
             "grow-on-redo restored the committed page beyond the old EOF"
         );
+    }
+
+    #[test]
+    fn checkpoint_restores_stale_main_then_recycles_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ckpt.db");
+        let row = 0x5Cu8;
+
+        // Session A (redo on): write ROW under committed txn 5 → frame durable; flush meta.
+        let page_id = {
+            let mut s = MmapStorage::create(&db).unwrap();
+            s.enable_redo_log(&db).unwrap();
+            let pid = s.alloc_page(PageType::Data).unwrap();
+            s.set_current_txn(5);
+            let mut p = Page::new(PageType::Data, pid);
+            p.body_mut()[0] = row;
+            p.update_checksum();
+            s.write_page(pid, &p).unwrap();
+            s.sync_frame_log().unwrap();
+            s.set_current_txn(0);
+            s.flush().unwrap();
+            pid
+        };
+
+        // Session B (redo off): clobber the main page with an empty lsn-0 image.
+        {
+            let s = MmapStorage::open(&db).unwrap();
+            s.write_page(page_id, &Page::new(PageType::Data, page_id))
+                .unwrap();
+            s.flush().unwrap();
+            assert_eq!(s.read_page(page_id).unwrap().body()[0], 0, "main lost the row");
+        }
+
+        // Session C (redo on): checkpoint applies the committed frame, then recycles.
+        {
+            let mut s = MmapStorage::open(&db).unwrap();
+            s.enable_redo_log(&db).unwrap();
+            assert_eq!(
+                s.checkpoint_frames(&|t| t == 5).unwrap(),
+                1,
+                "one committed page checkpointed to the main file"
+            );
+            assert_eq!(
+                s.read_page(page_id).unwrap().body()[0],
+                row,
+                "page restored from its frame"
+            );
+            // The log was recycled (fresh salt, empty): a second checkpoint applies nothing.
+            assert_eq!(
+                s.checkpoint_frames(&|t| t == 5).unwrap(),
+                0,
+                "log recycled — nothing left to apply"
+            );
+        }
     }
 }

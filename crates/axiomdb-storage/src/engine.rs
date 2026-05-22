@@ -130,6 +130,15 @@ pub trait StorageEngine: Send + Sync {
         Ok(0)
     }
 
+    /// CHECKPOINT: apply every committed frame to the main file (pageLSN-guarded, growing
+    /// the file for a page beyond EOF), fsync the main file, then recycle the frame log
+    /// (project B subphase 6b). `is_committed(txn_id)` selects committed frames. Returns
+    /// the number of pages written to the main file. Default: no-op (no redo log).
+    fn checkpoint_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        let _ = is_committed;
+        Ok(0)
+    }
+
     /// Returns the number of pages currently waiting in the deferred-free queue.
     /// Useful for diagnostics and tests. Default: 0.
     fn deferred_free_count(&self) -> usize {
