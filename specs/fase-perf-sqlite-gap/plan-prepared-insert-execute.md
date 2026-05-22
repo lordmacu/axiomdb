@@ -2,7 +2,15 @@
 
 Phase: perf-sqlite-gap — Parity lever #1 (executor scaffolding)
 Spec: specs/fase-perf-sqlite-gap/spec-prepared-insert-execute.md
-Status: draft
+Status: in-progress
+
+> **Progress:** Step 1 split into 1a (done) + 1b (next). **1a `948f8552`** —
+> `PreparedInsertPlan` + `try_prepare_insert_plan` (eligibility gate) +
+> `SessionContext::catalog_epoch()` (the DDL-only revalidation token) + 5 eligibility
+> tests; clippy+fmt clean. **NEXT = 1b**: `execute_prepared_insert` (epoch recheck → bind →
+> codec → enqueue via the existing inner fns, statement-atomic) + `PreparedStatement`
+> routing (embedded `lib.rs`) + the differential-equivalence test (fast vs generic →
+> byte-identical). Then Steps 2-6.
 
 ## Summary
 
