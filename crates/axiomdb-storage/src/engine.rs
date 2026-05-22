@@ -147,6 +147,35 @@ pub trait StorageEngine: Send + Sync {
         Ok(0)
     }
 
+    /// Current size in bytes of the page-frame log's gap-free written prefix, or
+    /// `0` when redo is off. The frame-checkpoint trigger (project B subphase 6f)
+    /// compares this against the soft/hard thresholds. Default: `0` (no redo log).
+    fn frame_log_durable_len(&self) -> u64 {
+        0
+    }
+
+    /// Checkpoint the frame log IFF redo is active AND (`force` OR the log's
+    /// written size has reached `threshold_bytes`). The single guarded entry that
+    /// BOTH the background checkpointer (soft threshold) and the commit
+    /// back-pressure (hard cap) route through, so all triggered checkpoints share
+    /// one code path + the checkpoint lock. Returns frames applied (`0` = skipped
+    /// or nothing to apply). Composed from the primitives so any backend that
+    /// implements them gets the trigger for free.
+    fn maybe_checkpoint_frames(
+        &self,
+        is_committed: &dyn Fn(u64) -> bool,
+        threshold_bytes: u64,
+        force: bool,
+    ) -> Result<usize, DbError> {
+        if !self.frame_log_active() {
+            return Ok(0);
+        }
+        if !force && self.frame_log_durable_len() < threshold_bytes {
+            return Ok(0);
+        }
+        self.checkpoint_frames(is_committed)
+    }
+
     /// Returns the number of pages currently waiting in the deferred-free queue.
     /// Useful for diagnostics and tests. Default: 0.
     fn deferred_free_count(&self) -> usize {

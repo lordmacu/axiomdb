@@ -1017,6 +1017,13 @@ impl StorageEngine for MmapStorage {
         self.frame_log.is_some()
     }
 
+    fn frame_log_durable_len(&self) -> u64 {
+        // Gap-free written prefix (bytes); resets to FILE_HDR_SIZE on recycle.
+        self.frame_log
+            .as_ref()
+            .map_or(0, |fl| fl.contiguous_written_offset())
+    }
+
     fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
         // Recovery REDO shares the apply with the checkpoint (grow-on-redo + freelist
         // reload). On open, this materializes committed frames into the main file.
@@ -1790,6 +1797,62 @@ mod tests {
             s.read_page(pid).unwrap().body()[0],
             0x9A,
             "read falls back to the main file when the frame was recycled"
+        );
+    }
+
+    #[test]
+    fn maybe_checkpoint_respects_threshold_and_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("mc.db");
+        let mut s = MmapStorage::create(&db).unwrap();
+
+        // Redo off: durable_len is 0 and maybe_checkpoint is always a no-op.
+        assert_eq!(s.frame_log_durable_len(), 0);
+        assert_eq!(s.maybe_checkpoint_frames(&|_| true, 0, true).unwrap(), 0);
+
+        s.enable_redo_log(&db).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        s.set_current_txn(5);
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x7;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        s.sync_frame_log().unwrap();
+        s.set_current_txn(0);
+
+        let len = s.frame_log_durable_len();
+        assert!(len > 0, "a written + synced frame advances durable_len");
+
+        // Under a huge threshold, no force → skip (log untouched).
+        assert_eq!(
+            s.maybe_checkpoint_frames(&|t| t == 5, u64::MAX, false).unwrap(),
+            0
+        );
+        assert_eq!(s.frame_log_durable_len(), len, "log untouched under threshold");
+
+        // Over threshold (1 byte ≪ len) → checkpoint runs + recycles. In dual-write
+        // the apply COUNT is 0 (main is already current via the equal pageLSN), but
+        // the log is recycled (all frames committed) → durable_len drops. The
+        // recycle (bounding the log) is the trigger's actual job, not the count.
+        s.maybe_checkpoint_frames(&|t| t == 5, 1, false).unwrap();
+        let after = s.frame_log_durable_len();
+        assert!(after < len, "over threshold → log recycled ({after} < {len})");
+
+        // force=true checkpoints/recycles even under a huge threshold (the
+        // clean-shutdown path). Write a fresh frame, then force.
+        s.set_current_txn(6);
+        let mut p2 = Page::new(PageType::Data, pid);
+        p2.body_mut()[0] = 0x8;
+        p2.update_checksum();
+        s.write_page(pid, &p2).unwrap();
+        s.sync_frame_log().unwrap();
+        s.set_current_txn(0);
+        let grew = s.frame_log_durable_len();
+        assert!(grew > after, "a new frame grows the log again");
+        s.maybe_checkpoint_frames(&|t| t == 6, u64::MAX, true).unwrap();
+        assert!(
+            s.frame_log_durable_len() < grew,
+            "force → log recycled even under threshold"
         );
     }
 
