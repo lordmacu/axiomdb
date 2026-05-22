@@ -123,7 +123,7 @@ transaction — matching SQLite's `PRAGMA synchronous` semantics
 
 ---
 
-## Frame-only redo (opt-in)
+## Frame-only redo (the embedded default)
 
 `SET synchronous` controls *how hard* a commit syncs; **frame-only redo** changes *where*
 a commit becomes durable. It is AxiomDB's port of SQLite's WAL (`journal_mode=WAL`):
@@ -132,22 +132,31 @@ page writes go to a **page-frame log** first, a commit is durable once its frame
 drops the per-commit main-file `fsync` — the dominant cost of single-row autocommit
 inserts.
 
-It is **opt-in and off by default** (no behavior change unless you enable it):
+**Since the redo rollout, frame-only redo is the default for the embedded `Db`.** Besides
+the autocommit speed-up, it closes a real durability hole: with the old `Off` mode recovery
+was UNDO-only and nothing flushed the main file per commit, so a committed write could be
+lost on a crash before the next checkpoint. Frame-only redo replays committed frames on
+open, so committed data always survives. The flip is gated by a power-loss crash suite
+(redo of every clustered page type, idempotent re-recovery, post-checkpoint recovery,
+uncommitted-undo, and a randomized soak vs. an oracle).
+
+You can opt back out per database (e.g. for a pure in-memory cache where durability does
+not matter):
 
 ```rust
-// Embedded (Rust): enable on open.
+// Embedded (Rust): frame-only is the default — nothing to enable.
 use axiomdb_embedded::Db;
-use axiomdb_storage::{DbConfig, RedoMode};
+let mut db = Db::open("./app.db")?;            // frame-only redo
 
-let cfg = DbConfig {
-    redo: Some(RedoMode::FrameOnly),
-    ..DbConfig::default()
-};
+// Opt out explicitly:
+use axiomdb_storage::{DbConfig, RedoMode};
+let cfg = DbConfig { redo: Some(RedoMode::Off), ..DbConfig::default() };
 let mut db = Db::open_with_config("./app.db", &cfg)?;
 ```
 
 ```toml
-# Server (axiomdb.toml):
+# Server (axiomdb.toml): still opt-in (the server's background checkpointer
+# wiring lands in a later subphase); enable explicitly:
 redo = "frame_only"
 ```
 

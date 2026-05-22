@@ -796,6 +796,26 @@ subphase-3 default) `read_page`/`write_page` behave byte-for-byte as before. Whi
   ordering: **pool hit → wal-index → main file**. An empty index or a disabled log
   short-circuits to the mmap path, so warm reads and the disabled path pay nothing.
 
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Now the embedded default — durability + autocommit speed</span>
+The subphases above shipped redo as an opt-in; the embedded <code>Db</code> now defaults to
+<code>RedoMode::FrameOnly</code> (opt out with <code>redo = "off"</code>). Two wins at once:
+it <strong>closes a real data-loss hole</strong> (the old <code>Off</code> recovery was
+UNDO-only and nothing flushed the main file per commit, so a committed write could vanish on
+a crash — frame-only replays committed frames on open) and it makes <strong>single-row
+autocommit inserts ~1.5× faster</strong> (the per-commit main-file <code>fsync</code> moves
+to the cheaper frame-log <code>fsync</code>; batch is a wash, reads are neutral). The flip is
+gated by a power-loss crash suite on <code>FaultInjectionStorage</code> (redo of every
+clustered page type, idempotent re-recovery, post-checkpoint recovery, uncommitted-undo, and
+a randomized soak vs. an in-memory oracle). The crash suite caught and fixed a real
+frame-only bug first: recovery of an uncommitted clustered insert (whose new pages never
+fsync'd) tried to read a lost page and aborted, and leaked that lost root into the
+post-recovery hint. The server stays opt-in until its background checkpointer is wired.
+</div>
+</div>
+
 **Multi-writer scalability.** The frame log mirrors the engine's existing concurrency
 models instead of serializing writers behind a global lock:
 
