@@ -219,6 +219,27 @@ impl TxnManager {
         self.max_committed.fetch_max(txn_id, Ordering::Release);
     }
 
+    /// Returns `true` if `txn_id` is durably committed — its commit advanced
+    /// `max_committed` (in pipeline mode, after the WAL fsync) and it is no
+    /// longer in the active set. This is the predicate the frame checkpoint
+    /// (subphase 6f) uses to decide which frames are safe to apply + recycle.
+    ///
+    /// Sufficient under today's dual-write `RedoMode::FrameOnly`: an aborted txn
+    /// whose id is `<= max_committed` (because a *later* txn committed) also reads
+    /// as committed here, but that is harmless — the main file is already current
+    /// (the checkpoint apply is a pageLSN strict-`>` no-op) and an aborted txn's
+    /// frames only need to be recycled, never redone. A future *true* frame-only
+    /// mode (main not authoritative) would need an explicit committed-set instead.
+    pub fn is_committed(&self, txn_id: TxnId) -> bool {
+        txn_id != 0
+            && txn_id <= self.max_committed.load(Ordering::Acquire)
+            && !self
+                .active_set
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&txn_id)
+    }
+
     /// Returns the WAL writer's current LSN (the last assigned LSN).
     pub fn wal_current_lsn(&self) -> u64 {
         self.wal.current_lsn()
