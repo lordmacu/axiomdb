@@ -153,7 +153,10 @@ impl FaultInjectionStorage {
             // txn (mirrors MmapStorage). The data page stays volatile until flush();
             // the appended frame is made durable by sync_frame_log at the commit.
             // Hold the checkpoint read-guard so a checkpoint's recycle can't race it.
-            let _ck = self.checkpoint_lock.read().unwrap_or_else(|e| e.into_inner());
+            let _ck = self
+                .checkpoint_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
             let mut stamped = page.clone();
             stamped.set_lsn(lsn);
@@ -315,7 +318,10 @@ impl StorageEngine for FaultInjectionStorage {
         // Exclusive guard (model A): drains in-flight appends, blocks new ones until the
         // recycle completes. The apply already wrote both layers, so the data is durable
         // before the log is reset.
-        let _ckpt = self.checkpoint_lock.write().unwrap_or_else(|e| e.into_inner());
+        let _ckpt = self
+            .checkpoint_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let applied = self.apply_committed_frames(is_committed)?;
         if let Some(frame_log) = &self.frame_log {
             frame_log.recycle()?;
@@ -530,7 +536,11 @@ mod tests {
         storage.sync_frame_log().unwrap();
         storage.set_current_txn(0);
         storage.simulate_power_loss();
-        assert_eq!(storage.read_page(id).unwrap().body()[0], 0xAA, "row lost on crash");
+        assert_eq!(
+            storage.read_page(id).unwrap().body()[0],
+            0xAA,
+            "row lost on crash"
+        );
 
         assert_eq!(storage.checkpoint_frames(&|t| t == 5).unwrap(), 1);
         assert_eq!(

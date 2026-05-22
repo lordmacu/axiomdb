@@ -576,7 +576,10 @@ impl MmapStorage {
             // read-after-write is a pool hit (no frame pread).
             // Hold the checkpoint read-guard across the append so a checkpoint's log
             // recycle (write-guard) never races it (subphase 6b).
-            let _ck = self.checkpoint_lock.read().unwrap_or_else(|e| e.into_inner());
+            let _ck = self
+                .checkpoint_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
             let mut buf = [0u8; PAGE_SIZE];
             buf.copy_from_slice(page.as_bytes());
@@ -1004,7 +1007,10 @@ impl StorageEngine for MmapStorage {
         }
         // Exclusive guard (model A): drains in-flight frame appends and blocks new ones
         // until the recycle completes, so the truncate never races an append.
-        let _ckpt = self.checkpoint_lock.write().unwrap_or_else(|e| e.into_inner());
+        let _ckpt = self
+            .checkpoint_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         // Ordering invariant: apply committed frames → fsync main → recycle the log.
         let applied = self.apply_committed_frames(is_committed)?;
         self.flush()?; // applied pages are durable in the main file before the recycle
@@ -1645,7 +1651,11 @@ mod tests {
         );
 
         // REDO must grow the file back and restore the committed page.
-        assert_eq!(s.redo_committed_frames(&|t| t == 5).unwrap(), 1, "one page redone");
+        assert_eq!(
+            s.redo_committed_frames(&|t| t == 5).unwrap(),
+            1,
+            "one page redone"
+        );
         assert_eq!(
             s.read_page(pid).unwrap().body()[0],
             row,
@@ -1681,7 +1691,11 @@ mod tests {
             s.write_page(page_id, &Page::new(PageType::Data, page_id))
                 .unwrap();
             s.flush().unwrap();
-            assert_eq!(s.read_page(page_id).unwrap().body()[0], 0, "main lost the row");
+            assert_eq!(
+                s.read_page(page_id).unwrap().body()[0],
+                0,
+                "main lost the row"
+            );
         }
 
         // Session C (redo on): checkpoint applies the committed frame, then recycles.

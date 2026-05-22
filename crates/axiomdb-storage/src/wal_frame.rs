@@ -766,7 +766,11 @@ mod tests {
         log.append(2, 1, 7, &page(1)).unwrap();
         log.sync_to_durable().unwrap();
         log.recycle().unwrap();
-        assert_ne!(log.salt(), old_salt, "fresh salt invalidates any stale tail");
+        assert_ne!(
+            log.salt(),
+            old_salt,
+            "fresh salt invalidates any stale tail"
+        );
         assert_eq!(log.scan().unwrap().len(), 0, "log is empty after recycle");
         assert_eq!(log.contiguous_written_offset(), FILE_HDR_SIZE);
         assert_eq!(log.durable_offset(), FILE_HDR_SIZE);

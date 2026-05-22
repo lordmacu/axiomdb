@@ -2,7 +2,7 @@
 
 Phase: redo-recovery (project B) — subphase 6b
 Spec: specs/fase-redo-recovery/spec-subfase-6b-checkpoint.md
-Status: draft
+Status: done
 
 ## Summary
 

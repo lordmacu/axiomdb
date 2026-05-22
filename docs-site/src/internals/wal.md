@@ -935,3 +935,42 @@ below the target" rule are PostgreSQL's <code>XLogFlush</code> /
 offsets with a lock-free <code>pwrite</code> plus a reorder watermark.
 </div>
 </div>
+
+### Subphase 6b — frame checkpoint (frames → main, recycle the log)
+
+The checkpoint is the only thing that moves frames into the main DB file and bounds the
+log. `StorageEngine::checkpoint_frames(is_committed)` runs under an **exclusive guard**
+(frame appends take the read side, the checkpoint takes the write side), in this order:
+
+1. **apply** every committed frame to the main file — the same pageLSN-guarded apply as
+   recovery REDO (shared `apply_committed_frames`; idempotent: only `frame.lsn >
+   page.lsn`). It **grows** the main file for a committed frame whose page is beyond EOF
+   (a page allocated after the last flush, then lost — the subphase-5 deferred case), and
+   **reloads the in-memory freelist** if the bitmap page (page 1) was among the redone
+   frames.
+2. **fsync** the main file — the applied pages are durable.
+3. **recycle** the frame log (`FrameLog::recycle`): truncate to the header with a fresh
+   salt and reset the offset watermarks. The engine's monotonic frame-LSN counter is
+   **not** reset — a frame appended after a recycle must still out-rank the on-disk page
+   lsn, or the redo guard would wrongly skip it.
+
+A crash between any two steps is safe: before step 2 the main file is unchanged (frames
+replay); after step 2 before step 3 the frames replay idempotently; after step 3 the log
+is empty and the main file is current.
+
+Additive in 6b: writes are still dual-write, so the main file is already current and the
+apply is a near-no-op — the **recycle** is what matters (bounding the log). Once subphase
+6c removes the dual-write and makes writes frame-only, the checkpoint becomes load-bearing
+and its recycle must additionally preserve in-flight (uncommitted) frames; that hardening
+lands in 6c.
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed</span>
+The apply → fsync-main → recycle order is SQLite's <code>walCheckpoint</code> /
+<code>walRestartHdr</code> (copy frames to the db file, fsync, then reset the WAL with a
+fresh salt). The exclusive guard mirrors SQLite's TRUNCATE-mode checkpoint, which also
+needs the write lock.
+</div>
+</div>
