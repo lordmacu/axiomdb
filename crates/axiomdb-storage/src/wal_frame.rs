@@ -306,13 +306,22 @@ impl FrameLog {
         // Lock-free: reserve this frame's slot, then pwrite into it. Two writers get
         // disjoint offsets, so the writes never overlap and need no lock.
         let offset = self.write_offset.fetch_add(FRAME_SIZE, Ordering::Relaxed);
-        self.file
+        let write = self
+            .file
             .write_all_at(&hdr, offset)
-            .map_err(|e| classify_io(e, "frame log write header"))?;
-        self.file
-            .write_all_at(page, offset + FRAME_HDR_SIZE as u64)
-            .map_err(|e| classify_io(e, "frame log write page"))?;
-        Ok(offset)
+            .and_then(|()| self.file.write_all_at(page, offset + FRAME_HDR_SIZE as u64));
+        match write {
+            Ok(()) => {
+                // Publish completion so the contiguous-written prefix can advance.
+                self.mark_written(offset);
+                Ok(offset)
+            }
+            Err(e) => {
+                // Poison the slot: a committer waiting past it must error, not deadlock.
+                self.mark_poison(offset);
+                Err(classify_io(e, "frame log write"))
+            }
+        }
     }
 
     /// Flushes appended frames durably (fdatasync). Low-level primitive — the commit
@@ -335,6 +344,17 @@ impl FrameLog {
                 cw += FRAME_SIZE;
             }
             s.contiguous_written = cw;
+        }
+        self.advanced.notify_all();
+    }
+
+    /// Records that the frame at START `offset` failed to write — a permanent gap. A
+    /// later [`sync_to_durable`](Self::sync_to_durable) targeting beyond it errors rather
+    /// than blocking forever on a hole that will never fill.
+    fn mark_poison(&self, offset: u64) {
+        {
+            let mut s = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+            s.poison = Some(s.poison.map_or(offset, |p| p.min(offset)));
         }
         self.advanced.notify_all();
     }
@@ -563,6 +583,18 @@ mod tests {
         // Filling the gap folds both in one step.
         log.mark_written(h);
         assert_eq!(log.contiguous_written_offset(), h + 2 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn sequential_appends_advance_contiguous_written() {
+        let (_d, path) = tmp("wm-seq.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.append(2, 1, 7, &page(1)).unwrap();
+        log.append(3, 2, 7, &page(2)).unwrap();
+        assert_eq!(
+            log.contiguous_written_offset(),
+            FILE_HDR_SIZE + 2 * FRAME_SIZE
+        );
     }
 
     #[test]
