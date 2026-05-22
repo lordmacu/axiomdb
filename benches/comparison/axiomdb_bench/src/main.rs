@@ -83,6 +83,31 @@ fn insert_batch_pure(db: &mut Db, inserts: &[String]) {
     db_sql(db, "COMMIT");
 }
 
+// Prepared INSERT (parse+analyze ONCE + bind per row) — the FAIR comparison vs SQLite's
+// `prepare_cached`. Eliminates the per-row re-parse that raw-SQL `insert_batch_pure` pays.
+fn insert_batch_prepared(db: &mut Db, n_rows: usize) {
+    use axiomdb_types::Value;
+    let stmt = db
+        .prepare("INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)")
+        .expect("prepare");
+    db_sql(db, "BEGIN");
+    for i in 1..=n_rows {
+        stmt.execute(
+            db,
+            &[
+                Value::Int(i as i32),
+                Value::Text(format!("user_{i:06}")),
+                Value::Int((18 + (i % 62)) as i32),
+                Value::Bool(i % 2 == 0),
+                Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+                Value::Text(format!("u{i}@b.local")),
+            ],
+        )
+        .expect("prepared insert");
+    }
+    db_sql(db, "COMMIT");
+}
+
 // ── Measurement ───────────────────────────────────────────────────────────────
 
 fn measure<F: FnMut()>(mut f: F) -> f64 {
@@ -1207,7 +1232,8 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
         "insert_batch" => measure_timed(|| {
             reset(db);
             let t0 = Instant::now();
-            insert_batch_pure(db, &inserts);
+            // Prepared path (parse once) — fair vs SQLite's prepare_cached.
+            insert_batch_prepared(db, n_rows);
             t0.elapsed()
         }),
 
