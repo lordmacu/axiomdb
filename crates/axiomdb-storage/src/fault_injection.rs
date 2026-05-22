@@ -260,7 +260,7 @@ impl StorageEngine for FaultInjectionStorage {
 
     fn sync_frame_log(&self) -> Result<(), DbError> {
         match &self.frame_log {
-            Some(fl) => fl.sync(),
+            Some(fl) => fl.sync_to_durable(),
             None => Ok(()),
         }
     }
@@ -422,6 +422,38 @@ mod tests {
         assert_eq!(storage.read_page(id).unwrap().body()[0], 0xAA);
         // … but the fsync'd frame for txn 5 is still in the (separate) frame log.
         assert!(storage.frame_log_has_committed(id, &|t| t == 5));
+    }
+
+    #[test]
+    fn concurrent_commits_are_all_durable() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = FaultInjectionStorage::new();
+        storage.enable_redo_log(&dir.path().join("cc.wf")).unwrap();
+        let storage = Arc::new(storage);
+
+        let threads = 8u64;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let s = Arc::clone(&storage);
+            handles.push(std::thread::spawn(move || {
+                let id = s.alloc_page(PageType::Data).unwrap();
+                s.set_current_txn(t + 1);
+                s.write_page(id, &data_page(id, (t & 0xFF) as u8)).unwrap();
+                s.sync_frame_log().unwrap(); // commit boundary: returns only when durable
+                (t + 1, id)
+            }));
+        }
+        let committed: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every committed frame survives in the gap-free durable prefix: a swallowed gap
+        // would make `scan` (inside build_index) stop early and drop some page.
+        for (txn, id) in committed {
+            assert!(
+                storage.frame_log_has_committed(id, &|t| t == txn),
+                "committed frame for txn {txn} (page {id}) must be in the durable prefix"
+            );
+        }
     }
 
     #[test]

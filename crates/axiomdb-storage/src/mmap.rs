@@ -894,7 +894,9 @@ impl StorageEngine for MmapStorage {
 
     fn sync_frame_log(&self) -> Result<(), DbError> {
         if let Some(fl) = &self.frame_log {
-            fl.sync()?;
+            // Gap-free durability: wait for the contiguous written prefix to cover every
+            // frame reserved before this commit, then fsync (subphase 6a).
+            fl.sync_to_durable()?;
         }
         Ok(())
     }
