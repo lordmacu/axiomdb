@@ -88,7 +88,7 @@ impl<'db> Appender<'db> {
         // resolution can come later if needed.
         let snap = db.txn.snapshot();
         let mut resolver = SchemaResolver::new(
-            &db.storage,
+            &*db.storage,
             snap,
             axiomdb_catalog::schema::DEFAULT_DATABASE_NAME,
             "public",
@@ -243,7 +243,7 @@ impl<'db> Appender<'db> {
                     .as_ref()
                     .expect("Appender has active txn while alive");
                 let next = axiomdb_sql::next_auto_increment_value(
-                    &self.db.storage,
+                    &*self.db.storage,
                     &self.db.txn,
                     conn_txn,
                     &self.table_def,
@@ -324,7 +324,7 @@ impl<'db> Appender<'db> {
                 axiomdb_sql::fk_enforcement::check_fk_child_insert(
                     &coerced,
                     &immediate,
-                    &self.db.storage,
+                    &*self.db.storage,
                     &self.db.txn,
                     conn_txn,
                     &self.db.bloom,
@@ -392,7 +392,7 @@ impl<'db> Appender<'db> {
             // To avoid the re-resolve, we'll just pass all indexes — the
             // clustered helper splits primary vs secondary internally.
             let count = axiomdb_sql::TableEngine::insert_clustered_rows_batch_with_ctx(
-                &self.db.storage,
+                &*self.db.storage,
                 &self.db.txn,
                 &self.db.bloom,
                 &self.table_def,
@@ -412,7 +412,7 @@ impl<'db> Appender<'db> {
             self.db.session.invalidate_all();
         } else {
             let rids = axiomdb_sql::TableEngine::insert_rows_batch_with_ctx(
-                &self.db.storage,
+                &*self.db.storage,
                 &self.db.txn,
                 &self.table_def,
                 &self.columns,
@@ -449,7 +449,7 @@ impl<'db> Appender<'db> {
                         &self.indexes,
                         values,
                         *rid,
-                        &self.db.storage,
+                        &*self.db.storage,
                         &self.db.bloom,
                         &empty_preds,
                         &empty_idx_exprs,
@@ -459,7 +459,7 @@ impl<'db> Appender<'db> {
                     )?;
                     for (index_id, new_root) in updated {
                         axiomdb_catalog::CatalogWriter::new(
-                            &self.db.storage,
+                            &*self.db.storage,
                             &self.db.txn,
                             conn_txn,
                         )?
@@ -487,7 +487,7 @@ impl<'db> Appender<'db> {
         // (we still own conn_txn) before propagating.
         if let Err(e) = self.flush() {
             if let Some(conn_txn) = self.conn_txn.take() {
-                let _ = self.db.txn.rollback(conn_txn, &self.db.storage);
+                let _ = self.db.txn.rollback(conn_txn, &*self.db.storage);
             }
             return Err(e);
         }
@@ -497,12 +497,12 @@ impl<'db> Appender<'db> {
         // flush avoided). flush() passed `defer_table_root_persist=true`.
         if self.table_def.is_clustered() {
             if let Err(e) = axiomdb_sql::TableEngine::flush_appender_clustered_table_root(
-                &self.db.storage,
+                &*self.db.storage,
                 &self.db.txn,
                 &mut conn_txn,
                 &self.table_def,
             ) {
-                let _ = self.db.txn.rollback(conn_txn, &self.db.storage);
+                let _ = self.db.txn.rollback(conn_txn, &*self.db.storage);
                 return Err(e);
             }
         }
@@ -512,7 +512,9 @@ impl<'db> Appender<'db> {
         self.db.txn.commit(conn_txn)?;
         // Drain post-commit page-batch state (mirrors
         // commit_active_txn in exec_with_ctx.rs).
-        self.db.txn.drain_committed_page_batches(&self.db.storage)?;
+        self.db
+            .txn
+            .drain_committed_page_batches(&*self.db.storage)?;
         Ok(self.rows_inserted)
     }
 }
@@ -523,7 +525,7 @@ impl Drop for Appender<'_> {
             // Silent rollback. Errors here are unrecoverable from a Drop
             // context (panicking would be worse). If the caller wanted
             // commit semantics they should have called finish().
-            let _ = self.db.txn.rollback(conn_txn, &self.db.storage);
+            let _ = self.db.txn.rollback(conn_txn, &*self.db.storage);
         }
     }
 }

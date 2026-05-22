@@ -80,6 +80,7 @@ mod shared_db;
 mod db {
     use std::ffi::CString;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use axiomdb_catalog::bootstrap::CatalogBootstrap;
     use axiomdb_core::{error::DbError, parse_dsn, ParsedDsn};
@@ -93,12 +94,20 @@ mod db {
         result::QueryResult,
         verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
     };
-    use axiomdb_storage::{DbConfig, MmapStorage, RedoMode};
+    use axiomdb_storage::checkpointer::{FrameCheckpointer, DEFAULT_CHECKPOINT_POLL};
+    use axiomdb_storage::{DbConfig, MmapStorage, RedoMode, StorageEngine};
     use axiomdb_types::Value;
     use axiomdb_wal::TxnManager;
 
     /// A single result row — a `Vec` of `Value`s in column order.
     pub type Row = Vec<axiomdb_types::Value>;
+
+    /// Hard-cap multiplier for the 6f frame-log back-pressure: the synchronous
+    /// inline checkpoint fires once the log reaches `K × soft` (with
+    /// `soft = max_wal_size_mb`), so the log is bounded even if the background
+    /// checkpointer stalls. `K` is a constant here; subphase 6f step 7 makes it
+    /// configurable.
+    const CHECKPOINT_HARD_MULTIPLIER: u64 = 2;
 
     /// An in-process AxiomDB database.
     ///
@@ -110,8 +119,15 @@ mod db {
     /// Every `execute()` and `query()` call is wrapped in an implicit BEGIN/COMMIT
     /// unless an explicit `begin()` is active.
     pub struct Db {
-        pub(super) storage: MmapStorage,
-        pub(super) txn: TxnManager,
+        /// Background frame-log checkpointer (6f), spawned only under frame-only redo.
+        /// Declared first so it is dropped (and joined, via `Drop for Db`) before
+        /// `storage`/`txn`, while the engine is still alive for its final checkpoint.
+        /// `None` when redo is off (today's behavior — no thread).
+        checkpointer: Option<FrameCheckpointer>,
+        /// `Arc` so the background checkpointer thread can share the engine handle.
+        pub(super) storage: Arc<MmapStorage>,
+        /// `Arc` so the checkpointer's committed-txn predicate can read it off-thread.
+        pub(super) txn: Arc<TxnManager>,
         pub(super) bloom: BloomRegistry,
         pub(super) schema_cache: SchemaCache,
         pub(super) session: SessionContext,
@@ -161,8 +177,9 @@ mod db {
             };
 
             Ok(Self {
-                storage,
-                txn,
+                checkpointer: None,
+                storage: Arc::new(storage),
+                txn: Arc::new(txn),
                 bloom: BloomRegistry::new(),
                 schema_cache: SchemaCache::new(),
                 session: SessionContext::default(),
@@ -216,7 +233,36 @@ mod db {
                 (storage, txn)
             };
 
+            // Share the engine + txn manager so the background checkpointer can hold them.
+            let storage = Arc::new(storage);
+            let txn = Arc::new(txn);
+
+            // 6f: under frame-only redo, bound the frame log. Set the hard cap
+            // (synchronous back-pressure at K×soft) and spawn the background
+            // checkpointer (soft = max_wal_size_mb), installing its wake hook into the
+            // storage. Redo off ⇒ no thread, no cap (today's behavior, byte-for-byte).
+            let checkpointer = if frame_only {
+                let soft = config.max_wal_size_mb.saturating_mul(1024 * 1024);
+                let hard = soft.saturating_mul(CHECKPOINT_HARD_MULTIPLIER);
+                storage.set_checkpoint_hard_bytes(hard);
+                let txn_pred = Arc::clone(&txn);
+                let is_committed: Arc<dyn Fn(u64) -> bool + Send + Sync> =
+                    Arc::new(move |t| txn_pred.is_committed(t));
+                let storage_dyn: Arc<dyn StorageEngine + Send + Sync> = storage.clone();
+                let cp = FrameCheckpointer::spawn(
+                    storage_dyn,
+                    is_committed,
+                    soft,
+                    DEFAULT_CHECKPOINT_POLL,
+                );
+                storage.set_checkpoint_trigger(cp.trigger());
+                Some(cp)
+            } else {
+                None
+            };
+
             Ok(Self {
+                checkpointer,
                 storage,
                 txn,
                 bloom: BloomRegistry::new(),
@@ -248,8 +294,9 @@ mod db {
             let txn = TxnManager::create(&wal_path)?;
 
             Ok(Self {
-                storage,
-                txn,
+                checkpointer: None,
+                storage: Arc::new(storage),
+                txn: Arc::new(txn),
                 bloom: BloomRegistry::new(),
                 schema_cache: SchemaCache::new(),
                 session: SessionContext::default(),
@@ -448,7 +495,7 @@ mod db {
                 let read_only = self.session.conn_txn.is_none();
                 axiomdb_sql::statement_cache::run_cached(
                     sql,
-                    &self.storage,
+                    &*self.storage,
                     &self.txn,
                     &self.bloom,
                     &mut self.schema_cache,
@@ -462,10 +509,10 @@ mod db {
                 } else {
                     self.txn.snapshot()
                 };
-                let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
+                let analyzed = analyze_cached(stmt, &*self.storage, snap, &mut self.schema_cache)?;
                 execute_with_ctx(
                     analyzed,
-                    &self.storage,
+                    &*self.storage,
                     &self.txn,
                     &self.bloom,
                     &mut self.session,
@@ -480,7 +527,7 @@ mod db {
             // maintenance.
             if result.is_ok() && !self.degraded {
                 axiomdb_sql::vacuum::auto_vacuum_if_needed(
-                    &self.storage,
+                    &*self.storage,
                     &self.txn,
                     &self.bloom,
                     &mut self.session,
@@ -598,12 +645,24 @@ mod db {
             } else {
                 self.txn.snapshot()
             };
-            let analyzed = analyze_cached(stmt, &self.storage, snap, &mut self.schema_cache)?;
+            let analyzed = analyze_cached(stmt, &*self.storage, snap, &mut self.schema_cache)?;
 
             Ok(PreparedStatement {
                 analyzed,
                 param_count,
             })
+        }
+    }
+
+    impl Drop for Db {
+        fn drop(&mut self) {
+            // Stop + join the background checkpointer before `storage`/`txn` drop, so
+            // its final checkpoint (flush committed frames → main, recycle the log)
+            // completes while the engine is still alive. `FrameCheckpointer`'s own Drop
+            // also joins (idempotent); doing it here makes the shutdown order explicit.
+            if let Some(cp) = self.checkpointer.as_mut() {
+                cp.stop_and_join();
+            }
         }
     }
 
@@ -635,13 +694,13 @@ mod db {
                 if matches!(stmt, Stmt::Select(_)) && db.session.conn_txn.is_none() {
                     execute_read_only_with_ctx(
                         stmt,
-                        &db.storage,
+                        &*db.storage,
                         &db.txn,
                         &db.bloom,
                         &mut db.session,
                     )
                 } else {
-                    execute_with_ctx(stmt, &db.storage, &db.txn, &db.bloom, &mut db.session)
+                    execute_with_ctx(stmt, &*db.storage, &db.txn, &db.bloom, &mut db.session)
                 }
             })
         }
@@ -784,6 +843,83 @@ mod db {
             ParsedDsn::Wire(_) => Err(DbError::InvalidDsn {
                 reason: "embedded open_dsn only supports local-path DSNs in 5.15".into(),
             }),
+        }
+    }
+
+    #[cfg(test)]
+    mod frame_only_redo_tests {
+        use super::*;
+
+        /// Frame-only opt-in (6f): a sustained autocommit load keeps the frame log
+        /// bounded by the background checkpointer, the data stays correct, and a clean
+        /// shutdown + reopen recovers every row (durability via frames → checkpoint).
+        #[test]
+        fn frame_only_bounds_log_and_survives_reopen() {
+            use std::time::{Duration, Instant};
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fo.db");
+
+            // soft = 1 MB so the checkpointer trips quickly; hard = K×soft = 2 MB.
+            let cfg = DbConfig {
+                redo: Some(RedoMode::FrameOnly),
+                max_wal_size_mb: 1,
+                ..DbConfig::default()
+            };
+            let hard = 2 * 1024 * 1024;
+
+            {
+                let mut db = Db::open_with_config(&path, &cfg).unwrap();
+                assert!(
+                    db.checkpointer.is_some(),
+                    "frame-only ⇒ checkpointer spawned"
+                );
+                db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                    .unwrap();
+                for i in 0..2000 {
+                    db.execute(&format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+                        .unwrap();
+                }
+
+                // The checkpointer (background + commit back-pressure) keeps the log
+                // bounded ≤ ~hard; without it ~2000 frames would be tens of MB. Poll
+                // until it settles (the background thread recycles once writes stop).
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while db.storage.frame_log_durable_len() > hard && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(
+                    db.storage.frame_log_durable_len() <= hard,
+                    "frame log bounded by the checkpointer: {} <= {hard}",
+                    db.storage.frame_log_durable_len()
+                );
+
+                let rows = db.query("SELECT id FROM t").unwrap();
+                assert_eq!(rows.len(), 2000, "all rows visible before shutdown");
+                // drop(db) → `Drop for Db` joins the checkpointer + runs a final checkpoint.
+            }
+
+            // Reopen frame-only: every committed row survived the clean restart.
+            let mut db = Db::open_with_config(&path, &cfg).unwrap();
+            let rows = db.query("SELECT id FROM t").unwrap();
+            assert_eq!(rows.len(), 2000, "all rows recovered after reopen");
+        }
+
+        /// Redo off (the default) spawns no checkpointer and writes no frame log.
+        #[test]
+        fn redo_off_default_has_no_checkpointer() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("off.db");
+            let mut db = Db::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            assert!(db.checkpointer.is_none(), "redo off ⇒ no background thread");
+            assert_eq!(
+                db.storage.frame_log_durable_len(),
+                0,
+                "redo off ⇒ no frame log"
+            );
         }
     }
 }
