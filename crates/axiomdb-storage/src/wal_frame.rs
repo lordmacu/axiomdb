@@ -120,6 +120,16 @@ impl WalIndex {
         out
     }
 
+    /// Drops every recorded frame. Used by the checkpoint after a full recycle: the
+    /// recycled log's offsets are invalid and the pages now live in the main file, so
+    /// reads must fall through to it (subphase 6c).
+    pub fn clear(&self) {
+        for shard in self.shards.iter() {
+            shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        self.last_commit_lsn.store(0, Ordering::Release);
+    }
+
     /// Records `frame` as the latest version of its page (live append path).
     /// Locks only that page's shard.
     pub fn record(&self, frame: FrameRef) {

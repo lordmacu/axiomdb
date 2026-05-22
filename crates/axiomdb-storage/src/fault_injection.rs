@@ -312,9 +312,9 @@ impl StorageEngine for FaultInjectionStorage {
     }
 
     fn checkpoint_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
-        if self.frame_log.is_none() {
+        let Some(frame_log) = &self.frame_log else {
             return Ok(0);
-        }
+        };
         // Exclusive guard (model A): drains in-flight appends, blocks new ones until the
         // recycle completes. The apply already wrote both layers, so the data is durable
         // before the log is reset.
@@ -322,8 +322,11 @@ impl StorageEngine for FaultInjectionStorage {
             .checkpoint_lock
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        let applied = self.apply_committed_frames(is_committed)?;
-        if let Some(frame_log) = &self.frame_log {
+        // `txn_id == 0` (system write) counts as committed for apply + recycle.
+        let committed = |t: u64| t == 0 || is_committed(t);
+        let applied = self.apply_committed_frames(&committed)?;
+        // In-flight-safe: only recycle when every frame is committed.
+        if frame_log.scan()?.iter().all(|f| committed(f.txn_id)) {
             frame_log.recycle()?;
         }
         Ok(applied)

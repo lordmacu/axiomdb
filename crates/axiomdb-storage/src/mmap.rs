@@ -1007,20 +1007,28 @@ impl StorageEngine for MmapStorage {
     }
 
     fn checkpoint_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
-        if self.frame_log.is_none() {
+        let Some(frame_log) = &self.frame_log else {
             return Ok(0);
-        }
+        };
         // Exclusive guard (model A): drains in-flight frame appends and blocks new ones
         // until the recycle completes, so the truncate never races an append.
         let _ckpt = self
             .checkpoint_lock
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        // `txn_id == 0` is a non-transactional/system write — always durable, never an
+        // in-flight user txn — so it counts as committed for both apply and recycle.
+        let committed = |t: u64| t == 0 || is_committed(t);
         // Ordering invariant: apply committed frames → fsync main → recycle the log.
-        let applied = self.apply_committed_frames(is_committed)?;
+        let applied = self.apply_committed_frames(&committed)?;
         self.flush()?; // applied pages are durable in the main file before the recycle
-        if let Some(frame_log) = &self.frame_log {
+        // In-flight-safe: only recycle when EVERY frame is committed (else an uncommitted
+        // txn's frames live only in the log and must survive once writes are frame-only).
+        // On a full recycle, clear the live wal_index — its offsets are now invalid and
+        // the pages are in the (just-fsync'd) main file, so reads fall through to it.
+        if frame_log.scan()?.iter().all(|f| committed(f.txn_id)) {
             frame_log.recycle()?;
+            self.wal_index.clear();
         }
         Ok(applied)
     }
@@ -1749,6 +1757,43 @@ mod tests {
             s.read_page(pid).unwrap().body()[0],
             0x9A,
             "read falls back to the main file when the frame was recycled"
+        );
+    }
+
+    #[test]
+    fn checkpoint_with_inflight_frame_does_not_recycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("inflight.db");
+        let mut s = MmapStorage::create(&db).unwrap();
+        s.enable_redo_log(&db).unwrap();
+        let p_committed = s.alloc_page(PageType::Data).unwrap();
+        let p_inflight = s.alloc_page(PageType::Data).unwrap();
+
+        s.set_current_txn(5);
+        let mut a = Page::new(PageType::Data, p_committed);
+        a.body_mut()[0] = 0x11;
+        a.update_checksum();
+        s.write_page(p_committed, &a).unwrap();
+
+        s.set_current_txn(9); // in-flight: never committed
+        let mut b = Page::new(PageType::Data, p_inflight);
+        b.body_mut()[0] = 0x22;
+        b.update_checksum();
+        s.write_page(p_inflight, &b).unwrap();
+        s.set_current_txn(0);
+
+        // Only txn 5 committed → the txn-9 frame is in-flight → NO recycle.
+        s.checkpoint_frames(&|t| t == 5).unwrap();
+        assert!(
+            s.frame_index_contains(p_inflight),
+            "an in-flight frame must survive the checkpoint (no recycle)"
+        );
+
+        // Now both committed → full recycle + the live wal_index is cleared.
+        s.checkpoint_frames(&|t| t == 5 || t == 9).unwrap();
+        assert!(
+            !s.frame_index_contains(p_inflight),
+            "all committed → recycled + wal_index cleared"
         );
     }
 }
