@@ -3,7 +3,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
 };
 
@@ -167,6 +167,11 @@ pub struct MmapStorage {
     /// main file (the page lives in the frame log until a checkpoint applies it). `false`
     /// = dual-write (the main file stays authoritative). Set by `enable_frame_only_redo`.
     frame_only: AtomicBool,
+    /// 6f auto-checkpoint trigger: the shared wake primitive of the background
+    /// [`FrameCheckpointer`](crate::checkpointer::FrameCheckpointer). Set once by the
+    /// Db/server open path when frame-only redo is on; `None` otherwise (no thread, no
+    /// wake — today's behavior). Read lock-free on the write path.
+    checkpoint_trigger: OnceLock<Arc<crate::checkpointer::CheckpointTrigger>>,
 }
 
 impl Drop for MmapStorage {
@@ -258,6 +263,7 @@ impl MmapStorage {
             wal_index: WalIndex::default(),
             frame_lsn: AtomicU64::new(0),
             frame_only: AtomicBool::new(false),
+            checkpoint_trigger: OnceLock::new(),
         })
     }
 
@@ -357,6 +363,7 @@ impl MmapStorage {
             wal_index: WalIndex::default(),
             frame_lsn: AtomicU64::new(0),
             frame_only: AtomicBool::new(false),
+            checkpoint_trigger: OnceLock::new(),
         };
         storage.write_clean_shutdown_flag(false)?;
         storage
@@ -617,6 +624,12 @@ impl MmapStorage {
             // checksum is still valid — skip the redundant re-verification (6d).
             let stamped = Page::from_bytes_unchecked(buf);
             self.buffer_pool.insert(page_id, Arc::new(stamped));
+            // 6f: wake the background checkpointer if this append pushed the log past
+            // its soft threshold. Cheap on the steady-state path (`note` is a single
+            // size compare under the threshold; it only locks + notifies once over).
+            if let Some(trigger) = self.checkpoint_trigger.get() {
+                trigger.note(offset);
+            }
         } else {
             self.pwrite_page(page_id, page)?;
             // Drop any stale cached copy so the next read reloads the new bytes.
@@ -1012,6 +1025,17 @@ impl StorageEngine for MmapStorage {
 
     fn sync_frame_log(&self) -> Result<(), DbError> {
         if let Some(fl) = &self.frame_log {
+            // Hold the checkpoint read-guard across the durability wait + fsync so a
+            // concurrent checkpoint's log recycle (write-guard) cannot reset the frame
+            // log's watermarks underneath this in-flight `sync_to_durable` — which
+            // would otherwise strand the commit waiting on a stale (pre-recycle)
+            // target. The 6f background checkpointer makes such concurrency routine.
+            // Reads are shared, so concurrent commits' syncs/appends still proceed in
+            // parallel; only a checkpoint (exclusive) waits for in-flight syncs to drain.
+            let _ck = self
+                .checkpoint_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             // Gap-free durability: wait for the contiguous written prefix to cover every
             // frame reserved before this commit, then fsync (subphase 6a).
             fl.sync_to_durable()?;
@@ -1205,6 +1229,15 @@ impl MmapStorage {
     /// (the default) disables back-pressure.
     pub fn set_checkpoint_hard_bytes(&self, bytes: u64) {
         self.checkpoint_hard_bytes.store(bytes, Ordering::Release);
+    }
+
+    /// Installs the background checkpointer's wake primitive (6f). After this, a frame
+    /// append that crosses the soft threshold wakes the
+    /// [`FrameCheckpointer`](crate::checkpointer::FrameCheckpointer) immediately
+    /// instead of waiting for its poll interval. Call once, right after spawning the
+    /// thread; a second call is ignored (the trigger is set once per storage).
+    pub fn set_checkpoint_trigger(&self, trigger: Arc<crate::checkpointer::CheckpointTrigger>) {
+        let _ = self.checkpoint_trigger.set(trigger);
     }
 
     /// Whether the page-image redo log is active.

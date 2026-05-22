@@ -2,6 +2,7 @@
 
 pub mod brin;
 pub mod buffer_pool;
+pub mod checkpointer;
 pub mod clustered_internal;
 pub mod clustered_leaf;
 pub mod clustered_overflow;
