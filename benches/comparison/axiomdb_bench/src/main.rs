@@ -20,24 +20,32 @@ const RUNS: usize = 5;
 // ── Engine helpers ────────────────────────────────────────────────────────────
 
 fn db_open(dir: &Path) -> Db {
-    // A/B knob (project B 6c): AXIOMDB_BENCH_REDO=1 opens frame-only redo so the
-    // per-commit main-file sync_all (ensure_database_roots flush) is dropped and
-    // durability comes from the frame log — measures the autocommit win.
-    let mut db = if std::env::var_os("AXIOMDB_BENCH_REDO").is_some() {
-        // AXIOMDB_BENCH_WAL_MB sets the soft checkpoint threshold — a small value (e.g. 1-2)
-        // forces frame-log recycles within a batch so the steady-state WAL-reuse (T1) is
-        // exercised + measurable (default 256 = no recycle in a single batch).
-        let cfg = axiomdb_storage::DbConfig {
-            redo: Some(axiomdb_storage::RedoMode::FrameOnly),
-            max_wal_size_mb: std::env::var("AXIOMDB_BENCH_WAL_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256),
-            ..Default::default()
-        };
-        Db::open_with_config(dir.join("bench.db"), &cfg).expect("open db (frame-only)")
-    } else {
-        Db::open(dir.join("bench.db")).expect("open db")
+    // A/B knob. Since lever B the embedded default is frame-only redo, so:
+    //   AXIOMDB_BENCH_REDO=off|0 → force the legacy redo=Off baseline (for the A/B)
+    //   AXIOMDB_BENCH_REDO=<other> → force frame-only (with AXIOMDB_BENCH_WAL_MB as
+    //       the soft checkpoint threshold; small values force recycles within a batch)
+    //   unset → the shipped embedded default (frame-only)
+    let redo_env = std::env::var("AXIOMDB_BENCH_REDO").ok();
+    let mut db = match redo_env.as_deref() {
+        Some("off") | Some("0") => {
+            let cfg = axiomdb_storage::DbConfig {
+                redo: Some(axiomdb_storage::RedoMode::Off),
+                ..Default::default()
+            };
+            Db::open_with_config(dir.join("bench.db"), &cfg).expect("open db (redo off)")
+        }
+        Some(_) => {
+            let cfg = axiomdb_storage::DbConfig {
+                redo: Some(axiomdb_storage::RedoMode::FrameOnly),
+                max_wal_size_mb: std::env::var("AXIOMDB_BENCH_WAL_MB")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(256),
+                ..Default::default()
+            };
+            Db::open_with_config(dir.join("bench.db"), &cfg).expect("open db (frame-only)")
+        }
+        None => Db::open(dir.join("bench.db")).expect("open db"),
     };
     // Attack 6: match SQLite's PRAGMA synchronous=NORMAL for an
     // apples-to-apples comparison on the insert_autocommit scenario.

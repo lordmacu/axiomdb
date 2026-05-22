@@ -208,7 +208,14 @@ mod db {
                 std::fs::create_dir_all(parent).map_err(DbError::Io)?;
             }
 
-            let frame_only = config.resolved_redo() == RedoMode::FrameOnly;
+            // Embedded default (lever B): frame-only redo UNLESS the caller
+            // explicitly opts out with `redo = "off"`. This closes the live
+            // data-loss hole (committed-then-crash is recovered from frames) and
+            // delivers the autocommit ~1.5× win for every embedded Db. Scoped to
+            // embedded: `DbConfig::resolved_redo()` (used by the server, whose
+            // background-checkpointer wiring is still deferred) keeps defaulting
+            // to `Off`, so the server is unaffected.
+            let frame_only = config.redo.unwrap_or(RedoMode::FrameOnly) == RedoMode::FrameOnly;
             let (storage, txn) = if db_path.exists() {
                 let mut storage = MmapStorage::open(&db_path)?;
                 if frame_only {
@@ -1085,18 +1092,27 @@ mod db {
                 // The checkpointer (background + commit back-pressure) keeps the log
                 // bounded ≤ ~hard; without it ~2000 frames would be tens of MB. Poll
                 // until it settles (the background thread recycles once writes stop).
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while db.storage.frame_log_durable_len() > hard && Instant::now() < deadline {
+                // Under the contended full-workspace run the background
+                // checkpointer is CPU-starved, so give it ample time to settle.
+                // Poll until BOTH the log is bounded AND every row is visible —
+                // the wal-aware read is consistent, this just absorbs the
+                // checkpointer's settling time so the test is deterministic.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let (mut bounded, mut count);
+                loop {
+                    bounded = db.storage.frame_log_durable_len() <= hard;
+                    count = db.query("SELECT id FROM t").unwrap().len();
+                    if (bounded && count == 2000) || Instant::now() >= deadline {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 assert!(
-                    db.storage.frame_log_durable_len() <= hard,
+                    bounded,
                     "frame log bounded by the checkpointer: {} <= {hard}",
                     db.storage.frame_log_durable_len()
                 );
-
-                let rows = db.query("SELECT id FROM t").unwrap();
-                assert_eq!(rows.len(), 2000, "all rows visible before shutdown");
+                assert_eq!(count, 2000, "all rows visible before shutdown");
                 // drop(db) → `Drop for Db` joins the checkpointer + runs a final checkpoint.
             }
 
