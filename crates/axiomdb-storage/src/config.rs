@@ -60,6 +60,21 @@ impl<'de> Deserialize<'de> for WalDurabilityPolicy {
     }
 }
 
+// ── RedoMode ────────────────────────────────────────────────────────────────
+
+/// Redo / frame-only durability mode (project B subphase 6c) — like SQLite's
+/// `journal_mode`. Selects how a committed write reaches durability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedoMode {
+    /// Today's behavior: dual-write to the main file + a per-commit main-file flush.
+    Off,
+    /// Write-ahead frame-only: writes go to the page-frame log; a commit is durable via
+    /// the frame fsync; the main file is updated only by the checkpoint. Drops the
+    /// per-commit main-file flush — the autocommit win.
+    FrameOnly,
+}
+
 // ── DbConfig ──────────────────────────────────────────────────────────────────
 
 /// Engine-wide configuration.
@@ -96,6 +111,12 @@ pub struct DbConfig {
     /// `fsync = true` → `Strict`, `fsync = false` → `Off`.
     #[serde(default)]
     pub wal_durability: Option<WalDurabilityPolicy>,
+
+    /// Redo durability mode (project B subphase 6c). When `frame_only`, writes go to the
+    /// page-frame log only and the per-commit main-file flush is dropped (durability via
+    /// the frame fsync). Absent ⇒ [`RedoMode::Off`] (today's dual-write).
+    #[serde(default)]
+    pub redo: Option<RedoMode>,
 
     /// Minimum log level passed to `tracing_subscriber`.
     /// Accepted values: `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
@@ -136,6 +157,7 @@ impl Default for DbConfig {
             max_wal_size_mb: default_max_wal_size_mb(),
             fsync: default_fsync(),
             wal_durability: None,
+            redo: None,
             log_level: default_log_level(),
             max_prepared_stmts_per_connection: default_max_prepared_stmts(),
         }
@@ -159,6 +181,11 @@ impl DbConfig {
                 }
             }
         }
+    }
+
+    /// Resolves the effective redo mode (project B subphase 6c). Default [`RedoMode::Off`].
+    pub fn resolved_redo(&self) -> RedoMode {
+        self.redo.unwrap_or(RedoMode::Off)
     }
 
     /// Loads configuration from `path`.
@@ -204,6 +231,21 @@ mod tests {
         assert_eq!(cfg.max_prepared_stmts_per_connection, 1024);
         assert!(cfg.wal_durability.is_none());
         assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Strict);
+        assert!(cfg.redo.is_none());
+        assert_eq!(cfg.resolved_redo(), RedoMode::Off);
+    }
+
+    #[test]
+    fn test_redo_mode_parses_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "redo = \"frame_only\"\n").unwrap();
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_redo(), RedoMode::FrameOnly);
+
+        std::fs::write(&path, "redo = \"off\"\n").unwrap();
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.resolved_redo(), RedoMode::Off);
     }
 
     #[test]

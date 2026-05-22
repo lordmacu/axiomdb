@@ -29,7 +29,7 @@ mod txn_stamp;
 pub mod wal_frame;
 pub mod zone_map;
 
-pub use config::{DbConfig, WalDurabilityPolicy};
+pub use config::{DbConfig, RedoMode, WalDurabilityPolicy};
 pub use dirty::PageDirtyTracker;
 pub use doublewrite::DoublewriteBuffer;
 pub use engine::StorageEngine;
