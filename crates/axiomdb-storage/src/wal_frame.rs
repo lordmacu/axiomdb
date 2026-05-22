@@ -157,7 +157,9 @@ impl WalIndex {
 /// writers never contend (mirrors `ConcurrentWalWriter`'s atomic-LSN reservation).
 pub struct FrameLog {
     file: File,
-    salt: u64,
+    /// Run identity, copied into every frame. `AtomicU64` so [`recycle`](Self::recycle)
+    /// can swap it through `&self` (under the caller's exclusive checkpoint guard).
+    salt: AtomicU64,
     /// Offset where the next frame will be appended. Reserved via `fetch_add`.
     write_offset: AtomicU64,
     /// Contiguous-durable-prefix bookkeeping (subphase 6a). Guards only the completion
@@ -222,7 +224,7 @@ impl FrameLog {
             .map_err(|e| classify_io(e, "frame log sync header"))?;
         Ok(FrameLog {
             file,
-            salt,
+            salt: AtomicU64::new(salt),
             write_offset: AtomicU64::new(FILE_HDR_SIZE),
             sync_state: Mutex::new(SyncState::new(FILE_HDR_SIZE)),
             advanced: Condvar::new(),
@@ -264,7 +266,7 @@ impl FrameLog {
         let salt = le_u64(&hdr[16..24]);
         let log = FrameLog {
             file,
-            salt,
+            salt: AtomicU64::new(salt),
             write_offset: AtomicU64::new(FILE_HDR_SIZE),
             sync_state: Mutex::new(SyncState::new(FILE_HDR_SIZE)),
             advanced: Condvar::new(),
@@ -299,7 +301,7 @@ impl FrameLog {
         hdr[0..8].copy_from_slice(&page_id.to_le_bytes());
         hdr[8..16].copy_from_slice(&lsn.to_le_bytes());
         hdr[16..24].copy_from_slice(&txn_id.to_le_bytes());
-        hdr[24..32].copy_from_slice(&self.salt.to_le_bytes());
+        hdr[24..32].copy_from_slice(&self.salt.load(Ordering::Relaxed).to_le_bytes());
         let crc = frame_crc(&hdr[0..FRAME_HDR_CRC_PREFIX], page);
         hdr[32..36].copy_from_slice(&crc.to_le_bytes());
 
@@ -425,6 +427,39 @@ impl FrameLog {
         Ok(())
     }
 
+    /// Recycles the log after a checkpoint: rewrites the header with a FRESH salt,
+    /// truncates to the header, fsyncs, and resets the offset watermarks. The caller MUST
+    /// hold the exclusive checkpoint guard (no concurrent appends). Does NOT touch any
+    /// external monotonic LSN counter — the engine's `frame_lsn` must keep increasing, or
+    /// the pageLSN redo guard would wrongly skip a frame appended after the recycle.
+    pub fn recycle(&self) -> Result<(), DbError> {
+        let salt = fresh_salt();
+        let mut hdr = [0u8; FILE_HDR_SIZE as usize];
+        hdr[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        hdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        hdr[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        hdr[16..24].copy_from_slice(&salt.to_le_bytes());
+        let hcrc = crc32c::crc32c(&hdr[0..24]);
+        hdr[24..28].copy_from_slice(&hcrc.to_le_bytes());
+        self.file
+            .set_len(FILE_HDR_SIZE)
+            .map_err(|e| classify_io(e, "frame log recycle truncate"))?;
+        self.file
+            .write_all_at(&hdr, 0)
+            .map_err(|e| classify_io(e, "frame log recycle header"))?;
+        self.file
+            .sync_all()
+            .map_err(|e| classify_io(e, "frame log recycle sync"))?;
+        self.salt.store(salt, Ordering::Release);
+        self.write_offset.store(FILE_HDR_SIZE, Ordering::Release);
+        self.durable.store(FILE_HDR_SIZE, Ordering::Release);
+        let mut s = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+        s.completed.clear();
+        s.contiguous_written = FILE_HDR_SIZE;
+        s.poison = None;
+        Ok(())
+    }
+
     /// Test-only: force the reserved-end (`write_offset`) to simulate in-flight appends
     /// without performing real I/O, so the contiguous-prefix logic can be tested
     /// deterministically.
@@ -459,7 +494,7 @@ impl FrameLog {
                 .map_err(|e| classify_io(e, "frame log scan read"))?;
             let (hdr, page) = buf.split_at(FRAME_HDR_SIZE);
             let salt = le_u64(&hdr[24..32]);
-            if salt != self.salt {
+            if salt != self.salt.load(Ordering::Relaxed) {
                 break; // stale frame from a previous run
             }
             let stored_crc = le_u32(&hdr[32..36]);
@@ -497,7 +532,7 @@ impl FrameLog {
 
     /// The run salt (test/diagnostic).
     pub fn salt(&self) -> u64 {
-        self.salt
+        self.salt.load(Ordering::Relaxed)
     }
 }
 
@@ -721,6 +756,23 @@ mod tests {
         let end = FILE_HDR_SIZE + FRAME_SIZE;
         assert_eq!(log.contiguous_written_offset(), end);
         assert_eq!(log.durable_offset(), end);
+    }
+
+    #[test]
+    fn recycle_resets_to_empty_with_a_fresh_salt() {
+        let (_d, path) = tmp("recycle.wf");
+        let log = FrameLog::create(&path).unwrap();
+        let old_salt = log.salt();
+        log.append(2, 1, 7, &page(1)).unwrap();
+        log.sync_to_durable().unwrap();
+        log.recycle().unwrap();
+        assert_ne!(log.salt(), old_salt, "fresh salt invalidates any stale tail");
+        assert_eq!(log.scan().unwrap().len(), 0, "log is empty after recycle");
+        assert_eq!(log.contiguous_written_offset(), FILE_HDR_SIZE);
+        assert_eq!(log.durable_offset(), FILE_HDR_SIZE);
+        // New appends after a recycle are scannable under the fresh salt.
+        log.append(3, 2, 8, &page(2)).unwrap();
+        assert_eq!(log.scan().unwrap().len(), 1);
     }
 
     #[test]
