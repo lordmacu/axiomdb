@@ -47,6 +47,9 @@ const CHECKSUM_OFFSET: usize = 12;
 // only the body [HEADER_SIZE..], so stamping the lsn here never invalidates it.
 const LSN_OFFSET: usize = 24;
 
+/// Page 1 holds the free-list bitmap (page 0 is the meta page).
+const FREELIST_PAGE_ID: u64 = 1;
+
 // ── DbFileMeta ────────────────────────────────────────────────────────────────
 
 /// File metadata stored in the body of page 0.
@@ -459,6 +462,85 @@ impl MmapStorage {
     fn pwrite_page(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
         let offset = page_id * PAGE_SIZE as u64;
         self.pwrite_bytes(offset, page.as_bytes())
+    }
+
+    /// Applies every committed frame to the main file — shared by recovery REDO and the
+    /// checkpoint (subphase 6b). For each page's latest committed frame, if
+    /// `frame.lsn > page.lsn` the frame's full image is written directly. Grows the file
+    /// for a committed frame whose page is beyond EOF (allocated after the last main-file
+    /// flush, then lost), and reloads the in-memory freelist if the bitmap page (page 1)
+    /// was redone. Returns the number of pages written.
+    fn apply_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        let Some(frame_log) = &self.frame_log else {
+            return Ok(0);
+        };
+        let index = frame_log.build_index(is_committed)?;
+        let mut applied = 0usize;
+        let mut touched_bitmap = false;
+        for frame in index.frames() {
+            // Grow-on-redo: extend the main file to cover a committed frame whose page is
+            // past EOF before writing it.
+            if frame.page_id >= self.page_count.load(Ordering::Acquire) {
+                let _grow = self.grow_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let cur = self.page_count.load(Ordering::Acquire);
+                if frame.page_id >= cur {
+                    self.do_grow(frame.page_id + 1 - cur)?;
+                }
+            }
+            let page_lsn = match self.read_page_raw(frame.page_id) {
+                Ok(bytes) => u64::from_le_bytes(
+                    bytes[LSN_OFFSET..LSN_OFFSET + 8]
+                        .try_into()
+                        .expect("8 bytes"),
+                ),
+                Err(DbError::PageNotFound { .. }) => 0,
+                Err(e) => return Err(e),
+            };
+            // Idempotence guard (Postgres pageLSN): apply only a strictly newer frame.
+            if frame.lsn > page_lsn {
+                let page_bytes = frame_log.read_page_at(frame.offset)?;
+                self.pwrite_bytes(frame.page_id * PAGE_SIZE as u64, &page_bytes[..])?;
+                self.buffer_pool.invalidate(frame.page_id);
+                if frame.page_id == FREELIST_PAGE_ID {
+                    touched_bitmap = true;
+                }
+                applied += 1;
+            }
+        }
+        // A redone freelist bitmap (page 1) makes the in-memory freelist stale.
+        if touched_bitmap {
+            self.reload_freelist_from_disk()?;
+        }
+        Ok(applied)
+    }
+
+    /// Reloads the in-memory freelist from the (possibly redone) bitmap page (page 1),
+    /// so it matches the on-disk bitmap after a REDO/checkpoint applied a bitmap frame.
+    fn reload_freelist_from_disk(&self) -> Result<(), DbError> {
+        let page_count = self.page_count.load(Ordering::Acquire);
+        let bitmap = self.read_page_raw(FREELIST_PAGE_ID)?;
+        let page = Page::from_bytes(bitmap)?;
+        let fl = FreeList::from_bytes(page.body(), page_count);
+        *self.freelist.lock().unwrap_or_else(|e| e.into_inner()) = fl;
+        Ok(())
+    }
+
+    /// Test-only: shrink the main file (and `page_count`) to `page_count` pages, then
+    /// remap — models a page allocated after the last flush that a crash lost, so the
+    /// grow-on-redo path can be tested deterministically.
+    #[cfg(test)]
+    pub(crate) fn truncate_file_for_test(&self, page_count: u64) {
+        self.file
+            .set_len(page_count * PAGE_SIZE as u64)
+            .expect("truncate");
+        self.page_count.store(page_count, Ordering::Release);
+        // Keep the freelist consistent with the shrunk page_count (else do_grow's
+        // `grow(new_total > total)` assert trips when REDO grows the file back).
+        *self.freelist.lock().unwrap_or_else(|e| e.into_inner()) =
+            FreeList::new(page_count, &[0, 1]);
+        let mut g = self.mmap.write().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: file just resized; no other writer (test-only, single-threaded).
+        *g = unsafe { Mmap::map(&self.file).expect("remap") };
     }
 
     fn write_page_inner(&self, page_id: u64, page: &Page) -> Result<(), DbError> {
@@ -902,38 +984,9 @@ impl StorageEngine for MmapStorage {
     }
 
     fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
-        let Some(frame_log) = &self.frame_log else {
-            return Ok(0);
-        };
-        let index = frame_log.build_index(is_committed)?;
-        let mut redone = 0usize;
-        for frame in index.frames() {
-            // On-disk page LSN, read raw (no checksum verify): the page may be stale.
-            // A committed frame whose page no longer exists in the main file (allocated
-            // after the last flush, then lost) needs file growth to restore — that is
-            // the checkpoint's job (subphase 6), so skip it here.
-            let page_lsn = match self.read_page_raw(frame.page_id) {
-                Ok(bytes) => u64::from_le_bytes(
-                    bytes[LSN_OFFSET..LSN_OFFSET + 8]
-                        .try_into()
-                        .expect("8 bytes"),
-                ),
-                Err(DbError::PageNotFound { .. }) => continue,
-                Err(e) => return Err(e),
-            };
-            // Idempotence guard (Postgres pageLSN, xlogutils.c): apply only when the
-            // frame is strictly newer. The frame is a full page image whose embedded
-            // lsn becomes the page lsn, so a recovery re-entry sees `==` and skips.
-            if frame.lsn > page_lsn {
-                let page_bytes = frame_log.read_page_at(frame.offset)?;
-                // Write the frame bytes DIRECTLY (no new frame appended) + drop the
-                // stale cached copy so the next read reloads the redone bytes.
-                self.pwrite_bytes(frame.page_id * PAGE_SIZE as u64, &page_bytes[..])?;
-                self.buffer_pool.invalidate(frame.page_id);
-                redone += 1;
-            }
-        }
-        Ok(redone)
+        // Recovery REDO shares the apply with the checkpoint (grow-on-redo + freelist
+        // reload). On open, this materializes committed frames into the main file.
+        self.apply_committed_frames(is_committed)
     }
 
     fn deferred_free_count(&self) -> usize {
@@ -1540,5 +1593,38 @@ mod tests {
                 "idempotent re-run is a no-op (pageLSN guard)"
             );
         }
+    }
+
+    #[test]
+    fn redo_grows_the_file_for_a_committed_frame_beyond_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("grow.db");
+        let row = 0xE9u8;
+
+        let mut s = MmapStorage::create(&db).unwrap();
+        s.enable_redo_log(&db).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        s.set_current_txn(5);
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = row;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        s.sync_frame_log().unwrap();
+        s.set_current_txn(0);
+
+        // Model a lost post-flush allocation: shrink the main file below `pid`.
+        s.truncate_file_for_test(pid);
+        assert!(
+            matches!(s.read_page(pid), Err(DbError::PageNotFound { .. })),
+            "precondition: the allocated page is beyond EOF after the shrink"
+        );
+
+        // REDO must grow the file back and restore the committed page.
+        assert_eq!(s.redo_committed_frames(&|t| t == 5).unwrap(), 1, "one page redone");
+        assert_eq!(
+            s.read_page(pid).unwrap().body()[0],
+            row,
+            "grow-on-redo restored the committed page beyond the old EOF"
+        );
     }
 }
