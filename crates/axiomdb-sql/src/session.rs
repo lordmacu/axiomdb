@@ -1541,6 +1541,14 @@ impl SessionContext {
         }
     }
 
+    /// Like [`invalidate_table_epoch_for_ref`](Self::invalidate_table_epoch_for_ref)
+    /// but for an already-known `table_id`, skipping the name → id resolution
+    /// (which allocates the database string and probes the schema cache). Used on
+    /// the INSERT hot path where the target table was just resolved.
+    pub fn invalidate_table_epoch_for_id(&mut self, table_id: u32) {
+        self.table_epoch_cache.remove(&table_id);
+    }
+
     /// Drop all epoch marks without evicting the schema cache.
     /// Used by `VACUUM` (all tables) so the next access to any table
     /// re-validates via the catalog schema_version probe.

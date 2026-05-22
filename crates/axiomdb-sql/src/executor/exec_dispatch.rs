@@ -67,9 +67,19 @@ fn dispatch_ctx(
         Stmt::Insert(s) => {
             let table_ref = s.table.clone();
             let mut conn = ctx.conn_txn.take().expect("conn_txn set");
-            let r = execute_insert_ctx(s, exec_ctx, &mut conn, ctx);
+            // Resolve the target ONCE and carry its id through to the epoch
+            // invalidation so we avoid a second name resolution (which allocates
+            // the database string + re-probes the schema cache) per INSERT.
+            let r = match resolve_insert_target(&s, exec_ctx, &mut conn, ctx) {
+                Ok(resolved) => {
+                    let table_id = resolved.def.id;
+                    execute_insert_ctx_with_resolved(s, exec_ctx, &mut conn, ctx, resolved)
+                        .map(|qr| (qr, table_id))
+                }
+                Err(e) => Err(e),
+            };
             ctx.conn_txn = Some(conn);
-            let result =
+            let (result, table_id) =
                 r.map_err(|e| translate_exclusion_violation_ctx(e, exec_ctx, ctx, &table_ref))?;
             let result = run_statement_triggers_for_result(
                 TriggerEvent::Insert,
@@ -81,7 +91,7 @@ fn dispatch_ctx(
             // A.2: clear epoch mark so the next autocommit access re-validates
             // the schema_version — catches any B-tree root split that occurred
             // during the write (update_table_root bumps schema_version).
-            ctx.invalidate_table_epoch_for_ref(&table_ref);
+            ctx.invalidate_table_epoch_for_id(table_id);
             Ok(result)
         }
         Stmt::Merge(s) => {

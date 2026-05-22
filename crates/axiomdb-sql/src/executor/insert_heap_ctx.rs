@@ -4,21 +4,27 @@ fn execute_insert_ctx(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<QueryResult, DbError> {
-    // Phase 21.4b — INSERT RETURNING: ODKU + REPLACE interactions cover
-    // post-conflict row semantics that land with 21.5 (MERGE / ON CONFLICT).
-    // For 21.4b we accept RETURNING on plain INSERT VALUES / INSERT SELECT /
-    // DEFAULT VALUES paths and reject the conflict-resolution combos.
-    if !stmt.returning.is_empty() && (stmt.replace || stmt.on_duplicate_update.is_some()) {
-        return Err(DbError::NotImplemented {
-            feature: "INSERT ... RETURNING with REPLACE / ON DUPLICATE KEY UPDATE \
-                      — deferred to 21.5 (MERGE family)"
-                .into(),
-        });
-    }
+    let resolved = resolve_insert_target(&stmt, exec_ctx, conn_txn, ctx)?;
+    execute_insert_ctx_with_resolved(stmt, exec_ctx, conn_txn, ctx, resolved)
+}
+
+/// Resolves the INSERT target to its [`ResolvedTable`].
+///
+/// Uses the explicit-transaction batch fast path — when an active clustered
+/// batch already targets this table the session `ResolvedTable` cache is fresh
+/// (all B-tree writes are deferred to COMMIT, so the catalog entry including
+/// `root_page_id` is unchanged) — before falling back to a full
+/// [`resolve_table_cached`] probe. Shared by [`execute_insert_ctx`] and the
+/// prepared INSERT fast path so neither path resolves the table twice.
+pub(crate) fn resolve_insert_target(
+    stmt: &InsertStmt,
+    exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
+    ctx: &mut SessionContext,
+) -> Result<Arc<ResolvedTable>, DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
-    let bloom = exec_ctx.bloom();
 
     // Fast path: for repeated INSERTs into the same clustered table inside an
     // explicit transaction, the session cache is always fresh. The batch's
@@ -61,6 +67,35 @@ fn execute_insert_ctx(
         }
         resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?
     } });
+    Ok(resolved)
+}
+
+/// Executes an INSERT once its target table has been resolved.
+///
+/// Split from [`execute_insert_ctx`] so the prepared INSERT fast path can
+/// supply a once-resolved table and dispatch the clustered / heap routing
+/// without resolving again.
+pub(crate) fn execute_insert_ctx_with_resolved(
+    stmt: InsertStmt,
+    exec_ctx: &ExecutionContext,
+    conn_txn: &mut ConnectionTxn,
+    ctx: &mut SessionContext,
+    resolved: Arc<ResolvedTable>,
+) -> Result<QueryResult, DbError> {
+    // Phase 21.4b — RETURNING with REPLACE / ON DUPLICATE KEY UPDATE is rejected:
+    // post-conflict row semantics land with 21.5 (MERGE / ON CONFLICT). Plain
+    // INSERT VALUES / INSERT SELECT / DEFAULT VALUES RETURNING is accepted.
+    if !stmt.returning.is_empty() && (stmt.replace || stmt.on_duplicate_update.is_some()) {
+        return Err(DbError::NotImplemented {
+            feature: "INSERT ... RETURNING with REPLACE / ON DUPLICATE KEY UPDATE \
+                      — deferred to 21.5 (MERGE family)"
+                .into(),
+        });
+    }
+    // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
+    let storage = exec_ctx.storage();
+    let txn = exec_ctx.coord();
+    let bloom = exec_ctx.bloom();
 
     // Phase 40.11: IX(table) — once per statement, before any row write.
     // Idempotent: InnoDB `lock_table_has()` pattern — returns immediately if

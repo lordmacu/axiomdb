@@ -4,6 +4,43 @@ Phase: redo-recovery (project B) — subphase 6e (SQLite write-parity, lever 1 o
 Status: in-progress
 Effort: **max** (executor hot path, shared crate, correctness-critical with fallback)
 
+## ⚠️ MEASURED REFRAME (2026-05-22) — implemented as a generic-dispatch optimization, NOT a prepared bypass
+
+The original plan below (cache `Arc<ResolvedTable>` + `schema_version` on
+`PreparedStatement`, bypass dispatch) was **superseded by measurement**. Two findings:
+
+1. **`schema_version` is NOT a valid revalidation token for inserts** — `update_table_root`
+   bumps it on every B-tree root split during the write, so a cached `schema_version` would
+   mismatch after the first split. (SQLite's schema cookie only moves on DDL; AxiomDB's moves
+   on data writes too.)
+2. **The bypass is the wrong trade.** `--diagnose-insert-deep` (50K, low-noise) located the
+   `~0.85µs/row` "generic dispatch remainder". The dispatch *structure* (matches) is cheap;
+   the per-statement `txn.savepoint` is also cheap (3 length reads, no WAL). The remainder is
+   dominated by **per-INSERT catalog round-trips**: `run_statement_triggers_for_result`
+   (`database.to_string()` + `get_table` + clone of table_name + trigger list) and
+   `invalidate_table_epoch_for_ref` (`database.to_string()` + key build + cache probe). A
+   prepared bypass would also have to re-implement the per-statement savepoint + `on_error`
+   handling (and `enqueue` is NOT fully atomic on non-PK-dup errors), risking statement
+   atomicity — high risk for marginal extra capture.
+
+**Implemented (Direction B):** optimize the **generic** INSERT dispatch (`dispatch_ctx`),
+benefiting prepared **and** wire **and** raw-SQL paths, with zero bypass:
+- `dispatch_ctx` resolves the target ONCE (`resolve_insert_target` +
+  `execute_insert_ctx_with_resolved`, the 6e-1 split) and invalidates the epoch by id
+  (`SessionContext::invalidate_table_epoch_for_id`) — no second name resolution.
+- `run_statement_triggers_for_result`: `database` as `&str` (no alloc), and clones the
+  table_name + trigger list **only when the table has triggers**. Keeps the `get_table`/
+  resolve probe, which repopulates the resolve cache after an autocommit write that evicted it
+  (guarded by `integration_resolve_table_cache::cache_serves_select_after_insert`).
+
+**Measured:** dispatch remainder `0.85 → 0.56µs/row`, `execute_with_ctx 1.67 → 1.36µs/row`
+(−0.3µs) with the full skip; the safe in-place version recovers most of it. insert_batch
+`~2.8–3.2× → ~2.6–2.7×` vs SQLite. **Parity still needs lever 2 (commit/WAL: page-cache +
+WAL-file reuse, ~1.2µs/row, structural) and lever 3 (codec).** The original prepared-bypass
+plan is kept below as historical context.
+
+---
+
 ## Goal
 
 Cut the **generic dispatch (~0.9µs/row, ~30% of the ~2.9µs insert)** — the per-statement
