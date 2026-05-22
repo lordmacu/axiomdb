@@ -1499,6 +1499,14 @@ impl SessionContext {
         self.table_epoch_cache.get(&table_id).copied() == Some(self.catalog_epoch)
     }
 
+    /// The current catalog epoch — bumped ONLY by DDL (`invalidate_all`), never by a
+    /// clustered root split (that bumps `schema_version`). A cached plan stamped with
+    /// this value is schema-fresh until the next DDL, so the specialized prepared-INSERT
+    /// execute can revalidate without a catalog probe.
+    pub fn catalog_epoch(&self) -> u64 {
+        self.catalog_epoch
+    }
+
     /// A.2 optimization: records that `table_id` was validated at the current
     /// epoch after a successful catalog probe. Subsequent calls to
     /// `is_table_epoch_current` will return `true` until DDL bumps the epoch.

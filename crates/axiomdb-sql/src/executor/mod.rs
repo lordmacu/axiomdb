@@ -112,6 +112,7 @@ include!("dml_join.rs");
 include!("aggregate.rs");
 include!("select.rs");
 include!("insert.rs");
+include!("prepared_insert.rs");
 include!("replace_helpers.rs");
 include!("on_conflict_helpers.rs");
 include!("odku_helpers.rs");
