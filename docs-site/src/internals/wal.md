@@ -888,10 +888,50 @@ stays, physical REDO is added only for committed data.
 <div class="callout-body">
 <span class="callout-label">Status</span>
 REDO recovery works (<code>t0_…</code> green). Still additive: the per-commit flush
-stays as a net under the new REDO. Remaining: subphase 6 (drop the per-commit flush +
-frame-only writes + the contiguous durable prefix for concurrent appends + checkpoint
-copies frames to the main file), and subphase 7 (the full crash suite T1–T7 + perf A/B).
-A committed frame for a page that no longer exists in the main file (allocated after the
-last flush) needs file growth on REDO — deferred to the subphase-6 checkpoint.
+stays as a net under the new REDO. Subphase 6 is split into <strong>6a</strong>
+(contiguous durable prefix — below), <strong>6b</strong> (checkpoint copies frames to the
+main file), and <strong>6c</strong> (drop the per-commit flush + frame-only writes — the
+switch); subphase 7 is the full crash suite T1–T7 + perf A/B. A committed frame for a page
+that no longer exists in the main file (allocated after the last flush) needs file growth
+on REDO — deferred to the 6b checkpoint.
+</div>
+</div>
+
+### Subphase 6a — contiguous durable prefix (multi-writer)
+
+`FrameLog::append` is fully lock-free — it reserves a fixed-size slot with an atomic
+`fetch_add` and `pwrite`s concurrently. Two interleaved appenders can momentarily leave a
+**hole**: if the higher-offset frame finishes and a commit fsyncs while the lower slot is
+still unwritten, a crash leaves a gap that `scan` stops at — losing the committed frame
+beyond it. (`ConcurrentWalWriter`, the logical WAL, avoids this by writing under a leader
+mutex; the frame log traded that for a lock-free `pwrite`, so it needs an explicit
+contiguous-prefix watermark.) Harmless today (durability still comes from the per-commit
+main-file flush) — but a data-loss hole the moment 6c makes frames the sole source.
+
+The fix mirrors PostgreSQL's `LogwrtResult` Write/Flush split:
+
+- **`contiguous_written_offset`** — the gap-free *written* prefix. Each append, on
+  completing its `pwrite`, folds its slot into this watermark (out-of-order completions
+  wait in a small reorder set). The fold takes a `~ns` bookkeeping mutex — never the
+  `pwrite` itself, which stays concurrent.
+- **`durable_offset`** — the *fsync'd* prefix.
+- **`sync_to_durable()`** (the commit boundary, via `commit_durable` → `sync_frame_log`)
+  snapshots the reserved end, **waits** until `contiguous_written` covers it (PostgreSQL's
+  `WaitXLogInsertionsToFinish`), fsyncs once under a *separate* leader lock (so a multi-ms
+  fsync never blocks appends' bookkeeping), then advances `durable`. It returns only once
+  the reserved end is durable — so a crash can never leave a committed frame behind a hole.
+
+A failed `pwrite` poisons its slot: a commit waiting past it errors instead of blocking
+forever. Additive (redo still opt-in) — it makes the frame log's durable point gap-free so
+6c can safely make frames the sole durability source.
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed</span>
+The Write/Flush watermark separation and the "flush waits for all in-flight insertions
+below the target" rule are PostgreSQL's <code>XLogFlush</code> /
+<code>WaitXLogInsertionsToFinish</code> (<code>xlog.c</code>), adapted to fixed-size frame
+offsets with a lock-free <code>pwrite</code> plus a reorder watermark.
 </div>
 </div>

@@ -638,7 +638,11 @@ mod tests {
         assert_eq!(log.durable_offset(), h);
         // A higher frame completes before a lower one → the prefix must NOT skip the gap.
         log.mark_written(h + FRAME_SIZE);
-        assert_eq!(log.contiguous_written_offset(), h, "gap must not be skipped");
+        assert_eq!(
+            log.contiguous_written_offset(),
+            h,
+            "gap must not be skipped"
+        );
         // Filling the gap folds both in one step.
         log.mark_written(h);
         assert_eq!(log.contiguous_written_offset(), h + 2 * FRAME_SIZE);

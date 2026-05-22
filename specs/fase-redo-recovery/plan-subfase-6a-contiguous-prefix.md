@@ -2,7 +2,7 @@
 
 Phase: redo-recovery (project B) — subphase 6a
 Spec: specs/fase-redo-recovery/spec-subfase-6a-contiguous-prefix.md
-Status: draft
+Status: done
 
 ## Summary
 
