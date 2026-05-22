@@ -384,12 +384,14 @@ fn enqueue_clustered_insert_ctx(
     let table_id = resolved.def.id;
 
     // Flush existing batch if it is for a different table.
+    // Use the conn-explicit flush: `exec_dispatch` took `ctx.conn_txn` out
+    // before calling us, so `ctx.conn_txn` is `None` here.
     if ctx
         .clustered_insert_batch
         .as_ref()
         .is_some_and(|b| b.table_id != table_id)
     {
-        flush_clustered_insert_batch(exec_ctx, ctx)?;
+        flush_clustered_insert_batch_with_conn(exec_ctx, ctx, conn_txn)?;
     }
 
     // Initialize batch if none exists yet for this table.
@@ -607,12 +609,15 @@ fn enqueue_clustered_insert_ctx(
     }
 
     // Safety valve: flush immediately if the batch has grown very large.
+    // Use the conn-explicit flush: `exec_dispatch` took `ctx.conn_txn` out
+    // before calling us, so `ctx.conn_txn` is `None` here. Reading it would
+    // panic; the open transaction lives in the `conn_txn` parameter.
     if ctx
         .clustered_insert_batch
         .as_ref()
         .is_some_and(|b| b.rows.len() >= CLUSTERED_BATCH_MAX_ROWS)
     {
-        flush_clustered_insert_batch(exec_ctx, ctx)?;
+        flush_clustered_insert_batch_with_conn(exec_ctx, ctx, conn_txn)?;
     }
 
     if let Some(id) = first_generated {

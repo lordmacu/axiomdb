@@ -646,3 +646,90 @@ fn clustered_batch_autocommit_does_not_use_batch() {
     let r = rows(result);
     assert_eq!(r[0][0], axiomdb_types::Value::BigInt(2));
 }
+
+/// 11. Regression: a >200K-row single transaction must not panic.
+///
+/// A single transaction that inserts more than `CLUSTERED_BATCH_MAX_ROWS`
+/// (200_000) rows must complete via the mid-statement safety-valve flush.
+///
+/// Pre-fix, the safety valve called `flush_clustered_insert_batch`, which reads
+/// `ctx.conn_txn`. But `exec_dispatch` had already `take()`n the connection out
+/// for the duration of the INSERT, so `ctx.conn_txn` was `None` and the flush
+/// panicked (`staging.rs`: "active txn for clustered insert flush"). The fix
+/// threads the borrowed connection into `flush_clustered_insert_batch_with_conn`.
+#[test]
+fn clustered_batch_safety_valve_flushes_past_max_rows_without_panic() {
+    let (mut s, mut txn, mut bloom, mut ctx) = setup_ctx();
+
+    ok(
+        "CREATE TABLE bulk (id INT PRIMARY KEY, v INT)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+
+    ok("BEGIN", &mut s, &mut txn, &mut bloom, &mut ctx);
+
+    // 250_000 rows in one transaction — comfortably past the 200_000 safety
+    // valve. Chunked multi-row INSERTs keep the test fast while still routing
+    // through the clustered staging path (explicit txn + VALUES source).
+    const TOTAL: i64 = 250_000;
+    const MAX_ROWS: i64 = 200_000; // mirrors CLUSTERED_BATCH_MAX_ROWS (private)
+    const CHUNK: i64 = 1_000;
+    let mut id = 1i64;
+    while id <= TOTAL {
+        let mut sql = String::from("INSERT INTO bulk VALUES ");
+        for j in 0..CHUNK {
+            if j > 0 {
+                sql.push(',');
+            }
+            let cur = id + j;
+            sql.push_str(&format!("({cur},{})", cur * 2));
+        }
+        ok(&sql, &mut s, &mut txn, &mut bloom, &mut ctx);
+        id += CHUNK;
+    }
+
+    // The safety valve must have fired mid-transaction: after staging 200_000
+    // rows it flushed and reset the batch, so only the residual rows remain
+    // staged before COMMIT. This proves the mid-txn flush ran without panicking.
+    let staged = ctx
+        .clustered_insert_batch
+        .as_ref()
+        .expect("residual batch staged after safety-valve flush");
+    assert_eq!(
+        staged.rows.len(),
+        (TOTAL - MAX_ROWS) as usize,
+        "safety valve should have flushed the first 200_000 rows mid-transaction"
+    );
+
+    ok("COMMIT", &mut s, &mut txn, &mut bloom, &mut ctx);
+
+    // All rows must be present after COMMIT.
+    let r = rows(ok(
+        "SELECT COUNT(*) FROM bulk",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    ));
+    assert_eq!(r[0][0], Value::BigInt(TOTAL));
+
+    // Spot-check boundary rows: first row, the safety-valve boundary, and last.
+    for check_id in [1i64, MAX_ROWS, TOTAL] {
+        let r = rows(ok(
+            &format!("SELECT v FROM bulk WHERE id = {check_id}"),
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        ));
+        assert_eq!(r.len(), 1, "row id={check_id} must exist after COMMIT");
+        assert_eq!(
+            r[0][0],
+            Value::Int((check_id * 2) as i32),
+            "row id={check_id} value"
+        );
+    }
+}

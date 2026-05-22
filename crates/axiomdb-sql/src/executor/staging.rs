@@ -213,7 +213,53 @@ pub(super) fn flush_pending_inserts_ctx(
 // ── Clustered INSERT batch flush (Phase 40.1) ─────────────────────────────────
 
 /// Flushes the staged clustered INSERT buffer to the B-tree, WAL, and secondary
-/// indexes in one sorted batch call.
+/// indexes in one sorted batch call, using `ctx.conn_txn` as the active
+/// connection.
+///
+/// No-op (and no active txn required) if there is no pending clustered batch or
+/// the batch is empty. On return `ctx.clustered_insert_batch` is `None`.
+///
+/// This is the entry point for transaction-control barriers (COMMIT, SAVEPOINT,
+/// and the non-INSERT statement barrier in `exec_dispatch`), where `ctx.conn_txn`
+/// is still populated. The DML insert path must instead use
+/// [`flush_clustered_insert_batch_with_conn`] because `exec_dispatch` extracts
+/// `ctx.conn_txn` via `take()` before calling the insert executor.
+pub(super) fn flush_clustered_insert_batch(
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+) -> Result<(), DbError> {
+    // Nothing staged → no-op, and crucially no active txn is required. Drop any
+    // empty staged batch so `ctx.clustered_insert_batch` is `None` on return.
+    let has_pending = ctx
+        .clustered_insert_batch
+        .as_ref()
+        .is_some_and(|b| !b.rows.is_empty());
+    if !has_pending {
+        ctx.clustered_insert_batch = None;
+        return Ok(());
+    }
+
+    // Move the connection out so it can be borrowed disjointly from `ctx`
+    // (the flush also needs `&mut ctx` for stats + cache invalidation), then
+    // restore it afterwards so the open transaction survives the flush.
+    let mut conn = ctx
+        .conn_txn
+        .take()
+        .expect("active txn for clustered insert flush");
+    let result = flush_clustered_insert_batch_with_conn(exec_ctx, ctx, &mut conn);
+    ctx.conn_txn = Some(conn);
+    result
+}
+
+/// Flushes the staged clustered INSERT buffer against a caller-held
+/// `ConnectionTxn` instead of `ctx.conn_txn`.
+///
+/// The DML dispatch path (`exec_dispatch`) extracts `ctx.conn_txn` via `take()`
+/// and threads it as an explicit parameter, leaving `ctx.conn_txn == None` for
+/// the duration of the insert. The mid-statement flushes inside
+/// `enqueue_clustered_insert_ctx` (table switch + the `CLUSTERED_BATCH_MAX_ROWS`
+/// safety valve) must therefore flush against that borrowed connection — reading
+/// `ctx.conn_txn` here would observe `None` and panic.
 ///
 /// No-op if there is no pending clustered batch. On return
 /// `ctx.clustered_insert_batch` is `None`.
@@ -227,9 +273,10 @@ pub(super) fn flush_pending_inserts_ctx(
 ///    `try_insert_rightmost_leaf_batch` fast path, fallback single inserts, WAL
 ///    recording, secondary-index maintenance, and root persistence.
 /// 4. Update the stats tracker and invalidate the schema cache.
-pub(super) fn flush_clustered_insert_batch(
+pub(super) fn flush_clustered_insert_batch_with_conn(
     exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
+    conn: &mut ConnectionTxn,
 ) -> Result<(), DbError> {
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
@@ -261,29 +308,23 @@ pub(super) fn flush_clustered_insert_batch(
         .collect();
 
     let mut secondary_indexes = batch.secondary_indexes;
-    let count = {
-        let conn = ctx
-            .conn_txn
-            .as_mut()
-            .expect("active txn for clustered insert flush");
-        apply_clustered_insert_rows(
-            storage,
-            txn,
-            conn,
-            bloom,
-            &batch.table_def,
-            &batch.primary_idx,
-            &mut secondary_indexes,
-            &batch.secondary_layouts,
-            &batch.compiled_preds,
-            &prepared,
-            // No session hint: ctx.invalidate_all() below would clear
-            // it anyway. The local rightmost_leaf_hint inside the
-            // function already handles the batched-flush case.
-            None,
-            /*defer_table_root_persist=*/ false,
-        )?
-    };
+    let count = apply_clustered_insert_rows(
+        storage,
+        txn,
+        conn,
+        bloom,
+        &batch.table_def,
+        &batch.primary_idx,
+        &mut secondary_indexes,
+        &batch.secondary_layouts,
+        &batch.compiled_preds,
+        &prepared,
+        // No session hint: ctx.invalidate_all() below would clear
+        // it anyway. The local rightmost_leaf_hint inside the
+        // function already handles the batched-flush case.
+        None,
+        /*defer_table_root_persist=*/ false,
+    )?;
 
     ctx.stats.on_rows_changed(batch.table_id, count);
     ctx.invalidate_all();
