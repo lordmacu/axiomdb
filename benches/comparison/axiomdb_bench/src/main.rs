@@ -24,8 +24,15 @@ fn db_open(dir: &Path) -> Db {
     // per-commit main-file sync_all (ensure_database_roots flush) is dropped and
     // durability comes from the frame log — measures the autocommit win.
     let mut db = if std::env::var_os("AXIOMDB_BENCH_REDO").is_some() {
+        // AXIOMDB_BENCH_WAL_MB sets the soft checkpoint threshold — a small value (e.g. 1-2)
+        // forces frame-log recycles within a batch so the steady-state WAL-reuse (T1) is
+        // exercised + measurable (default 256 = no recycle in a single batch).
         let cfg = axiomdb_storage::DbConfig {
             redo: Some(axiomdb_storage::RedoMode::FrameOnly),
+            max_wal_size_mb: std::env::var("AXIOMDB_BENCH_WAL_MB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
             ..Default::default()
         };
         Db::open_with_config(dir.join("bench.db"), &cfg).expect("open db (frame-only)")
