@@ -324,6 +324,9 @@ impl StorageEngine for FaultInjectionStorage {
             .unwrap_or_else(|e| e.into_inner());
         // `txn_id == 0` (system write) counts as committed for apply + recycle.
         let committed = |t: u64| t == 0 || is_committed(t);
+        // 6d: fsync the frame log BEFORE applying to main (walCheckpoint order). Under NORMAL
+        // the per-commit frame fsync is deferred to here.
+        frame_log.sync_to_durable()?;
         let applied = self.apply_committed_frames(&committed)?;
         // In-flight-safe: only recycle when every frame is committed.
         if frame_log.scan()?.iter().all(|f| committed(f.txn_id)) {

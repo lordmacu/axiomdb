@@ -149,6 +149,19 @@ impl Page {
         Ok(page)
     }
 
+    /// Builds a `Page` from raw bytes **without** verifying magic or checksum.
+    ///
+    /// For the hot path that caches a page it JUST produced from a known-valid
+    /// page (e.g. the frame-only `write_page` stamps only the LSN at offset 24,
+    /// which lives in the header — outside the checksum-covered body — so the
+    /// body checksum is still valid). Skips the redundant `crc32c(body())` that
+    /// [`from_bytes`] would recompute.
+    ///
+    /// Caller contract: `bytes` is a valid, correctly-checksummed page image.
+    pub fn from_bytes_unchecked(bytes: [u8; PAGE_SIZE]) -> Self {
+        Page { data: bytes }
+    }
+
     /// Reference to the header by interpreting the first 64 bytes.
     ///
     /// # SAFETY

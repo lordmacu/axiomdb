@@ -606,7 +606,10 @@ impl MmapStorage {
                 txn_id,
                 offset,
             });
-            let stamped = Page::from_bytes(buf)?;
+            // The page was just produced from a valid page; only the LSN (offset 24,
+            // in the header, outside the checksum body) was stamped, so the body
+            // checksum is still valid — skip the redundant re-verification (6d).
+            let stamped = Page::from_bytes_unchecked(buf);
             self.buffer_pool.insert(page_id, Arc::new(stamped));
         } else {
             self.pwrite_page(page_id, page)?;
@@ -1033,7 +1036,13 @@ impl StorageEngine for MmapStorage {
         // `txn_id == 0` is a non-transactional/system write — always durable, never an
         // in-flight user txn — so it counts as committed for both apply and recycle.
         let committed = |t: u64| t == 0 || is_committed(t);
-        // Ordering invariant: apply committed frames → fsync main → recycle the log.
+        // 6d: make the frame log durable BEFORE mutating the main file (SQLite walCheckpoint
+        // order: fsync WAL → copy to db). Under NORMAL the per-commit frame fsync is deferred
+        // to here, so this is where the committed frames actually become durable. If a crash
+        // hits mid-apply, recovery REDOes from these (now-durable) frames — without this fsync
+        // a power loss could lose un-synced frames that a partially-applied main still needs.
+        frame_log.sync_to_durable()?;
+        // Ordering invariant: fsync frame log → apply committed frames → fsync main → recycle.
         let applied = self.apply_committed_frames(&committed)?;
         self.flush()?; // applied pages are durable in the main file before the recycle
                        // In-flight-safe: only recycle when EVERY frame is committed (else an uncommitted
