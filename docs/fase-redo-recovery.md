@@ -61,7 +61,7 @@ paralelo para el default-on. Sprint (specs/fase-redo-recovery/, brainstorm hecho
 
 ---
 
-## 🔄 Subfase 6f (Task 1) — estado: 3/8 pasos
+## 🔄 Subfase 6f (Task 1) — estado: 5/8 pasos · ✅ opt-in embebido ACOTADO
 
 Spec: `specs/fase-redo-recovery/spec-subfase-6f-frame-checkpoint-trigger.md` (approved).
 Plan: `specs/fase-redo-recovery/plan-subfase-6f-frame-checkpoint-trigger.md` (in-progress).
@@ -83,34 +83,35 @@ colisiona, no reusar).
 [x] 1. TxnManager::is_committed predicate                  fe082e0e
 [x] 2. maybe_checkpoint_frames + frame_log_durable_len     491687b8
 [x] 3. back-pressure síncrono en commit_durable (hard cap) a3680dc8
-─────  el frame log queda PROVABLEMENTE acotado una vez seteado el cap  ─────
-[ ] 4. FrameCheckpointer thread background  ← EMPEZAR ACÁ
-[ ] 5. wire embedded Db (Arc-share storage+txn + Drop join + setear cap desde DbConfig)
-[ ] 6. wire server SharedDatabase (spawn + shutdown join)
+[x] 4. FrameCheckpointer thread background                 e37482ea
+[x] 5. wire embedded Db (Arc-share storage+txn + Drop join + cap desde DbConfig) 9eb7960d
+─────  ✅ EL OPT-IN EMBEBIDO YA QUEDA ACOTADO (cap cableado = max_wal_size_mb × 2)  ─────
+[ ] 6. wire server SharedDatabase (spawn + shutdown join)  ← EMPEZAR ACÁ (baja prio: embedded-first)
 [ ] 7. config soft/hard (K=hard/soft, default ~2) + watchdog de muerte del thread
 [ ] 8. docs (user durability + internals/wal.md) + re-confirmar A/B + cierre
 ```
 
-### ⚠️ Lo honesto que falta para que el opt-in REALMENTE acote
-El hard cap default es `u64::MAX` (sin back-pressure) hasta que **el paso 5/7 lo
-cablee desde `DbConfig.max_wal_size_mb × K`**. El MECANISMO (pasos 1-3) está completo +
-testeado; el WIRING (5-7) es lo que hace que el opt-in quede acotado por defecto.
-Mínimo para opt-in seguro = pasos 1-3 + cablear el cap (parte de 5/7). El thread (4) es
-perf (hace el back-pressure raro/off-path); back-pressure solo ya garantiza correctitud.
+### ✅ Pasos 4-5 hechos — el opt-in embebido YA queda acotado
+El cap (`max_wal_size_mb × CHECKPOINT_HARD_MULTIPLIER=2`) y el `FrameCheckpointer` se
+cablean en `open_with_config` cuando `redo = FrameOnly`; `Drop for Db` hace join +
+checkpoint final. El paso 4 (commit `e37482ea`) trajo además dos cosas no triviales: el
+hook de wake `OnceLock<Arc<CheckpointTrigger>>` en `MmapStorage` (`note(offset)` al cruzar
+soft, barato bajo el umbral) y un **fix de coordinación en `sync_frame_log`** (toma el
+checkpoint read-guard para que un recycle concurrente no deje colgado un `sync_to_durable`
+en vuelo — el bg thread vuelve rutinaria esa concurrencia). Falta el server (paso 6),
+volver K configurable (paso 7) y docs+cierre (paso 8).
 
-### EXACT next step — Paso 4: FrameCheckpointer
-- Nuevo `crates/axiomdb-storage/src/checkpointer.rs`: `FrameCheckpointer { JoinHandle,
-  stop: Arc<AtomicBool>, cv: Arc<Condvar> }`. Spawn con `Arc<MmapStorage>` + fuente del
-  committed-predicate (`Arc<TxnManager>` o closure). Loop: esperar Condvar (con timeout)
-  hasta `stop` o `frame_log_durable_len() >= soft` → `maybe_checkpoint_frames(is_committed,
-  soft, false)`. `notify()` lo llama el frame-append al cruzar soft. `stop_and_join()` =
-  señal + checkpoint final + join.
-- **Bloqueante estructural:** el thread necesita acceso 'static compartido a storage+txn.
-  Embedded `Db` los tiene **por valor** (lib.rs:112-114, sin `Drop`) → el paso 5 hace
-  Arc-wrap (`Db.storage: Arc<MmapStorage>`, `Db.txn: Arc<TxnManager>`; los call-sites
-  usan `&*self.storage` en los sitios `&dyn`). Server `SharedDatabase` ya se comparte vía
-  `Arc<SharedDatabase>` (storage/txn por valor adentro). MmapStorage + TxnManager YA son
-  Send+Sync (probado por el uso del server).
+### EXACT next step — Paso 6: server SharedDatabase (o saltar a 7-8 por embedded-first)
+- **Paso 6** = espejar el paso 5 en `crates/axiomdb-network/src/mysql/shared_db.rs`:
+  Arc-share storage+txn dentro de `SharedDbInner`, spawn del `FrameCheckpointer` cuando
+  redo on, join en el shutdown del server. `SharedDatabase` ya se comparte vía
+  `Arc<SharedDatabase>`. **Baja prioridad por EMBEDDED-FIRST** — alternativa: cerrar 6f
+  para embedded ya (paso 7 config K + watchdog, paso 8 docs + A/B) y dejar el server para
+  después / con su gap documentado, luego ir a Task 3 (el win de BATCH).
+- **GOTCHA del paso 5 (costó 1 ciclo de clippy):** el executor toma `storage: &dyn
+  StorageEngine` (usar `&*self.storage`) pero `txn: &TxnManager` concreto (auto-deref a
+  través de `Arc` → `&self.txn` pelado; `&*self.txn` es error `explicit_auto_deref`).
+  Aplicar el mismo split en el paso 6.
 
 ---
 
