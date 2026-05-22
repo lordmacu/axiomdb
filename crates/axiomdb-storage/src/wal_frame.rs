@@ -18,12 +18,12 @@
 //!   partially-written frame fails the crc → marks the end of the valid prefix
 //!   (append-only ⇒ damage is always at the tail).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use axiomdb_core::error::{classify_io, DbError};
 
@@ -160,6 +160,42 @@ pub struct FrameLog {
     salt: u64,
     /// Offset where the next frame will be appended. Reserved via `fetch_add`.
     write_offset: AtomicU64,
+    /// Contiguous-durable-prefix bookkeeping (subphase 6a). Guards only the completion
+    /// fold (~ns) — NEVER held across a `pwrite` or an fsync, so the append hot path and
+    /// the fsync stay off this lock.
+    sync_state: Mutex<SyncState>,
+    /// Notified whenever `contiguous_written` advances or a slot is poisoned, so a
+    /// [`sync_to_durable`](Self::sync_to_durable) waiter can re-check its target.
+    advanced: Condvar,
+    /// Highest fsync'd offset (≤ `contiguous_written`). A crash preserves exactly the
+    /// frames in `[FILE_HDR_SIZE, durable)`. Atomic for a lock-free fast-path read.
+    durable: AtomicU64,
+    /// Serializes/coalesces fsyncs so a multi-ms `sync_data` never blocks append
+    /// bookkeeping (the `sync_state` mutex is dropped before the fsync runs under this).
+    fsync_leader: Mutex<()>,
+}
+
+/// Bookkeeping for the gap-free written prefix under concurrent lock-free appends.
+/// Offsets are frame START boundaries; "prefix ends at X" ⇔ every frame with START < X
+/// has finished its `pwrite`.
+struct SyncState {
+    /// Completed frame START offsets not yet folded into `contiguous_written` (i.e. a
+    /// higher frame finished before a lower one — the out-of-order reorder buffer).
+    completed: BTreeSet<u64>,
+    /// Gap-free written prefix == the next expected (lowest un-written) START offset.
+    contiguous_written: u64,
+    /// Lowest START offset whose append `pwrite` failed (a permanent gap), if any.
+    poison: Option<u64>,
+}
+
+impl SyncState {
+    fn new(start: u64) -> Self {
+        SyncState {
+            completed: BTreeSet::new(),
+            contiguous_written: start,
+            poison: None,
+        }
+    }
 }
 
 impl FrameLog {
@@ -188,6 +224,10 @@ impl FrameLog {
             file,
             salt,
             write_offset: AtomicU64::new(FILE_HDR_SIZE),
+            sync_state: Mutex::new(SyncState::new(FILE_HDR_SIZE)),
+            advanced: Condvar::new(),
+            durable: AtomicU64::new(FILE_HDR_SIZE),
+            fsync_leader: Mutex::new(()),
         })
     }
 
@@ -226,13 +266,23 @@ impl FrameLog {
             file,
             salt,
             write_offset: AtomicU64::new(FILE_HDR_SIZE),
+            sync_state: Mutex::new(SyncState::new(FILE_HDR_SIZE)),
+            advanced: Condvar::new(),
+            durable: AtomicU64::new(FILE_HDR_SIZE),
+            fsync_leader: Mutex::new(()),
         };
-        // Advance write_offset past the valid prefix.
+        // The valid prefix on disk is already durable: set every watermark to its end.
         let frames = log.scan()?;
-        if let Some(last) = frames.last() {
-            log.write_offset
-                .store(last.offset + FRAME_SIZE, Ordering::Relaxed);
-        }
+        let end = frames
+            .last()
+            .map(|f| f.offset + FRAME_SIZE)
+            .unwrap_or(FILE_HDR_SIZE);
+        log.write_offset.store(end, Ordering::Relaxed);
+        log.sync_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contiguous_written = end;
+        log.durable.store(end, Ordering::Relaxed);
         Ok(log)
     }
 
@@ -265,11 +315,43 @@ impl FrameLog {
         Ok(offset)
     }
 
-    /// Flushes appended frames durably (fdatasync).
+    /// Flushes appended frames durably (fdatasync). Low-level primitive — the commit
+    /// boundary uses [`sync_to_durable`](Self::sync_to_durable) instead, which first
+    /// waits for a gap-free written prefix.
     pub fn sync(&self) -> Result<(), DbError> {
         self.file
             .sync_data()
             .map_err(|e| classify_io(e, "frame log sync"))
+    }
+
+    /// Records that the frame at START `offset` finished its `pwrite`, folding it into the
+    /// contiguous-written prefix (advancing over any now-contiguous earlier completions).
+    fn mark_written(&self, offset: u64) {
+        {
+            let mut s = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+            s.completed.insert(offset);
+            let mut cw = s.contiguous_written;
+            while s.completed.remove(&cw) {
+                cw += FRAME_SIZE;
+            }
+            s.contiguous_written = cw;
+        }
+        self.advanced.notify_all();
+    }
+
+    /// Highest offset W such that every frame with START `< W` has finished its `pwrite`
+    /// (the gap-free written prefix).
+    pub fn contiguous_written_offset(&self) -> u64 {
+        self.sync_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contiguous_written
+    }
+
+    /// Highest fsync'd offset — a crash preserves exactly the frames in
+    /// `[FILE_HDR_SIZE, durable)`.
+    pub fn durable_offset(&self) -> u64 {
+        self.durable.load(Ordering::Acquire)
     }
 
     /// Reads the page image of the frame whose header starts at `offset`.
@@ -466,6 +548,35 @@ mod tests {
         let off = log2.append(2, 2, 5, &page(2)).unwrap();
         assert_eq!(off, FILE_HDR_SIZE + FRAME_SIZE);
         assert_eq!(log2.scan().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn contiguous_watermark_reorders_out_of_order_completions() {
+        let (_d, path) = tmp("wm.wf");
+        let log = FrameLog::create(&path).unwrap();
+        let h = FILE_HDR_SIZE;
+        assert_eq!(log.contiguous_written_offset(), h);
+        assert_eq!(log.durable_offset(), h);
+        // A higher frame completes before a lower one → the prefix must NOT skip the gap.
+        log.mark_written(h + FRAME_SIZE);
+        assert_eq!(log.contiguous_written_offset(), h, "gap must not be skipped");
+        // Filling the gap folds both in one step.
+        log.mark_written(h);
+        assert_eq!(log.contiguous_written_offset(), h + 2 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn reopen_inits_watermarks_to_valid_prefix_end() {
+        let (_d, path) = tmp("wm-reopen.wf");
+        {
+            let log = FrameLog::create(&path).unwrap();
+            log.append(2, 1, 4, &page(1)).unwrap();
+            log.sync().unwrap();
+        }
+        let log = FrameLog::open(&path).unwrap();
+        let end = FILE_HDR_SIZE + FRAME_SIZE;
+        assert_eq!(log.contiguous_written_offset(), end);
+        assert_eq!(log.durable_offset(), end);
     }
 
     #[test]
