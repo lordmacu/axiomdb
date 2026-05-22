@@ -5,6 +5,8 @@
 //! executor path.
 
 use std::ops::Bound;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 
@@ -25,6 +27,67 @@ use page_utils::{
     validate_row_payload, write_page,
 };
 use search::{descend_to_leaf, find_start_position, leaf_search_checked, leftmost_leaf_pid};
+
+/// Coarse sub-phase timing for the rightmost-leaf batch append fast path.
+///
+/// Gated by `AXIOMDB_DEBUG_CLUSTERED_INSERT` so production builds pay nothing.
+/// We accumulate exactly ONE `Instant` pair per leaf-fill call (≈ #leaves, not
+/// #rows) into process-global atomics, keeping timer overhead negligible — the
+/// lever-1 lesson was that per-row `Instant::now()` inflates and misleads. The
+/// SQL layer reads + resets these via [`take_rightmost_batch_timings`] when it
+/// prints the `[clustered-insert-debug]` line, so the breakdown lines up with
+/// the same 50K-row run that reports `tree_ms`.
+mod rightmost_batch_timing {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::OnceLock;
+
+    /// Setup per call: page lock + read_page + into_page (16 KiB copy) + checks.
+    pub(super) static SETUP_NS: AtomicU64 = AtomicU64::new(0);
+    /// The per-row loop: `materialize_leaf_cell` + `insert_cell_with_overflow`.
+    pub(super) static LOOP_NS: AtomicU64 = AtomicU64::new(0);
+    /// `Page::update_checksum` (crc32c over the full 16 KiB body), once per leaf.
+    pub(super) static CRC_NS: AtomicU64 = AtomicU64::new(0);
+    /// `write_page_under_page_lock` (mmap copy + pwrite), once per leaf.
+    pub(super) static WRITE_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whole `split_leaf` call (the slow leaf-boundary path), once per split.
+    pub(super) static SPLIT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    /// The O(N) redistribution inside `split_leaf` that SQLite's `balance_quick`
+    /// skips on appends: `collect_leaf_cells` + the two `rebuild_leaf_page`s.
+    pub(super) static SPLIT_REDISTRIB_NS: AtomicU64 = AtomicU64::new(0);
+    /// Number of `split_leaf` calls (≈ #leaf boundaries).
+    pub(super) static SPLIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("AXIOMDB_DEBUG_CLUSTERED_INSERT").is_some())
+    }
+}
+
+/// Reads and resets the rightmost-leaf-batch sub-phase accumulators, returning
+/// `(setup_ns, loop_ns, crc_ns, write_ns)`. Only meaningful when
+/// `AXIOMDB_DEBUG_CLUSTERED_INSERT` is set; otherwise all four are zero.
+pub fn take_rightmost_batch_timings() -> (u64, u64, u64, u64) {
+    (
+        rightmost_batch_timing::SETUP_NS.swap(0, Ordering::Relaxed),
+        rightmost_batch_timing::LOOP_NS.swap(0, Ordering::Relaxed),
+        rightmost_batch_timing::CRC_NS.swap(0, Ordering::Relaxed),
+        rightmost_batch_timing::WRITE_NS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Reads and resets the leaf-split sub-phase accumulators, returning
+/// `(split_total_ns, split_redistrib_ns, split_count)`. The redistribution
+/// term is the O(N) collect+rebuild that an append-aware `balance_quick`
+/// split would eliminate; the residual `total - redistrib` is the irreducible
+/// alloc + 3 page writes that any split keeps.
+pub fn take_split_timings() -> (u64, u64, u64) {
+    (
+        rightmost_batch_timing::SPLIT_TOTAL_NS.swap(0, Ordering::Relaxed),
+        rightmost_batch_timing::SPLIT_REDISTRIB_NS.swap(0, Ordering::Relaxed),
+        rightmost_batch_timing::SPLIT_COUNT.swap(0, Ordering::Relaxed),
+    )
+}
 
 #[derive(Debug, Clone)]
 struct OwnedLeafCell {
@@ -372,6 +435,9 @@ pub fn try_insert_rightmost_leaf_batch<'a>(
         return Ok(0);
     }
 
+    let timing = rightmost_batch_timing::enabled();
+    let setup_start = timing.then(Instant::now);
+
     let _leaf_guard = storage.page_lock_table().write(hinted_leaf_pid);
     let page_ref = storage.read_page(hinted_leaf_pid)?;
     if clustered_page_type(&page_ref)? != PageType::ClusteredLeaf {
@@ -393,6 +459,12 @@ pub fn try_insert_rightmost_leaf_batch<'a>(
         .to_vec();
     let mut inserted = 0usize;
     let mut defragmented = false;
+
+    if let Some(s) = setup_start {
+        rightmost_batch_timing::SETUP_NS
+            .fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    let loop_start = timing.then(Instant::now);
 
     for row in rows {
         validate_row_payload(row.key, row.row_data)?;
@@ -469,9 +541,23 @@ pub fn try_insert_rightmost_leaf_batch<'a>(
         }
     }
 
+    if let Some(s) = loop_start {
+        rightmost_batch_timing::LOOP_NS.fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     if inserted > 0 {
+        let crc_start = timing.then(Instant::now);
         page.update_checksum();
+        if let Some(s) = crc_start {
+            rightmost_batch_timing::CRC_NS
+                .fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        let write_start = timing.then(Instant::now);
         storage.write_page_under_page_lock(hinted_leaf_pid, &page)?;
+        if let Some(s) = write_start {
+            rightmost_batch_timing::WRITE_NS
+                .fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     Ok(inserted)

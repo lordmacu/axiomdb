@@ -126,6 +126,9 @@ fn split_leaf(
     insert_pos: usize,
     cell: OwnedLeafCell,
 ) -> Result<InsertResult, DbError> {
+    let timing = super::rightmost_batch_timing::enabled();
+    let total_start = timing.then(std::time::Instant::now);
+
     let mut cells = collect_leaf_cells(page)?;
     cells.insert(insert_pos, cell);
 
@@ -133,14 +136,33 @@ fn split_leaf(
     let old_next_leaf = clustered_leaf::next_leaf(page);
     let right_pid = batch_alloc_page(storage, batch, PageType::ClusteredLeaf)?;
 
+    // The O(N) redistribution that an append-aware balance_quick would skip:
+    // the two full-page rebuilds (collect already happened above, but the
+    // rebuilds dominate). Timed separately to bound the balance_quick ceiling.
+    let redistrib_start = timing.then(std::time::Instant::now);
     let mut left_page = Page::new(PageType::ClusteredLeaf, pid);
     rebuild_leaf_page(&mut left_page, &cells[..split_at], right_pid)?;
     let mut right_page = Page::new(PageType::ClusteredLeaf, right_pid);
     rebuild_leaf_page(&mut right_page, &cells[split_at..], old_next_leaf)?;
+    if let Some(s) = redistrib_start {
+        super::rightmost_batch_timing::SPLIT_REDISTRIB_NS.fetch_add(
+            s.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
     left_page.update_checksum();
     storage.write_page_under_page_lock(pid, &left_page)?;
     write_page(storage, right_pid, &mut right_page)?;
+
+    if let Some(s) = total_start {
+        super::rightmost_batch_timing::SPLIT_TOTAL_NS.fetch_add(
+            s.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        super::rightmost_batch_timing::SPLIT_COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     Ok(InsertResult::Split {
         sep_key: cells[split_at].key.clone(),

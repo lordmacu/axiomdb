@@ -36,9 +36,14 @@ fn execute_clustered_insert(
     macro_rules! prepare_one_row {
         ($full_values:expr) => {{
             let mut fv = $full_values;
-            match enforce_text_constraints(&resolved.columns, &mut fv)
-                .and_then(|()| check_row_constraints_with_cols(&resolved.constraints, &fv, &resolved.def.table_name, &resolved.columns))
-            {
+            match enforce_text_constraints(&resolved.columns, &mut fv).and_then(|()| {
+                check_row_constraints_with_cols(
+                    &resolved.constraints,
+                    &fv,
+                    &resolved.def.table_name,
+                    &resolved.columns,
+                )
+            }) {
                 Err(e) if ignore && is_ignorable_insert_error(&e) => {}
                 Err(e) => return Err(e),
                 Ok(()) => {
@@ -113,7 +118,8 @@ fn execute_clustered_insert(
                     &resolved.def.table_name,
                 )?;
                 resolve_expr_defaults(&col_positions, &value_exprs, &mut provided, schema_cols);
-                let mut full_values = materialize_insert_row(&col_positions, &provided, schema_cols);
+                let mut full_values =
+                    materialize_insert_row(&col_positions, &provided, schema_cols);
                 assign_auto_increment(
                     storage,
                     txn,
@@ -144,7 +150,8 @@ fn execute_clustered_insert(
                     schema_cols,
                     &resolved.def.table_name,
                 )?;
-                let mut full_values = materialize_insert_row(&col_positions, &row_values, schema_cols);
+                let mut full_values =
+                    materialize_insert_row(&col_positions, &row_values, schema_cols);
                 assign_auto_increment(
                     storage,
                     txn,
@@ -289,7 +296,13 @@ pub(crate) fn apply_clustered_insert_rows(
     // bulk_entries[i] is non-None only when bulk_eligible[i] == true.
     let mut bulk_entries: Vec<Option<Vec<Vec<u8>>>> = bulk_eligible
         .iter()
-        .map(|&e| if e { Some(Vec::with_capacity(rows.len())) } else { None })
+        .map(|&e| {
+            if e {
+                Some(Vec::with_capacity(rows.len()))
+            } else {
+                None
+            }
+        })
         .collect();
     let append_biased = rows
         .windows(2)
@@ -351,17 +364,17 @@ pub(crate) fn apply_clustered_insert_rows(
                     // wal.append_with_buf calls — wasteful in the
                     // rightmost-leaf fast path where every row already
                     // shares the leaf and current_root.
-                    let images: Vec<axiomdb_wal::ClusteredRowImage> =
-                        rows[row_idx..row_idx + inserted]
-                            .iter()
-                            .map(|inserted_row| {
-                                axiomdb_wal::ClusteredRowImage::new(
-                                    current_root,
-                                    new_header,
-                                    &inserted_row.encoded_row,
-                                )
-                            })
-                            .collect();
+                    let images: Vec<axiomdb_wal::ClusteredRowImage> = rows
+                        [row_idx..row_idx + inserted]
+                        .iter()
+                        .map(|inserted_row| {
+                            axiomdb_wal::ClusteredRowImage::new(
+                                current_root,
+                                new_header,
+                                &inserted_row.encoded_row,
+                            )
+                        })
+                        .collect();
                     let wal_started = debug_clustered_insert.then(Instant::now);
                     let entries: Vec<(&[u8], &axiomdb_wal::ClusteredRowImage)> = rows
                         [row_idx..row_idx + inserted]
@@ -375,20 +388,19 @@ pub(crate) fn apply_clustered_insert_rows(
                     }
 
                     for inserted_row in &rows[row_idx..row_idx + inserted] {
-                        let secondary_elapsed =
-                            maintain_clustered_secondary_inserts_deferred(
-                                storage,
-                                txn,
-                                conn_txn,
-                                bloom,
-                                current_root,
-                                secondary_indexes,
-                                secondary_layouts,
-                                compiled_preds,
-                                &inserted_row.values,
-                                debug_clustered_insert,
-                                &bulk_eligible,
-                            )?;
+                        let secondary_elapsed = maintain_clustered_secondary_inserts_deferred(
+                            storage,
+                            txn,
+                            conn_txn,
+                            bloom,
+                            current_root,
+                            secondary_indexes,
+                            secondary_layouts,
+                            compiled_preds,
+                            &inserted_row.values,
+                            debug_clustered_insert,
+                            &bulk_eligible,
+                        )?;
                         secondary_time += secondary_elapsed;
                         // Attack 11: collect entries for bulk-eligible indexes.
                         collect_bulk_secondary_entries(
@@ -460,7 +472,12 @@ pub(crate) fn apply_clustered_insert_rows(
             )?;
             let new_image =
                 axiomdb_wal::ClusteredRowImage::new(new_root, new_header, &row.encoded_row);
-            txn.record_clustered_insert(conn_txn, table_def.id, &row.primary_key_bytes, &new_image)?;
+            txn.record_clustered_insert(
+                conn_txn,
+                table_def.id,
+                &row.primary_key_bytes,
+                &new_image,
+            )?;
             new_root
         };
         if let Some(started) = tree_started {
@@ -533,7 +550,8 @@ pub(crate) fn apply_clustered_insert_rows(
 
     if current_root != table_def.root_page_id && !defer_table_root_persist {
         let persist_started = debug_clustered_insert.then(Instant::now);
-        CatalogWriter::new(storage, txn, conn_txn)?.update_table_root(table_def.id, current_root)?;
+        CatalogWriter::new(storage, txn, conn_txn)?
+            .update_table_root(table_def.id, current_root)?;
         if let Some(started) = persist_started {
             root_persist_time += started.elapsed();
         }
@@ -543,27 +561,61 @@ pub(crate) fn apply_clustered_insert_rows(
     // a single `update_table_root` at end-of-Appender-lifetime.
 
     if debug_clustered_insert {
+        let tree_ms = tree_insert_time.as_secs_f64() * 1000.0;
         eprintln!(
             "[clustered-insert-debug] rows={} append_biased={} fast_path_hits={} lookup_ms={:.3} tree_ms={:.3} wal_ms={:.3} secondary_ms={:.3} root_persist_ms={:.3}",
             rows.len(),
             append_biased,
             fast_path_hits,
             physical_lookup_time.as_secs_f64() * 1000.0,
-            tree_insert_time.as_secs_f64() * 1000.0,
+            tree_ms,
             wal_time.as_secs_f64() * 1000.0,
             secondary_time.as_secs_f64() * 1000.0,
             root_persist_time.as_secs_f64() * 1000.0,
+        );
+        // Coarse breakdown of tree_ms's rightmost-leaf fast path (one Instant
+        // pair per leaf-fill, not per row). slow_tree_ms = the residual spent
+        // in the slow split/descent path (insert_with_batch / restore).
+        let (setup_ns, loop_ns, crc_ns, write_ns) =
+            axiomdb_storage::clustered_tree::take_rightmost_batch_timings();
+        let to_ms = |ns: u64| ns as f64 / 1.0e6;
+        let fast_subtotal = to_ms(setup_ns + loop_ns + crc_ns + write_ns);
+        eprintln!(
+            "[clustered-insert-tree-breakdown] fast: setup_ms={:.3} loop_ms={:.3} crc_ms={:.3} write_ms={:.3} (fast_subtotal_ms={:.3}); slow_tree_ms={:.3}",
+            to_ms(setup_ns),
+            to_ms(loop_ns),
+            to_ms(crc_ns),
+            to_ms(write_ns),
+            fast_subtotal,
+            tree_ms - fast_subtotal,
+        );
+        let (split_total_ns, split_redistrib_ns, split_count) =
+            axiomdb_storage::clustered_tree::take_split_timings();
+        let per_split_us = if split_count > 0 {
+            split_total_ns as f64 / 1.0e3 / split_count as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[clustered-insert-split-breakdown] splits={} split_total_ms={:.3} redistrib_ms={:.3} (={:.1}%) per_split_us={:.2}",
+            split_count,
+            to_ms(split_total_ns),
+            to_ms(split_redistrib_ns),
+            if split_total_ns > 0 {
+                split_redistrib_ns as f64 / split_total_ns as f64 * 100.0
+            } else {
+                0.0
+            },
+            per_split_us,
         );
     }
 
     // Attack 5 step 5.4: persist the rightmost leaf as a session hint so
     // the NEXT autocommit INSERT statement can prime its fast path and
     // skip the descent entirely (the bench's insert_autocommit pattern).
-    if let (Some(slot), Some(leaf_pid), Some(last_row)) = (
-        session_hint,
-        rightmost_leaf_hint,
-        rows.last(),
-    ) {
+    if let (Some(slot), Some(leaf_pid), Some(last_row)) =
+        (session_hint, rightmost_leaf_hint, rows.last())
+    {
         // The leaf may have just been split inside try_insert_rightmost_leaf
         // — read the current max key directly from the page rather than
         // relying on the in-memory row data.
