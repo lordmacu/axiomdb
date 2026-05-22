@@ -90,6 +90,9 @@ pub struct FaultInjectionStorage {
     frame_log: Option<FrameLog>,
     /// Monotonic LSN stamped into each written page (`0` while redo is disabled).
     frame_lsn: AtomicU64,
+    /// Excludes frame appends during a checkpoint's log recycle (subphase 6b). Appends
+    /// take the read side; `checkpoint_frames` takes the write side.
+    checkpoint_lock: RwLock<()>,
 }
 
 impl FaultInjectionStorage {
@@ -102,6 +105,7 @@ impl FaultInjectionStorage {
             page_locks: crate::page_lock::PageLockTable::new(),
             frame_log: None,
             frame_lsn: AtomicU64::new(0),
+            checkpoint_lock: RwLock::new(()),
         }
     }
 
@@ -148,6 +152,8 @@ impl FaultInjectionStorage {
             // Redo on: stamp the page LSN and append a frame stamped with the current
             // txn (mirrors MmapStorage). The data page stays volatile until flush();
             // the appended frame is made durable by sync_frame_log at the commit.
+            // Hold the checkpoint read-guard so a checkpoint's recycle can't race it.
+            let _ck = self.checkpoint_lock.read().unwrap_or_else(|e| e.into_inner());
             let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
             let mut stamped = page.clone();
             stamped.set_lsn(lsn);
@@ -166,6 +172,39 @@ impl FaultInjectionStorage {
             state.current.allocated[idx] = true;
         }
         Ok(())
+    }
+
+    /// Applies every committed frame into BOTH the current and durable layers — shared by
+    /// recovery REDO and the checkpoint. The frame is a full page image; absent pages grow
+    /// via `ensure_capacity`. Returns the pages applied.
+    fn apply_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        let Some(frame_log) = &self.frame_log else {
+            return Ok(0);
+        };
+        let index = frame_log.build_index(is_committed)?;
+        let mut applied = 0usize;
+        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        // One deref to &mut State so `current` and `durable` are disjoint field borrows.
+        let st = &mut *guard;
+        for frame in index.frames() {
+            let idx = frame.page_id as usize;
+            let page_lsn = if idx < st.current.pages.len() && st.current.allocated[idx] {
+                st.current.pages[idx].lsn()
+            } else {
+                0 // page lost on crash (allocated after the last flush) ⇒ apply.
+            };
+            if frame.lsn > page_lsn {
+                let page = Page::from_bytes(*frame_log.read_page_at(frame.offset)?)?;
+                // Apply into BOTH layers so the restored page is itself durable.
+                for layer in [&mut st.current, &mut st.durable] {
+                    layer.ensure_capacity(frame.page_id);
+                    layer.pages[idx] = page.clone();
+                    layer.allocated[idx] = true;
+                }
+                applied += 1;
+            }
+        }
+        Ok(applied)
     }
 }
 
@@ -266,34 +305,22 @@ impl StorageEngine for FaultInjectionStorage {
     }
 
     fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
-        let Some(frame_log) = &self.frame_log else {
+        self.apply_committed_frames(is_committed)
+    }
+
+    fn checkpoint_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
+        if self.frame_log.is_none() {
             return Ok(0);
-        };
-        let index = frame_log.build_index(is_committed)?;
-        let mut redone = 0usize;
-        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
-        // One deref to &mut State so `current` and `durable` are disjoint field borrows.
-        let st = &mut *guard;
-        for frame in index.frames() {
-            let idx = frame.page_id as usize;
-            let page_lsn = if idx < st.current.pages.len() && st.current.allocated[idx] {
-                st.current.pages[idx].lsn()
-            } else {
-                0 // page lost on crash (allocated after the last flush) ⇒ apply.
-            };
-            if frame.lsn > page_lsn {
-                let page = Page::from_bytes(*frame_log.read_page_at(frame.offset)?)?;
-                // Redo into BOTH layers so the restored page is itself durable
-                // (a later power loss must not lose it again).
-                for layer in [&mut st.current, &mut st.durable] {
-                    layer.ensure_capacity(frame.page_id);
-                    layer.pages[idx] = page.clone();
-                    layer.allocated[idx] = true;
-                }
-                redone += 1;
-            }
         }
-        Ok(redone)
+        // Exclusive guard (model A): drains in-flight appends, blocks new ones until the
+        // recycle completes. The apply already wrote both layers, so the data is durable
+        // before the log is reset.
+        let _ckpt = self.checkpoint_lock.write().unwrap_or_else(|e| e.into_inner());
+        let applied = self.apply_committed_frames(is_committed)?;
+        if let Some(frame_log) = &self.frame_log {
+            frame_log.recycle()?;
+        }
+        Ok(applied)
     }
 
     fn page_count(&self) -> u64 {
@@ -488,5 +515,83 @@ mod tests {
         assert_eq!(storage.redo_committed_frames(&|t| t == 5).unwrap(), 0);
         // An uncommitted txn's frame is never applied.
         assert_eq!(storage.redo_committed_frames(&|_| false).unwrap(), 0);
+    }
+
+    #[test]
+    fn checkpoint_applies_committed_then_recycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = FaultInjectionStorage::new();
+        storage.enable_redo_log(&dir.path().join("ck.wf")).unwrap();
+        let id = storage.alloc_page(PageType::Data).unwrap();
+        storage.write_page(id, &data_page(id, 0xAA)).unwrap(); // baseline txn 0
+        storage.flush().unwrap();
+        storage.set_current_txn(5);
+        storage.write_page(id, &data_page(id, 0xBB)).unwrap(); // committed row
+        storage.sync_frame_log().unwrap();
+        storage.set_current_txn(0);
+        storage.simulate_power_loss();
+        assert_eq!(storage.read_page(id).unwrap().body()[0], 0xAA, "row lost on crash");
+
+        assert_eq!(storage.checkpoint_frames(&|t| t == 5).unwrap(), 1);
+        assert_eq!(
+            storage.read_page(id).unwrap().body()[0],
+            0xBB,
+            "checkpoint applied the committed frame"
+        );
+        // Log recycled → the committed frame is no longer in the log.
+        assert!(
+            !storage.frame_log_has_committed(id, &|t| t == 5),
+            "checkpoint recycled the log"
+        );
+        assert_eq!(
+            storage.checkpoint_frames(&|t| t == 5).unwrap(),
+            0,
+            "nothing left to apply after the recycle"
+        );
+    }
+
+    #[test]
+    fn checkpoint_excludes_concurrent_writers_safely() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = FaultInjectionStorage::new();
+        storage.enable_redo_log(&dir.path().join("cck.wf")).unwrap();
+        let storage = Arc::new(storage);
+
+        let mut handles = Vec::new();
+        // A checkpoint thread racing the writers must never panic/deadlock or lose data.
+        {
+            let s = Arc::clone(&storage);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    s.checkpoint_frames(&|_| true).unwrap();
+                }
+                (0u64, u64::MAX, 0u8) // sentinel for the checkpoint thread
+            }));
+        }
+        for t in 1..=8u64 {
+            let s = Arc::clone(&storage);
+            handles.push(std::thread::spawn(move || {
+                let id = s.alloc_page(PageType::Data).unwrap();
+                s.set_current_txn(t);
+                let marker = (t & 0xFF) as u8;
+                s.write_page(id, &data_page(id, marker)).unwrap();
+                s.sync_frame_log().unwrap();
+                (t, id, marker)
+            }));
+        }
+        let results: Vec<(u64, u64, u8)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Every committed page's data survives in the live state — a concurrent recycle
+        // must not lose it (the data is in the layers; the log is just a redo source).
+        for (t, id, marker) in results {
+            if id == u64::MAX {
+                continue; // the checkpoint thread's sentinel
+            }
+            assert_eq!(
+                storage.read_page(id).unwrap().body()[0],
+                marker,
+                "committed page {id} (txn {t}) lost under a concurrent checkpoint"
+            );
+        }
     }
 }
