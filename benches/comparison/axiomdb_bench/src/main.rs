@@ -196,10 +196,12 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
             let mean = measure_timed(|| {
                 reset(&mut db);
                 let t0 = Instant::now();
-                insert_batch_pure(&mut db, &inserts);
+                // Prepared (apples-to-apples with SQLite's prepare_cached batch):
+                // bind a prepared INSERT per row instead of re-parsing raw SQL.
+                insert_batch_prepared(&mut db, n_rows);
                 t0.elapsed()
             });
-            out(scenario, n_rows, mean, "reset outside timing");
+            out(scenario, n_rows, mean, "prepared, reset outside timing");
         }
 
         "crud_flow" => {
@@ -211,7 +213,8 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 reset(&mut db);
 
                 let t0 = Instant::now();
-                insert_batch_pure(&mut db, &inserts);
+                // Prepared, apples-to-apples with SQLite's prepare_cached.
+                insert_batch_prepared(&mut db, n_rows);
                 let t_ins = t0.elapsed().as_secs_f64();
 
                 let t0 = Instant::now();
@@ -502,18 +505,30 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                     n_rows / 2,
                     "",
                 ),
-                "point_lookup" => (
-                    measure(|| {
-                        for i in (1..=n_rows).step_by(step).take(100) {
-                            db_sql_count(
-                                &mut db,
-                                &format!("SELECT * FROM bench_users WHERE id = {i}"),
-                            );
-                        }
-                    }),
-                    100,
-                    "",
-                ),
+                "point_lookup" => {
+                    // Apples-to-apples with SQLite's prepare_cached: bind a prepared
+                    // statement per lookup instead of re-parsing raw SQL, which
+                    // dominates a 1-row query (the parse is not amortized).
+                    let stmt = db
+                        .prepare("SELECT * FROM bench_users WHERE id = ?")
+                        .expect("prepare point_lookup");
+                    let ids: Vec<i32> = (1..=n_rows)
+                        .step_by(step)
+                        .take(100)
+                        .map(|i| i as i32)
+                        .collect();
+                    (
+                        measure(|| {
+                            for &i in &ids {
+                                let _ = stmt
+                                    .execute(&mut db, &[axiomdb_types::Value::Int(i)])
+                                    .expect("point lookup");
+                            }
+                        }),
+                        100,
+                        "prepared (vs SQLite prepare_cached)",
+                    )
+                }
                 "range_scan" => (
                     measure(|| {
                         db_sql_count(
