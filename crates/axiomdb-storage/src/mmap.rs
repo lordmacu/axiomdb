@@ -1979,4 +1979,62 @@ mod tests {
             "checkpoint wrote the page to the main file"
         );
     }
+
+    #[test]
+    fn frame_only_reuse_recycle_survives_reopen_and_keeps_wf_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("reuse.db");
+        let wf = dir.path().join("reuse.wf");
+        let row = 0x5Au8;
+
+        // Session A: frame-only; write a committed (txn 5) page, sync, then checkpoint
+        // (apply -> fsync main -> Reuse recycle, which must NOT truncate the .wf).
+        let page_id = {
+            let mut s = MmapStorage::create(&db).unwrap();
+            s.enable_frame_only_redo(&db).unwrap();
+            let pid = s.alloc_page(PageType::Data).unwrap();
+            s.set_current_txn(5);
+            let mut p = Page::new(PageType::Data, pid);
+            p.body_mut()[0] = row;
+            p.update_checksum();
+            s.write_page(pid, &p).unwrap();
+            s.sync_frame_log().unwrap();
+            s.set_current_txn(0);
+
+            let wf_grown = std::fs::metadata(&wf).unwrap().len();
+            assert!(wf_grown > 0, "frame-only write grew the .wf");
+
+            s.checkpoint_frames(&|t| t == 5).unwrap();
+            assert_eq!(
+                std::fs::metadata(&wf).unwrap().len(),
+                wf_grown,
+                "Reuse recycle keeps the .wf allocated (no truncate)"
+            );
+            // The reused log is empty (fresh salt): a second checkpoint applies nothing.
+            assert_eq!(
+                s.checkpoint_frames(&|t| t == 5).unwrap(),
+                0,
+                "reused log is empty after recycle"
+            );
+            s.flush().unwrap();
+            pid
+        };
+
+        // Session B: reopen frame-only -> the row survived in main; REDO is an idempotent
+        // no-op against the empty reused log (models a clean reopen / crash after recycle).
+        {
+            let mut s = MmapStorage::open(&db).unwrap();
+            s.enable_redo_log(&db).unwrap();
+            assert_eq!(
+                s.read_page(page_id).unwrap().body()[0],
+                row,
+                "committed row survived the reuse recycle (durable in main)"
+            );
+            assert_eq!(
+                s.redo_committed_frames(&|t| t == 5).unwrap(),
+                0,
+                "empty reused log -> REDO no-op (idempotent)"
+            );
+        }
+    }
 }

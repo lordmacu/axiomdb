@@ -897,6 +897,142 @@ mod tests {
     }
 
     #[test]
+    fn recycle_reuse_uses_a_fresh_salt_each_cycle() {
+        let (_d, path) = tmp("salt_cycles.wf");
+        let log = FrameLog::create(&path).unwrap();
+        let s0 = log.salt();
+        log.recycle(RecycleMode::Reuse).unwrap();
+        let s1 = log.salt();
+        log.recycle(RecycleMode::Reuse).unwrap();
+        let s2 = log.salt();
+        assert_ne!(s0, s1, "first recycle bumps the salt");
+        assert_ne!(s1, s2, "second recycle bumps it again");
+        assert_ne!(s0, s2, "no salt is reused across cycles");
+    }
+
+    #[test]
+    fn reuse_roundtrip_scan_sees_only_new_frames() {
+        let (_d, path) = tmp("roundtrip.wf");
+        let log = FrameLog::create(&path).unwrap();
+        for i in 0..6u64 {
+            log.append(i + 2, i + 1, 0, &page((i & 0xFF) as u8))
+                .unwrap();
+        }
+        log.sync_to_durable().unwrap();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        log.recycle(RecycleMode::Reuse).unwrap();
+        assert!(
+            log.scan().unwrap().is_empty(),
+            "fresh salt empties the scan"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size_before,
+            "reuse keeps the file size"
+        );
+
+        // Append FEWER frames than before; scan must stop at the first leftover old frame.
+        for i in 0..3u64 {
+            log.append(i + 10, i + 100, 0, &page((i & 0xFF) as u8))
+                .unwrap();
+        }
+        let frames = log.scan().unwrap();
+        assert_eq!(
+            frames.len(),
+            3,
+            "scan stops at the first leftover old-salt frame"
+        );
+        assert_eq!(frames[0].page_id, 10);
+        assert_eq!(frames[2].lsn, 102);
+    }
+
+    #[test]
+    fn reuse_does_not_resurrect_stale_frames_across_shrinking_cycles() {
+        let (_d, path) = tmp("shrink_cycles.wf");
+        let log = FrameLog::create(&path).unwrap();
+        // cycle 1: 10 frames (page byte 1), cycle 2: 3 (byte 2), cycle 3: 5 (byte 3).
+        for i in 0..10u64 {
+            log.append(i + 1, i + 1, 0, &page(1)).unwrap();
+        }
+        log.recycle(RecycleMode::Reuse).unwrap();
+        for i in 0..3u64 {
+            log.append(i + 1, i + 1, 0, &page(2)).unwrap();
+        }
+        log.recycle(RecycleMode::Reuse).unwrap();
+        for i in 0..5u64 {
+            log.append(i + 1, i + 1, 0, &page(3)).unwrap();
+        }
+        let frames = log.scan().unwrap();
+        assert_eq!(
+            frames.len(),
+            5,
+            "only the current cycle's frames are visible"
+        );
+        for f in &frames {
+            assert_eq!(
+                log.read_page_at(f.offset).unwrap()[0],
+                3,
+                "no frame from cycle 1/2 resurrects"
+            );
+        }
+    }
+
+    #[test]
+    fn torn_write_after_reuse_stops_scan_at_crc_not_leftover() {
+        use std::os::unix::fs::FileExt;
+        let (_d, path) = tmp("torn_reuse.wf");
+        let log = FrameLog::create(&path).unwrap();
+        for i in 0..5u64 {
+            log.append(i + 1, i + 1, 0, &page(1)).unwrap(); // leftovers beyond the new prefix
+        }
+        log.recycle(RecycleMode::Reuse).unwrap();
+        for i in 0..3u64 {
+            log.append(i + 1, i + 1, 0, &page(2)).unwrap(); // 3 new (fresh salt)
+        }
+        // Corrupt the page bytes of new frame index 1 → its crc fails.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let corrupt_off = FILE_HDR_SIZE + FRAME_SIZE + FRAME_HDR_SIZE as u64;
+        f.write_all_at(&[0xFF], corrupt_off).unwrap();
+        f.sync_all().unwrap();
+        let frames = log.scan().unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "scan stops at the corrupted frame, ignoring any leftover frame beyond it"
+        );
+    }
+
+    #[test]
+    fn reopen_after_reuse_reads_the_new_prefix() {
+        let (_d, path) = tmp("reopen_reuse.wf");
+        {
+            let log = FrameLog::create(&path).unwrap();
+            for i in 0..5u64 {
+                log.append(i + 1, i + 1, 0, &page(1)).unwrap();
+            }
+            log.recycle(RecycleMode::Reuse).unwrap();
+            for i in 0..3u64 {
+                log.append(i + 10, i + 100, 7, &page(2)).unwrap();
+            }
+            log.sync_to_durable().unwrap();
+        }
+        let log2 = FrameLog::open(&path).unwrap();
+        let frames = log2.scan().unwrap();
+        assert_eq!(
+            frames.len(),
+            3,
+            "reopen reads exactly the post-reuse prefix"
+        );
+        assert_eq!(frames[0].page_id, 10);
+        assert_eq!(
+            log2.contiguous_written_offset(),
+            FILE_HDR_SIZE + 3 * FRAME_SIZE
+        );
+        assert_eq!(log2.durable_offset(), FILE_HDR_SIZE + 3 * FRAME_SIZE);
+    }
+
+    #[test]
     fn read_page_if_for_verifies_page_and_salt() {
         let (_d, path) = tmp("rif.wf");
         let log = FrameLog::create(&path).unwrap();
