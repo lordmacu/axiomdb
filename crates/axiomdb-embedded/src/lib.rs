@@ -88,11 +88,12 @@ mod db {
         analyze_cached,
         ast::{InsertSource, SelectItem, Stmt},
         bloom::BloomRegistry,
-        execute_read_only_with_ctx, execute_with_ctx,
+        execute_prepared_insert, execute_read_only_with_ctx, execute_with_ctx,
         expr::Expr,
         parse_with_sql_mode,
         result::QueryResult,
-        verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
+        try_prepare_insert_plan, verify_and_repair_indexes_on_open, PreparedInsertPlan,
+        SchemaCache, SessionContext,
     };
     use axiomdb_storage::checkpointer::{FrameCheckpointer, DEFAULT_CHECKPOINT_POLL};
     use axiomdb_storage::{DbConfig, MmapStorage, RedoMode, StorageEngine};
@@ -586,6 +587,10 @@ mod db {
     pub struct PreparedStatement {
         analyzed: Stmt,
         param_count: usize,
+        /// Parity lever #1: when the statement is an eligible INSERT, the cached plan that
+        /// routes `execute` to the specialized fast path (revalidated by `catalog_epoch`).
+        /// `None` ⇒ always the generic path.
+        insert_plan: Option<PreparedInsertPlan>,
     }
 
     impl Db {
@@ -640,9 +645,14 @@ mod db {
             };
             let analyzed = analyze_cached(stmt, &*self.storage, snap, &mut self.schema_cache)?;
 
+            // Parity lever #1: build the INSERT fast-path plan now (stamps the current
+            // catalog_epoch). `None` for ineligible statements ⇒ generic path on execute.
+            let insert_plan = try_prepare_insert_plan(&analyzed, &self.session);
+
             Ok(PreparedStatement {
                 analyzed,
                 param_count,
+                insert_plan,
             })
         }
     }
@@ -679,6 +689,28 @@ mod db {
                 substitute_params(self.analyzed.clone(), params)?
             );
             axiomdb_sql::bench_timings::bump_select_calls(1);
+
+            // Parity lever #1: an eligible + schema-current prepared INSERT inside an
+            // explicit transaction takes the specialized fast path (skips the generic
+            // per-statement dispatch scaffolding). Anything else falls through unchanged.
+            let stmt = match stmt {
+                Stmt::Insert(ins)
+                    if self
+                        .insert_plan
+                        .as_ref()
+                        .is_some_and(|p| p.is_current(&db.session))
+                        && db.session.conn_txn.is_some() =>
+                {
+                    return execute_prepared_insert(
+                        ins,
+                        &*db.storage,
+                        &db.txn,
+                        &db.bloom,
+                        &mut db.session,
+                    );
+                }
+                other => other,
+            };
 
             // Read-only fast path: a SELECT in autocommit (no staged writes in an
             // open txn) is served from a snapshot — skips the per-statement
@@ -836,6 +868,83 @@ mod db {
             ParsedDsn::Wire(_) => Err(DbError::InvalidDsn {
                 reason: "embedded open_dsn only supports local-path DSNs in 5.15".into(),
             }),
+        }
+    }
+
+    #[cfg(test)]
+    mod prepared_insert_exec_tests {
+        use super::*;
+
+        /// Differential equivalence (parity lever #1): the same rows inserted via the
+        /// prepared fast path (table `a`) and the generic path (table `b`) produce
+        /// byte-identical state, and the fast-path hit counter advances for `a`.
+        #[test]
+        fn prepared_fast_and_generic_insert_are_equivalent() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("pi.db")).unwrap();
+            db.execute("CREATE TABLE a (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            db.execute("CREATE TABLE b (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+
+            let stmt = db.prepare("INSERT INTO a VALUES (?, ?)").unwrap();
+            assert!(
+                stmt.insert_plan.is_some(),
+                "INSERT ... VALUES is fast-path eligible"
+            );
+            let hits0 = axiomdb_sql::prepared_insert_fast_hits();
+
+            // Table a: prepared fast path inside an explicit txn.
+            db.execute("BEGIN").unwrap();
+            for i in 0..100i32 {
+                stmt.execute(
+                    &mut db,
+                    &[Value::Int(i), Value::Text(format!("v{i}").into())],
+                )
+                .unwrap();
+            }
+            db.execute("COMMIT").unwrap();
+
+            // Table b: generic path inside an explicit txn.
+            db.execute("BEGIN").unwrap();
+            for i in 0..100i32 {
+                db.execute(&format!("INSERT INTO b VALUES ({i}, 'v{i}')"))
+                    .unwrap();
+            }
+            db.execute("COMMIT").unwrap();
+
+            let a = db.query("SELECT id, v FROM a ORDER BY id").unwrap();
+            let b = db.query("SELECT id, v FROM b ORDER BY id").unwrap();
+            assert_eq!(a, b, "fast-path and generic INSERT produce identical rows");
+            assert_eq!(a.len(), 100);
+            assert!(
+                axiomdb_sql::prepared_insert_fast_hits() >= hits0 + 100,
+                "fast path taken for each prepared INSERT (hits {hits0} -> {})",
+                axiomdb_sql::prepared_insert_fast_hits()
+            );
+        }
+
+        /// Autocommit prepared INSERT (no open txn) falls back to the generic path and is
+        /// still correct (the fast path currently targets the explicit-txn staged case).
+        #[test]
+        fn autocommit_prepared_insert_is_correct() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("ac.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            let stmt = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+            for i in 0..10i32 {
+                stmt.execute(
+                    &mut db,
+                    &[Value::Int(i), Value::Text(format!("v{i}").into())],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                db.query("SELECT id FROM t").unwrap().len(),
+                10,
+                "autocommit prepared INSERT inserts all rows"
+            );
         }
     }
 
