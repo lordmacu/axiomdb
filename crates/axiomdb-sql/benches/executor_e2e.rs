@@ -28,8 +28,8 @@ impl Db {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("bench.db");
         let wal_path = dir.path().join("bench.wal");
-        let mut storage = MmapStorage::create(&db_path).unwrap();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MmapStorage::create(&db_path).unwrap();
+        CatalogBootstrap::init(&storage).unwrap();
         let txn = TxnManager::create(&wal_path).unwrap();
         Db {
             storage,
@@ -41,26 +41,20 @@ impl Db {
 
     fn run(&mut self, sql: &str) {
         let stmt = parse(sql, None).unwrap();
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = self.txn.snapshot();
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
-        execute(analyzed, &mut self.storage, &mut self.txn).unwrap();
+        execute(analyzed, &self.storage, &self.txn).unwrap();
     }
 
     fn run_ctx(&mut self, sql: &str, ctx: &mut SessionContext) {
         let stmt = parse(sql, None).unwrap();
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = self.txn.snapshot();
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
         execute_with_ctx(
             analyzed,
-            &mut self.storage,
-            &mut self.txn,
-            &mut self.bloom,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
             ctx,
         )
         .unwrap();
@@ -428,48 +422,45 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                     || {
                         let dir = tempfile::tempdir().unwrap();
                         let wal_path = dir.path().join("bench.wal");
-                        let mut storage = MemoryStorage::new();
-                        CatalogBootstrap::init(&mut storage).unwrap();
+                        let storage = MemoryStorage::new();
+                        CatalogBootstrap::init(&storage).unwrap();
                         let txn = TxnManager::create(&wal_path).unwrap();
                         let mut ctx = SessionContext::new();
-                        let mut bloom = BloomRegistry::new();
-                        let mut db_mem = (storage, txn, dir);
-                        let snap = db_mem
-                            .1
-                            .active_snapshot()
-                            .unwrap_or_else(|_| db_mem.1.snapshot());
+                        let bloom = BloomRegistry::new();
+                        let db_mem = (storage, txn, dir);
+                        let snap = db_mem.1.snapshot();
                         let stmt = parse("CREATE TABLE t (id INT, val TEXT)", None).unwrap();
                         let analyzed = analyze(stmt, &db_mem.0, snap).unwrap();
                         execute_with_ctx(
                             analyzed,
-                            &mut db_mem.0,
-                            &mut db_mem.1,
-                            &mut bloom,
+                            &db_mem.0,
+                            &db_mem.1,
+                            &bloom,
                             &mut ctx,
                         )
                         .unwrap();
                         (db_mem, ctx, bloom)
                     },
-                    |((mut storage, mut txn, _dir), mut ctx, mut bloom)| {
+                    |((storage, txn, _dir), mut ctx, bloom)| {
                         execute_with_ctx(
                             analyze(parse("BEGIN", None).unwrap(), &storage, txn.snapshot())
                                 .unwrap(),
-                            &mut storage,
-                            &mut txn,
-                            &mut bloom,
+                            &storage,
+                            &txn,
+                            &bloom,
                             &mut ctx,
                         )
                         .unwrap();
                         for i in 1..=n {
                             let sql = format!("INSERT INTO t VALUES ({i}, 'row{i}')");
-                            let snap = txn.active_snapshot().unwrap();
+                            let snap = txn.snapshot();
                             let analyzed =
                                 analyze(parse(&sql, None).unwrap(), &storage, snap).unwrap();
                             execute_with_ctx(
                                 analyzed,
-                                &mut storage,
-                                &mut txn,
-                                &mut bloom,
+                                &storage,
+                                &txn,
+                                &bloom,
                                 &mut ctx,
                             )
                             .unwrap();
@@ -478,12 +469,12 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                             analyze(
                                 parse("COMMIT", None).unwrap(),
                                 &storage,
-                                txn.active_snapshot().unwrap(),
+                                txn.snapshot(),
                             )
                             .unwrap(),
-                            &mut storage,
-                            &mut txn,
-                            &mut bloom,
+                            &storage,
+                            &txn,
+                            &bloom,
                             &mut ctx,
                         )
                         .unwrap();

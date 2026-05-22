@@ -77,9 +77,8 @@ fn test_information_schema_scheduled_jobs_shows_registered_job() {
     assert_eq!(text_col(&rows[0], 0), "daily_cleanup");
     assert_eq!(text_col(&rows[0], 1), "@daily");
     assert_eq!(text_col(&rows[0], 2), "DELETE FROM tmp WHERE 1=1");
-    assert_eq!(
+    assert!(
         bool_col(&rows[0], 4),
-        true,
         "job should be enabled by default"
     );
 }
@@ -224,7 +223,7 @@ fn test_cron_disable_sets_enabled_false() {
         panic!("expected rows")
     };
     assert_eq!(rows.len(), 1);
-    assert_eq!(bool_col(&rows[0], 0), false, "job should be disabled");
+    assert!(!bool_col(&rows[0], 0), "job should be disabled");
 }
 
 #[test]
@@ -269,7 +268,7 @@ fn test_cron_enable_restores_enabled_true() {
         panic!("expected rows")
     };
     assert_eq!(rows.len(), 1);
-    assert_eq!(bool_col(&rows[0], 0), true, "job should be re-enabled");
+    assert!(bool_col(&rows[0], 0), "job should be re-enabled");
 }
 
 #[test]

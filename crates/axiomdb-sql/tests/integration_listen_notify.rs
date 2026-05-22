@@ -73,7 +73,7 @@ fn listen_notify_show_notifications_across_sessions() {
     assert_eq!(
         got,
         vec![vec![
-            Value::Text(channel.into()),
+            Value::Text(channel),
             Value::Text("ready".into())
         ]]
     );
@@ -181,7 +181,7 @@ fn notify_inside_transaction_flushes_on_commit_and_discards_on_rollback() {
     assert_eq!(
         after_commit,
         vec![vec![
-            Value::Text(channel.clone().into()),
+            Value::Text(channel.clone()),
             Value::Text("commit-me".into())
         ]]
     );
@@ -275,7 +275,7 @@ fn rollback_to_savepoint_discards_later_notifications_only() {
     assert_eq!(
         got,
         vec![vec![
-            Value::Text(channel.into()),
+            Value::Text(channel),
             Value::Text("before".into())
         ]]
     );

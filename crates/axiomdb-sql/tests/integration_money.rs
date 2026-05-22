@@ -1,6 +1,6 @@
 mod common;
 
-use axiomdb_catalog::{CatalogReader, ExchangeRateDef};
+use axiomdb_catalog::CatalogReader;
 use axiomdb_core::error::DbError;
 use axiomdb_sql::QueryResult;
 use axiomdb_types::Value;

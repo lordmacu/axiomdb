@@ -262,7 +262,7 @@ mod tests {
             DataType::Timestamp,
             DataType::Uuid,
         ] {
-            let ct = datatype_to_column_type(&dt).unwrap();
+            let ct = datatype_to_column_type(dt).unwrap();
             assert_eq!(column_type_to_datatype(ct), dt.clone());
         }
     }

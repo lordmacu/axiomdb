@@ -30,8 +30,8 @@ impl AxiomDb {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("bench.db");
         let wal_path = dir.path().join("bench.wal");
-        let mut storage = MmapStorage::create(&db_path).unwrap();
-        CatalogBootstrap::init(&mut storage).unwrap();
+        let storage = MmapStorage::create(&db_path).unwrap();
+        CatalogBootstrap::init(&storage).unwrap();
         let txn = TxnManager::create(&wal_path).unwrap();
         AxiomDb {
             storage,
@@ -43,26 +43,20 @@ impl AxiomDb {
 
     fn run(&mut self, sql: &str) {
         let stmt = parse(sql, None).unwrap();
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = self.txn.snapshot();
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
-        execute(analyzed, &mut self.storage, &mut self.txn).unwrap();
+        execute(analyzed, &self.storage, &self.txn).unwrap();
     }
 
     fn run_ctx(&mut self, sql: &str, ctx: &mut SessionContext) {
         let stmt = parse(sql, None).unwrap();
-        let snap = self
-            .txn
-            .active_snapshot()
-            .unwrap_or_else(|_| self.txn.snapshot());
+        let snap = self.txn.snapshot();
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
         execute_with_ctx(
             analyzed,
-            &mut self.storage,
-            &mut self.txn,
-            &mut self.bloom,
+            &self.storage,
+            &self.txn,
+            &self.bloom,
             ctx,
         )
         .unwrap();

@@ -48,7 +48,7 @@ fn scalar_int(
 }
 
 fn insert_sql(i: usize) -> String {
-    let active = if i % 2 == 0 { "TRUE" } else { "FALSE" };
+    let active = if i.is_multiple_of(2) { "TRUE" } else { "FALSE" };
     format!(
         "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
         age   = 18 + (i % 62),
@@ -108,7 +108,7 @@ fn check_row(row: &[Value], id: usize) {
     );
     assert_eq!(
         row[3],
-        Value::Bool(id % 2 == 0),
+        Value::Bool(id.is_multiple_of(2)),
         "active mismatch at id={id}"
     );
     let expected_score = 100.0 + (id % 1000) as f64 * 0.1;
@@ -152,7 +152,7 @@ fn full_scan_returns_all_rows_with_correct_values() {
             Value::Int(v) => v as usize,
             ref other => panic!("id column not Int: {other:?}"),
         };
-        assert!(id >= 1 && id <= N, "id {id} out of range [1, {N}]");
+        assert!((1..=N).contains(&id), "id {id} out of range [1, {N}]");
         check_row(row, id);
     }
 
@@ -162,7 +162,7 @@ fn full_scan_returns_all_rows_with_correct_values() {
             Value::Int(v) => v,
             ref o => panic!("age not Int: {o:?}"),
         };
-        assert!(age >= 18 && age <= 79, "age {age} out of range [18, 79]");
+        assert!((18..=79).contains(&age), "age {age} out of range [18, 79]");
     }
 }
 
@@ -519,7 +519,7 @@ fn group_by_age_returns_62_groups_with_correct_counts() {
             Value::Int(v) => v,
             ref o => panic!("age not Int: {o:?}"),
         };
-        assert!(age >= 18 && age <= 79, "age {age} out of range [18, 79]");
+        assert!((18..=79).contains(&age), "age {age} out of range [18, 79]");
 
         let cnt = match row[1] {
             Value::Int(v) => v as i64,

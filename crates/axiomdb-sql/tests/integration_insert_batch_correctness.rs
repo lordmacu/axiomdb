@@ -50,7 +50,7 @@ fn scalar_real(result: QueryResult) -> f64 {
 
 /// Generate the INSERT SQL for row `i` (1-based), same formula as the bench.
 fn insert_sql(i: usize) -> String {
-    let active = if i % 2 == 0 { "TRUE" } else { "FALSE" };
+    let active = if i.is_multiple_of(2) { "TRUE" } else { "FALSE" };
     format!(
         "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
         age   = 18 + (i % 62),

@@ -164,7 +164,6 @@ mod harness {
     }
 }
 
-use axiomdb_sql::ast::Stmt;
 use axiomdb_sql::plan_deps::PlanDeps;
 use axiomdb_sql::statement_cache::{CachedPlan, STATEMENT_CACHE_MAX_ENTRIES};
 

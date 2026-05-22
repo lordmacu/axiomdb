@@ -91,12 +91,9 @@ fn test_parse_cube_accepted() {
         &mut b,
         &mut c,
     );
-    match res {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(!msg.contains("syntax error"), "parse error: {msg}");
-        }
-        Ok(_) => {}
+    if let Err(e) = res {
+        let msg = format!("{e}");
+        assert!(!msg.contains("syntax error"), "parse error: {msg}");
     }
 }
 
@@ -111,12 +108,9 @@ fn test_parse_grouping_sets_accepted() {
         &mut b,
         &mut c,
     );
-    match res {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(!msg.contains("syntax error"), "parse error: {msg}");
-        }
-        Ok(_) => {}
+    if let Err(e) = res {
+        let msg = format!("{e}");
+        assert!(!msg.contains("syntax error"), "parse error: {msg}");
     }
 }
 
@@ -131,12 +125,9 @@ fn test_parse_mixed_plain_and_rollup() {
         &mut b,
         &mut c,
     );
-    match res {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(!msg.contains("syntax error"), "parse error: {msg}");
-        }
-        Ok(_) => {}
+    if let Err(e) = res {
+        let msg = format!("{e}");
+        assert!(!msg.contains("syntax error"), "parse error: {msg}");
     }
 }
 
