@@ -64,4 +64,4 @@ pub use meta::{
 pub use mmap::MmapStorage;
 pub use page::{Page, PageType, HEADER_SIZE, PAGE_FLAG_ALL_VISIBLE, PAGE_MAGIC, PAGE_SIZE};
 pub use page_ref::PageRef;
-pub use wal_frame::{FrameLog, FrameRef, WalIndex};
+pub use wal_frame::{FrameLog, FrameRef, RecycleMode, WalIndex};

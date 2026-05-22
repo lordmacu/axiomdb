@@ -26,7 +26,7 @@ use crate::{
     engine::StorageEngine,
     freelist::FreeList,
     page::{Page, PageType, PAGE_SIZE},
-    wal_frame::FrameLog,
+    wal_frame::{FrameLog, RecycleMode},
 };
 
 const INITIAL_PAGES: u64 = 64;
@@ -330,7 +330,7 @@ impl StorageEngine for FaultInjectionStorage {
         let applied = self.apply_committed_frames(&committed)?;
         // In-flight-safe: only recycle when every frame is committed.
         if frame_log.scan()?.iter().all(|f| committed(f.txn_id)) {
-            frame_log.recycle()?;
+            frame_log.recycle(RecycleMode::Reuse)?;
         }
         Ok(applied)
     }

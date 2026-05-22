@@ -63,6 +63,22 @@ pub struct FrameRef {
     pub offset: u64,
 }
 
+/// How [`FrameLog::recycle`] treats the file's already-allocated blocks after a
+/// checkpoint has made the main file durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecycleMode {
+    /// Keep the file at its current (high-water) size: bump the salt + reset the
+    /// watermarks only. Old frames become stale via salt mismatch and the next append
+    /// overwrites them in place — SQLite's PERSIST WAL-reuse (`wal.c` increments the
+    /// salt on checkpoint-restart without truncating). The runtime default: it avoids
+    /// freeing + re-allocating the file's blocks every checkpoint cycle.
+    Reuse,
+    /// As [`Reuse`](Self::Reuse), then truncate the file to the header to reclaim disk
+    /// (SQLite's TRUNCATE mode). For the shutdown / final checkpoint so the log is small
+    /// at rest.
+    Truncate,
+}
+
 /// Number of shards in the live index (mirrors `BufferPool`'s partitioning).
 const WAL_INDEX_SHARDS: usize = 16;
 
@@ -437,12 +453,20 @@ impl FrameLog {
         Ok(())
     }
 
-    /// Recycles the log after a checkpoint: rewrites the header with a FRESH salt,
-    /// truncates to the header, fsyncs, and resets the offset watermarks. The caller MUST
-    /// hold the exclusive checkpoint guard (no concurrent appends). Does NOT touch any
-    /// external monotonic LSN counter — the engine's `frame_lsn` must keep increasing, or
-    /// the pageLSN redo guard would wrongly skip a frame appended after the recycle.
-    pub fn recycle(&self) -> Result<(), DbError> {
+    /// Recycles the log after a checkpoint: rewrites the header with a FRESH salt, fsyncs,
+    /// and resets the offset watermarks. With [`RecycleMode::Truncate`] the file is also
+    /// truncated to the header (reclaim disk); with [`RecycleMode::Reuse`] (the runtime
+    /// default) the file keeps its size so the next append overwrites the now-stale frames
+    /// in place — the fresh salt is what invalidates them ([`scan`](Self::scan) stops at the
+    /// first salt mismatch). The caller MUST hold the exclusive checkpoint guard (no
+    /// concurrent appends). Does NOT touch any external monotonic LSN counter — the engine's
+    /// `frame_lsn` must keep increasing, or the pageLSN redo guard would wrongly skip a frame
+    /// appended after the recycle.
+    ///
+    /// Crash-safe regardless of mode: the checkpoint already applied every committed frame
+    /// to the main file and fsync'd it before calling this, so a crash mid-recycle leaves
+    /// the main file current and any leftover frames REDO idempotently (pageLSN strict-`>`).
+    pub fn recycle(&self, mode: RecycleMode) -> Result<(), DbError> {
         let salt = fresh_salt();
         let mut hdr = [0u8; FILE_HDR_SIZE as usize];
         hdr[0..8].copy_from_slice(&MAGIC.to_le_bytes());
@@ -451,9 +475,15 @@ impl FrameLog {
         hdr[16..24].copy_from_slice(&salt.to_le_bytes());
         let hcrc = crc32c::crc32c(&hdr[0..24]);
         hdr[24..28].copy_from_slice(&hcrc.to_le_bytes());
-        self.file
-            .set_len(FILE_HDR_SIZE)
-            .map_err(|e| classify_io(e, "frame log recycle truncate"))?;
+        // Reuse (the runtime default) keeps the file at its high-water size so the next
+        // append overwrites the now-stale frames in place — no block free + re-alloc. Only
+        // Truncate reclaims disk (shutdown / disk-pressure). Either way the fresh-salt header
+        // rewrite below is what invalidates the leftover frames for `scan`.
+        if mode == RecycleMode::Truncate {
+            self.file
+                .set_len(FILE_HDR_SIZE)
+                .map_err(|e| classify_io(e, "frame log recycle truncate"))?;
+        }
         self.file
             .write_all_at(&hdr, 0)
             .map_err(|e| classify_io(e, "frame log recycle header"))?;
@@ -808,7 +838,7 @@ mod tests {
         let old_salt = log.salt();
         log.append(2, 1, 7, &page(1)).unwrap();
         log.sync_to_durable().unwrap();
-        log.recycle().unwrap();
+        log.recycle(RecycleMode::Reuse).unwrap();
         assert_ne!(
             log.salt(),
             old_salt,
@@ -823,6 +853,50 @@ mod tests {
     }
 
     #[test]
+    fn recycle_reuse_keeps_size_truncate_shrinks() {
+        let (_d, path) = tmp("reuse_size.wf");
+        let log = FrameLog::create(&path).unwrap();
+        let salt0 = log.salt();
+        for i in 0..4u64 {
+            log.append(i + 2, i + 1, 0, &page((i & 0xFF) as u8))
+                .unwrap();
+        }
+        log.sync_to_durable().unwrap();
+        let grown = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            grown > FILE_HDR_SIZE,
+            "frames grew the file past the header"
+        );
+
+        // Reuse: blocks stay allocated (size preserved); the fresh salt empties scan.
+        log.recycle(RecycleMode::Reuse).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            grown,
+            "reuse keeps the file at its high-water size"
+        );
+        assert!(
+            log.scan().unwrap().is_empty(),
+            "fresh salt ⇒ old frames stale"
+        );
+        assert_ne!(log.salt(), salt0, "recycle bumps the salt");
+
+        // Truncate: reclaim disk down to the header.
+        for i in 0..4u64 {
+            log.append(i + 2, i + 1, 0, &page((i & 0xFF) as u8))
+                .unwrap();
+        }
+        log.sync_to_durable().unwrap();
+        log.recycle(RecycleMode::Truncate).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            FILE_HDR_SIZE,
+            "truncate reclaims the blocks"
+        );
+        assert!(log.scan().unwrap().is_empty());
+    }
+
+    #[test]
     fn read_page_if_for_verifies_page_and_salt() {
         let (_d, path) = tmp("rif.wf");
         let log = FrameLog::create(&path).unwrap();
@@ -831,8 +905,9 @@ mod tests {
         assert_eq!(log.read_page_if_for(off, 7).unwrap().unwrap()[0], 0xAB);
         // Wrong page_id (a stale offset reused for another page) → None.
         assert!(log.read_page_if_for(off, 8).unwrap().is_none());
-        // After a recycle the file is truncated + the salt changes → the old offset is stale.
-        log.recycle().unwrap();
+        // After a recycle the salt changes → the old offset is stale. Even with Reuse
+        // (which keeps the file), read_page_if_for rejects the leftover frame by salt.
+        log.recycle(RecycleMode::Reuse).unwrap();
         assert!(log.read_page_if_for(off, 7).unwrap().is_none());
     }
 

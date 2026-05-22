@@ -21,7 +21,7 @@ use crate::{
     freelist::FreeList,
     page::{Page, PageType, HEADER_SIZE, PAGE_SIZE},
     page_lock::PageLockTable,
-    wal_frame::{FrameLog, FrameRef, WalIndex},
+    wal_frame::{FrameLog, FrameRef, RecycleMode, WalIndex},
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -1091,7 +1091,7 @@ impl StorageEngine for MmapStorage {
                        // On a full recycle, clear the live wal_index — its offsets are now invalid and
                        // the pages are in the (just-fsync'd) main file, so reads fall through to it.
         if frame_log.scan()?.iter().all(|f| committed(f.txn_id)) {
-            frame_log.recycle()?;
+            frame_log.recycle(RecycleMode::Reuse)?;
             self.wal_index.clear();
         }
         Ok(applied)
