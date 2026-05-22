@@ -4,7 +4,9 @@ Phase: redo-recovery (project B) — final rollout
 Task: Lever B — flip the embedded `Db` default to frame-only redo, gated by the
 crash suite (T1–T7) + a no-regression A/B.
 Spec: specs/fase-redo-recovery/spec-redo-default-on.md
-Status: draft
+Status: done — Steps 1-3 (crash suite T1/T6, T2/T3/T7) + Step 9 (flip) + Step 10
+(docs/memory) complete; Step 8 A/B measured. Deferred: T4 torn-page (needs a
+fault hook), T1 secondary/freelist (mechanism-covered), server default-on.
 
 ## Summary
 

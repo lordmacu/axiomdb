@@ -3,7 +3,9 @@
 Phase: redo-recovery (project B) — final rollout subphase
 Task: Lever B — flip the embedded `Db` default to frame-only redo, gated by the
 full crash suite (T1–T7) and a no-regression A/B.
-Status: draft
+Status: implemented — embedded default flipped to FrameOnly; crash suite T1-T7
+green; autocommit ~1.56× (interleaved); workspace 4706/4706. Commits aedddb4a +
+72034b84 + e85b7a23 + 73eeb6f8. (T4 torn / server default-on = follow-ups.)
 
 ## Context
 
