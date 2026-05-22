@@ -102,7 +102,17 @@ impl TxnManager {
         if effective_policy == WalDurabilityPolicy::Strict {
             storage.sync_frame_log()?;
         }
-        self.commit(conn_txn)
+        let result = self.commit(conn_txn)?;
+        // 6f synchronous back-pressure: keep the frame log bounded even with no
+        // background checkpointer (or if it falls behind / dies). No-op unless redo
+        // is on AND the log has reached the hard cap — maybe_checkpoint_frames
+        // guards both — so the common commit pays only a cheap atomic read.
+        storage.maybe_checkpoint_frames(
+            &|t| self.is_committed(t),
+            storage.checkpoint_hard_bytes(),
+            false,
+        )?;
+        Ok(result)
     }
 
     /// Commits the transaction: writes the Commit WAL entry, fsyncs (or defers),

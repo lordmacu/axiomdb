@@ -131,6 +131,10 @@ pub struct MmapStorage {
     /// appends take the read side; `checkpoint_frames` takes the write side so the
     /// recycle (truncate + fresh salt) never races an in-flight append.
     checkpoint_lock: RwLock<()>,
+    /// Hard cap (bytes) for the frame log: a commit that observes the log at this
+    /// size checkpoints inline (6f synchronous back-pressure). `u64::MAX` until
+    /// the open path configures it from `DbConfig` (frame-only redo only).
+    checkpoint_hard_bytes: AtomicU64,
     /// Authoritative page count. `AtomicU64` avoids acquiring the mmap read
     /// lock on every `read_page` call (hot path).
     page_count: AtomicU64,
@@ -244,6 +248,7 @@ impl MmapStorage {
             page_locks: PageLockTable::new(),
             grow_lock: Mutex::new(()),
             checkpoint_lock: RwLock::new(()),
+            checkpoint_hard_bytes: AtomicU64::new(u64::MAX),
             page_count: AtomicU64::new(GROW_PAGES),
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
@@ -342,6 +347,7 @@ impl MmapStorage {
             page_locks: PageLockTable::new(),
             grow_lock: Mutex::new(()),
             checkpoint_lock: RwLock::new(()),
+            checkpoint_hard_bytes: AtomicU64::new(u64::MAX),
             page_count: AtomicU64::new(db_page_count),
             recycle_queue: crossbeam_queue::SegQueue::new(),
             extension_waiters: AtomicU32::new(0),
@@ -1024,6 +1030,10 @@ impl StorageEngine for MmapStorage {
             .map_or(0, |fl| fl.contiguous_written_offset())
     }
 
+    fn checkpoint_hard_bytes(&self) -> u64 {
+        self.checkpoint_hard_bytes.load(Ordering::Acquire)
+    }
+
     fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
         // Recovery REDO shares the apply with the checkpoint (grow-on-redo + freelist
         // reload). On open, this materializes committed frames into the main file.
@@ -1188,6 +1198,13 @@ impl MmapStorage {
         self.enable_redo_log(db_path)?;
         self.frame_only.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Sets the frame-log hard cap (bytes) for 6f synchronous back-pressure. The
+    /// open path configures it from `DbConfig.max_wal_size_mb × K`; `u64::MAX`
+    /// (the default) disables back-pressure.
+    pub fn set_checkpoint_hard_bytes(&self, bytes: u64) {
+        self.checkpoint_hard_bytes.store(bytes, Ordering::Release);
     }
 
     /// Whether the page-image redo log is active.

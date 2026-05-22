@@ -154,6 +154,14 @@ pub trait StorageEngine: Send + Sync {
         0
     }
 
+    /// Hard cap (bytes) for the frame log. When a commit observes the log has
+    /// reached this size it checkpoints inline (synchronous back-pressure, project
+    /// B subphase 6f) so the log is bounded even with no background checkpointer.
+    /// Default `u64::MAX` (no back-pressure until configured at open).
+    fn checkpoint_hard_bytes(&self) -> u64 {
+        u64::MAX
+    }
+
     /// Checkpoint the frame log IFF redo is active AND (`force` OR the log's
     /// written size has reached `threshold_bytes`). The single guarded entry that
     /// BOTH the background checkpointer (soft threshold) and the commit
