@@ -28,8 +28,15 @@ Effort: **max** (durability/commit path + a background thread)
       wired here; server is step 6, K-config is step 7). 2 in-crate tests
       (bounds-log+survives-reopen / redo-off-has-no-checkpointer); embedded 124/124,
       clippy clean. Redo off ⇒ no thread, byte-for-byte unchanged.
-- [ ] **Step 6** — server `SharedDatabase` wiring. **Step 7** — config K + watchdog.
-      **Step 8** — docs + A/B + close.
+- [~] **Step 6** — server `SharedDatabase` wiring. **DEFERRED** (user chose embedded-first,
+      2026-05-22): server frame-only opt-in is not yet auto-bounded; redo is off by default so
+      no production impact. Documented as a gap in step 8. Mirror step 5 when picked up.
+- [x] **Step 7** — config K + watchdog. `DbConfig.checkpoint_hard_multiplier` (default 2,
+      `#[serde(default)]`, clamped `>=1` at use); embedded `open_with_config` reads it. The
+      `FrameCheckpointer` thread carries a `DeathWatch` drop-guard that `error!`-logs an
+      unexpected (panic) exit — back-pressure then bounds the log synchronously (safe
+      degradation). storage config test + embedded frame-only tests green; clippy clean.
+- [ ] **Step 8** — docs (user durability + internals/wal.md) + A/B re-confirm + close. ← NEXT
 
 ## Summary
 

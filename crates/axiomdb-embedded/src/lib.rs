@@ -102,13 +102,6 @@ mod db {
     /// A single result row — a `Vec` of `Value`s in column order.
     pub type Row = Vec<axiomdb_types::Value>;
 
-    /// Hard-cap multiplier for the 6f frame-log back-pressure: the synchronous
-    /// inline checkpoint fires once the log reaches `K × soft` (with
-    /// `soft = max_wal_size_mb`), so the log is bounded even if the background
-    /// checkpointer stalls. `K` is a constant here; subphase 6f step 7 makes it
-    /// configurable.
-    const CHECKPOINT_HARD_MULTIPLIER: u64 = 2;
-
     /// An in-process AxiomDB database.
     ///
     /// All operations are synchronous and single-writer. Concurrent reads from
@@ -243,7 +236,7 @@ mod db {
             // storage. Redo off ⇒ no thread, no cap (today's behavior, byte-for-byte).
             let checkpointer = if frame_only {
                 let soft = config.max_wal_size_mb.saturating_mul(1024 * 1024);
-                let hard = soft.saturating_mul(CHECKPOINT_HARD_MULTIPLIER);
+                let hard = soft.saturating_mul(config.checkpoint_hard_multiplier.max(1));
                 storage.set_checkpoint_hard_bytes(hard);
                 let txn_pred = Arc::clone(&txn);
                 let is_committed: Arc<dyn Fn(u64) -> bool + Send + Sync> =

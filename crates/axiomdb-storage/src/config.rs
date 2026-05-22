@@ -118,6 +118,14 @@ pub struct DbConfig {
     #[serde(default)]
     pub redo: Option<RedoMode>,
 
+    /// Hard-cap multiplier for the frame-log auto-checkpoint back-pressure (project B
+    /// subphase 6f). Under `redo = "frame_only"` the background checkpointer runs at the
+    /// soft threshold (`max_wal_size_mb`); if it falls behind, a commit that observes the
+    /// log at `max_wal_size_mb × checkpoint_hard_multiplier` checkpoints inline (bounded
+    /// latency spike, log never unbounded). Clamped to `>= 1` (hard `>=` soft). Default 2.
+    #[serde(default = "default_checkpoint_hard_multiplier")]
+    pub checkpoint_hard_multiplier: u64,
+
     /// Minimum log level passed to `tracing_subscriber`.
     /// Accepted values: `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
     /// Default: `"info"`.
@@ -136,6 +144,10 @@ pub struct DbConfig {
 
 fn default_max_wal_size_mb() -> u64 {
     256
+}
+
+fn default_checkpoint_hard_multiplier() -> u64 {
+    2
 }
 
 fn default_fsync() -> bool {
@@ -158,6 +170,7 @@ impl Default for DbConfig {
             fsync: default_fsync(),
             wal_durability: None,
             redo: None,
+            checkpoint_hard_multiplier: default_checkpoint_hard_multiplier(),
             log_level: default_log_level(),
             max_prepared_stmts_per_connection: default_max_prepared_stmts(),
         }
@@ -233,6 +246,21 @@ mod tests {
         assert_eq!(cfg.resolved_wal_durability(), WalDurabilityPolicy::Strict);
         assert!(cfg.redo.is_none());
         assert_eq!(cfg.resolved_redo(), RedoMode::Off);
+        assert_eq!(cfg.checkpoint_hard_multiplier, 2);
+    }
+
+    #[test]
+    fn test_checkpoint_hard_multiplier_parses_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("axiomdb.toml");
+        std::fs::write(&path, "checkpoint_hard_multiplier = 4\n").unwrap();
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.checkpoint_hard_multiplier, 4);
+
+        // Absent ⇒ default 2.
+        std::fs::write(&path, "max_wal_size_mb = 128\n").unwrap();
+        let cfg = DbConfig::load(Some(&path)).unwrap();
+        assert_eq!(cfg.checkpoint_hard_multiplier, 2);
     }
 
     #[test]

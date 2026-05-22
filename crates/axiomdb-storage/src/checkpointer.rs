@@ -166,6 +166,25 @@ fn run(
     poll: Duration,
     trigger: Arc<CheckpointTrigger>,
 ) {
+    // Watchdog: if this thread leaves the loop WITHOUT a stop signal (i.e. it panicked),
+    // log it. The commit back-pressure (subphase 6f step 3) then bounds the log
+    // synchronously — a safe degradation — but the death must never be silent.
+    struct DeathWatch {
+        clean: bool,
+    }
+    impl Drop for DeathWatch {
+        fn drop(&mut self) {
+            if !self.clean {
+                tracing::error!(
+                    target: "axiomdb::checkpointer",
+                    "frame checkpointer thread exited unexpectedly; commit back-pressure \
+                     now bounds the frame log synchronously"
+                );
+            }
+        }
+    }
+    let mut watch = DeathWatch { clean: false };
+
     let pred = |t: u64| (*is_committed)(t);
     loop {
         // Wait for a wake (notify), the poll timeout, or stop.
@@ -196,4 +215,5 @@ fn run(
             break;
         }
     }
+    watch.clean = true; // normal shutdown — suppress the watchdog log
 }
