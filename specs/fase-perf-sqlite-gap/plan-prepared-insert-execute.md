@@ -4,13 +4,18 @@ Phase: perf-sqlite-gap — Parity lever #1 (executor scaffolding)
 Spec: specs/fase-perf-sqlite-gap/spec-prepared-insert-execute.md
 Status: in-progress
 
-> **Progress:** Step 1 split into 1a (done) + 1b (next). **1a `948f8552`** —
-> `PreparedInsertPlan` + `try_prepare_insert_plan` (eligibility gate) +
-> `SessionContext::catalog_epoch()` (the DDL-only revalidation token) + 5 eligibility
-> tests; clippy+fmt clean. **NEXT = 1b**: `execute_prepared_insert` (epoch recheck → bind →
-> codec → enqueue via the existing inner fns, statement-atomic) + `PreparedStatement`
-> routing (embedded `lib.rs`) + the differential-equivalence test (fast vs generic →
-> byte-identical). Then Steps 2-6.
+> **Progress:** Step 1 DONE (1a `948f8552` + 1b `eba98b64`). 1a = `PreparedInsertPlan` +
+> `try_prepare_insert_plan` (eligibility) + `catalog_epoch()` accessor + 5 tests. 1b =
+> `execute_prepared_insert` (replicates the dispatch INSERT arm via the existing inner fns,
+> skipping the execute_with_ctx_locked/dispatch_ctx scaffolding) + `is_current` epoch
+> recheck + a fast-hit counter + `PreparedStatement.insert_plan` routing (embedded) + the
+> **differential-equivalence test** (fast vs generic → byte-identical, fast path exercised)
+> + autocommit-fallback test. Embedded 126/126, clippy+fmt clean. **The path is wired +
+> proven-equivalent but NOT yet faster** (1b only skips the outer wrapping; the real win is
+> Step 5). **NEXT = Steps 2-4** (atomicity / DDL-fallback / eligibility tests — lock
+> correctness) → **Step 5** (optimize the inner loop: reuse `ExecutionContext`, value
+> template instead of the `substitute_params` clone, skip the per-row epoch invalidate = the
+> actual win) → **Step 6** (measure via `--diagnose-prepared-insert`).
 
 ## Summary
 
