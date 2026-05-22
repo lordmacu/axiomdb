@@ -155,7 +155,10 @@ Measure with `cargo build --release -p axiomdb-bench-comparison` then
 
 - `crates/axiomdb-storage/src/mmap.rs` (`write_page_inner` redo branch, `read_page`,
   `checkpoint_frames`, `wal_index`), `wal_frame.rs` (`recycle`).
-- `crates/axiomdb-sql/.../catalog/writer.rs` (`ensure_database_roots` per-commit flush);
+- `crates/axiomdb-catalog/src/bootstrap.rs` (`CatalogBootstrap::ensure_database_roots` —
+  the per-commit `storage.flush()`, called from `CatalogWriter::new`, writer.rs:154; the
+  catalog is its own crate now — memory `project_insert_perf.md` saying `axiomdb-sql/catalog`
+  is STALE);
   `crates/axiomdb-storage/src/config.rs` (`DbConfig`, `WalDurabilityPolicy`).
 - `crates/axiomdb-network/tests/integration_open_integrity.rs`
   (`test_dirty_open_truncates_unlogged_tables_only` — the gating guarantee).
