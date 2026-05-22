@@ -755,6 +755,9 @@ fn diagnose_prepared_insert(data_dir: &Path, n_rows: usize) {
     db.execute("BEGIN").unwrap();
     stmt.execute(&mut db, &mk(1)).unwrap(); // warmup row (discarded)
 
+    #[cfg(feature = "bench-timings")]
+    axiomdb_sql::bench_timings::reset_select_timings();
+
     let t0 = Instant::now();
     for i in 2..=n_rows {
         stmt.execute(&mut db, &mk(i)).unwrap();
@@ -776,6 +779,16 @@ fn diagnose_prepared_insert(data_dir: &Path, n_rows: usize) {
     );
     println!("║  total per row (incl COMMIT):     {total_us:.2} µs/row");
     println!("║  throughput:                      {rows_s:.0} rows/s");
+    #[cfg(feature = "bench-timings")]
+    {
+        let st = axiomdb_sql::bench_timings::snapshot_select_timings();
+        let calls = (st.calls.max(1)) as f64;
+        println!(
+            "║  [split] clone+substitute_params: {:.3} µs/row | execute_with_ctx: {:.3} µs/row",
+            st.clone_ns as f64 / calls / 1000.0,
+            st.exec_ns as f64 / calls / 1000.0,
+        );
+    }
     println!("╚═ vs SQLite insert_batch (prepared): 362.7K rows/s = 2.76 µs/row ═\n");
 }
 
