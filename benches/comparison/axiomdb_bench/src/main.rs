@@ -694,6 +694,66 @@ fn diagnose_insert(data_dir: &Path, n_rows: usize) {
     eprintln!();
 }
 
+// ── Prepared-INSERT diagnostic (parse+analyze ONCE, execute many) ──────────────
+// The FAIR vs-SQLite insert path: SQLite's bench uses prepare_cached (parse once).
+// This prepares `INSERT … VALUES(?,…)` once and binds per row, eliminating the
+// per-row re-parse — isolating the executor + B-tree apply cost from the parse cost.
+fn diagnose_prepared_insert(data_dir: &Path, n_rows: usize) {
+    use axiomdb_embedded::Db;
+    use axiomdb_types::Value;
+
+    let _ = std::fs::remove_dir_all(data_dir);
+    std::fs::create_dir_all(data_dir).unwrap();
+    let mut db = Db::open(data_dir.join("diag_prep.db")).expect("open");
+    db.execute(
+        "CREATE TABLE bench_users (id INT NOT NULL, name TEXT NOT NULL, age INT NOT NULL, \
+         active BOOL NOT NULL, score REAL NOT NULL, email TEXT NOT NULL, PRIMARY KEY (id))",
+    )
+    .expect("create");
+
+    let mk = |i: usize| -> Vec<Value> {
+        vec![
+            Value::Int(i as i32),
+            Value::Text(format!("user_{i:06}")),
+            Value::Int((18 + (i % 62)) as i32),
+            Value::Bool(i % 2 == 0),
+            Value::Real(100.0 + (i % 1000) as f64 * 0.1),
+            Value::Text(format!("u{i}@b.local")),
+        ]
+    };
+
+    // Parse + analyze ONCE (the SQLite-prepared equivalent).
+    let stmt = db
+        .prepare("INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)")
+        .expect("prepare");
+
+    db.execute("BEGIN").unwrap();
+    stmt.execute(&mut db, &mk(1)).unwrap(); // warmup row (discarded)
+
+    let t0 = Instant::now();
+    for i in 2..=n_rows {
+        stmt.execute(&mut db, &mk(i)).unwrap();
+    }
+    let exec_ns = t0.elapsed().as_nanos();
+    let tc = Instant::now();
+    db.execute("COMMIT").unwrap();
+    let commit_ns = tc.elapsed().as_nanos();
+
+    let measured = (n_rows.saturating_sub(1)).max(1) as u128;
+    let exec_us = exec_ns as f64 / measured as f64 / 1000.0;
+    let total_us = (exec_ns + commit_ns) as f64 / measured as f64 / 1000.0;
+    let rows_s = measured as f64 / ((exec_ns + commit_ns) as f64 / 1e9);
+    println!("\n╔═ AxiomDB PREPARED INSERT — {n_rows} rows (parse+analyze once) ═");
+    println!("║  prepared execute (excl COMMIT):  {exec_us:.2} µs/row");
+    println!(
+        "║  COMMIT (group apply+fsync):      {:.2} ms total",
+        commit_ns as f64 / 1e6
+    );
+    println!("║  total per row (incl COMMIT):     {total_us:.2} µs/row");
+    println!("║  throughput:                      {rows_s:.0} rows/s");
+    println!("╚═ vs SQLite insert_batch (prepared): 362.7K rows/s = 2.76 µs/row ═\n");
+}
+
 // ── Parse breakdown: lex (tokenize) vs AST-build (recursive descent) ───────────
 // Splits parse_with_sql_mode into its two halves so we know whether the INSERT
 // parse cost is dominated by the logos lexer or by AST construction. Decides
@@ -1535,6 +1595,8 @@ fn main() {
         diagnose(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-insert".to_string()) {
         diagnose_insert(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-prepared-insert".to_string()) {
+        diagnose_prepared_insert(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-insert-deep".to_string()) {
         diagnose_insert_deep(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-parse".to_string()) {
