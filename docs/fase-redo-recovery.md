@@ -61,7 +61,7 @@ paralelo para el default-on. Sprint (specs/fase-redo-recovery/, brainstorm hecho
 
 ---
 
-## 🔄 Subfase 6f (Task 1) — estado: 5/8 pasos · ✅ opt-in embebido ACOTADO
+## ✅ Subfase 6f (Task 1) — CERRADA para embedded (7/8 · step 6 server diferido)
 
 Spec: `specs/fase-redo-recovery/spec-subfase-6f-frame-checkpoint-trigger.md` (approved).
 Plan: `specs/fase-redo-recovery/plan-subfase-6f-frame-checkpoint-trigger.md` (in-progress).
@@ -85,10 +85,10 @@ colisiona, no reusar).
 [x] 3. back-pressure síncrono en commit_durable (hard cap) a3680dc8
 [x] 4. FrameCheckpointer thread background                 e37482ea
 [x] 5. wire embedded Db (Arc-share storage+txn + Drop join + cap desde DbConfig) 9eb7960d
-─────  ✅ EL OPT-IN EMBEBIDO YA QUEDA ACOTADO (cap cableado = max_wal_size_mb × 2)  ─────
-[ ] 6. wire server SharedDatabase (spawn + shutdown join)  ← EMPEZAR ACÁ (baja prio: embedded-first)
-[ ] 7. config soft/hard (K=hard/soft, default ~2) + watchdog de muerte del thread
-[ ] 8. docs (user durability + internals/wal.md) + re-confirmar A/B + cierre
+[x] 7. config K (DbConfig.checkpoint_hard_multiplier, default 2) + watchdog de thread 40421bac
+[x] 8. docs (transactions.md + internals/wal.md) + A/B re-confirmado + cierre
+─────  ✅ 6f CERRADO PARA EMBEDDED (opt-in frame-only acotado + documentado)  ─────
+[~] 6. wire server SharedDatabase — DIFERIDO (embedded-first; redo off por defecto = sin impacto)
 ```
 
 ### ✅ Pasos 4-5 hechos — el opt-in embebido YA queda acotado
@@ -101,17 +101,22 @@ checkpoint read-guard para que un recycle concurrente no deje colgado un `sync_t
 en vuelo — el bg thread vuelve rutinaria esa concurrencia). Falta el server (paso 6),
 volver K configurable (paso 7) y docs+cierre (paso 8).
 
-### EXACT next step — Paso 6: server SharedDatabase (o saltar a 7-8 por embedded-first)
-- **Paso 6** = espejar el paso 5 en `crates/axiomdb-network/src/mysql/shared_db.rs`:
-  Arc-share storage+txn dentro de `SharedDbInner`, spawn del `FrameCheckpointer` cuando
-  redo on, join en el shutdown del server. `SharedDatabase` ya se comparte vía
-  `Arc<SharedDatabase>`. **Baja prioridad por EMBEDDED-FIRST** — alternativa: cerrar 6f
-  para embedded ya (paso 7 config K + watchdog, paso 8 docs + A/B) y dejar el server para
-  después / con su gap documentado, luego ir a Task 3 (el win de BATCH).
-- **GOTCHA del paso 5 (costó 1 ciclo de clippy):** el executor toma `storage: &dyn
-  StorageEngine` (usar `&*self.storage`) pero `txn: &TxnManager` concreto (auto-deref a
-  través de `Arc` → `&self.txn` pelado; `&*self.txn` es error `explicit_auto_deref`).
-  Aplicar el mismo split en el paso 6.
+### EXACT next step — Task 3: reuso del archivo de frame-log (el win de BATCH)
+6f quedó **cerrada para embedded** (usuario eligió embedded-first, 2026-05-22). El próximo
+lever hacia la paridad de writes es **Task 3**: `insert_batch` sigue ~2.6× porque con redo
+ON el batch es un *wash* (el +18ms del frame-append amortiza el sync_all que se quitó). El
+fix = reusar el archivo del frame log en estado estable (estilo SQLite WAL-reuse: no
+truncar→re-alloc en cada recycle; sobrescribir bloques in-place) para matar el costo de
+crecer el log. Eso es lo que mueve `insert_batch` hacia SQLite. Spec/plan nuevos al arrancar.
+
+**Pendiente diferido de 6f:**
+- **Step 6 (server)** = espejar el step 5 en `crates/axiomdb-network/src/mysql/shared_db.rs`
+  (`SharedDbInner`: Arc-share storage+txn, spawn del `FrameCheckpointer` con redo on, join en
+  shutdown). Server frame-only NO está auto-acotado aún; seguro solo porque redo está off por
+  defecto. **GOTCHA a reaplicar:** executor toma `storage: &dyn StorageEngine` (usar
+  `&*self.x.storage`) pero `txn: &TxnManager` concreto (auto-deref vía `Arc` → `&` pelado;
+  `&*` es error `explicit_auto_deref`).
+- **Task 2** = suite de crash T1–T7 (gate para flip a redo default-on).
 
 ---
 

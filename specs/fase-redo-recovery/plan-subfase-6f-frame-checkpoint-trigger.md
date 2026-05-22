@@ -2,7 +2,7 @@
 
 Phase: redo-recovery (project B) — subphase 6f (Lever 2 / Task 1)
 Spec: specs/fase-redo-recovery/spec-subfase-6f-frame-checkpoint-trigger.md
-Status: in-progress
+Status: CLOSED for embedded (7/8 done; step 6 server wiring deferred per embedded-first)
 Effort: **max** (durability/commit path + a background thread)
 
 ## Progress (2026-05-22)
@@ -36,7 +36,14 @@ Effort: **max** (durability/commit path + a background thread)
       `FrameCheckpointer` thread carries a `DeathWatch` drop-guard that `error!`-logs an
       unexpected (panic) exit — back-pressure then bounds the log synchronously (safe
       degradation). storage config test + embedded frame-only tests green; clippy clean.
-- [ ] **Step 8** — docs (user durability + internals/wal.md) + A/B re-confirm + close. ← NEXT
+- [x] **Step 8** — docs + A/B re-confirm + close. `docs-site/.../transactions.md` (user
+      frame-only opt-in: enable, ~win, threshold tuning, embedded-only + opt-in caveats) +
+      `internals/wal.md` (subphase-6f auto-checkpoint section). A/B (macOS, same-session
+      interleaved — the trustworthy comparison): autocommit redo **ON ~1.4× OFF** (OFF ~18K,
+      ON ~25K ops/s at the 300-row autocommit cap; macOS ±60% noisy — the prior cross-session
+      "2×" is unreliable, but the win direction is consistent ON>OFF every run); reads ≈ no
+      regression (point_lookup ON≈OFF within noise). **6f CLOSED for embedded** (step 6 server
+      deferred). Next: Task 3 (frame-log file reuse — the batch win).
 
 ## Summary
 

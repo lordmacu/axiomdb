@@ -974,3 +974,64 @@ fresh salt). The exclusive guard mirrors SQLite's TRUNCATE-mode checkpoint, whic
 needs the write lock.
 </div>
 </div>
+
+### Subphase 6f — auto-checkpoint trigger (bounding the frame-only log)
+
+Under `RedoMode::FrameOnly` (the SQLite-WAL write-ahead mode, opt-in) the frame log is the
+sole durability source, so the 6b checkpoint **must** run automatically — otherwise the log
+grows without bound until the disk fills. The trigger is modelled on PostgreSQL's
+checkpointer / InnoDB's page cleaner: a dedicated background thread does the checkpoint **off
+the commit path** (so commits keep their low latency — the autocommit win is preserved
+without spikes), and a **synchronous back-pressure** path at the commit boundary guarantees
+the log is bounded even if that thread stalls or dies.
+
+Two thresholds, both derived from config:
+
+- **soft = `max_wal_size_mb`** — when the frame log's gap-free written prefix
+  (`frame_log_durable_len`) crosses this, the background `FrameCheckpointer`
+  (`axiomdb-storage/src/checkpointer.rs`) runs `checkpoint_frames` (apply → fsync main →
+  recycle).
+- **hard = `max_wal_size_mb × checkpoint_hard_multiplier`** (`checkpoint_hard_multiplier`
+  defaults to 2) — if the background thread has fallen behind, the *committing* thread
+  observes the log at this size and runs the checkpoint **inline** before returning
+  (`commit_durable` → `maybe_checkpoint_frames(.., force=false)` against the hard cap). A
+  bounded latency spike, but the log is never unbounded. This is the robustness net.
+
+Both paths funnel through one guarded entry, `StorageEngine::maybe_checkpoint_frames`, so
+every triggered checkpoint serializes on the single checkpoint write-lock.
+
+**Wake model.** The thread sleeps on a `Condvar` with a poll-timeout fallback. A frame
+append that crosses the soft threshold pokes it via `CheckpointTrigger::note(offset)` — a
+cheap size compare on the write path that only locks + notifies once over the threshold
+(installed into `MmapStorage` as a `OnceLock<Arc<CheckpointTrigger>>` so redo-off pays
+nothing). The timeout is a fallback so a missed notify still re-checks within one interval.
+
+**Concurrency hardening.** Because the background checkpointer now recycles the log
+concurrently with commits, `sync_frame_log` (the commit-boundary fsync) takes the checkpoint
+**read-guard** across its `sync_to_durable` wait+fsync — a recycle (write-guard) can no
+longer reset the log's watermarks underneath an in-flight sync and strand the committer.
+Reads stay shared, so concurrent commits still sync in parallel; only the exclusive
+checkpoint waits for in-flight syncs to drain.
+
+**Clean shutdown + thread death.** On `Drop`/shutdown the thread is signalled, runs a final
+forced checkpoint (so a restart begins with a current main file + recycled log), and is
+joined. If the thread ever exits unexpectedly (a panic), a `DeathWatch` drop-guard
+`error!`-logs it; the commit back-pressure then bounds the log synchronously — a safe
+degradation, never silent unbounded growth.
+
+Wired into the embedded `Db` (`open_with_config` spawns it under frame-only, `Drop for Db`
+joins it). The server (`SharedDatabase`) wiring is deferred — server frame-only redo is not
+yet auto-bounded, which is safe only because redo is **off by default**.
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed</span>
+The background-checkpointer-plus-back-pressure design is PostgreSQL's checkpointer / InnoDB's
+page cleaner (off-path checkpoints with a synchronous fallback), and the size-threshold
+trigger is SQLite's WAL auto-checkpoint (<code>sqlite3WalDefaultHook</code> fires once the
+WAL passes <code>nWalCkpt</code> frames). AxiomDB splits the threshold into a soft
+(background) and hard (inline back-pressure) cap so the log is bounded with bounded commit
+latency.
+</div>
+</div>

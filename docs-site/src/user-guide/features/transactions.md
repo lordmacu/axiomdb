@@ -123,6 +123,68 @@ transaction — matching SQLite's `PRAGMA synchronous` semantics
 
 ---
 
+## Frame-only redo (opt-in)
+
+`SET synchronous` controls *how hard* a commit syncs; **frame-only redo** changes *where*
+a commit becomes durable. It is AxiomDB's port of SQLite's WAL (`journal_mode=WAL`):
+page writes go to a **page-frame log** first, a commit is durable once its frames are
+`fsync`'d, and the main database file is updated only by a background **checkpoint**. This
+drops the per-commit main-file `fsync` — the dominant cost of single-row autocommit
+inserts.
+
+It is **opt-in and off by default** (no behavior change unless you enable it):
+
+```rust
+// Embedded (Rust): enable on open.
+use axiomdb_embedded::Db;
+use axiomdb_storage::{DbConfig, RedoMode};
+
+let cfg = DbConfig {
+    redo: Some(RedoMode::FrameOnly),
+    ..DbConfig::default()
+};
+let mut db = Db::open_with_config("./app.db", &cfg)?;
+```
+
+```toml
+# Server (axiomdb.toml):
+redo = "frame_only"
+```
+
+::: callout-advantage
+**~2× faster autocommit inserts vs. the default**
+On a single-row `INSERT`-per-commit workload, frame-only redo removes the per-commit
+main-file `fsync` (durability moves to the frame-log `fsync`), measured at ≈2× throughput
+(≈19.5K → ≈38K ops/s), closing the gap vs. SQLite from ≈6× to ≈3×. Reads are unaffected
+(a read consults the in-memory frame index then the main file, SQLite's `walFindFrame`
+order). Batch/transactional inserts are roughly unchanged — that win is a separate
+work item.
+:::
+
+**The frame log stays bounded automatically.** A background checkpointer copies committed
+frames into the main file and recycles the log once it reaches `max_wal_size_mb` (the *soft*
+threshold), off the commit path. If it ever falls behind, a commit that sees the log reach
+`max_wal_size_mb × checkpoint_hard_multiplier` (the *hard* cap, multiplier defaults to `2`)
+runs the checkpoint inline, so the log is never unbounded. On a clean shutdown a final
+checkpoint runs, so a restart begins with a current main file.
+
+```toml
+# Tune the checkpoint thresholds (axiomdb.toml):
+max_wal_size_mb           = 256   # soft: background checkpoint trips here
+checkpoint_hard_multiplier = 2    # hard cap = 256 × 2 = 512 MB (inline back-pressure)
+```
+
+::: callout-tip
+**When to enable**
+Reach for frame-only redo on **write-heavy embedded workloads** dominated by single-row
+autocommit inserts. It is currently wired for the **embedded API**; the network server's
+frame-only path is not yet auto-bounded, so prefer the default durability mode there for
+now. Frame-only redo is also still **opt-in pending the full crash-recovery test suite** —
+it is correct and bounded, but not yet the default until that matrix lands.
+:::
+
+---
+
 ## SAVEPOINT — Partial Rollback
 
 Savepoints mark a point within a transaction to which you can roll back without
