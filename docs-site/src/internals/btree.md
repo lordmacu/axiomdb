@@ -232,6 +232,44 @@ The simpler “allocate two fresh pages on every clustered split” option would
 </div>
 </div>
 
+### Rightmost Append Split (`balance_quick`)
+
+A monotonically increasing primary key (auto-increment ids, timestamps, ULIDs)
+always lands at the **rightmost** leaf. Splitting such a leaf 50/50 is wasted
+work: the left half is immediately frozen (no key will ever fall back into it)
+and the right half is what keeps filling. AxiomDB special-cases this exactly as
+SQLite's `balance_quick` (`research/sqlite/src/btree.c:7992`):
+
+When a full leaf takes an **end-insert** (`insert_pos == num_cells`) **and** it
+is the rightmost leaf (`next_leaf == NULL`), `append_split_leaf` keeps the full
+page verbatim — only its `next_leaf` link changes — and puts the single new row
+in a fresh right sibling. There is no `collect_leaf_cells` + double
+`rebuild_leaf_page` redistribution, and the wasted optimistic-defragment
+re-descent is skipped (`insert_append_split` bypasses the same-leaf pre-pass
+that a known-full boundary would only burn a descent on). Upward propagation of
+the divider reuses the normal `insert_subtree` recursion, so latch ordering and
+parent/root growth are unchanged.
+
+The split-strategy gate is what keeps this safe: a **non-rightmost** full leaf
+(or an insert before the last cell) still takes the balanced 50/50 split, so a
+middle-of-tree insert never fragments a page into a one-cell sibling. Rows that
+later grow past their now-full leaf relocate via `update_with_relocation`
+(delete + reinsert), matching SQLite's relocate-on-grow model.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">🚀</span>
+<div class="callout-body">
+<span class="callout-label">Advantage vs. a naive 50/50 split — append density</span>
+Borrowing SQLite's <code>balance_quick</code>, an append boundary drops from
+~72 µs to ~13 µs (no O(N) cell redistribution, no re-descent round-trip). On a
+50K-row clustered <code>insert_batch</code> the per-boundary slow path falls
+from 37.7 ms to ~7 ms, lifting throughput ~206K → ~250K rows/s and closing the
+gap to SQLite's prepared <code>insert_batch</code> from ~1.75× to ~1.46×.
+Append-built pages also pack 100% full (denser storage, fewer pages to scan)
+instead of the ~50% occupancy a 50/50 split leaves behind.
+</div>
+</div>
+
 ### Clustered Point Lookup Controller (Phase 39.4)
 
 Phase `39.4` extends that dedicated clustered controller with exact point
