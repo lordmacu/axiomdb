@@ -1032,10 +1032,10 @@ impl StorageEngine for MmapStorage {
         // Ordering invariant: apply committed frames → fsync main → recycle the log.
         let applied = self.apply_committed_frames(&committed)?;
         self.flush()?; // applied pages are durable in the main file before the recycle
-        // In-flight-safe: only recycle when EVERY frame is committed (else an uncommitted
-        // txn's frames live only in the log and must survive once writes are frame-only).
-        // On a full recycle, clear the live wal_index — its offsets are now invalid and
-        // the pages are in the (just-fsync'd) main file, so reads fall through to it.
+                       // In-flight-safe: only recycle when EVERY frame is committed (else an uncommitted
+                       // txn's frames live only in the log and must survive once writes are frame-only).
+                       // On a full recycle, clear the live wal_index — its offsets are now invalid and
+                       // the pages are in the (just-fsync'd) main file, so reads fall through to it.
         if frame_log.scan()?.iter().all(|f| committed(f.txn_id)) {
             frame_log.recycle()?;
             self.wal_index.clear();
@@ -1840,7 +1840,11 @@ mod tests {
         );
         // But read_page returns the row, served from the frame via the wal_index.
         s.evict_from_pool(pid);
-        assert_eq!(s.read_page(pid).unwrap().body()[0], 0x77, "served from the frame");
+        assert_eq!(
+            s.read_page(pid).unwrap().body()[0],
+            0x77,
+            "served from the frame"
+        );
         // A checkpoint applies it to the main file.
         s.checkpoint_frames(&|t| t == 5).unwrap();
         assert_eq!(
