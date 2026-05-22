@@ -121,7 +121,12 @@ fn update_in_place_on_split_tree_preserves_leaf_identity_and_next_link() {
     let storage = MemoryStorage::new();
     let mut root = None;
 
-    for key in 0u32..128 {
+    // Shuffled (coprime-stride) build so the 50/50 splits leave leaves partly
+    // free: this test asserts the in-place grow keeps the row in the SAME leaf,
+    // which needs slack. A pure-append build now packs leaves full via the
+    // balance_quick append split, where a grow correctly relocates instead.
+    for i in 0u32..128 {
+        let key = (i * 53) % 128;
         root = Some(
             insert(
                 &storage,
@@ -220,4 +225,3 @@ fn update_in_place_returns_heap_page_full_when_growth_cannot_stay_in_leaf() {
     assert_eq!(row.row_data, vec![0u8; 2_100]);
     assert_eq!(row.row_header.txn_id_created, 1);
 }
-
