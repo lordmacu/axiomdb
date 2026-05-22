@@ -744,8 +744,9 @@ Crash recovery is currently **UNDO-only**: it rolls back uncommitted transaction
 but never **REDOes** committed ones. Committed data survives a crash only because the
 data pages are eagerly `fsync`'d to the main file at commit. A committed write whose
 page was *not* flushed (e.g. an insert that didn't change the table root) can be lost
-on power loss — see the regression test
-`axiomdb-wal/tests/integration_redo_recovery.rs` (`t0_…`, currently `#[ignore]`d).
+on power loss — proven by the regression test `t0_…` in
+`axiomdb-wal/tests/integration_redo_recovery.rs` (RED while recovery was UNDO-only;
+**green since subphase 5**, below).
 
 The fix is SQLite's proven **write-ahead page-frame** model: page writes go to the
 WAL as frames first; the main file is updated only by a checkpoint; a commit is
@@ -840,11 +841,57 @@ unchanged and `t0_…` is still RED.
 <span class="callout-icon">🧭</span>
 <div class="callout-body">
 <span class="callout-label">Status</span>
-Frames are durably correct at commit. Remaining: subphase 5 (recovery rebuilds the
-wal-index from committed frames on open — the <code>t0_…</code> regression flips green),
-subphase 6 (drop the per-commit flush + frame-only writes + the contiguous durable
-prefix for concurrent appends + checkpoint copies frames to the main file), and
-subphase 7 (the full crash suite). Until subphase 6 the per-commit flush stays and
-<code>t0_…</code> is <code>#[ignore]</code>d.
+Frames are durably correct at commit. (At subphase 4 this was still additive — the
+per-commit flush stayed and <code>t0_…</code> was <code>#[ignore]</code>d.)
+</div>
+</div>
+
+### Subphase 5 — recovery (REDO replay → `t0_…` green)
+
+Recovery becomes a **hybrid**: UNDO the logical records of uncommitted transactions (as
+before), then **REDO the physical frames of committed ones**. On open,
+`CrashRecovery::recover` collects the committed-txn set during its forward scan and,
+after the UNDO pass, calls `StorageEngine::redo_committed_frames(committed)`:
+
+- `FrameLog::build_index(committed)` folds the valid prefix into `page_id → latest
+  committed frame` (in-flight transactions' frames are excluded by the predicate).
+- for each such frame, if `frame.lsn > page.lsn` the frame's full page image is written
+  **directly** to the page — no new frame is appended. A committed write whose data page
+  never reached the main file is thus restored.
+
+**Idempotence (safe to crash mid-recovery).** The guard is the page `lsn`: a frame is a
+full page image whose embedded `PageHeader.lsn` becomes the page's lsn once applied, so
+re-running recovery sees `frame.lsn == page.lsn` and skips. This is PostgreSQL's pageLSN
+rule (`xlogutils.c`: apply only when strictly newer); InnoDB uses the same idea with
+`>=`. We use strict `>` (Postgres) — fewer redundant applies on a recovery re-entry.
+
+`FaultInjectionStorage` (the test vehicle) gets a real `FrameLog` whose fsync'd file
+**survives `simulate_power_loss`** while the volatile data pages revert — exactly the
+power-loss asymmetry a real fsync'd WAL has. `t0_committed_heap_insert_survives_power_loss`
+is now **green**: a committed insert whose page was never flushed is restored from its
+frame, and a second recovery pass redoes nothing (the pageLSN guard).
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Borrowed</span>
+The committed-prefix scan (stop at the first bad CRC) is SQLite
+<code>walIndexRecover</code>; keeping the latest frame per page is its checkpoint's
+merge. The pageLSN idempotence guard is ARIES / PostgreSQL (<code>xlogutils.c</code>) /
+InnoDB. The hybrid split — undo logical, redo physical — is AxiomDB's: classic-heap UNDO
+stays, physical REDO is added only for committed data.
+</div>
+</div>
+
+<div class="callout callout-design">
+<span class="callout-icon">🧭</span>
+<div class="callout-body">
+<span class="callout-label">Status</span>
+REDO recovery works (<code>t0_…</code> green). Still additive: the per-commit flush
+stays as a net under the new REDO. Remaining: subphase 6 (drop the per-commit flush +
+frame-only writes + the contiguous durable prefix for concurrent appends + checkpoint
+copies frames to the main file), and subphase 7 (the full crash suite T1–T7 + perf A/B).
+A committed frame for a page that no longer exists in the main file (allocated after the
+last flush) needs file growth on REDO — deferred to the subphase-6 checkpoint.
 </div>
 </div>
