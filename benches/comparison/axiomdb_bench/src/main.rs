@@ -1724,6 +1724,7 @@ fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
 
     bench_timings::reset_insert_timings();
 
+    let mut exec_total_ns: u128 = 0;
     for sql in &sqls[1..] {
         let stmt = parse_with_sql_mode(sql, None, sql_mode).unwrap();
         let snap = if let Some(ref ct) = session.conn_txn {
@@ -1732,14 +1733,20 @@ fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
             txn.snapshot()
         };
         let analyzed = analyze_cached(stmt, &storage, snap, &mut schema_cache).unwrap();
+        // Time the WHOLE execute_with_ctx call: exec_total - (phases below) = the untimed
+        // generic dispatch (execute_with_ctx_locked → dispatch_ctx → execute_insert_ctx).
+        let e0 = Instant::now();
         execute_with_ctx(analyzed, &storage, &txn, &bloom, &mut session).unwrap();
+        exec_total_ns += e0.elapsed().as_nanos();
     }
 
     let t = bench_timings::snapshot_insert_timings();
     let rows = t.rows.max(1) as u128;
     let per = |ns: u128| ns / rows;
+    let exec_total_per = exec_total_ns / rows;
 
     let measured = [
+        ("resolve_table (per-stmt)", per(t.resolve_ns)),
         ("eval (expr → Value)", per(t.eval_ns)),
         ("validate exprs+defaults", per(t.validate_ns)),
         ("assign_auto_increment", per(t.auto_inc_ns)),
@@ -1786,6 +1793,14 @@ fn diagnose_insert_deep(data_dir: &Path, n_rows: usize) {
     eprintln!(
         "║  measured subtotal              {}                       ║",
         fmt_us(total)
+    );
+    eprintln!(
+        "║  execute_with_ctx TOTAL         {}                       ║",
+        fmt_us(exec_total_per)
+    );
+    eprintln!(
+        "║  generic dispatch (remainder)   {}                       ║",
+        fmt_us(exec_total_per.saturating_sub(total))
     );
     eprintln!("║                                                                  ║");
 

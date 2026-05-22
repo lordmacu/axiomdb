@@ -31,6 +31,8 @@ pub struct InsertPhaseTimings {
     pub enum_validate_ns: u128,
     pub pk_dup_ns: u128,
     pub batch_push_ns: u128,
+    /// 6d: per-statement table resolve (execute_insert_ctx fast path / resolve_table_cached).
+    pub resolve_ns: u128,
     pub rows: u64,
 }
 
@@ -40,7 +42,8 @@ thread_local! {
         const { RefCell::new(InsertPhaseTimings {
             eval_ns: 0, validate_ns: 0, auto_inc_ns: 0, generated_cols_ns: 0,
             constraints_ns: 0, fk_check_ns: 0, prepare_row_ns: 0,
-            enum_validate_ns: 0, pk_dup_ns: 0, batch_push_ns: 0, rows: 0,
+            enum_validate_ns: 0, pk_dup_ns: 0, batch_push_ns: 0,
+            resolve_ns: 0, rows: 0,
         }) };
 }
 

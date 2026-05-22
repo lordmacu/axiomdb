@@ -25,7 +25,7 @@ fn execute_insert_ctx(
     // table_id confirms we are targeting the same table, and since all B-tree
     // writes are deferred to COMMIT in this path, the catalog entry (including
     // root_page_id) is unchanged since the batch was created.
-    let resolved: Arc<ResolvedTable> = 'resolve: {
+    let resolved: Arc<ResolvedTable> = crate::time_insert_phase!(resolve_ns, { 'resolve: {
         if ctx.in_explicit_txn
             && stmt.returning.is_empty()
             && matches!(stmt.source, InsertSource::Values(_))
@@ -60,7 +60,7 @@ fn execute_insert_ctx(
             }
         }
         resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?
-    };
+    } });
 
     // Phase 40.11: IX(table) — once per statement, before any row write.
     // Idempotent: InnoDB `lock_table_has()` pattern — returns immediately if
