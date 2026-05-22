@@ -20,7 +20,18 @@ const RUNS: usize = 5;
 // ── Engine helpers ────────────────────────────────────────────────────────────
 
 fn db_open(dir: &Path) -> Db {
-    let mut db = Db::open(dir.join("bench.db")).expect("open db");
+    // A/B knob (project B 6c): AXIOMDB_BENCH_REDO=1 opens frame-only redo so the
+    // per-commit main-file sync_all (ensure_database_roots flush) is dropped and
+    // durability comes from the frame log — measures the autocommit win.
+    let mut db = if std::env::var_os("AXIOMDB_BENCH_REDO").is_some() {
+        let cfg = axiomdb_storage::DbConfig {
+            redo: Some(axiomdb_storage::RedoMode::FrameOnly),
+            ..Default::default()
+        };
+        Db::open_with_config(dir.join("bench.db"), &cfg).expect("open db (frame-only)")
+    } else {
+        Db::open(dir.join("bench.db")).expect("open db")
+    };
     // Attack 6: match SQLite's PRAGMA synchronous=NORMAL for an
     // apples-to-apples comparison on the insert_autocommit scenario.
     // SqliteDb::open_file above sets the same level (line 464).
