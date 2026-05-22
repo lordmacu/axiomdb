@@ -3,7 +3,8 @@
 Phase: perf-sqlite-gap — close embedded write gap with SQLite
 Task: Parity lever #2 — O(1) rightmost append split (SQLite `balance_quick`)
 Spec: specs/fase-perf-sqlite-gap/spec-clustered-append-split.md
-Status: draft
+Status: done — Steps 1-3 implemented + committed (456e60dc), measured (Step 4),
+docs (c02610b8); workspace nextest validating at close
 
 ## Summary
 

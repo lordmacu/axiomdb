@@ -4,7 +4,8 @@ Phase: perf-sqlite-gap — close embedded write gap with SQLite
 Task: Parity lever #2 — eliminate the per-leaf-boundary slow round-trip in the
 clustered insert apply path by giving the rightmost append an O(1) split that
 reuses the existing tree-recursion (latch discipline + split propagation).
-Status: draft
+Status: implemented (slow_tree_ms 37.7→~7ms, throughput 206K→~250K rows/s,
+gap vs SQLite 1.75×→~1.46×; commits 4a15e9ca + 456e60dc + c02610b8)
 
 ## Context
 
