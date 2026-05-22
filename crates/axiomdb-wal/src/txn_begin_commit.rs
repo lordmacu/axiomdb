@@ -89,7 +89,19 @@ impl TxnManager {
         conn_txn: ConnectionTxn,
         storage: &dyn StorageEngine,
     ) -> Result<Option<TxnId>, DbError> {
-        storage.sync_frame_log()?;
+        // 6d: frame fsync is policy-aware (SQLite `synchronous` model). At Strict we fsync the
+        // frame log per commit (write-ahead: data durable before the WAL Commit record). At
+        // Normal/Off the fsync is DEFERRED to the checkpoint (which fsyncs the frame log before
+        // applying to main — 6d step 1a), exactly like SQLite WAL+NORMAL (`wal.c`: all WAL
+        // fsyncs occur in walCheckpoint under NORMAL). The frames are still written + visible
+        // to readers via the wal_index; only the per-commit fsync is dropped. A power loss at
+        // NORMAL may lose the last unsynced txn(s) — the documented NORMAL relaxation.
+        let effective_policy = conn_txn
+            .durability_override
+            .unwrap_or(self.durability_policy);
+        if effective_policy == WalDurabilityPolicy::Strict {
+            storage.sync_frame_log()?;
+        }
         self.commit(conn_txn)
     }
 

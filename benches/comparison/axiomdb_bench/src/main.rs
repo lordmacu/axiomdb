@@ -740,6 +740,10 @@ fn diagnose_prepared_insert(data_dir: &Path, n_rows: usize) {
     } else {
         Db::open(data_dir.join("diag_prep.db")).expect("open")
     };
+    // Match SQLite's PRAGMA synchronous=NORMAL (the bench's SQLite config) and trigger the
+    // 6d deferred frame fsync (Strict would fsync per-commit).
+    db.execute("SET synchronous = 'NORMAL'")
+        .expect("set synchronous=NORMAL");
     db.execute(
         "CREATE TABLE bench_users (id INT NOT NULL, name TEXT NOT NULL, age INT NOT NULL, \
          active BOOL NOT NULL, score REAL NOT NULL, email TEXT NOT NULL, PRIMARY KEY (id))",
