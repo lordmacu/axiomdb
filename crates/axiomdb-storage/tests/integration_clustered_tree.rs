@@ -331,7 +331,13 @@ fn clustered_update_in_place_is_visible_to_lookup_and_range_on_split_tree() {
     let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
     let mut root = None;
 
-    for key in 0u32..2_000 {
+    // Shuffled (coprime-stride) key order so the 50/50 splits leave leaves
+    // partly free — the in-place `update_in_place` grow needs slack. A pure
+    // append build now packs leaves full via the balance_quick append split,
+    // where an in-place grow correctly relocates instead (see the executor /
+    // fk_enforcement HeapPageFull → update_with_relocation fallback).
+    for i in 0u32..2_000 {
+        let key = (i * 1001) % 2_000;
         let row_len = 180 + (key as usize % 5) * 121;
         root = Some(
             clustered_tree::insert(
@@ -390,7 +396,10 @@ fn clustered_update_in_place_transitions_inline_and_overflow_and_frees_old_chain
     let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
     let mut root = None;
 
-    for key in 0u32..256 {
+    // Shuffled build (see the split-tree update test): keeps leaves partly free
+    // so the in-place inline→overflow transition has room without relocating.
+    for i in 0u32..256 {
+        let key = (i * 151) % 256;
         root = Some(
             clustered_tree::insert(
                 storage.as_mut(),
@@ -725,4 +734,161 @@ fn clustered_update_with_relocation_preserves_order_on_split_tree() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[1].key, 1_111u32.to_be_bytes());
     assert_eq!(rows[1].row_data, vec![7u8; 8_000]);
+}
+
+// ── Append-split (SQLite balance_quick) — lever #2 ──────────────────────────
+
+/// Behavioral contract of the O(1) append split: when a strictly-increasing
+/// append fills the rightmost leaf and forces the first split, the full leaf is
+/// kept intact (NOT redistributed) and the new sibling carries only the one
+/// boundary row. With a 50/50 split this fails (both halves ~half-full).
+#[test]
+fn clustered_append_split_keeps_old_leaf_full_on_first_split() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root: Option<u64> = None;
+    let mut last_leaf_cells: u16 = 0;
+    let mut split_root: Option<u64> = None;
+
+    for key in 0u32..50_000 {
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, 80),
+            )
+            .unwrap(),
+        );
+        let root_pid = root.unwrap();
+        let page = storage.read_page(root_pid).unwrap();
+        match clustered_page_type(page.header().page_type).unwrap() {
+            PageType::ClusteredLeaf => last_leaf_cells = clustered_leaf::num_cells(&page),
+            PageType::ClusteredInternal => {
+                split_root = Some(root_pid);
+                break;
+            }
+            other => panic!("unexpected root page type {other:?}"),
+        }
+    }
+
+    let root_pid = split_root.expect("rightmost appends must eventually split the root leaf");
+    assert!(
+        last_leaf_cells > 2,
+        "leaf should have filled before splitting"
+    );
+
+    let root_page = storage.read_page(root_pid).unwrap();
+    let left_pid = clustered_internal::child_at(&root_page, 0u16).unwrap();
+    let right_pid = clustered_internal::child_at(&root_page, 1u16).unwrap();
+    let left = storage.read_page(left_pid).unwrap();
+    let right = storage.read_page(right_pid).unwrap();
+
+    assert_eq!(
+        clustered_leaf::num_cells(&left),
+        last_leaf_cells,
+        "append-split must leave the old rightmost leaf intact (no 50/50 redistribution)"
+    );
+    assert_eq!(
+        clustered_leaf::num_cells(&right),
+        1,
+        "append-split new leaf holds only the boundary row"
+    );
+    assert_eq!(clustered_leaf::next_leaf(&left), right_pid);
+    assert_eq!(clustered_leaf::next_leaf(&right), clustered_leaf::NULL_PAGE);
+}
+
+/// Gate guard: append-split must fire ONLY for the rightmost leaf
+/// (`next_leaf == NULL` + end-insert). Inserting a coprime-stride permutation
+/// of a dense range produces many MIDDLE end-inserts (keys that are the local
+/// max of a non-rightmost leaf's range). With the gate correct these take the
+/// balanced 50/50 split, so no non-rightmost leaf is ever left with a single
+/// cell — the tell-tale signature of a misfired append-split fragmenting a
+/// middle leaf. Passes both before (pure 50/50) and after (gated append-split).
+#[test]
+fn clustered_non_rightmost_splits_stay_balanced() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root: Option<u64> = None;
+
+    const N: u64 = 8192; // 2^13
+    const P: u64 = 5113; // odd ⇒ coprime to 2^13 ⇒ (i*P) mod N is a permutation
+    for i in 0..N {
+        let key = ((i * P) % N) as u32;
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, 80),
+            )
+            .unwrap(),
+        );
+    }
+    let root_pid = root.unwrap();
+
+    // Walk the leaf chain; every leaf except the rightmost must hold > 1 cell.
+    let mut leaf_pid = leftmost_leaf_pid(storage.as_ref(), root_pid).unwrap();
+    let mut total = 0usize;
+    loop {
+        let page = storage.read_page(leaf_pid).unwrap();
+        let nc = clustered_leaf::num_cells(&page);
+        total += nc as usize;
+        let next = clustered_leaf::next_leaf(&page);
+        if next == clustered_leaf::NULL_PAGE {
+            break;
+        }
+        assert!(
+            nc > 1,
+            "non-rightmost leaf {leaf_pid} has {nc} cell(s) — a misfired append-split fragmented a middle leaf"
+        );
+        leaf_pid = next;
+    }
+    assert_eq!(total, N as usize, "all keys must be present exactly once");
+}
+
+/// Append-split must preserve overflow-backed rows across many boundaries.
+#[test]
+fn clustered_append_split_overflow_rows_round_trip_across_boundaries() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root: Option<u64> = None;
+
+    // 5000-byte rows exceed page_capacity/4 → overflow chain; ~3 cells/leaf →
+    // hundreds of append-split boundaries.
+    let row_len = 5_000usize;
+    let n = 1_500u32;
+    for key in 0..n {
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, row_len),
+            )
+            .unwrap(),
+        );
+    }
+    let root_pid = root.unwrap();
+    let snapshot = TransactionSnapshot::committed(2);
+    for probe in [0u32, 1, 2, 500, 999, 1_499] {
+        let row = clustered_tree::lookup(
+            storage.as_ref(),
+            Some(root_pid),
+            &probe.to_be_bytes(),
+            &snapshot,
+        )
+        .unwrap()
+        .expect("probe must exist");
+        assert_eq!(
+            row.row_data,
+            row_bytes(probe, row_len),
+            "overflow row must round-trip after append-split"
+        );
+    }
+    let keys = collect_leaf_chain_keys(storage.as_ref(), root_pid).unwrap();
+    assert_eq!(keys.len(), n as usize);
+    for (idx, key) in keys.iter().enumerate() {
+        assert_eq!(key.as_slice(), &(idx as u32).to_be_bytes());
+    }
 }

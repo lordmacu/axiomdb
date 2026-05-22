@@ -93,6 +93,15 @@ fn insert_into_leaf(
             Ok(InsertResult::Inserted)
         }
         Err(DbError::HeapPageFull { .. }) => {
+            // Gate: a rightmost-leaf end-insert takes the O(1) append split
+            // (no defragment, no redistribution). Every other full-leaf case
+            // (middle leaf, or insert before the last cell) falls through to
+            // the balanced 50/50 split below.
+            if insert_pos == clustered_leaf::num_cells(&page) as usize
+                && clustered_leaf::next_leaf(&page) == clustered_leaf::NULL_PAGE
+            {
+                return append_split_leaf(storage, batch, pid, page, cell);
+            }
             clustered_leaf::defragment(&mut page);
             match clustered_leaf::insert_cell_with_overflow(
                 &mut page,
@@ -166,6 +175,56 @@ fn split_leaf(
 
     Ok(InsertResult::Split {
         sep_key: cells[split_at].key.clone(),
+        right_pid,
+    })
+}
+
+/// O(1) leaf split for a rightmost append (SQLite `balance_quick`,
+/// `research/sqlite/src/btree.c:7992`). The full `page` is kept verbatim — only
+/// its forward link changes — and the single appended `cell` becomes a fresh
+/// right sibling. Avoids the `collect_leaf_cells` + double `rebuild_leaf_page`
+/// redistribution that `split_leaf` performs.
+///
+/// Caller MUST guarantee `page` is the rightmost leaf (`next_leaf == NULL`) and
+/// `cell.key` is greater than every key in `page` (an end-insert); otherwise
+/// the leaf chain order would break. The returned separator (`cell.key`, the
+/// new leaf's only — hence smallest — key) routes searches the same way
+/// `split_leaf`'s `cells[split_at].key` does, so upward propagation via
+/// `insert_into_internal` is unchanged.
+fn append_split_leaf(
+    storage: &dyn StorageEngine,
+    batch: Option<&mut LocalPageBatch>,
+    pid: u64,
+    mut page: Page,
+    cell: OwnedLeafCell,
+) -> Result<InsertResult, DbError> {
+    let right_pid = batch_alloc_page(storage, batch, PageType::ClusteredLeaf)?;
+
+    // New right leaf inherits the old leaf's forward link (NULL for a rightmost
+    // leaf) and holds only the appended cell.
+    let mut right = Page::new(PageType::ClusteredLeaf, right_pid);
+    clustered_leaf::init_clustered_leaf(&mut right);
+    clustered_leaf::set_next_leaf(&mut right, clustered_leaf::next_leaf(&page));
+    clustered_leaf::insert_cell_with_overflow(
+        &mut right,
+        0,
+        &cell.key,
+        &cell.row_header,
+        cell.total_row_len,
+        &cell.local_row_data,
+        cell.overflow_first_page,
+    )?;
+
+    // Old leaf keeps every cell; only its forward link is rewritten.
+    clustered_leaf::set_next_leaf(&mut page, right_pid);
+    page.update_checksum();
+    storage.write_page_under_page_lock(pid, &page)?;
+
+    right.update_checksum();
+    write_page(storage, right_pid, &mut right)?;
+
+    Ok(InsertResult::Split {
+        sep_key: cell.key,
         right_pid,
     })
 }

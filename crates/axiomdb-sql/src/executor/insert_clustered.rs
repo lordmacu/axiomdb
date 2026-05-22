@@ -462,14 +462,29 @@ pub(crate) fn apply_clustered_insert_rows(
             )?;
             new_root
         } else {
-            let new_root = axiomdb_storage::clustered_tree::insert_with_batch(
-                storage,
-                Some(&mut conn_txn.local_page_batch),
-                Some(current_root),
-                &row.primary_key_bytes,
-                &new_header,
-                &row.encoded_row,
-            )?;
+            // Append boundary (the rightmost leaf just filled): use the O(1)
+            // balance_quick append split and skip the optimistic-defragment
+            // round-trip. The storage append gate keeps this correct even if a
+            // strictly-increasing batch is not actually a rightmost append.
+            let new_root = if append_biased {
+                axiomdb_storage::clustered_tree::insert_append_split(
+                    storage,
+                    Some(&mut conn_txn.local_page_batch),
+                    current_root,
+                    &row.primary_key_bytes,
+                    &new_header,
+                    &row.encoded_row,
+                )?
+            } else {
+                axiomdb_storage::clustered_tree::insert_with_batch(
+                    storage,
+                    Some(&mut conn_txn.local_page_batch),
+                    Some(current_root),
+                    &row.primary_key_bytes,
+                    &new_header,
+                    &row.encoded_row,
+                )?
+            };
             let new_image =
                 axiomdb_wal::ClusteredRowImage::new(new_root, new_header, &row.encoded_row);
             txn.record_clustered_insert(

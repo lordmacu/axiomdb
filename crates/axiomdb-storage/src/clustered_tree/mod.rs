@@ -318,6 +318,50 @@ pub fn insert_with_batch(
     }
 }
 
+/// Append-optimized insert for a strictly-increasing key (one greater than
+/// every key currently in the tree). Unlike [`insert_with_batch`] it skips the
+/// optimistic same-leaf pre-pass — the caller (the clustered apply loop at a
+/// rightmost-leaf boundary) already knows the leaf is full, so that pre-pass
+/// would only waste a descent + a defragment that frees nothing. The rightmost
+/// leaf split itself is then O(1) (`balance_quick`); see the append gate in
+/// `insert_into_leaf`. Returns the (possibly new) root pid, same contract as
+/// [`insert_with_batch`].
+///
+/// Safe for a mis-targeted (non-rightmost) key too: `insert_subtree` descends
+/// normally and the append gate only fires for a true rightmost end-insert, so
+/// the worst case is a balanced 50/50 split with the optimistic pass skipped.
+#[allow(clippy::needless_option_as_deref)]
+pub fn insert_append_split(
+    storage: &dyn StorageEngine,
+    mut batch: Option<&mut LocalPageBatch>,
+    root_pid: u64,
+    key: &[u8],
+    row_header: &RowHeader,
+    row_data: &[u8],
+) -> Result<u64, DbError> {
+    validate_row_payload(key, row_data)?;
+
+    match insert_subtree(
+        storage,
+        batch.as_deref_mut(),
+        root_pid,
+        key,
+        row_header,
+        row_data,
+    )? {
+        InsertResult::Inserted => Ok(root_pid),
+        InsertResult::Split { sep_key, right_pid } => {
+            let new_root_pid =
+                batch_alloc_page(storage, batch.as_deref_mut(), PageType::ClusteredInternal)?;
+            let mut new_root = Page::new(PageType::ClusteredInternal, new_root_pid);
+            clustered_internal::init_clustered_internal(&mut new_root, root_pid);
+            clustered_internal::insert_at(&mut new_root, 0, &sep_key, right_pid)?;
+            write_page(storage, new_root_pid, &mut new_root)?;
+            Ok(new_root_pid)
+        }
+    }
+}
+
 /// Tries the append-only fast path on a caller-provided rightmost leaf hint.
 ///
 /// This follows the same idea as PostgreSQL/SQLite append bias: only bypass
