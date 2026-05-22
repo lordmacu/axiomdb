@@ -72,10 +72,7 @@ fn listen_notify_show_notifications_across_sessions() {
     );
     assert_eq!(
         got,
-        vec![vec![
-            Value::Text(channel),
-            Value::Text("ready".into())
-        ]]
+        vec![vec![Value::Text(channel), Value::Text("ready".into())]]
     );
 
     let drained = rows(
@@ -274,10 +271,7 @@ fn rollback_to_savepoint_discards_later_notifications_only() {
     );
     assert_eq!(
         got,
-        vec![vec![
-            Value::Text(channel),
-            Value::Text("before".into())
-        ]]
+        vec![vec![Value::Text(channel), Value::Text("before".into())]]
     );
 }
 

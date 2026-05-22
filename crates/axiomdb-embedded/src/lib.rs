@@ -182,7 +182,10 @@ mod db {
         /// Ordering is load-bearing: the catalog bootstrap lands in the main file
         /// (durable, read on every open) BEFORE redo is enabled, and redo is enabled
         /// BEFORE recovery so REDO can replay committed data frames into the main file.
-        pub fn open_with_config(path: impl AsRef<Path>, config: &DbConfig) -> Result<Self, DbError> {
+        pub fn open_with_config(
+            path: impl AsRef<Path>,
+            config: &DbConfig,
+        ) -> Result<Self, DbError> {
             let path = path.as_ref();
             if path.as_os_str() == ":memory:" {
                 return Self::open_memory();

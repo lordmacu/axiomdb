@@ -50,14 +50,7 @@ impl Db {
         let stmt = parse(sql, None).unwrap();
         let snap = self.txn.snapshot();
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
-        execute_with_ctx(
-            analyzed,
-            &self.storage,
-            &self.txn,
-            &self.bloom,
-            ctx,
-        )
-        .unwrap();
+        execute_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, ctx).unwrap();
     }
 }
 
@@ -431,14 +424,7 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                         let snap = db_mem.1.snapshot();
                         let stmt = parse("CREATE TABLE t (id INT, val TEXT)", None).unwrap();
                         let analyzed = analyze(stmt, &db_mem.0, snap).unwrap();
-                        execute_with_ctx(
-                            analyzed,
-                            &db_mem.0,
-                            &db_mem.1,
-                            &bloom,
-                            &mut ctx,
-                        )
-                        .unwrap();
+                        execute_with_ctx(analyzed, &db_mem.0, &db_mem.1, &bloom, &mut ctx).unwrap();
                         (db_mem, ctx, bloom)
                     },
                     |((storage, txn, _dir), mut ctx, bloom)| {
@@ -456,22 +442,11 @@ fn bench_insert_batch_memory(c: &mut Criterion) {
                             let snap = txn.snapshot();
                             let analyzed =
                                 analyze(parse(&sql, None).unwrap(), &storage, snap).unwrap();
-                            execute_with_ctx(
-                                analyzed,
-                                &storage,
-                                &txn,
-                                &bloom,
-                                &mut ctx,
-                            )
-                            .unwrap();
+                            execute_with_ctx(analyzed, &storage, &txn, &bloom, &mut ctx).unwrap();
                         }
                         execute_with_ctx(
-                            analyze(
-                                parse("COMMIT", None).unwrap(),
-                                &storage,
-                                txn.snapshot(),
-                            )
-                            .unwrap(),
+                            analyze(parse("COMMIT", None).unwrap(), &storage, txn.snapshot())
+                                .unwrap(),
                             &storage,
                             &txn,
                             &bloom,

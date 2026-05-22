@@ -327,7 +327,6 @@ mod tests {
     use super::*;
     use crate::ast::UnnestClause;
     use crate::expr::Expr;
-    
 
     fn expr(s: &str) -> Expr {
         crate::parser::parse_expr_only(s).unwrap()

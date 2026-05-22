@@ -77,10 +77,7 @@ fn test_information_schema_scheduled_jobs_shows_registered_job() {
     assert_eq!(text_col(&rows[0], 0), "daily_cleanup");
     assert_eq!(text_col(&rows[0], 1), "@daily");
     assert_eq!(text_col(&rows[0], 2), "DELETE FROM tmp WHERE 1=1");
-    assert!(
-        bool_col(&rows[0], 4),
-        "job should be enabled by default"
-    );
+    assert!(bool_col(&rows[0], 4), "job should be enabled by default");
 }
 
 #[test]

@@ -45,7 +45,7 @@ fn db_sql_count(db: &mut Db, q: &str) -> usize {
 
 fn gen_inserts(n: usize) -> Vec<String> {
     (1..=n).map(|i| {
-        let active = if i % 2 == 0 { "TRUE" } else { "FALSE" };
+        let active = if i.is_multiple_of(2) { "TRUE" } else { "FALSE" };
         format!(
             "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
             age   = 18 + (i % 62),
@@ -98,7 +98,7 @@ fn insert_batch_prepared(db: &mut Db, n_rows: usize) {
                 Value::Int(i as i32),
                 Value::Text(format!("user_{i:06}")),
                 Value::Int((18 + (i % 62)) as i32),
-                Value::Bool(i % 2 == 0),
+                Value::Bool(i.is_multiple_of(2)),
                 Value::Real(100.0 + (i % 1000) as f64 * 0.1),
                 Value::Text(format!("u{i}@b.local")),
             ],
@@ -232,7 +232,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users").unwrap();
                 for i in 1..=ac_n {
-                    let active = i % 2 == 0;
+                    let active = i.is_multiple_of(2);
                     app.append_row_owned(vec![
                         Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),
@@ -260,7 +260,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users").unwrap();
                 for i in 1..=n_rows {
-                    let active = i % 2 == 0;
+                    let active = i.is_multiple_of(2);
                     app.append_row_owned(vec![
                         Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),
@@ -313,7 +313,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users").unwrap();
                 for i in 1..=ac_n {
-                    let active = i % 2 == 0;
+                    let active = i.is_multiple_of(2);
                     app.append_row_owned(vec![
                         Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),
@@ -357,7 +357,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users_heap").unwrap();
                 for i in 1..=ac_n {
-                    let active = i % 2 == 0;
+                    let active = i.is_multiple_of(2);
                     app.append_row_owned(vec![
                         Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),
@@ -396,7 +396,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                     app.append_int(i as i32).unwrap();
                     app.append_text(&format!("user_{i:06}")).unwrap();
                     app.append_int((18 + (i % 62)) as i32).unwrap();
-                    app.append_bool(i % 2 == 0).unwrap();
+                    app.append_bool(i.is_multiple_of(2)).unwrap();
                     app.append_real(100.0 + (i % 1000) as f64 * 0.1).unwrap();
                     app.append_text(&format!("u{i}@b.local")).unwrap();
                     app.end_row().unwrap();
@@ -438,7 +438,7 @@ fn run_scenario(scenario: &str, n_rows: usize, data_dir: &Path) {
                         axiomdb_embedded::axiomdb_appender_append_int(app, (18 + (i % 62)) as i32);
                         axiomdb_embedded::axiomdb_appender_append_bool(
                             app,
-                            if i % 2 == 0 { 1 } else { 0 },
+                            if i.is_multiple_of(2) { 1 } else { 0 },
                         );
                         axiomdb_embedded::axiomdb_appender_append_real(
                             app,
@@ -755,7 +755,7 @@ fn diagnose_prepared_insert(data_dir: &Path, n_rows: usize) {
             Value::Int(i as i32),
             Value::Text(format!("user_{i:06}")),
             Value::Int((18 + (i % 62)) as i32),
-            Value::Bool(i % 2 == 0),
+            Value::Bool(i.is_multiple_of(2)),
             Value::Real(100.0 + (i % 1000) as f64 * 0.1),
             Value::Text(format!("u{i}@b.local")),
         ]
@@ -1008,7 +1008,7 @@ fn gen_sqlite_inserts(n: usize) -> Vec<String> {
             format!(
                 "INSERT INTO bench_users VALUES ({i}, 'user_{i:06}', {age}, {active}, {score:.1}, 'u{i}@b.local')",
                 age    = 18 + (i % 62),
-                active = if i % 2 == 0 { 1 } else { 0 },
+                active = if i.is_multiple_of(2) { 1 } else { 0 },
                 score  = 100.0 + (i % 1000) as f64 * 0.1,
             )
         })
@@ -1057,7 +1057,7 @@ fn run_sqlite_scenario(scenario: &str, n_rows: usize, db: &SqliteDb) -> f64 {
                     .prepare_cached("INSERT INTO bench_users VALUES (?, ?, ?, ?, ?, ?)")
                     .unwrap();
                 for i in 1..=n {
-                    let active = if i % 2 == 0 { 1i64 } else { 0 };
+                    let active = if i.is_multiple_of(2) { 1i64 } else { 0 };
                     let age = (18 + (i % 62)) as i64;
                     let score = 100.0 + (i % 1000) as f64 * 0.1;
                     let name = format!("user_{i:06}");
@@ -1281,7 +1281,7 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users").unwrap();
                 for i in 1..=ac_n {
-                    let active = i % 2 == 0;
+                    let active = i.is_multiple_of(2);
                     app.append_row_owned(vec![
                         Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),
@@ -1316,7 +1316,7 @@ fn run_scenario_timed(scenario: &str, n_rows: usize, _data_dir: &Path, db: &mut 
                 let t0 = Instant::now();
                 let mut app = db.appender("bench_users_heap").unwrap();
                 for i in 1..=ac_n {
-                    let active = i % 2 == 0;
+                    let active = i.is_multiple_of(2);
                     app.append_row_owned(vec![
                         Value::Int(i as i32),
                         Value::Text(format!("user_{i:06}")),

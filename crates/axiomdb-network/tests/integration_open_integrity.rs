@@ -195,8 +195,12 @@ fn test_frame_only_redo_recovers_committed_rows_without_per_commit_flush() {
         let db = Database::open_with_config(dir.path(), &cfg).expect("open frame-only");
         let mut session = SessionContext::new();
         let mut cache = SchemaCache::new();
-        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY)", &mut session, &mut cache)
-            .expect("create");
+        db.execute_query(
+            "CREATE TABLE t (id INT PRIMARY KEY)",
+            &mut session,
+            &mut cache,
+        )
+        .expect("create");
         db.execute_query("INSERT INTO t VALUES (1)", &mut session, &mut cache)
             .expect("insert 1");
         db.execute_query("INSERT INTO t VALUES (2)", &mut session, &mut cache)

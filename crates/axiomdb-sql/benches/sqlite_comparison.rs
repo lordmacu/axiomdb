@@ -52,14 +52,7 @@ impl AxiomDb {
         let stmt = parse(sql, None).unwrap();
         let snap = self.txn.snapshot();
         let analyzed = analyze(stmt, &self.storage, snap).unwrap();
-        execute_with_ctx(
-            analyzed,
-            &self.storage,
-            &self.txn,
-            &self.bloom,
-            ctx,
-        )
-        .unwrap();
+        execute_with_ctx(analyzed, &self.storage, &self.txn, &self.bloom, ctx).unwrap();
     }
 
     fn setup_table(&mut self) {
