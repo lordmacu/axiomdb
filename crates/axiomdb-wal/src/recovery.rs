@@ -475,9 +475,19 @@ impl CrashRecovery {
                                     "clustered recovery missing current root for table {table_id}"
                                 ),
                             })?;
-                    let new_root = clustered_tree::delete_physical_by_key(storage, root_pid, &key)?
-                        .unwrap_or(root_pid);
-                    current_clustered_roots.insert(table_id, new_root);
+                    match clustered_tree::delete_physical_by_key(storage, root_pid, &key) {
+                        Ok(opt) => {
+                            current_clustered_roots.insert(table_id, opt.unwrap_or(root_pid));
+                        }
+                        // Frame-only: an uncommitted clustered insert that allocated
+                        // brand-new pages (e.g. the first row into a table, or a
+                        // split) never fsync'd those pages, so they did not survive
+                        // the crash. There is nothing to physically undo — the row
+                        // is already absent. (Under redo=Off the page is on disk and
+                        // this arm is not hit.)
+                        Err(DbError::PageNotFound { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
                 RecoveryOp::ClusteredRestore {
                     table_id,
@@ -557,12 +567,21 @@ impl CrashRecovery {
         // Flush all corrected pages to disk — makes recovery durable.
         storage.flush()?;
 
+        // The clustered-root HINT returned to the caller must reflect the
+        // COMMITTED durable state only. `current_clustered_roots` additionally
+        // carries active (uncommitted) txn roots for undo navigation above —
+        // but under frame-only those uncommitted pages were never fsync'd, so a
+        // leaked active root points at a page that did not survive the crash.
+        // Returning it would seed `last_clustered_roots` (→ `clustered_root_for_conn`,
+        // which the clustered insert path trusts over the catalog) with a lost
+        // page, breaking the next insert with `PageNotFound`. Committed-only is
+        // correct for both redo modes (the catalog agrees).
         Ok(RecoveryResult {
             max_committed,
             undone_txns,
             redone_pages,
             checkpoint_lsn,
-            clustered_roots: current_clustered_roots,
+            clustered_roots: committed_clustered_roots,
         })
     }
 }
