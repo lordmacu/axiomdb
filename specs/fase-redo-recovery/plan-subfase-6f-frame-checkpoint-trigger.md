@@ -2,8 +2,25 @@
 
 Phase: redo-recovery (project B) — subphase 6f (Lever 2 / Task 1)
 Spec: specs/fase-redo-recovery/spec-subfase-6f-frame-checkpoint-trigger.md
-Status: draft
+Status: in-progress
 Effort: **max** (durability/commit path + a background thread)
+
+## Progress (2026-05-22)
+
+- [x] **Step 1** — `TxnManager::is_committed` predicate (`fe082e0e`)
+- [x] **Step 2** — `maybe_checkpoint_frames` + `frame_log_durable_len` (`491687b8`)
+- [x] **Step 3** — synchronous back-pressure in `commit_durable` (hard cap) (`a3680dc8`)
+- [ ] **Step 4** — `FrameCheckpointer` background thread. NOTE: the existing
+      `axiomdb_wal::Checkpointer` (checkpoint.rs) is the STATELESS *logical-WAL*
+      checkpoint (flush pages + record Checkpoint LSN) — unrelated; the frame
+      checkpointer is new (name `FrameCheckpointer`, no collision). Needs Arc-shared
+      storage+txn (Step 5's refactor) so the thread holds handles.
+- [ ] **Step 5** — embedded `Db` wiring (Arc-share + Drop join + set the hard cap
+      from `DbConfig.max_wal_size_mb × K`). **Until the cap is wired here/Step 7 the
+      opt-in is NOT yet bounded** (hard defaults to `u64::MAX`); the *mechanism*
+      (steps 1-3) is complete + tested.
+- [ ] **Step 6** — server `SharedDatabase` wiring. **Step 7** — config K + watchdog.
+      **Step 8** — docs + A/B + close.
 
 ## Summary
 
