@@ -159,6 +159,10 @@ pub struct MmapStorage {
     /// Monotonic LSN stamped into each written page's header (`PageHeader.lsn`).
     /// `0` while redo is disabled; set past the log's highest LSN on enable.
     frame_lsn: AtomicU64,
+    /// Frame-only mode (project B subphase 6c): when set, `write_page` does NOT write the
+    /// main file (the page lives in the frame log until a checkpoint applies it). `false`
+    /// = dual-write (the main file stays authoritative). Set by `enable_frame_only_redo`.
+    frame_only: AtomicBool,
 }
 
 impl Drop for MmapStorage {
@@ -248,6 +252,7 @@ impl MmapStorage {
             frame_log: None,
             wal_index: WalIndex::default(),
             frame_lsn: AtomicU64::new(0),
+            frame_only: AtomicBool::new(false),
         })
     }
 
@@ -345,6 +350,7 @@ impl MmapStorage {
             frame_log: None,
             wal_index: WalIndex::default(),
             frame_lsn: AtomicU64::new(0),
+            frame_only: AtomicBool::new(false),
         };
         storage.write_clean_shutdown_flag(false)?;
         storage
@@ -584,7 +590,11 @@ impl MmapStorage {
             let mut buf = [0u8; PAGE_SIZE];
             buf.copy_from_slice(page.as_bytes());
             buf[LSN_OFFSET..LSN_OFFSET + 8].copy_from_slice(&lsn.to_le_bytes());
-            self.pwrite_bytes(page_id * PAGE_SIZE as u64, &buf)?;
+            // Frame-only (subphase 6c): skip the main-file write — the page lives in the
+            // frame log until a checkpoint applies it. Dual-write mode still writes main.
+            if !self.frame_only.load(Ordering::Relaxed) {
+                self.pwrite_bytes(page_id * PAGE_SIZE as u64, &buf)?;
+            }
             // Stamp the writing txn (thread-local, set per statement by the executor).
             // 0 = non-transactional/system write (e.g. bootstrap); recovery treats
             // such frames per the committed predicate in subphase 5.
@@ -1147,6 +1157,16 @@ impl MmapStorage {
         let max_lsn = log.scan()?.iter().map(|f| f.lsn).max().unwrap_or(0);
         self.frame_lsn.store(max_lsn + 1, Ordering::Relaxed);
         self.frame_log = Some(log);
+        Ok(())
+    }
+
+    /// Enables the redo log in **frame-only** mode (project B subphase 6c): `write_page`
+    /// stops writing the main file (a commit is durable via the frame fsync; the main file
+    /// is updated only by a checkpoint). The production durability switch — gated by the
+    /// `DbConfig` redo mode.
+    pub fn enable_frame_only_redo(&mut self, db_path: &Path) -> Result<(), DbError> {
+        self.enable_redo_log(db_path)?;
+        self.frame_only.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1794,6 +1814,39 @@ mod tests {
         assert!(
             !s.frame_index_contains(p_inflight),
             "all committed → recycled + wal_index cleared"
+        );
+    }
+
+    #[test]
+    fn frame_only_write_skips_the_main_file() {
+        use crate::page::HEADER_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fo.db");
+        let mut s = MmapStorage::create(&db).unwrap();
+        s.enable_frame_only_redo(&db).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        s.set_current_txn(5);
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x77;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap();
+        s.sync_frame_log().unwrap();
+        s.set_current_txn(0);
+        // Frame-only: the main file was NOT written — a raw read shows the zeroed page.
+        assert_eq!(
+            s.read_page_raw(pid).unwrap()[HEADER_SIZE],
+            0,
+            "a frame-only write must not touch the main file"
+        );
+        // But read_page returns the row, served from the frame via the wal_index.
+        s.evict_from_pool(pid);
+        assert_eq!(s.read_page(pid).unwrap().body()[0], 0x77, "served from the frame");
+        // A checkpoint applies it to the main file.
+        s.checkpoint_frames(&|t| t == 5).unwrap();
+        assert_eq!(
+            s.read_page_raw(pid).unwrap()[HEADER_SIZE],
+            0x77,
+            "checkpoint wrote the page to the main file"
         );
     }
 }
