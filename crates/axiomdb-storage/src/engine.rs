@@ -118,6 +118,14 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// Whether the page-frame redo log is active. When `true`, committed data is made
+    /// durable via [`Self::sync_frame_log`] (frame fsync) + REDO recovery on open, so
+    /// callers may drop a redundant per-commit main-file `flush()` (project B subphase
+    /// 6c). Default `false` (no redo log ⇒ keep the per-commit flush for durability).
+    fn frame_log_active(&self) -> bool {
+        false
+    }
+
     /// REDO: apply every committed frame to its page so committed data survives a
     /// crash (project B subphase 5). For each page with a committed frame (latest
     /// wins), if `frame.lsn > page.lsn` the frame's bytes are written to the page

@@ -1010,6 +1010,10 @@ impl StorageEngine for MmapStorage {
         Ok(())
     }
 
+    fn frame_log_active(&self) -> bool {
+        self.frame_log.is_some()
+    }
+
     fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
         // Recovery REDO shares the apply with the checkpoint (grow-on-redo + freelist
         // reload). On open, this materializes committed frames into the main file.

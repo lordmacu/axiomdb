@@ -175,6 +175,56 @@ fn test_dirty_open_truncates_unlogged_tables_only() {
     assert_eq!(rows[0][0], axiomdb_types::Value::BigInt(0));
 }
 
+/// Project B subphase 6c — the durability gate for dropping the per-commit flush.
+///
+/// With frame-only redo on, `ensure_database_roots` skips its `storage.flush()` (the
+/// ~14ms `sync_all` that is the dominant per-commit write cost). This test proves that
+/// committed rows still survive a crash: they live only in the frame log (no checkpoint,
+/// no clean shutdown — simulated by `std::mem::forget` of the open database), and REDO
+/// recovery replays them on reopen. If REDO did not cover the dropped flush, the rows
+/// would be lost (exactly the regression that reverted the conditional-flush attempt).
+#[test]
+fn test_frame_only_redo_recovers_committed_rows_without_per_commit_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = axiomdb_storage::DbConfig {
+        redo: Some(axiomdb_storage::RedoMode::FrameOnly),
+        ..Default::default()
+    };
+
+    {
+        let db = Database::open_with_config(dir.path(), &cfg).expect("open frame-only");
+        let mut session = SessionContext::new();
+        let mut cache = SchemaCache::new();
+        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY)", &mut session, &mut cache)
+            .expect("create");
+        db.execute_query("INSERT INTO t VALUES (1)", &mut session, &mut cache)
+            .expect("insert 1");
+        db.execute_query("INSERT INTO t VALUES (2)", &mut session, &mut cache)
+            .expect("insert 2");
+        // Drop at scope end releases the file lock but does NOT checkpoint (the
+        // clean-shutdown checkpoint trigger is subphase 6c step 6, not yet wired), so
+        // the committed rows remain ONLY in the frame log — never written to the main
+        // file (frame-only `write_page`) and never flushed (gate dropped it). Reopen
+        // must therefore REDO them from the frame log, or they are lost.
+    }
+
+    let db = Database::open_with_config(dir.path(), &cfg).expect("reopen frame-only");
+    let mut session = SessionContext::new();
+    let mut cache = SchemaCache::new();
+    let (res, _) = db
+        .execute_query("SELECT COUNT(*) FROM t", &mut session, &mut cache)
+        .expect("count after crash");
+    let axiomdb_sql::QueryResult::Rows { rows, .. } = res else {
+        panic!("expected rows");
+    };
+    assert_eq!(
+        rows[0][0],
+        axiomdb_types::Value::BigInt(2),
+        "frame-only REDO must restore both committed rows after a crash with the \
+         per-commit main-file flush dropped"
+    );
+}
+
 #[test]
 fn test_clean_reopen_preserves_unlogged_tables() {
     let dir = tempfile::tempdir().expect("tempdir");

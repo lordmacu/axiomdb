@@ -93,7 +93,7 @@ mod db {
         result::QueryResult,
         verify_and_repair_indexes_on_open, SchemaCache, SessionContext,
     };
-    use axiomdb_storage::MmapStorage;
+    use axiomdb_storage::{DbConfig, MmapStorage, RedoMode};
     use axiomdb_types::Value;
     use axiomdb_wal::TxnManager;
 
@@ -156,6 +156,59 @@ mod db {
             } else {
                 let storage = MmapStorage::create(&db_path)?;
                 CatalogBootstrap::init(&storage)?;
+                let txn = TxnManager::create(&wal_path)?;
+                (storage, txn)
+            };
+
+            Ok(Self {
+                storage,
+                txn,
+                bloom: BloomRegistry::new(),
+                schema_cache: SchemaCache::new(),
+                session: SessionContext::default(),
+                degraded: false,
+                error_msg: None,
+                _tmpdir: None,
+            })
+        }
+
+        /// Opens or creates a database at `path` with explicit configuration.
+        ///
+        /// Project B subphase 6c: `config.redo == Some(RedoMode::FrameOnly)` selects
+        /// frame-only durability (a commit is durable via the frame fsync + REDO
+        /// recovery; the per-commit main-file flush is dropped). Default config = today's
+        /// dual-write + per-commit flush.
+        ///
+        /// Ordering is load-bearing: the catalog bootstrap lands in the main file
+        /// (durable, read on every open) BEFORE redo is enabled, and redo is enabled
+        /// BEFORE recovery so REDO can replay committed data frames into the main file.
+        pub fn open_with_config(path: impl AsRef<Path>, config: &DbConfig) -> Result<Self, DbError> {
+            let path = path.as_ref();
+            if path.as_os_str() == ":memory:" {
+                return Self::open_memory();
+            }
+            let db_path = path.with_extension("db");
+            let wal_path = path.with_extension("wal");
+
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent).map_err(DbError::Io)?;
+            }
+
+            let frame_only = config.resolved_redo() == RedoMode::FrameOnly;
+            let (storage, txn) = if db_path.exists() {
+                let mut storage = MmapStorage::open(&db_path)?;
+                if frame_only {
+                    storage.enable_frame_only_redo(&db_path)?;
+                }
+                let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
+                verify_and_repair_indexes_on_open(&storage, &txn)?;
+                (storage, txn)
+            } else {
+                let mut storage = MmapStorage::create(&db_path)?;
+                CatalogBootstrap::init(&storage)?;
+                if frame_only {
+                    storage.enable_frame_only_redo(&db_path)?;
+                }
                 let txn = TxnManager::create(&wal_path)?;
                 (storage, txn)
             };

@@ -445,7 +445,15 @@ impl CatalogBootstrap {
             ids.composite_types = root;
         }
 
-        storage.flush()?;
+        // Per-commit durability for the catalog/data pages (project B subphase 6c):
+        // when the page-frame redo log is active, committed pages are made durable by
+        // the frame fsync (`commit_durable` → `sync_frame_log`) and replayed by REDO
+        // recovery on open, so this main-file `flush()` (a full `sync_all`, ~14ms on
+        // APFS — the dominant per-commit write cost) is redundant. Keep it only when
+        // redo is off (today's UNDO-only recovery relies on it for durability).
+        if !storage.frame_log_active() {
+            storage.flush()?;
+        }
         Ok(ids)
     }
 

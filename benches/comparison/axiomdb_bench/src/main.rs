@@ -729,7 +729,17 @@ fn diagnose_prepared_insert(data_dir: &Path, n_rows: usize) {
 
     let _ = std::fs::remove_dir_all(data_dir);
     std::fs::create_dir_all(data_dir).unwrap();
-    let mut db = Db::open(data_dir.join("diag_prep.db")).expect("open");
+    // A/B knob (project B 6c): AXIOMDB_BENCH_REDO=1 opens frame-only (per-commit main
+    // flush dropped, durability via the frame fsync + REDO) to measure the win.
+    let mut db = if std::env::var_os("AXIOMDB_BENCH_REDO").is_some() {
+        let cfg = axiomdb_storage::DbConfig {
+            redo: Some(axiomdb_storage::RedoMode::FrameOnly),
+            ..Default::default()
+        };
+        Db::open_with_config(data_dir.join("diag_prep.db"), &cfg).expect("open frame-only")
+    } else {
+        Db::open(data_dir.join("diag_prep.db")).expect("open")
+    };
     db.execute(
         "CREATE TABLE bench_users (id INT NOT NULL, name TEXT NOT NULL, age INT NOT NULL, \
          active BOOL NOT NULL, score REAL NOT NULL, email TEXT NOT NULL, PRIMARY KEY (id))",

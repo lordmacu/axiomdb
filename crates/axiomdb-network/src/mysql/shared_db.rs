@@ -51,7 +51,7 @@ use axiomdb_sql::{
     truncate_table_unchecked_on_open, verify_and_repair_indexes_on_open, SchemaCache,
     SessionContext,
 };
-use axiomdb_storage::{DbConfig, MmapStorage, WalDurabilityPolicy};
+use axiomdb_storage::{DbConfig, MmapStorage, RedoMode, WalDurabilityPolicy};
 use axiomdb_types::{DataType, Value};
 use axiomdb_wal::{AcquireResult, FsyncPipeline, TxnManager};
 
@@ -163,9 +163,20 @@ impl SharedDatabase {
         let db_path = data_dir.join("axiomdb.db");
         let wal_path = data_dir.join("axiomdb.wal");
 
+        // Project B subphase 6c: when the config selects frame-only redo, enable the
+        // page-frame redo log as the production durability switch (default `Off` =
+        // today's dual-write + per-commit catalog flush). ORDERING IS LOAD-BEARING:
+        // the catalog bootstrap must land in the MAIN file (durable, read on every
+        // open before recovery), so redo is enabled only AFTER `init` /
+        // `ensure_database_roots`, but BEFORE `open_with_recovery` so REDO can replay
+        // the committed data frames into the main file.
+        let frame_only = config.resolved_redo() == RedoMode::FrameOnly;
         let (storage, mut txn) = if db_path.exists() {
             let mut storage = MmapStorage::open(&db_path)?;
             CatalogBootstrap::ensure_database_roots(&storage)?;
+            if frame_only {
+                storage.enable_frame_only_redo(&db_path)?;
+            }
             let dirty_open = !storage.clean_shutdown_on_open();
             let (txn, _recovery) = TxnManager::open_with_recovery(&mut storage, &wal_path)?;
             if dirty_open {
@@ -174,8 +185,11 @@ impl SharedDatabase {
             verify_and_repair_indexes_on_open(&storage, &txn)?;
             (storage, txn)
         } else {
-            let storage = MmapStorage::create(&db_path)?;
+            let mut storage = MmapStorage::create(&db_path)?;
             CatalogBootstrap::init(&storage)?;
+            if frame_only {
+                storage.enable_frame_only_redo(&db_path)?;
+            }
             let txn = TxnManager::create(&wal_path)?;
             (storage, txn)
         };
