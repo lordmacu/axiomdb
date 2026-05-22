@@ -647,7 +647,13 @@ mod db {
 
             // Parity lever #1: build the INSERT fast-path plan now (stamps the current
             // catalog_epoch). `None` for ineligible statements ⇒ generic path on execute.
-            let insert_plan = try_prepare_insert_plan(&analyzed, &self.session);
+            // `AXIOMDB_NO_PREPARED_FAST` (checked once here, never per row) forces the
+            // generic path — an A/B knob for benchmarking the fast path's effect.
+            let insert_plan = if std::env::var_os("AXIOMDB_NO_PREPARED_FAST").is_some() {
+                None
+            } else {
+                try_prepare_insert_plan(&analyzed, &self.session)
+            };
 
             Ok(PreparedStatement {
                 analyzed,
