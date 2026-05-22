@@ -946,6 +946,99 @@ mod db {
                 "autocommit prepared INSERT inserts all rows"
             );
         }
+
+        /// Step 2 — statement atomicity: a PK-dup on the fast path errors and leaves NO
+        /// partial staged row; the surrounding txn's valid rows are unaffected.
+        #[test]
+        fn fast_path_pk_dup_leaves_no_partial_row() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("atom.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            let stmt = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+            db.execute("BEGIN").unwrap();
+            for i in 0..5i32 {
+                stmt.execute(
+                    &mut db,
+                    &[Value::Int(i), Value::Text(format!("v{i}").into())],
+                )
+                .unwrap();
+            }
+            // Duplicate PK 2 → must error, leaving no partial staged row.
+            assert!(
+                stmt.execute(&mut db, &[Value::Int(2), Value::Text("dup".into())])
+                    .is_err(),
+                "duplicate PK errors"
+            );
+            db.execute("COMMIT").unwrap();
+            assert_eq!(
+                db.query("SELECT id FROM t").unwrap().len(),
+                5,
+                "exactly the 5 valid rows; the dup left no residue"
+            );
+        }
+
+        /// Step 3 — a DDL between executes bumps `catalog_epoch`, so the plan is stale and
+        /// the next execute falls back to the generic path (no fast hit), staying correct.
+        #[test]
+        fn ddl_between_executes_falls_back_to_generic() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("ddl.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            let stmt = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+            db.execute("BEGIN").unwrap();
+            stmt.execute(&mut db, &[Value::Int(1), Value::Text("a".into())])
+                .unwrap();
+            db.execute("COMMIT").unwrap();
+            let hits_after_first = axiomdb_sql::prepared_insert_fast_hits();
+
+            // Any DDL bumps catalog_epoch → the prepared plan is no longer current.
+            db.execute("CREATE TABLE other (x INT)").unwrap();
+
+            db.execute("BEGIN").unwrap();
+            stmt.execute(&mut db, &[Value::Int(2), Value::Text("b".into())])
+                .unwrap();
+            db.execute("COMMIT").unwrap();
+            assert_eq!(
+                axiomdb_sql::prepared_insert_fast_hits(),
+                hits_after_first,
+                "post-DDL execute fell back to the generic path (no new fast hit)"
+            );
+            assert_eq!(
+                db.query("SELECT id FROM t").unwrap().len(),
+                2,
+                "both rows present (fast then generic)"
+            );
+        }
+
+        /// Step 4 — an ineligible INSERT (here `RETURNING`) builds no plan and always uses
+        /// the generic path; the statement still works.
+        #[test]
+        fn ineligible_insert_uses_generic_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("inelig.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            let stmt = db
+                .prepare("INSERT INTO t VALUES (?, ?) RETURNING id")
+                .unwrap();
+            assert!(
+                stmt.insert_plan.is_none(),
+                "RETURNING INSERT is not fast-path eligible"
+            );
+            let hits0 = axiomdb_sql::prepared_insert_fast_hits();
+            db.execute("BEGIN").unwrap();
+            stmt.execute(&mut db, &[Value::Int(1), Value::Text("a".into())])
+                .unwrap();
+            db.execute("COMMIT").unwrap();
+            assert_eq!(
+                axiomdb_sql::prepared_insert_fast_hits(),
+                hits0,
+                "ineligible INSERT → generic path (no fast hit)"
+            );
+            assert_eq!(db.query("SELECT id FROM t").unwrap().len(), 1);
+        }
     }
 
     #[cfg(test)]
