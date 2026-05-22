@@ -328,20 +328,17 @@ pub(crate) fn apply_clustered_insert_rows(
         if append_biased {
             if let Some(hinted_leaf_pid) = rightmost_leaf_hint {
                 let fast_try_started = debug_clustered_insert.then(Instant::now);
-                let append_rows: Vec<axiomdb_storage::clustered_tree::RightmostAppendRow<'_>> =
-                    rows[row_idx..]
-                        .iter()
-                        .map(|row| axiomdb_storage::clustered_tree::RightmostAppendRow {
-                            key: &row.primary_key_bytes,
-                            row_header: &new_header,
-                            row_data: &row.encoded_row,
-                        })
-                        .collect();
                 let inserted = axiomdb_storage::clustered_tree::try_insert_rightmost_leaf_batch(
                     storage,
                     Some(&mut conn_txn.local_page_batch),
                     hinted_leaf_pid,
-                    &append_rows,
+                    rows[row_idx..].iter().map(|row| {
+                        axiomdb_storage::clustered_tree::RightmostAppendRow {
+                            key: &row.primary_key_bytes,
+                            row_header: &new_header,
+                            row_data: &row.encoded_row,
+                        }
+                    }),
                 )?;
                 if let Some(started) = fast_try_started {
                     tree_insert_time += started.elapsed();

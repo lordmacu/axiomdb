@@ -358,13 +358,17 @@ pub fn try_insert_rightmost_leaf(
 /// Returns the number of rows that were appended directly. A return of `0`
 /// means the caller must fall back to the normal insert path for the first row.
 #[allow(clippy::needless_option_as_deref)]
-pub fn try_insert_rightmost_leaf_batch(
+pub fn try_insert_rightmost_leaf_batch<'a>(
     storage: &dyn StorageEngine,
     mut batch: Option<&mut LocalPageBatch>,
     hinted_leaf_pid: u64,
-    rows: &[RightmostAppendRow<'_>],
+    rows: impl IntoIterator<Item = RightmostAppendRow<'a>>,
 ) -> Result<usize, DbError> {
-    if rows.is_empty() {
+    // Rows are pulled lazily: the caller hands us `rows[idx..].iter().map(...)`,
+    // so we never materialize the "all remaining rows" Vec — that allocation was
+    // rebuilt once per leaf, i.e. O(N²) across a large append (~14ms / 50K rows).
+    let mut rows = rows.into_iter().peekable();
+    if rows.peek().is_none() {
         return Ok(0);
     }
 
