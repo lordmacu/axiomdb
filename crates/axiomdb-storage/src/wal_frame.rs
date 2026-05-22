@@ -374,6 +374,65 @@ impl FrameLog {
         self.durable.load(Ordering::Acquire)
     }
 
+    /// Commit-boundary durability: make every frame reserved before this call gap-free
+    /// and fsync'd. Snapshots the reserved end, waits until the contiguous-written
+    /// prefix covers it (so no committed frame is ever left behind a hole on crash),
+    /// fsyncs once under the fsync leader, then advances `durable`. Returns once the
+    /// reserved end is durable; concurrent callers coalesce on the same fsync.
+    ///
+    /// Mirrors PostgreSQL `XLogFlush`: `WaitXLogInsertionsToFinish` (the wait below) then
+    /// the single write+fsync that advances `LogwrtResult.Flush` (our `durable`).
+    ///
+    /// # Errors
+    /// If a lower frame's `append` failed (a permanent gap below the target), returns
+    /// `DbError` instead of blocking forever.
+    pub fn sync_to_durable(&self) -> Result<(), DbError> {
+        let target = self.write_offset.load(Ordering::Acquire);
+        if self.durable.load(Ordering::Acquire) >= target {
+            return Ok(());
+        }
+        // Wait for a gap-free written prefix covering `target` (bookkeeping mutex only).
+        {
+            let mut s = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(p) = s.poison {
+                    if p < target {
+                        return Err(DbError::Other(
+                            "frame log: durable prefix blocked by a failed append".into(),
+                        ));
+                    }
+                }
+                if s.contiguous_written >= target {
+                    break;
+                }
+                s = self.advanced.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        // fsync under the leader lock — never the bookkeeping mutex, so appends keep
+        // publishing completions while this multi-ms fsync runs. Coalesces syncers.
+        let _leader = self.fsync_leader.lock().unwrap_or_else(|e| e.into_inner());
+        if self.durable.load(Ordering::Acquire) < target {
+            let cw = self
+                .sync_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contiguous_written;
+            self.file
+                .sync_data()
+                .map_err(|e| classify_io(e, "frame log sync"))?;
+            self.durable.fetch_max(cw, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Test-only: force the reserved-end (`write_offset`) to simulate in-flight appends
+    /// without performing real I/O, so the contiguous-prefix logic can be tested
+    /// deterministically.
+    #[cfg(test)]
+    pub(crate) fn set_write_offset_for_test(&self, offset: u64) {
+        self.write_offset.store(offset, Ordering::Relaxed);
+    }
+
     /// Reads the page image of the frame whose header starts at `offset`.
     pub fn read_page_at(&self, offset: u64) -> Result<Box<[u8; PAGE_SIZE]>, DbError> {
         let mut page = Box::new([0u8; PAGE_SIZE]);
@@ -595,6 +654,55 @@ mod tests {
             log.contiguous_written_offset(),
             FILE_HDR_SIZE + 2 * FRAME_SIZE
         );
+    }
+
+    #[test]
+    fn sync_to_durable_makes_all_appends_durable_idempotently() {
+        let (_d, path) = tmp("sd.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.append(2, 1, 7, &page(1)).unwrap();
+        let end = FILE_HDR_SIZE + FRAME_SIZE;
+        log.sync_to_durable().unwrap();
+        assert_eq!(log.durable_offset(), end);
+        log.sync_to_durable().unwrap(); // idempotent fast-path (durable >= target)
+        assert_eq!(log.durable_offset(), end);
+    }
+
+    #[test]
+    fn sync_to_durable_blocks_until_a_gap_is_filled() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (_d, path) = tmp("sd-gap.wf");
+        let log = Arc::new(FrameLog::create(&path).unwrap());
+        let h = FILE_HDR_SIZE;
+        // Two frames reserved; only the higher one completed → a gap at h.
+        log.set_write_offset_for_test(h + 2 * FRAME_SIZE);
+        log.mark_written(h + FRAME_SIZE);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let (l2, d2) = (Arc::clone(&log), Arc::clone(&done));
+        let t = std::thread::spawn(move || {
+            l2.sync_to_durable().unwrap();
+            d2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "sync_to_durable must block while a gap exists below the target"
+        );
+        log.mark_written(h); // fill the gap → the waiter proceeds
+        t.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(log.durable_offset(), h + 2 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn sync_to_durable_errors_on_a_poisoned_gap() {
+        let (_d, path) = tmp("sd-poison.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.set_write_offset_for_test(FILE_HDR_SIZE + FRAME_SIZE);
+        log.mark_poison(FILE_HDR_SIZE); // a failed append below the target
+        assert!(log.sync_to_durable().is_err());
     }
 
     #[test]
