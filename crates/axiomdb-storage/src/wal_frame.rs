@@ -477,6 +477,39 @@ impl FrameLog {
         Ok(page)
     }
 
+    /// Reads the frame at `offset` **only if it is still a valid frame for `page_id`**
+    /// under the current run salt — one `pread` of header+page that verifies `page_id`,
+    /// `salt`, and crc. Returns `None` when the offset is stale: the log was recycled
+    /// (salt changed or the offset is now beyond EOF) or it points at a different page.
+    /// The read path uses this so a wal-index hit that races a checkpoint's recycle
+    /// safely falls back to the (now-current) main file instead of returning wrong bytes.
+    pub fn read_page_if_for(
+        &self,
+        offset: u64,
+        page_id: u64,
+    ) -> Result<Option<Box<[u8; PAGE_SIZE]>>, DbError> {
+        let mut buf = vec![0u8; FRAME_SIZE as usize];
+        match self.file.read_exact_at(&mut buf, offset) {
+            Ok(()) => {}
+            // Beyond EOF ⇒ the log was truncated by a recycle ⇒ stale.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(classify_io(e, "frame log read_if_for")),
+        }
+        let (hdr, page) = buf.split_at(FRAME_HDR_SIZE);
+        if le_u64(&hdr[0..8]) != page_id {
+            return Ok(None); // a different page (a recycled offset reused by a new frame)
+        }
+        if le_u64(&hdr[24..32]) != self.salt.load(Ordering::Relaxed) {
+            return Ok(None); // a previous run / post-recycle salt ⇒ stale
+        }
+        if frame_crc(&hdr[0..FRAME_HDR_CRC_PREFIX], page) != le_u32(&hdr[32..36]) {
+            return Ok(None); // torn ⇒ stale
+        }
+        let mut out = Box::new([0u8; PAGE_SIZE]);
+        out.copy_from_slice(page);
+        Ok(Some(out))
+    }
+
     /// Scans the valid prefix: every frame whose salt matches the run AND whose crc
     /// verifies. Stops at the first invalid/partial frame (the torn tail).
     pub fn scan(&self) -> Result<Vec<FrameRef>, DbError> {
@@ -777,6 +810,20 @@ mod tests {
         // New appends after a recycle are scannable under the fresh salt.
         log.append(3, 2, 8, &page(2)).unwrap();
         assert_eq!(log.scan().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn read_page_if_for_verifies_page_and_salt() {
+        let (_d, path) = tmp("rif.wf");
+        let log = FrameLog::create(&path).unwrap();
+        let off = log.append(7, 1, 3, &page(0xAB)).unwrap();
+        // Matching page_id under the current salt → Some.
+        assert_eq!(log.read_page_if_for(off, 7).unwrap().unwrap()[0], 0xAB);
+        // Wrong page_id (a stale offset reused for another page) → None.
+        assert!(log.read_page_if_for(off, 8).unwrap().is_none());
+        // After a recycle the file is truncated + the salt changes → the old offset is stale.
+        log.recycle().unwrap();
+        assert!(log.read_page_if_for(off, 7).unwrap().is_none());
     }
 
     #[test]

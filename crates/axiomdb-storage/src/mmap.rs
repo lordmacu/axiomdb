@@ -766,10 +766,15 @@ impl StorageEngine for MmapStorage {
         // so warm reads never pay the index lookup.
         if let Some(frame_log) = &self.frame_log {
             if let Some(frame) = self.wal_index.latest(page_id) {
-                let bytes = frame_log.read_page_at(frame.offset)?;
-                let arc = Arc::new(Page::from_bytes(*bytes)?);
-                let arc = self.buffer_pool.insert(page_id, arc);
-                return Ok(crate::page_ref::PageRef::from_arc(arc));
+                // Verify the frame is still for this page under the current salt: a
+                // concurrent checkpoint may have recycled the log, leaving a stale
+                // wal-index offset. On a mismatch the checkpoint already applied this page
+                // to the main file (apply precedes recycle), so fall through to mmap.
+                if let Some(bytes) = frame_log.read_page_if_for(frame.offset, page_id)? {
+                    let arc = Arc::new(Page::from_bytes(*bytes)?);
+                    let arc = self.buffer_pool.insert(page_id, arc);
+                    return Ok(crate::page_ref::PageRef::from_arc(arc));
+                }
             }
         }
         // Cold miss: take the mmap read lock, read straight into an Arc<Page>
@@ -1719,5 +1724,31 @@ mod tests {
                 "log recycled — nothing left to apply"
             );
         }
+    }
+
+    #[test]
+    fn read_falls_back_to_main_when_frame_was_recycled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fb.db");
+        let mut s = MmapStorage::create(&db).unwrap();
+        s.enable_redo_log(&db).unwrap();
+        let pid = s.alloc_page(PageType::Data).unwrap();
+        s.set_current_txn(5);
+        let mut p = Page::new(PageType::Data, pid);
+        p.body_mut()[0] = 0x9A;
+        p.update_checksum();
+        s.write_page(pid, &p).unwrap(); // dual-write: main + frame + wal_index
+        s.sync_frame_log().unwrap();
+        s.set_current_txn(0);
+        // A checkpoint recycles the frame log (all committed); a still-live wal-index
+        // offset is now stale. The next read must verify it, fail, and fall back to the
+        // main file (which the checkpoint made current).
+        s.checkpoint_frames(&|t| t == 5).unwrap();
+        s.evict_from_pool(pid); // force the miss path
+        assert_eq!(
+            s.read_page(pid).unwrap().body()[0],
+            0x9A,
+            "read falls back to the main file when the frame was recycled"
+        );
     }
 }
