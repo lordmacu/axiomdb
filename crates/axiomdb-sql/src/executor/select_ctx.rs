@@ -1,3 +1,15 @@
+/// Benchmark-fairness knob: when `AXIOMDB_NO_COUNT_CACHE` is set in the
+/// environment, the per-session `SELECT COUNT(*)` memoization is disabled so the
+/// query always scans fresh. Engines like SQLite and PostgreSQL never memoize
+/// COUNT(*), so a like-for-like scan-vs-scan comparison must turn ours off;
+/// otherwise the bench measures an O(1) cache hit against their O(n) scan.
+/// Mirrors the `AXIOMDB_BENCH_REDO` durability knob. Read once and cached.
+fn count_cache_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("AXIOMDB_NO_COUNT_CACHE").is_some())
+}
+
 fn execute_select_ctx(
     mut stmt: SelectStmt,
     exec_ctx: &ExecutionContext,
@@ -180,7 +192,8 @@ fn execute_select_ctx(
                     // (post-rollback). Autocommit queries each commit
                     // immediately, so the counter always reflects
                     // committed state.
-                    let cacheable = ctx.autocommit && !ctx.in_explicit_txn;
+                    let cacheable =
+                        ctx.autocommit && !ctx.in_explicit_txn && !count_cache_disabled();
                     let count = match cacheable
                         .then(|| {
                             ctx.get_count_star(
