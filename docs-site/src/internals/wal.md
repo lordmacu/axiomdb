@@ -1055,3 +1055,57 @@ WAL passes <code>nWalCkpt</code> frames). AxiomDB splits the threshold into a so
 latency.
 </div>
 </div>
+
+## Single-fsync commit — the commit marker in the frame log
+
+Under frame-only redo a durable `Strict` commit originally paid **two `fsync`s**: one for
+the page-frame log (data durable) and one for the logical WAL's `Commit` record (so
+recovery could tell which `txn_id`s committed). PostgreSQL has **one** WAL, so its commit
+is a single `XLogFlush` (`RecordTransactionCommit`). AxiomDB now matches that: the commit
+decision lives **inside the frame log**, so one frame-log `fsync` makes data *and* commit
+durable together.
+
+**Compact commit marker (variable-stride frame log).** Alongside full 16 KiB page frames,
+the frame log can append a 36-byte **commit marker** — just the frame header with the
+sentinel `page_id == COMMIT_MARKER` (`u64::MAX`), carrying the committed `txn_id`. A
+marker is *not* a full frame, so the log is now **variable-stride**: `scan`, the
+gap-free durable-prefix fold (`mark_written(offset, len)`), and `open`'s end-offset all
+advance by each record's actual length. A file-format bump to **v2** gates the
+variable-stride reader; a v1 log (page frames only) still opens and recovers via the
+logical-WAL predicate (no markers to read).
+
+**Commit path (one fsync).** `commit_durable` appends the marker **after** the txn's data
+frames and **before** the single `sync_frame_log` — preserving write-ahead order (data
+durable before the commit marker). The logical WAL's `Commit` record is then only
+`flush_no_sync`'d (best-effort, OS cache). `redo=off` is unchanged: it has no frame log,
+so it keeps `fsync`ing the logical WAL as its durability source.
+
+**Recovery (committed-ness from markers, UNION the logical scan).** Under frame-only,
+`recover` derives the committed set from `committed_txns_from_frames()` (the markers)
+**unioned** with the logical-WAL `Commit` scan. The union is the safe choice: the marker
+is `fsync`'d *before* the logical `Commit` is even written, so *"logical Commit durable ⇒
+marker durable"* — the union equals the marker set once the 2nd fsync is dropped, yet in
+the dual-durable interim it also covers any commit a path failed to mark. A marker'd txn
+is reconciled out of the undo set and its clustered root moved to the committed roots, so
+it is redone (not undone) even if its logical `Commit` was lost. The crash suite's **T8**
+proves a committed insert survives on the marker **alone** (logical `Commit` truncated
+away).
+
+**Measured.** `fsyncs/commit` drops from `1+1` to `1+0` (`axiomdb_bench --diagnose-1fsync`,
+interleaved A/B via a `force_double_fsync` toggle). On **Linux (Lima, real virtio fsync
+~50 µs)** that is **1.2–1.4× FULL autocommit**, growing toward ~2× as the device fsync gets
+costlier (real SSD / cloud / network disks). On **macOS APFS the win is ~0** — APFS
+coalesces the second consecutive `fsync` (4.0 ms either way), so AxiomDB was already at the
+single-fsync floor there. `NORMAL`, reads, and batch are unchanged.
+
+<div class="callout callout-advantage">
+<span class="callout-icon">⚡</span>
+<div class="callout-body">
+<span class="callout-label">vs PostgreSQL</span>
+This is PostgreSQL's single-WAL commit (<code>RecordTransactionCommit</code> → one
+<code>XLogFlush</code>), reached without merging the two logs: the commit marker rides the
+frame log so one <code>fsync</code> covers data + commit. At <code>synchronous=FULL</code>
+AxiomDB now does <strong>one fsync per commit — fsync-parity with SQLite</strong> — instead
+of two, a real latency win on every platform whose <code>fsync</code> is not coalesced.
+</div>
+</div>

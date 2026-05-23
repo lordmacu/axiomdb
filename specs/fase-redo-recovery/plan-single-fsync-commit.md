@@ -3,7 +3,12 @@
 Phase: redo-recovery (project B)
 Task: 1 fsync per durable commit under frame-only redo
 Spec: specs/fase-redo-recovery/spec-single-fsync-commit.md
-Status: in-progress — Steps 1-5 DONE (Step 6 docs remaining). **Step 5b (the flip):**
+Status: DONE — Steps 1-6 complete (commits 51ebfd57, 22717e75, e2dc85bf + docs). internals/
+wal.md "Single-fsync commit" section added. ⚠️ Workspace close (nextest --workspace / clippy
+--workspace / fmt --check) PENDING: a concurrent edit broke `axiomdb-sql/src/session.rs:1771`
+(`table_epoch_cache` is now `(u64,u64)` but the line compares to a `u64`) — unrelated to this
+work; axiomdb-storage + axiomdb-wal are green + clippy-clean on their own. Earlier status:
+Steps 1-5 DONE (Step 6 docs remaining). **Step 5b (the flip):**
 commit_durable does ONE fsync under frame-only (drop commit_data_sync; logical WAL
 flush_no_sync). MEASURED (interleaved A/B, `--diagnose-1fsync`, force_double_fsync toggle):
 fsyncs/commit 1+0 (was 1+1); **Lima 1.21–1.44× FULL autocommit** (real virtio fsync ~50µs),
