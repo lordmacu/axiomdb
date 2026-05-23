@@ -3,7 +3,13 @@
 Phase: redo-recovery (project B)
 Task: 1 fsync per durable commit under frame-only redo
 Spec: specs/fase-redo-recovery/spec-single-fsync-commit.md
-Status: DONE — Steps 1-6 complete (commits 51ebfd57, 22717e75, e2dc85bf + docs). internals/
+Status: DONE + CLOSED — Steps 1-6 complete (commits 51ebfd57, 22717e75, e2dc85bf + docs).
+Workspace close GREEN: nextest --workspace 4721/4721, clippy --workspace clean. (fmt: my
+files clean; pre-existing drift in 3 untouched files — mmap.rs checkpoint test,
+integration_is_committed.rs, integration_checkpoint_backpressure.rs — not from this work.
+Lima disk had hit 98% → freed; the alloc concurrency test was ENOSPC, not a regression.)
+Original plan note follows.
+Old status: DONE — Steps 1-6 complete (commits 51ebfd57, 22717e75, e2dc85bf + docs). internals/
 wal.md "Single-fsync commit" section added. ⚠️ Workspace close (nextest --workspace / clippy
 --workspace / fmt --check) PENDING: a concurrent edit broke `axiomdb-sql/src/session.rs:1771`
 (`table_epoch_cache` is now `(u64,u64)` but the line compares to a `u64`) — unrelated to this
