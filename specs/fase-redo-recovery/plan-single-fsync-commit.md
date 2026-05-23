@@ -3,7 +3,10 @@
 Phase: redo-recovery (project B)
 Task: 1 fsync per durable commit under frame-only redo
 Spec: specs/fase-redo-recovery/spec-single-fsync-commit.md
-Status: in-progress (Step 1)
+Status: in-progress — Steps 1-3 DONE (commit 51ebfd57: marker + variable-stride scan +
+length-aware durable prefix + committed_txns_from_markers; storage 385/385). Next: Step 4
+(recovery sources committed-ness from markers). Steps 1-3 were one inseparable correctness
+unit so they landed together.
 
 ## Summary
 
