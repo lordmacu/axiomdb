@@ -3,8 +3,15 @@
 Phase: redo-recovery (project B) — WAL-volume optimization
 Task: Borrow PostgreSQL's full-page-image hole elision for AxiomDB's page-frame
 redo log, to cut WAL volume (most impactful for autocommit, our worst write gap).
-Status: in-progress — Step 1 (foundation) DONE + pushed; the format/write-path
-change remains. Picked up by another agent.
+Status: PAUSED — measure-first gate FAILED for *throughput* (2026-05-22). The hole
+fraction is large (autocommit 57.5%, batch 33.3%) but it does NOT convert to
+autocommit throughput on macOS APFS (FULL ~0%: fsync is fixed-cost; NORMAL: the
+16KB frame pwrite is a tiny share of the ~22-34µs/commit, executor/B-tree-bound).
+Hole-skipping is a WAL-VOLUME win (disk/checkpoint/recovery/bandwidth-bound disks),
+NOT a write-speed lever. Foundation (`free_hole` + tests) stays; the format change
+is deferred. See "Measure-first RESULT" below. Pivot: the autocommit cost is the
+**2 fsyncs/commit** (frame log + logical WAL) vs PG's single WAL — a logging
+consolidation, not hole elision.
 
 ## Progress / Handoff (2026-05-22)
 
@@ -49,6 +56,32 @@ The safety crux (are the hole bounds correct?) is implemented and **proven**, wi
    (`write → frame → reconstruct == original`). `redo=Off` must stay unaffected.
 6. **Measure-first** — confirm the autocommit win (~10-30% est.) before/after; abort
    if < ~10%. The hole fraction is ~56% for autocommit, ~12% for the append-batch.
+
+### 🛑 Measure-first RESULT (2026-05-22) — gate FAILED for throughput
+
+Measured with a gated read-only counter (`hole_measure::record`, reuses the proven
+`free_hole`) + a throwaway hole-skip pwrite A/B (both reverted after measuring;
+never shipped). Frame-only redo forced (`AXIOMDB_BENCH_REDO=1`).
+
+- **Hole fraction (definitive, hardware-independent, Lima == macOS):** autocommit
+  **57.5%** (2.83/4.93 MB over 301 leaf frames), batch **33.3%** (4.31/12.96 MB
+  over 791 frames). Batch is *worse* than the spec's ~12% estimate: the rightmost
+  leaf is re-framed partially as it fills (~2.2 frames/leaf), not "once when full".
+- **Autocommit throughput A/B (macOS APFS, interleaved OFF/ON):**
+  - `synchronous=FULL` (fsync/commit): **−1.2%** (clean). At ~260 ops/s a commit is
+    ~3.9ms = 2 APFS fsyncs; APFS fsync is fixed-cost, so a smaller frame ≈ no win.
+  - `synchronous=NORMAL` (deferred fsync, the vs-SQLite mode): throwaway shows −24%
+    but that is a **sparse-stride artifact** (the throwaway keeps `FRAME_SIZE` stride
+    → sparse file → slower APFS writes); cleanly, the frame pwrite is a tiny share of
+    the ~22-34µs/commit, so the real win is < 10% regardless.
+
+**Verdict:** per the gate ("abort if < ~10%"), the format change is **NOT** justified
+as a throughput optimization. It remains valid as a *volume* optimization (−57%/−33%
+WAL bytes) for disk footprint, checkpoint/recovery speed, and bandwidth-bound
+(cloud/network) storage where fsync scales with bytes. The autocommit throughput
+lever is elsewhere: **collapse the 2 fsyncs/commit → 1** (consolidate the frame log
+and the logical WAL toward PostgreSQL's single-WAL model). See
+`memory/lessons.md` and the fsync-consolidation brainstorm.
 
 ## Context
 
