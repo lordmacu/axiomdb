@@ -27,6 +27,41 @@ Order: verify the validator (Step 1) → add the cached field + validator (2) �
 - [x] catalog_epoch / write_commit_seq / is_table_epoch_current exist; PreparedInsertPlan exists
 Blocks: nothing.
 
+## ✅ Correctness VERIFIED (2026-05-23) — caching Arc<ResolvedTable> is safe; v1 = no-secondary-index tables
+
+The risky intellectual work is DONE. Findings (read the code):
+- `resolve_insert_target` returns `Arc<ResolvedTable>` (insert_heap_ctx.rs:24); it calls
+  `resolve_table_cached` + `search_path[i].clone()` — THE per-row String allocs + SipHash. Arc ⇒
+  cheap to cache/clone.
+- `ResolvedTable { def, columns, indexes, constraints, foreign_keys }` (catalog/resolver.rs) = the
+  SCHEMA. `execute_insert_ctx_with_resolved` reads `resolved.def.id/.table_name/.is_clustered()/
+  .columns` — it does **NOT** read a root from `resolved`. The live clustered root comes from
+  `clustered_root_for_conn` (per-txn, Attack 14). So the cached resolve can't go stale on the
+  clustered root. Schema only changes on DDL → caught by the validator. ✅ safe.
+- SECONDARY index roots DO mutate per insert (index_maintenance.rs: AtomicU64 + update_index_root).
+  If the insert read them from cached `resolved.indexes`, splits would make them stale. So **v1
+  GATES the cache to tables with NO secondary indexes** (`resolved.indexes.is_empty()`) — the bench
+  qualifies (`bench_users` has only `PRIMARY KEY (id)`, no secondary). Indexed tables fall back to
+  the per-row resolve (correct, unoptimized) — a follow-on can verify index-root liveness.
+- Resolve at PREPARE: `resolve_table_cached(storage, txn, ctx, None, &s.table)` (Optional conn → works
+  outside a txn). execute is `&self` (no &mut) → eager cache at prepare; on epoch/seq-miss the existing
+  fallback (generic path) handles it (no re-cache needed for v1 — degrades to per-row resolve after DDL,
+  which is rare + correct).
+
+### Turn-key implementation recipe (mechanical now)
+1. `PreparedInsertPlan { catalog_epoch_at_build, write_seq_at_build: u64, resolved: Arc<ResolvedTable> }`
+   (ensure ResolvedTable: Debug or drop derive). `resolved_if_current(ctx, txn) -> Option<&Arc<ResolvedTable>>`
+   = epoch && write_seq match.
+2. `try_prepare_insert_plan(analyzed, ctx, storage, txn)`: eligible INSERT → resolve_table_cached(…, None, &s.table);
+   if `resolved.indexes.is_empty()` → Some(plan{resolved, epoch, seq}); else None.
+3. `Db::prepare` (lib.rs): pass `&*self.storage, &self.txn` to try_prepare_insert_plan.
+4. `execute` (lib.rs ~709): fast arm uses `resolved_if_current(&db.session,&db.txn)` → pass
+   `Some(rt.clone())` to execute_prepared_insert.
+5. `execute_prepared_insert(stmt, cached: Option<Arc<ResolvedTable>>, …)`:
+   `let resolved = match cached { Some(rt)=>rt, None=>resolve_insert_target(&stmt,&exec_ctx,&mut conn,ctx)? };`
+6. `resolve_table_cached` (shared.rs): add a `RESOLVE_CALLS` AtomicU64 + getter (test asserts the fast
+   path → resolve calls == 1 per batch, not N).
+
 ## Affected files
 Modified:
 - `crates/axiomdb-sql/src/executor/prepared_insert.rs` — `PreparedInsertPlan` gains `resolved` +
