@@ -47,6 +47,9 @@ pub enum DbError {
     #[error("table '{name}' not found")]
     TableNotFound { name: String },
 
+    #[error("procedure '{name}' does not exist")]
+    ProcedureNotFound { name: String },
+
     #[error("database '{name}' not found")]
     DatabaseNotFound { name: String },
 
@@ -263,6 +266,9 @@ pub enum DbError {
     #[error("table '{schema}.{name}' already exists")]
     TableAlreadyExists { schema: String, name: String },
 
+    #[error("procedure '{schema}.{name}' already exists")]
+    ProcedureAlreadyExists { schema: String, name: String },
+
     #[error("database '{name}' already exists")]
     DatabaseAlreadyExists { name: String },
 
@@ -388,6 +394,8 @@ impl DbError {
             // ── Schema ────────────────────────────────────────────────────
             DbError::ParseError { .. } => "42601",
             DbError::TableNotFound { .. } => "42P01",
+            DbError::ProcedureNotFound { .. } => "42883",
+            DbError::ProcedureAlreadyExists { .. } => "42723",
             DbError::TableAlreadyExists { .. } => "42P07",
             DbError::IndexAlreadyExists { .. } => "42P07",
             DbError::SchemaAlreadyExists { .. } => "42P06",
@@ -438,6 +446,38 @@ mod tests {
 
     fn generic_io_err() -> std::io::Error {
         std::io::Error::other("generic error")
+    }
+
+    #[test]
+    fn procedure_error_sqlstates() {
+        assert_eq!(
+            DbError::ProcedureNotFound { name: "p".into() }.sqlstate(),
+            "42883"
+        );
+        assert_eq!(
+            DbError::ProcedureAlreadyExists {
+                schema: "public".into(),
+                name: "p".into()
+            }
+            .sqlstate(),
+            "42723"
+        );
+    }
+
+    #[test]
+    fn procedure_error_messages() {
+        assert_eq!(
+            DbError::ProcedureNotFound { name: "p".into() }.to_string(),
+            "procedure 'p' does not exist"
+        );
+        assert_eq!(
+            DbError::ProcedureAlreadyExists {
+                schema: "public".into(),
+                name: "p".into()
+            }
+            .to_string(),
+            "procedure 'public.p' already exists"
+        );
     }
 
     #[test]
