@@ -1034,3 +1034,64 @@ fn count_star_cache_reflects_writes_and_is_not_stale() {
         "cached count after delete must be correct"
     );
 }
+
+/// PRODUCTION CONCURRENCY check: session A's per-session COUNT(*) cache must NOT
+/// return a stale count after ANOTHER session B commits an insert. Under MVCC
+/// autocommit, A's next query takes a fresh snapshot that must see B's commit.
+/// If A returns the stale cached count (missing B's row), the cache is unsafe
+/// for the multi-connection server.
+#[test]
+fn count_star_cache_sees_other_session_commits() {
+    let (mut s, mut txn, mut bloom, mut a) = setup_ctx();
+    let mut b = axiomdb_sql::SessionContext::new();
+
+    ok(
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    for i in 1..=100i64 {
+        ok(
+            &format!("INSERT INTO c VALUES ({i}, {i})"),
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut a,
+        );
+    }
+    // A counts → caches in A's session.
+    assert_eq!(
+        scalar_int(
+            "SELECT COUNT(*) FROM c",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut a
+        ),
+        100
+    );
+
+    // B (a DIFFERENT session) inserts + commits (autocommit).
+    ok(
+        "INSERT INTO c VALUES (101, 101)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut b,
+    );
+
+    // A counts again: fresh autocommit snapshot MUST see B's committed row → 101.
+    let a_count = scalar_int(
+        "SELECT COUNT(*) FROM c",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    assert_eq!(
+        a_count, 101,
+        "session A's COUNT(*) must see session B's committed insert (got {a_count} — STALE per-session cache)"
+    );
+}

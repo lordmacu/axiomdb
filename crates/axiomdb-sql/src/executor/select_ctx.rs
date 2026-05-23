@@ -122,8 +122,7 @@ fn execute_select_ctx(
         // Phase 22b.6 extracts equality predicates for URL construction. The full
         // WHERE is always preserved for local filtering (correctness guarantee).
         if resolved.def.id >= FOREIGN_TABLE_ID_BASE {
-            let (pushed, _) =
-                extract_fdw_pushable(stmt.where_clause.as_ref(), &resolved.columns);
+            let (pushed, _) = extract_fdw_pushable(stmt.where_clause.as_ref(), &resolved.columns);
 
             let pushed_limit: Option<u64> = stmt.limit.as_ref().and_then(|e| match e {
                 Expr::Literal(Value::Int(n)) if *n >= 0 => Some(*n as u64),
@@ -181,10 +180,15 @@ fn execute_select_ctx(
                     // (post-rollback). Autocommit queries each commit
                     // immediately, so the counter always reflects
                     // committed state.
-                    let cacheable =
-                        ctx.autocommit && !ctx.in_explicit_txn;
+                    let cacheable = ctx.autocommit && !ctx.in_explicit_txn;
                     let count = match cacheable
-                        .then(|| ctx.get_count_star(resolved.def.id, resolved.def.schema_version))
+                        .then(|| {
+                            ctx.get_count_star(
+                                resolved.def.id,
+                                resolved.def.schema_version,
+                                txn.max_committed(),
+                            )
+                        })
                         .flatten()
                     {
                         Some(c) => c,
@@ -196,17 +200,14 @@ fn execute_select_ctx(
                                     snap,
                                 )?
                             } else {
-                                HeapChain::count_visible(
-                                    storage,
-                                    resolved.def.root_page_id,
-                                    snap,
-                                )?
+                                HeapChain::count_visible(storage, resolved.def.root_page_id, snap)?
                             };
                             if cacheable {
                                 ctx.cache_count_star(
                                     resolved.def.id,
                                     resolved.def.schema_version,
                                     c,
+                                    txn.max_committed(),
                                 );
                             }
                             c
@@ -360,14 +361,22 @@ fn execute_select_ctx(
                 }
                 // GROUPING() args may reference columns — recurse.
                 crate::expr::Expr::Grouping { args, .. } => {
-                    for a in args { collect_expr_columns(a, mask); }
+                    for a in args {
+                        collect_expr_columns(a, mask);
+                    }
                 }
                 // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
                 crate::expr::Expr::ArrayConstructor { elements } => {
-                    for a in elements { collect_expr_columns(a, mask); }
+                    for a in elements {
+                        collect_expr_columns(a, mask);
+                    }
                 }
                 // Phase 20.4, Step 5 — array subscript: recurse into array and index.
-                crate::expr::Expr::Subscript { array, index, slice } => {
+                crate::expr::Expr::Subscript {
+                    array,
+                    index,
+                    slice,
+                } => {
                     collect_expr_columns(array, mask);
                     collect_expr_columns(index, mask);
                     if let Some(s) = slice {
@@ -403,15 +412,23 @@ fn execute_select_ctx(
                 }
                 // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
                 crate::expr::Expr::XmlElement { attrs, content, .. } => {
-                    for (e, _) in attrs { collect_expr_columns(e, mask); }
-                    for e in content { collect_expr_columns(e, mask); }
+                    for (e, _) in attrs {
+                        collect_expr_columns(e, mask);
+                    }
+                    for e in content {
+                        collect_expr_columns(e, mask);
+                    }
                 }
                 crate::expr::Expr::XmlForest { items } => {
-                    for (e, _) in items { collect_expr_columns(e, mask); }
+                    for (e, _) in items {
+                        collect_expr_columns(e, mask);
+                    }
                 }
                 crate::expr::Expr::XmlRoot { doc, .. } => collect_expr_columns(doc, mask),
                 crate::expr::Expr::XmlConcat { args } => {
-                    for e in args { collect_expr_columns(e, mask); }
+                    for e in args {
+                        collect_expr_columns(e, mask);
+                    }
                 }
                 crate::expr::Expr::XmlQuery { doc, .. } => collect_expr_columns(doc, mask),
             }
@@ -463,12 +480,20 @@ fn execute_select_ctx(
                         }
                     }
                     // ORDER BY, GROUP BY, HAVING
-                    for ob in &stmt.order_by { collect_expr_columns(&ob.expr, &mut mask); }
-                    for gb in stmt.group_by.exprs() { collect_expr_columns(gb, &mut mask); }
+                    for ob in &stmt.order_by {
+                        collect_expr_columns(&ob.expr, &mut mask);
+                    }
+                    for gb in stmt.group_by.exprs() {
+                        collect_expr_columns(gb, &mut mask);
+                    }
                     if let Some(ref having) = stmt.having {
                         collect_expr_columns(having, &mut mask);
                     }
-                    if mask.iter().all(|&b| b) { None } else { Some(mask) }
+                    if mask.iter().all(|&b| b) {
+                        None
+                    } else {
+                        Some(mask)
+                    }
                 };
                 if let Some(ref wc) = stmt.where_clause {
                     // Phase 39.20: compile a raw-byte BatchPredicate so rows that
@@ -669,9 +694,11 @@ fn execute_select_ctx(
                     )?
                 }
             }
-            crate::planner::AccessMethod::IndexLookup { index_def, key, covers_predicate }
-                if resolved.def.is_clustered() && index_def.is_primary =>
-            {
+            crate::planner::AccessMethod::IndexLookup {
+                index_def,
+                key,
+                covers_predicate,
+            } if resolved.def.is_clustered() && index_def.is_primary => {
                 // ── Clustered PK point lookup (Phase 39.15) ──────────────────
                 // Direct B-tree search returns full row inline — no heap fetch.
                 // The exact-PK key reproduces the entire WHERE, so skip the
@@ -724,7 +751,12 @@ fn execute_select_ctx(
                         BTree::range_in(storage, index_def.root_page_id, Some(&lo), Some(&hi))?;
                     let mut result = Vec::with_capacity(pairs.len());
                     for (rid, _k) in pairs {
-                        if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap.clone())? {
+                        if !HeapChain::is_slot_visible(
+                            storage,
+                            rid.page_id,
+                            rid.slot_id,
+                            snap.clone(),
+                        )? {
                             continue;
                         }
                         if let Some(values) =
@@ -763,19 +795,19 @@ fn execute_select_ctx(
                     snap,
                 )?
             }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. }
-                if resolved.def.is_clustered() =>
-            {
-                clustered_secondary_rows_for_range(
-                    storage,
-                    &resolved,
-                    index_def,
-                    lo.as_deref(),
-                    hi.as_deref(),
-                    snap,
-                )?
-            }
-            crate::planner::AccessMethod::IndexRange { index_def, lo, hi, .. } => {
+            crate::planner::AccessMethod::IndexRange {
+                index_def, lo, hi, ..
+            } if resolved.def.is_clustered() => clustered_secondary_rows_for_range(
+                storage,
+                &resolved,
+                index_def,
+                lo.as_deref(),
+                hi.as_deref(),
+                snap,
+            )?,
+            crate::planner::AccessMethod::IndexRange {
+                index_def, lo, hi, ..
+            } => {
                 // Range scan: B-Tree entries → batch heap reads by page.
                 // Inspired by PostgreSQL's BitmapHeapScan: collect RIDs, group by
                 // page_id, read each heap page ONCE, extract all matching rows.
@@ -839,11 +871,13 @@ fn execute_select_ctx(
                 let n_table_cols = resolved.columns.len();
                 let mut result = Vec::with_capacity(pairs.len());
                 for (rid, key_bytes) in pairs {
-                    if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap.clone())? {
+                    if !HeapChain::is_slot_visible(storage, rid.page_id, rid.slot_id, snap.clone())?
+                    {
                         continue;
                     }
-                    let decoded =
-                        crate::index_maintenance::decode_secondary_entry_values(index_def, &key_bytes);
+                    let decoded = crate::index_maintenance::decode_secondary_entry_values(
+                        index_def, &key_bytes,
+                    );
                     let mut row_values = vec![Value::Null; n_table_cols];
                     match decoded {
                         Ok((all_key_vals, include_vals)) => {
@@ -856,7 +890,9 @@ fn execute_select_ctx(
                                 }
                             }
                             if *n_include_cols == index_def.include_columns.len() {
-                                for (include_pos, col_idx) in index_def.include_columns.iter().enumerate() {
+                                for (include_pos, col_idx) in
+                                    index_def.include_columns.iter().enumerate()
+                                {
                                     let table_idx = *col_idx as usize;
                                     if let (true, Some(val)) =
                                         (table_idx < n_table_cols, include_vals.get(include_pos))
@@ -872,7 +908,8 @@ fn execute_select_ctx(
                             }
                         }
                         Err(_) => {
-                            if let Some(values) = TableEngine::read_row(storage, &resolved.columns, rid)?
+                            if let Some(values) =
+                                TableEngine::read_row(storage, &resolved.columns, rid)?
                             {
                                 result.push((rid, values));
                             }
@@ -1104,41 +1141,49 @@ fn execute_select_ctx(
         }
 
         // ── EXISTS decorrelation fast-path ────────────────────────────────────
-        let mut combined_rows: Vec<Row> = crate::time_select_phase!(where_ns, if !where_already_applied {
-            if let Some(ref wc) = stmt.where_clause {
-                if let Some(decorr) = try_extract_exists_decorrelation(wc) {
-                    apply_exists_semijoin(raw_rows, &decorr, exec_ctx.storage(), exec_ctx.coord())?
-                } else {
-                    let mut rows = Vec::new();
-                    let mut sq_cache_ctx: SubqueryCache = HashMap::new();
-                    let mut in_set_cache_ctx: InSetCache = HashMap::new();
-                    let mut corr_cache_ctx: CorrelatedCache = HashMap::new();
-                    let mut mat_cache_ctx: MaterializedCache = HashMap::new();
-                    for (_rid, values) in raw_rows {
-                        let mut runner = ExecSubqueryRunner {
-                            storage: exec_ctx.storage(),
-                            txn: exec_ctx.coord(),
-                            bloom: exec_ctx.bloom(),
-                            ctx,
-                            outer_row: &values,
-                            cache: Some(&mut sq_cache_ctx),
-                            in_set_cache: Some(&mut in_set_cache_ctx),
-                            correlated_cache: Some(&mut corr_cache_ctx),
-                            materialized: Some(&mut mat_cache_ctx),
-                        };
-                        if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
-                            continue;
+        let mut combined_rows: Vec<Row> = crate::time_select_phase!(
+            where_ns,
+            if !where_already_applied {
+                if let Some(ref wc) = stmt.where_clause {
+                    if let Some(decorr) = try_extract_exists_decorrelation(wc) {
+                        apply_exists_semijoin(
+                            raw_rows,
+                            &decorr,
+                            exec_ctx.storage(),
+                            exec_ctx.coord(),
+                        )?
+                    } else {
+                        let mut rows = Vec::new();
+                        let mut sq_cache_ctx: SubqueryCache = HashMap::new();
+                        let mut in_set_cache_ctx: InSetCache = HashMap::new();
+                        let mut corr_cache_ctx: CorrelatedCache = HashMap::new();
+                        let mut mat_cache_ctx: MaterializedCache = HashMap::new();
+                        for (_rid, values) in raw_rows {
+                            let mut runner = ExecSubqueryRunner {
+                                storage: exec_ctx.storage(),
+                                txn: exec_ctx.coord(),
+                                bloom: exec_ctx.bloom(),
+                                ctx,
+                                outer_row: &values,
+                                cache: Some(&mut sq_cache_ctx),
+                                in_set_cache: Some(&mut in_set_cache_ctx),
+                                correlated_cache: Some(&mut corr_cache_ctx),
+                                materialized: Some(&mut mat_cache_ctx),
+                            };
+                            if !is_truthy(&eval_with(wc, &values, &mut runner)?) {
+                                continue;
+                            }
+                            rows.push(values);
                         }
-                        rows.push(values);
+                        rows
                     }
-                    rows
+                } else {
+                    raw_rows.into_iter().map(|(_rid, v)| v).collect()
                 }
             } else {
                 raw_rows.into_iter().map(|(_rid, v)| v).collect()
             }
-        } else {
-            raw_rows.into_iter().map(|(_rid, v)| v).collect()
-        });
+        );
 
         if !stmt.group_by.is_empty() || has_aggregates(&stmt.columns, &stmt.having) {
             // Single-table path: choose sorted strategy when the access method
@@ -1156,7 +1201,12 @@ fn execute_select_ctx(
         if !stmt.distinct_on.is_empty() {
             // Phase 21.12 — DISTINCT ON: sort by (distinct_on ASC, then ORDER BY),
             // keep first pre-projection row per DISTINCT ON key group.
-            combined_rows = apply_distinct_on(combined_rows, &stmt.distinct_on, &resolved_ob, &stmt.columns)?;
+            combined_rows = apply_distinct_on(
+                combined_rows,
+                &stmt.distinct_on,
+                &resolved_ob,
+                &stmt.columns,
+            )?;
         } else {
             // Top-N optimization: partial sort when ORDER BY + LIMIT present.
             if !resolved_ob.is_empty()
@@ -1182,8 +1232,7 @@ fn execute_select_ctx(
         // time via `extend_from_slice` (see shared.rs). Skip it entirely and
         // move `combined_rows` straight through. Saves ~1 Vec + N heap-value
         // clones per row on the hot full-scan / range-scan path.
-        let mut rows = if stmt.columns.len() == 1
-            && matches!(stmt.columns[0], SelectItem::Wildcard)
+        let mut rows = if stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectItem::Wildcard)
         {
             combined_rows
         } else {

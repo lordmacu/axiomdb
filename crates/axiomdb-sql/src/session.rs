@@ -919,16 +919,18 @@ pub struct SessionContext {
     /// `invalidate_all` and `invalidate_table`. Mirrors SQLite's
     /// `BtCursor` cached metadata (BTCF_ValidNKey).
     clustered_leaf_hint: Option<axiomdb_storage::clustered_tree::LeafCursorHint>,
-    /// Attack 17b: per-table COUNT(*) cache. Stores
-    /// `(count, changes_count_at_cache_time, schema_version_at_cache_time)`
-    /// per table. The change counter doubles as a dirty bit: any
-    /// INSERT/UPDATE/DELETE through this session bumps
-    /// `stats.changes_for(table_id)`, which then mismatches the
-    /// cached value and forces a re-scan. DDL bumps `schema_version`
-    /// which also forces a miss. No invalidation hook needed —
-    /// callers don't have to touch this cache; correctness falls
-    /// out of the comparison on lookup.
-    count_star_cache: HashMap<u32, (u64, u64, u64)>,
+    /// Attack 17b: per-table COUNT(*) cache. THREE validity tags, all
+    /// must match on lookup: (1) `stats.changes_for(table_id)` — this
+    /// session's own INSERT/UPDATE/DELETE bump it (a per-session dirty
+    /// bit); (2) `schema_version` — DDL bumps it; (3) the GLOBAL
+    /// `TxnManager::max_committed` — ANY session's commit advances it,
+    /// so a concurrent writer's commit on another connection
+    /// invalidates this cache. Tag (3) is essential: without it the
+    /// per-session counter would return a stale count under
+    /// multi-connection concurrency (session A would miss session B's
+    /// committed insert). Tuple:
+    /// `(count, changes, schema_version, max_committed)`.
+    count_star_cache: HashMap<u32, (u64, u64, u64, u64)>,
     /// Per-table catalog statistics cache, keyed by `table_id`, storing the
     /// `schema_version` the stats were loaded at plus a shared `Arc` of the
     /// `StatsDef` list. The planner reads these once per statement for
@@ -1881,12 +1883,20 @@ impl SessionContext {
         self.heap_tail.remove(&table_id);
     }
 
-    /// Attack 17b: COUNT(*) cache lookup. Returns `Some(count)` when
-    /// `table_id` has a cached count AND the cached state still
-    /// matches: same change counter (no writes since cache time)
-    /// AND same schema version (no DDL since cache time).
-    pub fn get_count_star(&self, table_id: u32, schema_version: u64) -> Option<u64> {
-        let (count, cached_changes, cached_schema_ver) =
+    /// Attack 17b: COUNT(*) cache lookup. Returns `Some(count)` only when
+    /// ALL validity tags still match: same change counter (no writes by THIS
+    /// session since cache time), same schema version (no DDL), AND same global
+    /// `max_committed` (no commit by ANY session since cache time). The last
+    /// guard is what makes the cache correct under multi-connection concurrency:
+    /// a concurrent writer's commit advances `max_committed`, so this session's
+    /// next autocommit COUNT(*) re-scans instead of returning a stale count.
+    pub fn get_count_star(
+        &self,
+        table_id: u32,
+        schema_version: u64,
+        max_committed: u64,
+    ) -> Option<u64> {
+        let (count, cached_changes, cached_schema_ver, cached_max_committed) =
             self.count_star_cache.get(&table_id).copied()?;
         if cached_changes != self.stats.changes_for(table_id) {
             return None;
@@ -1894,15 +1904,26 @@ impl SessionContext {
         if cached_schema_ver != schema_version {
             return None;
         }
+        // Cross-session guard: ANY commit (any connection) advances
+        // max_committed → invalidate, so a concurrent writer can't leave us stale.
+        if cached_max_committed != max_committed {
+            return None;
+        }
         Some(count)
     }
 
-    /// Stores the freshly-computed COUNT(*) for `table_id`, capturing
-    /// the current change-count + schema_version as the validity tags.
-    pub fn cache_count_star(&mut self, table_id: u32, schema_version: u64, count: u64) {
+    /// Stores the freshly-computed COUNT(*) for `table_id`, capturing the current
+    /// change-count + schema_version + global `max_committed` as validity tags.
+    pub fn cache_count_star(
+        &mut self,
+        table_id: u32,
+        schema_version: u64,
+        count: u64,
+        max_committed: u64,
+    ) {
         let changes = self.stats.changes_for(table_id);
         self.count_star_cache
-            .insert(table_id, (count, changes, schema_version));
+            .insert(table_id, (count, changes, schema_version, max_committed));
     }
 
     pub fn cached_count(&self) -> usize {
