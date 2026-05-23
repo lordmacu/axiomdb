@@ -1,5 +1,38 @@
 # Lessons Learned
 
+## 2026-05-22 — Cross-session cache invalidation
+
+- **`max_committed` advances on read-only SELECTs — it is NOT a write watermark.**
+  Every autocommit SELECT does `begin()` + `commit()` with a fresh `txn_id`, and
+  `commit_inner` advances `max_committed` even for read-only txns (`undo_ops`
+  empty). Proven: 10 SELECTs bumped it by 10. So gating a cache on "did
+  `max_committed` change since I cached?" invalidates on EVERY read — correct but
+  it defeats the cache (a real regression on the hot `point_lookup`/`select_where`
+  path, the embedded #1 priority). The earlier COUNT(*) cross-session fix shipped
+  with exactly this flaw: the cache never actually hit.
+- **The right signal is a dedicated `write_commit_seq`** — a global atomic bumped
+  ONLY when a data-modifying txn (`undo_ops` non-empty) becomes visible, at the
+  same point its commit advances `max_committed` (inline atomic block +
+  `advance_committed`/`advance_committed_single` for the deferred pipeline).
+  Read-only commits never bump it, so a pure read loop keeps its caches warm
+  while any committed write by ANY connection forces revalidation.
+- **Bump the write counter co-located with the visibility advance, never earlier.**
+  Bumping at `commit_inner` entry (before the deferred `max_committed` advance)
+  opens a window where a reader caches data under the new seq before the write is
+  visible, then never invalidates when it becomes visible → stale. Tie the bump
+  to each `max_committed.fetch_max` site instead.
+- **Ordering:** the counter is read AFTER the statement's MVCC snapshot is built;
+  the snapshot's `active_set` acquire synchronizes-with every prior commit's
+  release, so any write visible in the snapshot has its `write_commit_seq` bump
+  observed (Release on bump / Acquire on read). A cache is therefore never served
+  stale relative to its own snapshot.
+- **The whole bug class is multi-connection only.** Embedded (single connection)
+  is immune — its own writes already clear the per-session marks. The fix is
+  zero-cost for embedded reads (reads don't bump the write counter).
+- **Caches that shared this bug:** resolve cache (`table_epoch_cache`),
+  statement-plan cache (`epoch_plan_fast_path`), COUNT(*) cache, holiday calendar
+  cache, exchange-rate cache — all per-session, all now gated on `write_commit_seq`.
+
 ## 2026-04-23 - Phase 13.13
 
 - **Do not start collation work by chasing ICU first if metadata precedence is

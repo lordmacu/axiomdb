@@ -492,3 +492,59 @@ fn business_days_between_holiday_cache_is_invalidated_after_create() {
     ));
     assert_eq!(v2, Value::Int(4));
 }
+
+/// MULTI-SESSION: session A caches the (empty) 'CO' calendar; session B then
+/// recreates 'CO' with a holiday via DDL. A's `holiday_cache` is per-session and
+/// B's DDL cannot clear it — but B's commit advances the global `max_committed`,
+/// so A's cache lookup must miss and reload, seeing the new holiday. Without the
+/// `max_committed` guard A would keep counting the holiday as a business day.
+/// Same bug class as the resolve / COUNT(*) caches.
+#[test]
+fn holiday_cache_sees_other_session_calendar_change() {
+    let (mut storage, mut txn, mut bloom, mut a) = common::setup_ctx();
+    let mut b = axiomdb_sql::SessionContext::new();
+
+    // A creates an empty 'CO' calendar and loads it into A's cache.
+    ok(
+        "CREATE HOLIDAY CALENDAR 'CO'",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    let v1 = scalar(ok(
+        "SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    ));
+    assert_eq!(
+        v1,
+        Value::Int(5),
+        "empty calendar: 5 business days in the week"
+    );
+
+    // B (a DIFFERENT session) recreates 'CO' with a Monday holiday.
+    ok(
+        "CREATE HOLIDAY CALENDAR 'CO' WITH HOLIDAYS ('2024-01-01')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut b,
+    );
+
+    // A must see B's holiday (4 business days), not its stale empty cache.
+    let v2 = scalar(ok(
+        "SELECT BUSINESS_DAYS_BETWEEN('2024-01-01', '2024-01-08', 'CO')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    ));
+    assert_eq!(
+        v2,
+        Value::Int(4),
+        "session A must see the holiday added by session B (got {v2:?} — STALE per-session holiday cache)"
+    );
+}

@@ -14,9 +14,7 @@ fn resolve_table_cached(
             .unwrap_or_else(|| txn.snapshot());
         let mut reader = axiomdb_catalog::CatalogReader::new(storage, snap)?;
         if !reader.database_exists(&database)? {
-            return Err(DbError::DatabaseNotFound {
-                name: database,
-            });
+            return Err(DbError::DatabaseNotFound { name: database });
         }
     }
 
@@ -27,14 +25,20 @@ fn resolve_table_cached(
 
     // If the user specified an explicit schema, resolve directly.
     if let Some(schema) = tref.schema.as_deref() {
-        if let Some(hit) = try_cached_with_version(
-            storage, txn, ctx, conn_txn, &database, schema, &tref.name,
-        )? {
+        if let Some(hit) =
+            try_cached_with_version(storage, txn, ctx, conn_txn, &database, schema, &tref.name)?
+        {
             return Ok(hit);
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         let resolved = resolver.resolve_table(Some(schema), &tref.name)?;
-        return Ok(ctx.cache_table(&database, schema, &tref.name, resolved));
+        return Ok(ctx.cache_table(
+            &database,
+            schema,
+            &tref.name,
+            resolved,
+            txn.write_commit_seq(),
+        ));
     }
 
     // Unqualified name: scan search_path in order until a match is found.
@@ -46,14 +50,20 @@ fn resolve_table_cached(
     let n_schemas = ctx.search_path.len();
     for schema_idx in 0..n_schemas {
         let schema = ctx.search_path[schema_idx].clone();
-        if let Some(hit) = try_cached_with_version(
-            storage, txn, ctx, conn_txn, &database, &schema, &tref.name,
-        )? {
+        if let Some(hit) =
+            try_cached_with_version(storage, txn, ctx, conn_txn, &database, &schema, &tref.name)?
+        {
             return Ok(hit);
         }
         let mut resolver = make_resolver_with_database(storage, txn, conn_txn, &database)?;
         if let Ok(resolved) = resolver.resolve_table(Some(&schema), &tref.name) {
-            return Ok(ctx.cache_table(&database, &schema, &tref.name, resolved));
+            return Ok(ctx.cache_table(
+                &database,
+                &schema,
+                &tref.name,
+                resolved,
+                txn.write_commit_seq(),
+            ));
         }
 
         // Phase 22b.2: fall back to foreign table catalog when not in regular catalog.
@@ -103,10 +113,12 @@ fn try_cached_with_version(
     let cached_id = cached.def.id;
     let cached_version = cached.def.schema_version;
 
-    // A.2 fast path: if the catalog epoch hasn't changed since we last
-    // validated this table AND we are not inside an explicit transaction,
-    // no DDL has run and the cached entry is guaranteed fresh. Skip the
-    // catalog probe entirely — O(1) HashMap lookup instead of a heap scan.
+    // A.2 fast path: skip the catalog schema_version probe entirely (O(1)
+    // HashMap lookup instead of a heap scan) only when the cached entry is
+    // provably fresh on THREE axes:
+    //   1. not inside an explicit transaction (`!ctx.in_explicit_txn`),
+    //   2. no DDL ran in THIS session since we validated (catalog_epoch match),
+    //   3. no WRITE commit ran in ANY session since (global write_commit_seq match).
     // Mirrors SQLite's schema-cookie fast path (research/sqlite/src/prepare.c:518-526).
     //
     // Restricted to autocommit (`!ctx.in_explicit_txn`): inside explicit
@@ -115,13 +127,24 @@ fn try_cached_with_version(
     // epoch does NOT revert, so serving a stale cached root_page_id would
     // silently read from wrong B-tree pages.
     //
+    // The `write_commit_seq` guard (axis 3) is what makes this correct under
+    // MULTI-CONNECTION concurrency: catalog_epoch only tracks DDL in the
+    // local session, so a *different* connection's `ALTER TABLE ... ADD
+    // COLUMN` (or any committed DDL) would NOT bump our epoch. But every
+    // WRITE commit — DML or DDL, any session — advances the global
+    // write-commit counter, so requiring it to be unchanged forces a
+    // schema_version probe after a concurrent writer commits, catching
+    // cross-session DDL. Read-only commits do NOT advance it (unlike
+    // `max_committed`, which every autocommit SELECT bumps), so a pure read
+    // loop keeps hitting this fast path with zero catalog probes.
+    //
     // For autocommit: DML statements clear the epoch mark for their table
     // via `invalidate_table_epoch_for_ref` in dispatch_ctx immediately after
     // each write statement. This forces a single schema_version probe on the
     // NEXT access, which re-validates the entry (catching any root split that
     // happened during the write) and re-marks the epoch. Subsequent reads
     // then use the fast path until the next write on that table.
-    if !ctx.in_explicit_txn && ctx.is_table_epoch_current(cached_id) {
+    if !ctx.in_explicit_txn && ctx.is_table_epoch_current(cached_id, txn.write_commit_seq()) {
         return Ok(Some(cached));
     }
 
@@ -134,8 +157,10 @@ fn try_cached_with_version(
 
     match current_version {
         Some(v) if v == cached_version => {
-            // Validated: record epoch so next call skips the probe.
-            ctx.mark_table_epoch_current(cached_id);
+            // Validated: record (epoch, max_committed) so the next call skips
+            // the probe until either DDL bumps the epoch (this session) or any
+            // session's commit advances max_committed (cross-session guard).
+            ctx.mark_table_epoch_current(cached_id, txn.write_commit_seq());
             Ok(Some(cached))
         }
         _ => {
@@ -291,11 +316,11 @@ fn translate_exclusion_violation_legacy(
         return err;
     };
     let schema = table_ref.schema.as_deref().unwrap_or("public");
-    let mut resolver = match make_resolver_with_database(storage, txn, Some(conn_txn), default_database)
-    {
-        Ok(resolver) => resolver,
-        Err(_) => return err,
-    };
+    let mut resolver =
+        match make_resolver_with_database(storage, txn, Some(conn_txn), default_database) {
+            Ok(resolver) => resolver,
+            Err(_) => return err,
+        };
     let resolved = match resolver.resolve_table(Some(schema), &table_ref.name) {
         Ok(resolved) => resolved,
         Err(_) => return err,
@@ -316,7 +341,6 @@ fn translate_exclusion_violation_legacy(
 }
 
 // ── ctx-aware DML handlers ────────────────────────────────────────────────────
-
 
 #[allow(dead_code)]
 fn build_column_mask(n_cols: usize, exprs: &[&Expr]) -> Vec<bool> {
@@ -434,7 +458,11 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
             }
         }
         // Phase 20.4, Step 5 — array subscript: recurse into array and index.
-        Expr::Subscript { array, index, slice } => {
+        Expr::Subscript {
+            array,
+            index,
+            slice,
+        } => {
             collect_column_refs(array, mask);
             collect_column_refs(index, mask);
             if let Some(s) = slice {
@@ -458,15 +486,23 @@ fn collect_column_refs(expr: &Expr, mask: &mut Vec<bool>) {
         }
         // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
         Expr::XmlElement { attrs, content, .. } => {
-            for (e, _) in attrs { collect_column_refs(e, mask); }
-            for e in content { collect_column_refs(e, mask); }
+            for (e, _) in attrs {
+                collect_column_refs(e, mask);
+            }
+            for e in content {
+                collect_column_refs(e, mask);
+            }
         }
         Expr::XmlForest { items } => {
-            for (e, _) in items { collect_column_refs(e, mask); }
+            for (e, _) in items {
+                collect_column_refs(e, mask);
+            }
         }
         Expr::XmlRoot { doc, .. } => collect_column_refs(doc, mask),
         Expr::XmlConcat { args } => {
-            for e in args { collect_column_refs(e, mask); }
+            for e in args {
+                collect_column_refs(e, mask);
+            }
         }
         Expr::XmlQuery { doc, .. } => collect_column_refs(doc, mask),
     }
@@ -572,7 +608,11 @@ fn datatype_of_value(v: &Value) -> DataType {
         Value::Uuid(_) => DataType::Uuid,
         Value::Array(elems) => {
             // Infer element type from the first non-null element.
-            let elem_dt = elems.iter().find(|e| !matches!(e, Value::Null)).map(datatype_of_value).unwrap_or(DataType::Int);
+            let elem_dt = elems
+                .iter()
+                .find(|e| !matches!(e, Value::Null))
+                .map(datatype_of_value)
+                .unwrap_or(DataType::Int);
             DataType::Array(Box::new(elem_dt))
         }
         Value::Range(_) => DataType::Range(Box::new(DataType::Int)),
@@ -671,13 +711,15 @@ pub(super) fn expand_unnest_rows(items: &[SelectItem], rows: Vec<Row>) -> Vec<Ro
 }
 
 fn select_items_have_window_functions(items: &[SelectItem]) -> bool {
-    items.iter().any(|item| matches!(
-        item,
-        SelectItem::Expr {
-            expr: Expr::Window { .. },
-            ..
-        }
-    ))
+    items.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Expr {
+                expr: Expr::Window { .. },
+                ..
+            }
+        )
+    })
 }
 
 fn project_rows_with_window_support<E>(
@@ -697,7 +739,12 @@ where
         else {
             continue;
         };
-        window_values[idx] = Some(compute_window_values(*func, spec, combined_rows, &mut eval_expr)?);
+        window_values[idx] = Some(compute_window_values(
+            *func,
+            spec,
+            combined_rows,
+            &mut eval_expr,
+        )?);
     }
 
     let mut rows = Vec::with_capacity(combined_rows.len());
@@ -705,7 +752,9 @@ where
         let mut out = Vec::new();
         for (item_idx, item) in items.iter().enumerate() {
             match item {
-                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => out.extend_from_slice(values),
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    out.extend_from_slice(values)
+                }
                 SelectItem::Expr { expr, .. } => {
                     if let Some(cache) = &window_values[item_idx] {
                         out.push(cache[row_idx].clone());
@@ -1123,8 +1172,7 @@ fn apply_order_by(mut rows: Vec<Row>, order_items: &[OrderByItem]) -> Result<Vec
         let mut rows_with_keys: Vec<(Row, Vec<f64>)> = rows
             .into_iter()
             .map(|row| {
-                let keys: Vec<f64> =
-                    random_positions.iter().map(|_| rng.gen::<f64>()).collect();
+                let keys: Vec<f64> = random_positions.iter().map(|_| rng.gen::<f64>()).collect();
                 (row, keys)
             })
             .collect();
@@ -1236,11 +1284,12 @@ fn apply_order_by_top_n(
             compare_rows_by_columns(&rows[a], &rows[b], &cols)
         });
         let mut top_indices = indices[..k].to_vec();
-        top_indices.sort_by(|&a, &b| {
-            compare_rows_by_columns(&rows[a], &rows[b], &cols)
-        });
+        top_indices.sort_by(|&a, &b| compare_rows_by_columns(&rows[a], &rows[b], &cols));
         let mut row_slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
-        return Ok(top_indices.into_iter().map(|i| row_slots[i].take().unwrap()).collect());
+        return Ok(top_indices
+            .into_iter()
+            .map(|i| row_slots[i].take().unwrap())
+            .collect());
     }
 
     // Slow path: expressions require eval() per comparison.
@@ -1261,8 +1310,8 @@ fn apply_order_by_top_n(
     }
 
     let mut top_indices = indices[..k].to_vec();
-    top_indices.sort_by(|&a, &b| {
-        match compare_rows_for_sort(&rows[a], &rows[b], order_items) {
+    top_indices.sort_by(
+        |&a, &b| match compare_rows_for_sort(&rows[a], &rows[b], order_items) {
             Ok(ord) => ord,
             Err(e) => {
                 if sort_err.is_none() {
@@ -1270,8 +1319,8 @@ fn apply_order_by_top_n(
                 }
                 Ordering::Equal
             }
-        }
-    });
+        },
+    );
     if let Some(e) = sort_err {
         return Err(e);
     }

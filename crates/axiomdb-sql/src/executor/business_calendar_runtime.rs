@@ -30,8 +30,17 @@ fn get_or_load_holidays(
     runner: &mut ExecSubqueryRunner<'_>,
 ) -> Result<std::sync::Arc<std::collections::HashSet<i32>>, DbError> {
     let key = country.to_ascii_uppercase();
-    if let Some(cached) = runner.ctx.holiday_cache.get(&key) {
-        return Ok(std::sync::Arc::clone(cached));
+    // Cross-session guard: only reuse the cached set if no WRITE commit (any
+    // session) has happened since it was loaded. `CREATE/DROP HOLIDAY CALENDAR`
+    // is DDL, which clears THIS session's cache via invalidate_all but cannot
+    // reach a different session — a stale `write_commit_seq` tag forces a
+    // catalog reload. (Read-only commits do not bump the counter, so a pure
+    // read loop keeps the cache warm.)
+    let cur_seq = runner.txn.write_commit_seq();
+    if let Some((cached_seq, set)) = runner.ctx.holiday_cache.get(&key) {
+        if *cached_seq == cur_seq {
+            return Ok(std::sync::Arc::clone(set));
+        }
     }
     // Use the executing statement's snapshot so a calendar created earlier in
     // the same (uncommitted) transaction is visible. `conn_txn` is taken out of
@@ -49,7 +58,10 @@ fn get_or_load_holidays(
         def.map(|d| d.holidays.into_iter().collect())
             .unwrap_or_default(),
     );
-    runner.ctx.holiday_cache.insert(key, std::sync::Arc::clone(&set));
+    runner
+        .ctx
+        .holiday_cache
+        .insert(key, (cur_seq, std::sync::Arc::clone(&set)));
     Ok(set)
 }
 
@@ -164,9 +176,11 @@ fn next_business_day_fn(
         if is_weekday(candidate) && !holidays.contains(&candidate) {
             return Ok(Value::Int(candidate));
         }
-        candidate = candidate.checked_add(1).ok_or_else(|| DbError::InvalidValue {
-            reason: "NEXT_BUSINESS_DAY: date overflow".into(),
-        })?;
+        candidate = candidate
+            .checked_add(1)
+            .ok_or_else(|| DbError::InvalidValue {
+                reason: "NEXT_BUSINESS_DAY: date overflow".into(),
+            })?;
     }
     Err(DbError::InvalidValue {
         reason: "NEXT_BUSINESS_DAY: no business day found within 10 years".into(),
@@ -188,8 +202,13 @@ fn business_days_between_fn(
     }
     let start = eval_date_arg("BUSINESS_DAYS_BETWEEN", "start_date", &args[0], row, runner)?;
     let end = eval_date_arg("BUSINESS_DAYS_BETWEEN", "end_date", &args[1], row, runner)?;
-    let country =
-        eval_text_arg_bc("BUSINESS_DAYS_BETWEEN", "country_code", &args[2], row, runner)?;
+    let country = eval_text_arg_bc(
+        "BUSINESS_DAYS_BETWEEN",
+        "country_code",
+        &args[2],
+        row,
+        runner,
+    )?;
     let holidays = get_or_load_holidays(&country, runner)?;
 
     if start >= end {
@@ -206,9 +225,8 @@ fn business_days_between_fn(
     let start_dow = ((start + 3).rem_euclid(7)) as i64;
 
     // Count weekdays in the remainder [start, start+remainder)
-    let remainder_weekdays: i64 = (0..remainder)
-        .filter(|i| ((start_dow + i) % 7) < 5)
-        .count() as i64;
+    let remainder_weekdays: i64 =
+        (0..remainder).filter(|i| ((start_dow + i) % 7) < 5).count() as i64;
 
     let total_weekdays = full_weeks * 5 + remainder_weekdays;
 

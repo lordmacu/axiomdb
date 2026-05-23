@@ -44,6 +44,8 @@ fn get_table_arc_if_version_returns_some_on_match() {
         "public",
         "t",
         fake_resolved_table(1, "t", 7),
+        0, // max_committed: irrelevant here — this test only exercises the
+           // schema_version-tagged accessor, not the epoch fast path.
     );
     let r = ctx.get_table_arc_if_version(DEFAULT_DATABASE_NAME, "public", "t", 7);
     assert!(r.is_some(), "cache hit expected when version matches");
@@ -58,6 +60,7 @@ fn get_table_arc_if_version_returns_none_on_version_mismatch() {
         "public",
         "t",
         fake_resolved_table(1, "t", 7),
+        0, // max_committed: irrelevant here — see note above.
     );
     assert!(
         ctx.get_table_arc_if_version(DEFAULT_DATABASE_NAME, "public", "t", 8)

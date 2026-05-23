@@ -360,6 +360,62 @@ fn convert_cache_invalidated_after_create() {
     }
 }
 
+/// MULTI-SESSION: session A caches the USD→EUR rate; session B then changes it
+/// via DDL. A's `exchange_rate_cache` is per-session and B's DDL cannot clear
+/// it — but B's commit advances the global `max_committed`, so A's cache lookup
+/// must miss and reload the new rate. Without the `max_committed` guard A would
+/// keep converting at the stale rate. Same bug class as the resolve / COUNT(*)
+/// caches.
+#[test]
+fn exchange_rate_cache_sees_other_session_rate_change() {
+    let (mut storage, mut txn, mut bloom, mut a) = common::setup_ctx();
+    let mut b = axiomdb_sql::SessionContext::new();
+
+    // A registers USD→EUR @ 0.90 and loads it into A's cache via a CONVERT.
+    ok(
+        "CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.90",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    let _ = scalar(ok(
+        "SELECT CONVERT(MONEY(100, 'USD'), 'EUR')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    ));
+
+    // B (a DIFFERENT session) changes the rate to 0.95.
+    ok(
+        "CREATE EXCHANGE RATE 'USD' TO 'EUR' RATE 0.95",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut b,
+    );
+
+    // A must convert at B's new rate (95.00), not its stale cached 0.90.
+    let v = scalar(ok(
+        "SELECT CONVERT(MONEY(100, 'USD'), 'EUR')",
+        &mut storage,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    ));
+    match v {
+        Value::Money(m, s, _) => {
+            let amount = m as f64 / 10f64.powi(s as i32);
+            assert!(
+                (amount - 95.0).abs() < 0.01,
+                "session A must see the rate changed by session B (got {amount} — STALE per-session rate cache)"
+            );
+        }
+        other => panic!("expected Money, got {other:?}"),
+    }
+}
+
 #[test]
 fn convert_missing_rate_returns_error() {
     let (mut storage, mut txn, mut bloom, mut ctx) = common::setup_ctx();

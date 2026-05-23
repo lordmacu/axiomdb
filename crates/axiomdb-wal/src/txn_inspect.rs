@@ -74,6 +74,21 @@ impl TxnManager {
         self.max_committed.load(Ordering::Acquire)
     }
 
+    /// Global WRITE-commit counter — see the field doc on [`TxnManager`]. Bumped
+    /// only when a data-modifying transaction becomes visible (NOT on read-only
+    /// commits), so per-session SQL caches can gate their fast paths on it
+    /// without being invalidated by every autocommit SELECT.
+    ///
+    /// Ordering: the load is `Acquire` and pairs with the `Release` increment at
+    /// each `max_committed` advance. Callers must read this AFTER establishing
+    /// their statement MVCC snapshot; that snapshot's `active_set` acquire
+    /// synchronizes-with every prior commit's release, guaranteeing that any
+    /// write visible in the snapshot has its `write_commit_seq` increment
+    /// observed here — so a cache is never served stale relative to its snapshot.
+    pub fn write_commit_seq(&self) -> u64 {
+        self.write_commit_seq.load(Ordering::Acquire)
+    }
+
     /// LSN of the last WAL entry written (0 if none).
     pub fn current_lsn(&self) -> u64 {
         self.wal.current_lsn()
@@ -100,7 +115,11 @@ impl TxnManager {
     pub fn snapshot_for_active(&self) -> Result<TransactionSnapshot, DbError> {
         let (txn_id, mc, active_ids) = {
             let set = self.active_set.read().unwrap();
-            let txn_id = set.iter().copied().next().ok_or(DbError::NoActiveTransaction)?;
+            let txn_id = set
+                .iter()
+                .copied()
+                .next()
+                .ok_or(DbError::NoActiveTransaction)?;
             let mc = self.max_committed.load(Ordering::Acquire);
             (txn_id, mc, Arc::new(set.clone()))
         };
@@ -196,6 +215,7 @@ impl TxnManager {
             max_committed: AtomicU64::new(result.max_committed),
             active_set: RwLock::new(HashSet::new()),
             lowest_active_id: AtomicU64::new(0),
+            write_commit_seq: AtomicU64::new(0),
             deferred_commit_mode: false,
             post_commit: Mutex::new(PostCommitBatches::default()),
             durability_policy: WalDurabilityPolicy::Strict,

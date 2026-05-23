@@ -839,7 +839,9 @@ pub fn run_cached_stmt(
     // the plan's schema_versions are guaranteed current — skip CatalogReader
     // creation and PlanDeps::is_stale (which does a HeapChain scan per dep).
     // Mirrors the epoch shortcut in resolve_table_cached / try_cached_with_version.
-    let analyzed = if let Some((plan_analyzed, param_count)) = session.epoch_plan_fast_path(hash) {
+    let analyzed = if let Some((plan_analyzed, param_count)) =
+        session.epoch_plan_fast_path(hash, txn.write_commit_seq())
+    {
         if extracted.len() != param_count {
             return Err(DbError::Internal {
                 message: format!(

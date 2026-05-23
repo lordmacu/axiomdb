@@ -272,6 +272,23 @@ pub struct TxnManager {
     /// Lowest in-flight txn_id — used as GC horizon (DuckDB-style).
     /// 0 means no active transactions.
     lowest_active_id: AtomicU64,
+    /// Global WRITE-commit counter. Incremented once whenever a transaction
+    /// that actually modified data (DML or DDL — `undo_ops` non-empty) becomes
+    /// visible, i.e. at the same point its commit advances `max_committed`
+    /// (inline or via the deferred pipeline). Crucially, read-only commits do
+    /// NOT advance it.
+    ///
+    /// This is the cross-session invalidation signal for the per-session caches
+    /// in the SQL layer (resolve / statement-plan / COUNT(*) / holiday /
+    /// exchange-rate). `max_committed` cannot serve that role because every
+    /// autocommit SELECT begins+commits a (read-only) transaction and so
+    /// advances `max_committed` — gating the caches on it would invalidate them
+    /// on every read, defeating the A.2 epoch fast path on the hot read path.
+    /// `write_commit_seq` only moves on writes, so a pure read loop keeps its
+    /// caches warm while any committed write by ANY connection forces a
+    /// revalidation. The absolute value is meaningless; only changes matter
+    /// (caches compare it for equality), so over-counting is harmless.
+    write_commit_seq: AtomicU64,
     /// When `true`, DML `commit()` skips inline flush+fsync.
     /// Set once at construction, immutable afterward.
     deferred_commit_mode: bool,

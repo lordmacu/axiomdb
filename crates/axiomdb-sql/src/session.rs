@@ -923,13 +923,15 @@ pub struct SessionContext {
     /// must match on lookup: (1) `stats.changes_for(table_id)` — this
     /// session's own INSERT/UPDATE/DELETE bump it (a per-session dirty
     /// bit); (2) `schema_version` — DDL bumps it; (3) the GLOBAL
-    /// `TxnManager::max_committed` — ANY session's commit advances it,
-    /// so a concurrent writer's commit on another connection
+    /// `TxnManager::write_commit_seq` — ANY session's WRITE commit advances
+    /// it, so a concurrent writer's commit on another connection
     /// invalidates this cache. Tag (3) is essential: without it the
     /// per-session counter would return a stale count under
     /// multi-connection concurrency (session A would miss session B's
-    /// committed insert). Tuple:
-    /// `(count, changes, schema_version, max_committed)`.
+    /// committed insert). Using the WRITE counter (not `max_committed`,
+    /// which every read-only SELECT also advances) keeps repeated COUNT(*)
+    /// on an unchanged table a cache hit. Tuple:
+    /// `(count, changes, schema_version, write_commit_seq)`.
     count_star_cache: HashMap<u32, (u64, u64, u64, u64)>,
     /// Per-table catalog statistics cache, keyed by `table_id`, storing the
     /// `schema_version` the stats were loaded at plus a shared `Arc` of the
@@ -943,15 +945,26 @@ pub struct SessionContext {
     stats_cache: HashMap<u32, (u64, Arc<Vec<axiomdb_catalog::StatsDef>>)>,
     /// A.2 optimization: session-level catalog epoch. Incremented by
     /// `invalidate_all()` whenever DDL executes (the DDL fence path) or a
-    /// database/schema switch happens. When `table_epoch_cache[table_id] ==
-    /// catalog_epoch`, the cached `ResolvedTable` is guaranteed fresh without
-    /// a catalog probe in `try_cached_with_version`.
+    /// database/schema switch happens. It is one of the two components of a
+    /// `table_epoch_cache` stamp (alongside the global `write_commit_seq`); when
+    /// both still match, the cached `ResolvedTable` is fresh without a catalog
+    /// probe in `try_cached_with_version`. On its own `catalog_epoch` only
+    /// tracks THIS session's DDL — see `table_epoch_cache` for why the
+    /// `write_commit_seq` component is required for cross-session correctness.
     catalog_epoch: u64,
     /// A.2 optimization: per-table validated epoch. Maps
-    /// `table_id → catalog_epoch at last validation`. An entry matching the
-    /// current `catalog_epoch` means the cached `ResolvedTable` is fresh and
-    /// the `get_table_schema_version` heap scan can be skipped entirely.
-    table_epoch_cache: HashMap<u32, u64>,
+    /// `table_id → (catalog_epoch, write_commit_seq) at last validation`. The
+    /// schema_version probe can be skipped only when BOTH still match the
+    /// current values: `catalog_epoch` catches this session's DDL, and the
+    /// global `TxnManager::write_commit_seq` catches ANY other session's WRITE
+    /// commit (incl. cross-session DDL — its commit advances write_commit_seq).
+    /// Without the write_commit_seq tag, session A would serve a stale
+    /// ResolvedTable after session B's committed DDL (e.g. miss an added
+    /// column). The WRITE counter is used rather than `max_committed` because
+    /// the latter is advanced by every read-only autocommit SELECT, which would
+    /// invalidate this fast path on every read. Embedded (single connection) is
+    /// unaffected: its own writes already clear the mark.
+    table_epoch_cache: HashMap<u32, (u64, u64)>,
     /// Phase 19.1: auto-vacuum config. When `auto_vacuum_enabled` is
     /// `true` (default), every successful autocommit query that
     /// touches any table is followed by an auto-vacuum check —
@@ -1109,15 +1122,32 @@ pub struct SessionContext {
     /// Per-session holiday set cache keyed by upper-cased country code.
     ///
     /// Loaded lazily on first call to `IS_BUSINESS_DAY` / `NEXT_BUSINESS_DAY` /
-    /// `BUSINESS_DAYS_BETWEEN` for a given country code. Cleared whenever the
-    /// schema cache is invalidated (i.e., after any DDL statement).
-    pub holiday_cache: HashMap<String, Arc<HashSet<i32>>>,
+    /// `BUSINESS_DAYS_BETWEEN` for a given country code. Cleared whenever this
+    /// session's schema cache is invalidated (i.e., after any DDL statement run
+    /// by THIS session).
+    ///
+    /// Value: `(write_commit_seq_at_load, holiday_set)`. The `write_commit_seq`
+    /// tag is the cross-session guard: `CREATE/DROP HOLIDAY CALENDAR` is DDL, so
+    /// a change committed by ANOTHER session does not clear this session's cache
+    /// — but it advances the global write-commit counter, so a lookup whose tag
+    /// no longer matches `TxnManager::write_commit_seq()` reloads from the
+    /// catalog. Without it, session A would keep serving a calendar that session
+    /// B dropped/replaced. Read-only commits don't advance it, so a read loop
+    /// stays warm. Embedded (single connection) is unaffected.
+    pub holiday_cache: HashMap<String, (u64, Arc<HashSet<i32>>)>,
     /// Per-session exchange rate cache keyed by (from_currency, to_currency).
     ///
     /// Loaded lazily on first call to `CONVERT(money, 'CUR')` for a given pair.
-    /// Cleared whenever the schema cache is invalidated (after any DDL statement).
-    /// Value: `(mantissa, scale)` — same fixed-point encoding as `ExchangeRateDef`.
-    pub exchange_rate_cache: HashMap<(String, String), (i128, u8)>,
+    /// Cleared whenever this session's schema cache is invalidated (after any
+    /// DDL statement run by THIS session).
+    ///
+    /// Value: `(write_commit_seq_at_load, (mantissa, scale))` — same fixed-point
+    /// encoding as `ExchangeRateDef`, tagged with the global write-commit counter
+    /// at load time. The tag is the cross-session guard (see `holiday_cache`):
+    /// `CREATE/DROP EXCHANGE RATE` is DDL committed by some session, advancing
+    /// `write_commit_seq`; a stale tag forces a catalog reload so session A never
+    /// serves a rate that session B changed.
+    pub exchange_rate_cache: HashMap<(String, String), (u64, (i128, u8))>,
 }
 
 impl Default for SessionContext {
@@ -1452,12 +1482,14 @@ impl SessionContext {
         schema: &str,
         table: &str,
         resolved: ResolvedTable,
+        write_seq: u64,
     ) -> Arc<ResolvedTable> {
-        // A.2: record the catalog epoch at which this table was validated so
-        // subsequent lookups can skip the schema_version probe when the epoch
-        // is unchanged (no DDL since last resolution).
+        // A.2: record (catalog_epoch, write_commit_seq) at which this table was
+        // validated, so subsequent lookups can skip the schema_version probe
+        // only when no DDL (this session) AND no WRITE commit (any session) has
+        // happened since — the latter guards cross-session DDL.
         self.table_epoch_cache
-            .insert(resolved.def.id, self.catalog_epoch);
+            .insert(resolved.def.id, (self.catalog_epoch, write_seq));
         let arc = Arc::new(resolved);
         self.cache
             .insert(Self::key(database, schema, table), Arc::clone(&arc));
@@ -1494,11 +1526,15 @@ impl SessionContext {
         arc
     }
 
-    /// A.2 optimization: returns `true` when the cached entry for `table_id`
-    /// was validated at the current catalog epoch, meaning no DDL has run since
-    /// the last resolution and the catalog probe can be skipped entirely.
-    pub fn is_table_epoch_current(&self, table_id: u32) -> bool {
-        self.table_epoch_cache.get(&table_id).copied() == Some(self.catalog_epoch)
+    /// A.2 optimization: returns `true` when the cached entry for `table_id` was
+    /// validated at the current catalog epoch AND the global `write_commit_seq`
+    /// has not advanced since — meaning no DDL ran in this session AND no WRITE
+    /// commit (DML or DDL) happened in ANY session. Only then is skipping the
+    /// catalog schema_version probe safe under multi-connection concurrency.
+    /// (Read-only commits do not advance `write_commit_seq`, so a pure read loop
+    /// keeps hitting this fast path.)
+    pub fn is_table_epoch_current(&self, table_id: u32, write_seq: u64) -> bool {
+        self.table_epoch_cache.get(&table_id).copied() == Some((self.catalog_epoch, write_seq))
     }
 
     /// The current catalog epoch — bumped ONLY by DDL (`invalidate_all`), never by a
@@ -1510,10 +1546,12 @@ impl SessionContext {
     }
 
     /// A.2 optimization: records that `table_id` was validated at the current
-    /// epoch after a successful catalog probe. Subsequent calls to
-    /// `is_table_epoch_current` will return `true` until DDL bumps the epoch.
-    pub fn mark_table_epoch_current(&mut self, table_id: u32) {
-        self.table_epoch_cache.insert(table_id, self.catalog_epoch);
+    /// `(catalog_epoch, write_commit_seq)` after a successful catalog probe.
+    /// Subsequent `is_table_epoch_current` calls return `true` until DDL bumps
+    /// the epoch OR any session's WRITE commit advances `write_commit_seq`.
+    pub fn mark_table_epoch_current(&mut self, table_id: u32, write_seq: u64) {
+        self.table_epoch_cache
+            .insert(table_id, (self.catalog_epoch, write_seq));
     }
 
     /// A.2 optimization: drop only the epoch mark for a table, keeping the
@@ -1742,22 +1780,36 @@ impl SessionContext {
     ///
     /// Returns `Some((analyzed_stmt, param_count))` when:
     ///   - `hash` is in the cache, AND
-    ///   - every dep table has an epoch-current entry in `table_epoch_cache`.
+    ///   - every dep table has a `table_epoch_cache` entry stamped with BOTH
+    ///     the current `catalog_epoch` (no local DDL) AND the supplied
+    ///     `write_commit_seq` (no WRITE commit by ANY session since validation).
     ///
-    /// When both conditions hold, the plan's `schema_version` stamps are
+    /// When all conditions hold, the plan's `schema_version` stamps are
     /// guaranteed current — no catalog probe is needed. The caller must still
     /// call `substitute_params` before executing.
     ///
+    /// The `write_commit_seq` guard is the cross-session correctness axis: a DDL
+    /// committed by a *different* connection does not bump our `catalog_epoch`,
+    /// but it does advance the global write-commit counter, so requiring an exact
+    /// match forces a catalog re-probe (slow path) and prevents serving a plan
+    /// built against a stale schema. Read-only commits don't advance it, so a
+    /// pure read loop keeps hitting this fast path. Mirrors the guard in
+    /// `try_cached_with_version` / `get_count_star`.
+    ///
     /// Returns `None` on cache miss or when any dep is epoch-stale.
-    pub fn epoch_plan_fast_path(&self, hash: u64) -> Option<(crate::ast::Stmt, usize)> {
+    pub fn epoch_plan_fast_path(
+        &self,
+        hash: u64,
+        write_seq: u64,
+    ) -> Option<(crate::ast::Stmt, usize)> {
         let (plan, _) = self.statement_cache.get(&hash)?;
-        let epoch = self.catalog_epoch;
+        let stamp = (self.catalog_epoch, write_seq);
         let all_current = plan.deps.tables.is_empty()
             || plan
                 .deps
                 .tables
                 .iter()
-                .all(|&(id, _)| self.table_epoch_cache.get(&id).copied() == Some(epoch));
+                .all(|&(id, _)| self.table_epoch_cache.get(&id).copied() == Some(stamp));
         if all_current {
             Some((plan.analyzed.clone(), plan.param_count))
         } else {
@@ -1886,17 +1938,19 @@ impl SessionContext {
     /// Attack 17b: COUNT(*) cache lookup. Returns `Some(count)` only when
     /// ALL validity tags still match: same change counter (no writes by THIS
     /// session since cache time), same schema version (no DDL), AND same global
-    /// `max_committed` (no commit by ANY session since cache time). The last
-    /// guard is what makes the cache correct under multi-connection concurrency:
-    /// a concurrent writer's commit advances `max_committed`, so this session's
-    /// next autocommit COUNT(*) re-scans instead of returning a stale count.
+    /// `write_commit_seq` (no WRITE commit by ANY session since cache time). The
+    /// last guard is what makes the cache correct under multi-connection
+    /// concurrency: a concurrent writer's commit advances `write_commit_seq`, so
+    /// this session's next autocommit COUNT(*) re-scans instead of returning a
+    /// stale count. (Read-only commits don't advance it, so repeated COUNT(*)
+    /// stays a cache hit.)
     pub fn get_count_star(
         &self,
         table_id: u32,
         schema_version: u64,
-        max_committed: u64,
+        write_seq: u64,
     ) -> Option<u64> {
-        let (count, cached_changes, cached_schema_ver, cached_max_committed) =
+        let (count, cached_changes, cached_schema_ver, cached_write_seq) =
             self.count_star_cache.get(&table_id).copied()?;
         if cached_changes != self.stats.changes_for(table_id) {
             return None;
@@ -1904,26 +1958,28 @@ impl SessionContext {
         if cached_schema_ver != schema_version {
             return None;
         }
-        // Cross-session guard: ANY commit (any connection) advances
-        // max_committed → invalidate, so a concurrent writer can't leave us stale.
-        if cached_max_committed != max_committed {
+        // Cross-session guard: ANY WRITE commit (any connection) advances
+        // write_commit_seq → invalidate, so a concurrent writer can't leave us
+        // stale. Read-only commits don't advance it, so repeated COUNT(*) on an
+        // unchanged table keeps hitting the cache.
+        if cached_write_seq != write_seq {
             return None;
         }
         Some(count)
     }
 
     /// Stores the freshly-computed COUNT(*) for `table_id`, capturing the current
-    /// change-count + schema_version + global `max_committed` as validity tags.
+    /// change-count + schema_version + global `write_commit_seq` as validity tags.
     pub fn cache_count_star(
         &mut self,
         table_id: u32,
         schema_version: u64,
         count: u64,
-        max_committed: u64,
+        write_seq: u64,
     ) {
         let changes = self.stats.changes_for(table_id);
         self.count_star_cache
-            .insert(table_id, (count, changes, schema_version, max_committed));
+            .insert(table_id, (count, changes, schema_version, write_seq));
     }
 
     pub fn cached_count(&self) -> usize {

@@ -186,7 +186,7 @@ fn execute_select_ctx(
                             ctx.get_count_star(
                                 resolved.def.id,
                                 resolved.def.schema_version,
-                                txn.max_committed(),
+                                txn.write_commit_seq(),
                             )
                         })
                         .flatten()
@@ -207,7 +207,7 @@ fn execute_select_ctx(
                                     resolved.def.id,
                                     resolved.def.schema_version,
                                     c,
-                                    txn.max_committed(),
+                                    txn.write_commit_seq(),
                                 );
                             }
                             c

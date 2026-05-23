@@ -158,6 +158,9 @@ impl TxnManager {
         sync_logical: bool,
     ) -> Result<Option<TxnId>, DbError> {
         let txn_id = conn_txn.txn_id;
+        // Whether this txn modified data (DML/DDL). Drives `write_commit_seq`:
+        // read-only commits must NOT bump it (see the field doc on TxnManager).
+        let is_write = !conn_txn.undo_ops.is_empty();
 
         {
             let mut roots = self.last_clustered_roots.lock().unwrap();
@@ -218,6 +221,12 @@ impl TxnManager {
                 // fetch_max: only advance, never regress. A lower txn_id
                 // committing after a higher one must not overwrite.
                 self.max_committed.fetch_max(txn_id, Ordering::Release);
+                // Co-located with the visibility advance: a WRITE becoming
+                // visible bumps write_commit_seq exactly once. Deferred writes
+                // (advance_now == false) bump it later in advance_committed*.
+                if is_write {
+                    self.write_commit_seq.fetch_add(1, Ordering::Release);
+                }
             }
             set.remove(&txn_id);
             let new_lowest = set.iter().copied().min().unwrap_or(0);
@@ -258,6 +267,12 @@ impl TxnManager {
     pub fn advance_committed(&self, txn_ids: &[TxnId]) {
         if let Some(&max) = txn_ids.iter().max() {
             self.max_committed.fetch_max(max, Ordering::Release);
+            // Deferred-pipeline txns are always writes (read-only commits never
+            // defer — see commit_inner), so their becoming-visible bumps the
+            // write-commit counter. One bump per batch is enough: the whole
+            // batch becomes visible together, so a single revalidation tick
+            // covers it (caches compare for equality, not exact counts).
+            self.write_commit_seq.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -266,6 +281,9 @@ impl TxnManager {
     /// visible after confirming WAL durability.
     pub fn advance_committed_single(&self, txn_id: TxnId) {
         self.max_committed.fetch_max(txn_id, Ordering::Release);
+        // Deferred-pipeline txns are always writes (see commit_inner): bump the
+        // write-commit counter as the txn becomes visible.
+        self.write_commit_seq.fetch_add(1, Ordering::Release);
     }
 
     /// Returns `true` if `txn_id` is durably committed — its commit advanced

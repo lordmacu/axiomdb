@@ -1095,3 +1095,186 @@ fn count_star_cache_sees_other_session_commits() {
         "session A's COUNT(*) must see session B's committed insert (got {a_count} — STALE per-session cache)"
     );
 }
+
+/// MULTI-SESSION schema check: after session B adds a column via DDL, session A's
+/// resolve cache must NOT serve a stale table definition (missing the column).
+/// Same bug class as the COUNT(*) cache: a per-session cache validated only by a
+/// per-session epoch (`catalog_epoch`) misses another session's committed DDL.
+///
+/// FIXED (2026-05-22): the `catalog_epoch` fast path in
+/// `try_cached_with_version` (executor/shared.rs) is now gated on the global
+/// `max_committed` watermark — a DDL commit by ANY session advances it and
+/// forces a catalog schema_version re-probe, so session A no longer serves a
+/// stale 1-column def. Mirrors the COUNT(*) max_committed guard. Embedded
+/// (single session) was never affected.
+#[test]
+fn resolve_cache_sees_other_session_ddl_add_column() {
+    let (mut s, mut txn, mut bloom, mut a) = setup_ctx();
+    let mut b = axiomdb_sql::SessionContext::new();
+
+    ok(
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    ok(
+        "INSERT INTO t VALUES (1)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    // Populate A's resolve cache with the 1-column definition.
+    let _ = ok("SELECT id FROM t", &mut s, &mut txn, &mut bloom, &mut a);
+
+    // B (a DIFFERENT session) adds a column via DDL.
+    ok(
+        "ALTER TABLE t ADD COLUMN v INT NOT NULL DEFAULT 7",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut b,
+    );
+
+    // A must now see the new column (not a stale cached def → "unknown column").
+    let r = run_ctx("SELECT v FROM t", &mut s, &mut txn, &mut bloom, &mut a);
+    assert!(
+        r.is_ok(),
+        "session A must see column v added by session B's DDL (got {r:?})"
+    );
+    assert_eq!(
+        scalar_int("SELECT v FROM t", &mut s, &mut txn, &mut bloom, &mut a),
+        7,
+        "A must read the new column's default value"
+    );
+}
+
+/// Load-bearing invariant for ALL the cross-session cache guards: a read-only
+/// SELECT in autocommit must NOT advance the global `write_commit_seq` counter,
+/// but a WRITE commit MUST. If reads advanced it, the resolve / statement /
+/// COUNT(*) / holiday / exchange-rate fast paths — all gated on an unchanged
+/// `write_commit_seq` — would invalidate on every read, defeating the caches
+/// (this is exactly why `write_commit_seq` exists instead of reusing
+/// `max_committed`, which every autocommit SELECT advances).
+#[test]
+fn read_only_select_does_not_advance_write_commit_seq() {
+    let (mut s, mut txn, mut bloom, mut a) = setup_ctx();
+    ok(
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    ok(
+        "INSERT INTO t VALUES (1)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+
+    // Reads must NOT advance the write-commit counter.
+    let before_reads = txn.write_commit_seq();
+    for _ in 0..5 {
+        let _ = ok("SELECT id FROM t", &mut s, &mut txn, &mut bloom, &mut a);
+        let _ = ok(
+            "SELECT COUNT(*) FROM t",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut a,
+        );
+    }
+    let after_reads = txn.write_commit_seq();
+    assert_eq!(
+        before_reads, after_reads,
+        "read-only SELECTs must not advance write_commit_seq \
+         (before={before_reads}, after={after_reads}) — caches would never hit"
+    );
+
+    // A WRITE commit MUST advance it (otherwise cross-session staleness leaks).
+    ok(
+        "INSERT INTO t VALUES (2)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    let after_write = txn.write_commit_seq();
+    assert!(
+        after_write > after_reads,
+        "a write commit must advance write_commit_seq (was {after_reads}, now {after_write})"
+    );
+
+    // Contrast: max_committed DOES advance on reads (documents why we don't use it).
+    let mc_before = txn.max_committed();
+    let _ = ok("SELECT id FROM t", &mut s, &mut txn, &mut bloom, &mut a);
+    assert!(
+        txn.max_committed() > mc_before,
+        "sanity: max_committed advances even on a read-only SELECT (the trap write_commit_seq avoids)"
+    );
+}
+
+/// MULTI-SESSION statement-cache check: session A caches the analyzed plan for
+/// `SELECT * FROM t` (the `*` is expanded into the concrete column list at
+/// analyze time and stored in the statement cache). After session B adds a
+/// column via DDL, A's `epoch_plan_fast_path` must NOT serve the stale plan —
+/// the global `max_committed` advanced on B's DDL commit, forcing a re-analyze
+/// that re-expands `*` to include the new column. Same bug class as the resolve
+/// and COUNT(*) caches; the fix is the shared `max_committed` stamp on
+/// `table_epoch_cache`. Embedded (single session) is unaffected.
+#[test]
+fn statement_cache_sees_other_session_ddl_add_column() {
+    let (mut s, mut txn, mut bloom, mut a) = setup_ctx();
+    let mut b = axiomdb_sql::SessionContext::new();
+
+    ok(
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+    ok(
+        "INSERT INTO t VALUES (1)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut a,
+    );
+
+    // Populate A's statement cache + epoch fast path for `SELECT * FROM t`.
+    // The first call analyzes + caches; the second goes through
+    // epoch_plan_fast_path (the path the cross-session guard protects).
+    let _ = ok("SELECT * FROM t", &mut s, &mut txn, &mut bloom, &mut a);
+    let before = rows(ok("SELECT * FROM t", &mut s, &mut txn, &mut bloom, &mut a));
+    assert_eq!(before[0].len(), 1, "before DDL: t has a single column");
+
+    // B (a DIFFERENT session) adds a column via DDL.
+    ok(
+        "ALTER TABLE t ADD COLUMN v INT NOT NULL DEFAULT 7",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut b,
+    );
+
+    // A's cached `SELECT *` plan must be invalidated → 2 columns now, with the
+    // new column carrying its default. A stale plan would return only 1 column.
+    let after = rows(ok("SELECT * FROM t", &mut s, &mut txn, &mut bloom, &mut a));
+    assert_eq!(
+        after[0].len(),
+        2,
+        "session A's SELECT * must re-expand to include column v added by B \
+         (got {} cols — STALE statement-cache plan)",
+        after[0].len()
+    );
+    assert_eq!(
+        after[0][1],
+        Value::Int(7),
+        "the new column must read back its default value"
+    );
+}

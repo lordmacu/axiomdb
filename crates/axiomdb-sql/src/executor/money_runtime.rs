@@ -51,7 +51,11 @@ fn money_constructor(
         }
         Value::Text(ref s) => {
             use axiomdb_types::{coerce, CoercionMode, DataType};
-            match coerce(Value::Text(s.clone()), DataType::Decimal, CoercionMode::Strict) {
+            match coerce(
+                Value::Text(s.clone()),
+                DataType::Decimal,
+                CoercionMode::Strict,
+            ) {
                 Ok(Value::Decimal(m, sc)) => (m, sc),
                 _ => {
                     return Err(DbError::TypeMismatch {
@@ -129,7 +133,9 @@ fn convert_currency_fn(
     };
 
     let src = std::str::from_utf8(&src_code)
-        .map_err(|_| DbError::InvalidValue { reason: "invalid money currency code".into() })?
+        .map_err(|_| DbError::InvalidValue {
+            reason: "invalid money currency code".into(),
+        })?
         .to_ascii_uppercase();
 
     if src == target {
@@ -143,7 +149,9 @@ fn convert_currency_fn(
     // result = src_mantissa × rate_mantissa at scale = src_scale + rate_scale
     let result_m = src_m
         .checked_mul(rate_m)
-        .ok_or_else(|| DbError::InvalidValue { reason: "currency conversion overflow".into() })?;
+        .ok_or_else(|| DbError::InvalidValue {
+            reason: "currency conversion overflow".into(),
+        })?;
     let result_s = src_s.saturating_add(rate_s);
 
     let mut code_bytes = [0u8; 3];
@@ -158,8 +166,15 @@ fn get_or_load_exchange_rate(
     runner: &mut ExecSubqueryRunner<'_>,
 ) -> Result<(i128, u8), DbError> {
     let key = (from.to_string(), to.to_string());
-    if let Some(&cached) = runner.ctx.exchange_rate_cache.get(&key) {
-        return Ok(cached);
+    // Cross-session guard (see get_or_load_holidays): only reuse the cached rate
+    // if no WRITE commit (any session) has happened since load. `CREATE/DROP
+    // EXCHANGE RATE` is DDL that clears only THIS session's cache, so the
+    // `write_commit_seq` tag is what catches another session's change.
+    let cur_seq = runner.txn.write_commit_seq();
+    if let Some(&(cached_seq, rate)) = runner.ctx.exchange_rate_cache.get(&key) {
+        if cached_seq == cur_seq {
+            return Ok(rate);
+        }
     }
     // Statement snapshot (stashed by the entry point) so an exchange rate created
     // earlier in the same uncommitted transaction is visible. `conn_txn` is taken
@@ -171,11 +186,13 @@ fn get_or_load_exchange_rate(
         .clone()
         .unwrap_or_else(|| runner.txn.snapshot());
     let mut reader = CatalogReader::new(runner.storage, snap)?;
-    let def = reader.get_exchange_rate(from, to)?.ok_or_else(|| DbError::InvalidValue {
-        reason: format!("no exchange rate registered for '{from}' → '{to}'"),
-    })?;
+    let def = reader
+        .get_exchange_rate(from, to)?
+        .ok_or_else(|| DbError::InvalidValue {
+            reason: format!("no exchange rate registered for '{from}' → '{to}'"),
+        })?;
     let rate = (def.mantissa, def.scale);
-    runner.ctx.exchange_rate_cache.insert(key, rate);
+    runner.ctx.exchange_rate_cache.insert(key, (cur_seq, rate));
     Ok(rate)
 }
 
