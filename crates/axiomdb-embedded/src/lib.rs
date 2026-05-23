@@ -659,7 +659,9 @@ mod db {
             let insert_plan = if std::env::var_os("AXIOMDB_NO_PREPARED_FAST").is_some() {
                 None
             } else {
-                try_prepare_insert_plan(&analyzed, &self.session)
+                // Resolve the table once here (carry-resolved-table) so per-execute can skip
+                // resolve_table_cached's per-row String allocs + SipHash.
+                try_prepare_insert_plan(&analyzed, &mut self.session, &*self.storage, &self.txn)
             };
 
             Ok(PreparedStatement {
@@ -714,8 +716,18 @@ mod db {
                         .is_some_and(|p| p.is_current(&db.session))
                         && db.session.conn_txn.is_some() =>
                 {
+                    // Carry-resolved-table: pass the prepare-time resolve when still valid (no
+                    // DDL since — catalog_epoch + write_commit_seq) and cached (no-secondary
+                    // table) → execute skips resolve_table_cached. Else None → it resolves
+                    // internally (unchanged: indexed tables / post-DDL keep the fast path).
+                    let cached = self
+                        .insert_plan
+                        .as_ref()
+                        .and_then(|p| p.resolved_if_current(&db.session, &db.txn))
+                        .cloned();
                     return execute_prepared_insert(
                         ins,
+                        cached,
                         &*db.storage,
                         &db.txn,
                         &db.bloom,
@@ -1051,6 +1063,156 @@ mod db {
                 "ineligible INSERT → generic path (no fast hit)"
             );
             assert_eq!(db.query("SELECT id FROM t").unwrap().len(), 1);
+        }
+
+        /// Step 4 (the lever's core proof) — carry-resolved-table. On the prepared-INSERT fast
+        /// path a CLUSTERED, PK-only table carries the resolve from `prepare`, so each execute
+        /// SKIPS the per-row INSERT-target resolve (the ~3 String allocs + SipHash the clean
+        /// perf profile flagged). `resolve_table_calls()` counts entries into
+        /// `resolve_insert_target` (exactly what the lever skips); a counter-sanity insert first
+        /// proves the counter is live, so the batch delta of 0 is a real signal. nextest's
+        /// process-per-test isolation makes the global counter delta exact.
+        #[test]
+        fn fast_execute_skips_per_row_resolve_when_cacheable() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("skip.db")).unwrap();
+            // Clustered (PK), no secondary index → the resolve is cacheable.
+            db.execute("CREATE TABLE a (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+
+            // Counter sanity: a generic (non-prepared) INSERT runs the per-row resolve, so a
+            // later delta of 0 is a real signal — not a dead counter.
+            let g0 = axiomdb_sql::resolve_table_calls();
+            db.execute("INSERT INTO a VALUES (100000, 'gen')").unwrap();
+            assert!(
+                axiomdb_sql::resolve_table_calls() > g0,
+                "a generic INSERT runs the per-row INSERT-target resolve (counter is live)"
+            );
+
+            let stmt = db.prepare("INSERT INTO a VALUES (?, ?)").unwrap();
+            assert!(
+                stmt.insert_plan.is_some(),
+                "plain INSERT is fast-path eligible"
+            );
+
+            const N: i32 = 64;
+
+            // Cacheable table: the per-row resolve count must NOT advance across the batch
+            // (resolved once at prepare; reused while catalog_epoch + write_commit_seq hold —
+            // both stable within one BEGIN..COMMIT, which is exactly the bulk-insert shape).
+            let hits0 = axiomdb_sql::prepared_insert_fast_hits();
+            db.execute("BEGIN").unwrap();
+            let resolve_before = axiomdb_sql::resolve_table_calls();
+            for i in 0..N {
+                stmt.execute(
+                    &mut db,
+                    &[Value::Int(i), Value::Text(format!("v{i}").into())],
+                )
+                .unwrap();
+            }
+            let resolve_after = axiomdb_sql::resolve_table_calls();
+            db.execute("COMMIT").unwrap();
+
+            assert_eq!(
+                resolve_after, resolve_before,
+                "carry-resolved-table: the fast path skips the per-row resolve for all {N} rows"
+            );
+            assert!(
+                axiomdb_sql::prepared_insert_fast_hits() >= hits0 + N as u64,
+                "every prepared INSERT took the fast path"
+            );
+            // N batch rows + the 1 generic sanity row.
+            assert_eq!(db.query("SELECT id FROM a").unwrap().len(), N as usize + 1);
+        }
+
+        /// Step 5 (the no-secondary gate's safety proof). An INSERT into a table WITH a
+        /// SECONDARY index is fast-eligible but its resolve is deliberately NOT cached — its
+        /// index roots mutate (and split) per insert, so a cached resolve would carry a stale
+        /// root and silently drop index entries. The gate keeps it re-resolving per row, so a
+        /// large prepared batch (enough to grow/split the secondary index) leaves the index
+        /// complete: every secondary-key bucket returns its full set.
+        #[test]
+        fn indexed_table_prepared_insert_keeps_secondary_index_correct() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("idx.db")).unwrap();
+            db.execute(
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, k INT NOT NULL, v TEXT NOT NULL)",
+            )
+            .unwrap();
+            db.execute("CREATE INDEX t_k ON t (k)").unwrap();
+            let stmt = db.prepare("INSERT INTO t VALUES (?, ?, ?)").unwrap();
+            assert!(
+                stmt.insert_plan.is_some(),
+                "INSERT stays fast-eligible for indexed tables (the gate only withholds the \
+                 resolve cache)"
+            );
+
+            const N: i32 = 1000;
+            const BUCKETS: i32 = 50;
+            db.execute("BEGIN").unwrap();
+            for i in 0..N {
+                stmt.execute(
+                    &mut db,
+                    &[
+                        Value::Int(i),
+                        Value::Int(i % BUCKETS),
+                        Value::Text(format!("v{i}").into()),
+                    ],
+                )
+                .unwrap();
+            }
+            db.execute("COMMIT").unwrap();
+
+            assert_eq!(
+                db.query("SELECT id FROM t").unwrap().len(),
+                N as usize,
+                "all rows present"
+            );
+            // No missing index entries after the per-row re-resolve kept roots live.
+            assert_eq!(
+                db.query("SELECT id FROM t WHERE k = 7").unwrap().len(),
+                (N / BUCKETS) as usize,
+                "secondary index complete for k=7 (no stale-root corruption)"
+            );
+        }
+
+        /// Step 5 (correctness gate — the crux Attack 2 got wrong twice). A DDL on the
+        /// *target* table between executes must NEVER reuse the carried (now-stale) resolve:
+        /// the ALTER bumps `catalog_epoch`, so `is_current` is false and the next execute
+        /// leaves the fast path and re-resolves against the NEW schema.
+        #[test]
+        fn ddl_on_target_between_executes_uses_new_schema() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("alter.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+                .unwrap();
+            let stmt = db.prepare("INSERT INTO t (id, v) VALUES (?, ?)").unwrap();
+            assert!(stmt.insert_plan.is_some());
+
+            db.execute("BEGIN").unwrap();
+            stmt.execute(&mut db, &[Value::Int(1), Value::Text("a".into())])
+                .unwrap();
+            db.execute("COMMIT").unwrap();
+            let hits_after_first = axiomdb_sql::prepared_insert_fast_hits();
+
+            // ALTER the TARGET table — adds a nullable column. Bumps catalog_epoch, so the
+            // carried 2-column resolve must be abandoned.
+            db.execute("ALTER TABLE t ADD COLUMN w INT").unwrap();
+
+            db.execute("BEGIN").unwrap();
+            stmt.execute(&mut db, &[Value::Int(2), Value::Text("b".into())])
+                .unwrap();
+            db.execute("COMMIT").unwrap();
+            assert_eq!(
+                axiomdb_sql::prepared_insert_fast_hits(),
+                hits_after_first,
+                "post-ALTER execute left the fast path (catalog_epoch changed)"
+            );
+
+            // The post-ALTER insert ran under the new 3-column schema without error: `w` is
+            // queryable and the new row's `w` defaulted to NULL.
+            let rows = db.query("SELECT id, v, w FROM t ORDER BY id").unwrap();
+            assert_eq!(rows.len(), 2, "both rows present across the schema change");
         }
     }
 

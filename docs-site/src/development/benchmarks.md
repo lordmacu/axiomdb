@@ -1019,3 +1019,47 @@ Trust one-timer-per-loop diagnostics (`--diagnose-wrapper`, `--diagnose-parse`).
 (wrapper + COMMIT + pwrite I/O); `AXIOMDB_DEBUG_CLUSTERED_INSERT=1` (flush phases:
 lookup/tree/wal/secondary/root_persist); `axiomdb_storage::io_stats` (armable pwrite
 ns/count). See `docs/checkpoint-sqlite-parity.md`.
+
+## Carry resolved table — prepared INSERT (2026-05-23)
+
+Addresses the "confirm INSERT uses the `Arc<ResolvedTable>` fast path" item above. A clean
+`perf` profile of `insert_batch` showed each `stmt.execute` re-runs the per-row INSERT-target
+resolve (`resolve_insert_target`): even its `get_table_arc` fast path allocates a
+`db+schema+table` key `String` and does a default-**SipHash** `HashMap` lookup **per row**,
+re-resolving the SAME table. SQLite resolves the table once into the compiled VDBE.
+
+**The lever:** `PreparedInsertPlan` now carries the `Arc<ResolvedTable>` resolved ONCE at
+`Db::prepare`, reused per execute while a cheap **2-scalar validator** holds
+(`catalog_epoch == ctx.catalog_epoch() && write_seq == txn.write_commit_seq()` — both
+DDL-bumped, and stable within one `BEGIN..COMMIT`, which is the bulk-insert shape). On any
+mismatch (DDL, or a data commit between batches) it falls back to the unchanged per-row
+resolve — bit-identical, so no regression.
+
+**Gate:** only **clustered tables whose sole index is the PRIMARY KEY**. A clustered PK does
+create an `IndexDef` row, so an `indexes.is_empty()` gate would have excluded every PK-only
+table (the whole bench); the PK entry is safe to cache because the clustered insert reads only
+its *columns* (key encoding), never its `root_page_id`. Only **secondary** index roots mutate
+per insert, so tables with secondary indexes keep re-resolving per row (correct, no stale root).
+
+**A/B (carry on vs off via `AXIOMDB_NO_CARRY_RESOLVE`), insert_batch, 50K rows, order-balanced:**
+
+| platform | carry off | carry on | win |
+|---|---|---|---|
+| **macOS native** (official bench) | 466,008 ops/s | 495,787 ops/s | **+6.4% median / +7.0% mean** |
+| Lima VM (frame-only, 100K) | 512,992 ops/s | 528,621 ops/s | +3.0% |
+
+On macOS the 6 carry-on runs and 6 carry-off runs **do not overlap** (every on > every off) — a
+clean signal. Lima's smaller win is its virtio I/O fixed cost diluting the per-row CPU saving;
+on macOS APFS the resolve is a larger relative share, so the win is bigger on the platform that
+matters. In `--compare` (50K, vs SQLite via `rusqlite`) this moves `insert_batch` from ~2.3× to
+**2.16× slower** than SQLite (1.08M ops/s) — closing part of the write gap.
+
+<div class="callout-design">
+<span class="callout-label">Measure-first — estimate corrected</span>
+The profile suggested ~8–12% (3.8% SipHash + a chunk of the ~31% allocator); the measured win is
+**+6.4% on macOS** (+3% on Lima). The baseline already skips the catalog probe via `get_table_arc`,
+so the carry removes only that lookup's `String` allocs + SipHash. The rest of the ~31% allocator
+is OTHER per-row work (`encode_row` `Vec`, `DataType::clone`, `materialize_insert_row`, the WAL
+record) — the next levers. Reads are untouched (full_scan/select_where/range_scan still beat SQLite;
+point_lookup ~1.2×). Knob `AXIOMDB_NO_CARRY_RESOLVE` (read once at prepare) isolates this lever.
+</div>

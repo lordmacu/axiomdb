@@ -4,7 +4,10 @@ Phase: perf-sqlite-gap — insert/execute hot-path
 Task: Carry the resolved table in `PreparedInsertPlan` so a prepared INSERT execute skips
 `resolve_table_cached` when no DDL has run — the "Attack 2 carry-resolved-tables" finally
 done, now profiler-confirmed as the #1 removable bulk-insert cost.
-Status: approved (2026-05-23) — open questions delegated to the plan (validator = 2-scalar).
+Status: **IMPLEMENTED (2026-05-23)** — landed; **measured +6.4% on macOS native** (the official
+bench platform; +3.0% on Lima), vs the estimated ≥8% (measure-first — see "Measured RESULT").
+Real, clean (macOS A/B has zero overlap), no-regression; all correctness gates green.
+Validator = 2-scalar (catalog_epoch + write_commit_seq).
 
 ## Context
 
@@ -106,6 +109,28 @@ impl PreparedInsertPlan {
 
 Reference: profile showed ~3.8% SipHash + a chunk of the ~31% allocator in the per-row resolve.
 
+## Measured RESULT (2026-05-23, order-balanced A/B via `AXIOMDB_NO_CARRY_RESOLVE`)
+
+**macOS native (official bench platform): +6.4% median / +7.0% mean** — insert_batch 50K,
+carry-on 495,787 vs carry-off 466,008 ops/s; the 6 carry-on and 6 carry-off runs **do not
+overlap** (clean, not noise). **Lima VM: +3.0%** (100K; median 528,621 vs 512,992) — smaller
+because virtio I/O fixed cost dilutes the per-row CPU saving. In `--compare` (vs SQLite via
+rusqlite) this moves insert_batch from ~2.3× to **2.16× slower** than SQLite. Knob isolates
+*this* lever (unlike `AXIOMDB_NO_PREPARED_FAST`, which disables the whole fast path).
+
+The ≥8% estimate was **optimistic** — corrected by measure-first:
+- The A-baseline (carry off) does NOT pay a full re-resolve: `resolve_insert_target`'s
+  `get_table_arc` fast path (clustered batch active) already skips the catalog probe. The carry
+  only removes the per-row **String allocs + SipHash** of that lookup → ~3%, matching the
+  profile's ~3.8% SipHash.
+- The "~31% allocator" is dominated by OTHER per-row allocs (encode_row Vec, DataType::clone,
+  materialize_insert_row, the WAL record), not the resolve. Those are the next levers.
+
+**Decision: LAND.** +6.4% (macOS) is real, clean (zero-overlap A/B), profiler-grounded, fully
+correctness-tested, zero-regression (fallback bit-identical; reads structurally untouched —
+full_scan/select_where/range_scan still beat SQLite). It stacks toward SQLite parity (the parity
+game is many small attacks). Not measured-out like hole-skip/minimal-WAL (those were ~0%).
+
 ## Dependencies
 
 - Depends on: `SessionContext::catalog_epoch()` + `txn.write_commit_seq()` +
@@ -113,30 +138,41 @@ Reference: profile showed ~3.8% SipHash + a chunk of the ~31% allocator in the p
   `resolve_table_cached` (the fallback); `Arc<ResolvedTable>`.
 - Blocks: nothing. Independent of the single-fsync commit (landed).
 
-## Open questions (resolve before approved)
+## Open questions — RESOLVED
 
-- [ ] Validator granularity: the cheap **2-scalar compare** `(catalog_epoch, write_commit_seq)`
-      (no HashMap, conservative — any DDL re-resolves) vs `is_table_epoch_current(table_id,
-      write_seq)` (per-table, but a `HashMap<u32,_>` SipHash lookup on the u32). → recommend the
-      2-scalar compare (fully alloc/hash-free); confirm `write_commit_seq` bumps on DDL only
-      (not per data-commit) so it's stable during a bulk insert.
-- [ ] Build eagerly at `Db::prepare` (resolve needs storage+txn — available there) vs lazily on
-      first execute. → recommend eager (simpler; `execute` is `&self`).
-- [ ] Does `execute_prepared_insert` currently re-resolve, or take the resolved table as an
-      arg? (wire the cached `resolved` into it.)
+- [x] Validator granularity → **2-scalar compare** `(catalog_epoch, write_commit_seq)`, fully
+      alloc/hash-free. `write_commit_seq` bumps on every WRITE commit (DML or DDL), NOT read-only
+      (txn_begin_commit.rs:163,228) — so it is STABLE within one `BEGIN..COMMIT` (the bulk-insert
+      shape → full win) and conservatively re-resolves across data-commit batches (safe, no win
+      there; v1 accepts this).
+- [x] Build eagerly at `Db::prepare` (storage+txn available; `execute` is `&self`). Done.
+- [x] `execute_prepared_insert` now takes `cached_resolved: Option<Arc<ResolvedTable>>` and skips
+      its internal `resolve_insert_target` when `Some`.
+- [x] **Gate correction (found during impl):** a clustered PK *does* create an `IndexDef` row
+      (ddl_create_table.rs:621), so the planned `indexes.is_empty()` gate would have excluded EVERY
+      PK-only clustered table (the whole bench). Verified the clustered insert reads only the PK
+      index's *columns* (clustered_table.rs:131), never its root → corrected gate to
+      `def.is_clustered() && indexes.iter().all(|i| i.is_primary)` (PK fine to cache; only SECONDARY
+      roots mutate). bench_users now qualifies.
 
 ## Done criteria
 
-- [ ] `PreparedInsertPlan` carries `resolved: Arc<ResolvedTable>` + the two stamps.
-- [ ] Per execute on the epoch-current path, `resolve_table_cached` is **not called** (assert
-      via a counter or the perf profile: no resolve String allocs, no SipHash).
-- [ ] DDL between executes on a live prepared stmt re-resolves correctly — test: prepare INSERT,
-      execute, `ALTER TABLE add column` (and a separate `DROP`), execute → new schema / correct
-      error.
-- [ ] Cross-session DDL test (second connection alters+commits) → re-resolve.
-- [ ] No regression: point_lookup / select / reads within ±2%; bulk insert A/B (Lima) ≥ +8%.
-- [ ] `cargo nextest run --workspace` green; clippy + fmt clean.
-- [ ] rustdoc on the new fields/method.
+- [x] `PreparedInsertPlan` carries `resolved: Option<Arc<ResolvedTable>>` + the two stamps
+      (`catalog_epoch_at_build`, `write_seq_at_build`) + `resolved_if_current`.
+- [x] Per execute on the current path, the per-row resolve (`resolve_insert_target`) is **not
+      called** — asserted by `fast_execute_skips_per_row_resolve_when_cacheable` (counter delta 0
+      across the batch, with a generic-insert sanity that the counter is live).
+- [x] DDL between executes re-resolves correctly — `ddl_on_target_between_executes_uses_new_schema`
+      (ALTER target → leaves the fast path, new schema) + the pre-existing
+      `ddl_between_executes_falls_back_to_generic`.
+- [~] Cross-session DDL: covered by the validator (`write_commit_seq` is global, bumps on any
+      session's write commit). Embedded is single-session so it is exercised via the same-session
+      data-commit invalidation; the wire/multi-session path does not use this embedded fast path yet.
+- [~] No regression: reads healthy (full_scan/select_where/range_scan beat SQLite; point_lookup
+      ~1.2×; INSERT-only change). bulk insert A/B = **+6.4% macOS / +3.0% Lima** (vs the ≥8%
+      estimate — measure-first correction; real + no-regression → LANDED).
+- [x] `cargo nextest run --workspace` green; clippy + fmt clean (my files).
+- [x] rustdoc on the new fields/method + the gate rationale.
 
 ## References
 

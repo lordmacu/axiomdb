@@ -1,3 +1,19 @@
+/// Diagnostic (carry-resolved-table): count of per-row INSERT-target resolutions
+/// (`resolve_insert_target`). The carry-resolved-table lever makes the prepared-INSERT
+/// fast path SKIP this per row — the table is resolved ONCE at `prepare` and reused while
+/// no DDL ran. A test asserts the counter does NOT advance across a fast-path batch on a
+/// cacheable (no-secondary-index) table, yet DOES advance once per row for an indexed table
+/// (whose roots mutate per insert → it correctly re-resolves). Counted at
+/// `resolve_insert_target` (not `resolve_table_cached`) because the lever skips that whole
+/// function, including its `get_table_arc` fast path which still allocs the db/schema key +
+/// SipHash per row. Relaxed; a monotonic diagnostic, not a correctness signal.
+pub static RESOLVE_TABLE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads [`RESOLVE_TABLE_CALLS`].
+pub fn resolve_table_calls() -> u64 {
+    RESOLVE_TABLE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn resolve_table_cached(
     storage: &dyn StorageEngine,
     txn: &TxnManager,

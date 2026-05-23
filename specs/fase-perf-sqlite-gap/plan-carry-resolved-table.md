@@ -3,13 +3,14 @@
 Phase: perf-sqlite-gap — insert/execute hot-path
 Task: skip per-execute `resolve_table_cached` by caching the resolved table in `PreparedInsertPlan`
 Spec: specs/fase-perf-sqlite-gap/spec-carry-resolved-table.md
-Status: in-progress — Step 1 (verify validator) DONE. write_commit_seq bumps at COMMIT on
-data/DDL txns (txn_begin_commit.rs:228/275/286), STABLE within an open txn (no commit in the
-batch row loop) — confirmed by the existing test `read_only_select_does_not_advance_ln`
-(integration_scenario_correctness.rs: reads don't bump, write-commit does). catalog_epoch += 1
-in invalidate_all (session.rs:1650, DDL). Validator correct + stable-within-batch (the win
-case); autocommit bumps per commit (no win there, expected). NEXT: Step 2 (the struct field +
-validator) → Steps 3-4 (build@prepare + wire/skip) → Step 5 (DDL-invalidation GATE, the crux).
+Status: **DONE (2026-05-23)** — all 6 steps landed. Measured **+6.4% on macOS native** (official
+bench; +3.0% on Lima) on insert_batch, order-balanced A/B via `AXIOMDB_NO_CARRY_RESOLVE` (macOS
+runs have zero overlap). `--compare`: insert_batch ~2.3×→2.16× slower vs SQLite. Real, consistent, no-regression; workspace
+nextest + clippy + fmt clean. Validator = 2-scalar (catalog_epoch + write_commit_seq), stable
+within a BEGIN..COMMIT. **Gate corrected during impl:** `def.is_clustered() && indexes.all(is_primary)`
+(NOT the recipe's `indexes.is_empty()`, which a clustered PK's IndexDef row would have failed →
+the lever would never fire for bench_users). 4 embedded tests cover the lever + both correctness
+gates (skip-resolve, indexed-table secondary-index integrity, ALTER-target re-resolve).
 
 ## Summary
 

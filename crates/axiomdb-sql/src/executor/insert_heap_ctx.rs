@@ -22,6 +22,11 @@ pub(crate) fn resolve_insert_target(
     conn_txn: &mut ConnectionTxn,
     ctx: &mut SessionContext,
 ) -> Result<Arc<ResolvedTable>, DbError> {
+    // Carry-resolved-table diagnostic: this whole function is the per-row INSERT-target
+    // resolve that the prepared fast path SKIPS when it carries a cached ResolvedTable.
+    // Counted here (not in resolve_table_cached) because the lever also skips the
+    // get_table_arc fast path below, which still allocs the db/schema key + SipHash per row.
+    RESOLVE_TABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: see ExecutionContext::storage_mut / coord_mut / bloom_mut.
     let storage = exec_ctx.storage();
     let txn = exec_ctx.coord();
@@ -31,42 +36,46 @@ pub(crate) fn resolve_insert_target(
     // table_id confirms we are targeting the same table, and since all B-tree
     // writes are deferred to COMMIT in this path, the catalog entry (including
     // root_page_id) is unchanged since the batch was created.
-    let resolved: Arc<ResolvedTable> = crate::time_insert_phase!(resolve_ns, { 'resolve: {
-        if ctx.in_explicit_txn
-            && stmt.returning.is_empty()
-            && matches!(stmt.source, InsertSource::Values(_))
-        {
-            if let Some(bid) = ctx.clustered_insert_batch.as_ref().map(|b| b.table_id) {
-                let database = stmt
-                    .table
-                    .database
-                    .as_deref()
-                    .unwrap_or_else(|| ctx.effective_database())
-                    .to_string();
-                let cached = if let Some(schema) = stmt.table.schema.as_deref() {
-                    ctx.get_table_arc(&database, schema, &stmt.table.name)
-                        .filter(|rt| rt.def.id == bid)
-                } else {
-                    let n = ctx.search_path.len();
-                    let mut found = None;
-                    for i in 0..n {
-                        let schema = ctx.search_path[i].clone();
-                        if let Some(rt) = ctx.get_table_arc(&database, &schema, &stmt.table.name) {
-                            if rt.def.id == bid {
-                                found = Some(rt);
-                                break;
+    let resolved: Arc<ResolvedTable> = crate::time_insert_phase!(resolve_ns, {
+        'resolve: {
+            if ctx.in_explicit_txn
+                && stmt.returning.is_empty()
+                && matches!(stmt.source, InsertSource::Values(_))
+            {
+                if let Some(bid) = ctx.clustered_insert_batch.as_ref().map(|b| b.table_id) {
+                    let database = stmt
+                        .table
+                        .database
+                        .as_deref()
+                        .unwrap_or_else(|| ctx.effective_database())
+                        .to_string();
+                    let cached = if let Some(schema) = stmt.table.schema.as_deref() {
+                        ctx.get_table_arc(&database, schema, &stmt.table.name)
+                            .filter(|rt| rt.def.id == bid)
+                    } else {
+                        let n = ctx.search_path.len();
+                        let mut found = None;
+                        for i in 0..n {
+                            let schema = ctx.search_path[i].clone();
+                            if let Some(rt) =
+                                ctx.get_table_arc(&database, &schema, &stmt.table.name)
+                            {
+                                if rt.def.id == bid {
+                                    found = Some(rt);
+                                    break;
+                                }
                             }
                         }
+                        found
+                    };
+                    if let Some(rt) = cached {
+                        break 'resolve rt;
                     }
-                    found
-                };
-                if let Some(rt) = cached {
-                    break 'resolve rt;
                 }
             }
+            resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?
         }
-        resolve_table_cached(storage, txn, ctx, Some(conn_txn), &stmt.table)?
-    } });
+    });
     Ok(resolved)
 }
 
@@ -271,11 +280,11 @@ pub(crate) fn execute_insert_ctx_with_resolved(
                 if let Some(ai_col) = auto_inc_col {
                     // Phase 24.1c: GENERATED ALWAYS AS IDENTITY rejects
                     // explicit non-trigger values (NULL / 0 still auto-generate).
-                    if schema_cols[ai_col].identity_kind
-                        == axiomdb_catalog::IdentityKind::Always
-                    {
+                    if schema_cols[ai_col].identity_kind == axiomdb_catalog::IdentityKind::Always {
                         match full_values.get(ai_col) {
-                            Some(Value::Null) | Some(Value::Int(0)) | Some(Value::BigInt(0))
+                            Some(Value::Null)
+                            | Some(Value::Int(0))
+                            | Some(Value::BigInt(0))
                             | None => {}
                             Some(_) => {
                                 return Err(DbError::InvalidValue {

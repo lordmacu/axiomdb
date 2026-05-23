@@ -75,8 +75,8 @@ pub use executor::{
     cleanup_nonblocking_heap_alter_plan, commit_nonblocking_heap_alter, execute,
     execute_prepared_insert, execute_read_only_with_ctx, execute_snapshot, execute_with_ctx,
     execute_with_ctx_locked, prepare_nonblocking_heap_alter, prepared_insert_fast_hits,
-    truncate_table_unchecked_on_open, try_prepare_insert_plan, NonBlockingHeapAlterPlan,
-    PreparedInsertPlan,
+    resolve_table_calls, truncate_table_unchecked_on_open, try_prepare_insert_plan,
+    NonBlockingHeapAlterPlan, PreparedInsertPlan,
 };
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use lexer::{tokenize, tokenize_with_sql_mode, Span, SpannedToken, Token};
