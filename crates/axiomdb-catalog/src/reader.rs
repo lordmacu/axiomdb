@@ -26,6 +26,7 @@ use crate::{
     schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
     schema_holiday_calendar::HolidayCalendarDef,
+    schema_procedure::ProcedureDef,
 };
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
@@ -942,6 +943,51 @@ impl<'a> CatalogReader<'a> {
             out.push(def);
         }
         out.sort_by(|a, b| a.country_code.cmp(&b.country_code));
+        Ok(out)
+    }
+
+    // ── Stored procedures (Phase 16.7) ────────────────────────────────────────
+
+    /// Returns the stored procedure for `(schema, name)` (exact match), or `None`.
+    pub fn get_procedure(
+        &mut self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<ProcedureDef>, DbError> {
+        let root = self.page_ids.procedures;
+        if root == 0 {
+            return Ok(None);
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        for (_, _, data) in rows {
+            let (def, _) = ProcedureDef::from_bytes(&data)?;
+            if def.schema_name == schema && def.name == name {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns visible procedures, optionally filtered by schema, sorted by
+    /// `(schema_name, name)`.
+    pub fn list_procedures(&mut self, schema: Option<&str>) -> Result<Vec<ProcedureDef>, DbError> {
+        let root = self.page_ids.procedures;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = HeapChain::scan_visible_ro(self.storage, root, self.snapshot.clone())?;
+        let mut out = Vec::new();
+        for (_, _, data) in rows {
+            let (def, _) = ProcedureDef::from_bytes(&data)?;
+            if schema.is_none_or(|s| def.schema_name == s) {
+                out.push(def);
+            }
+        }
+        out.sort_by(|a, b| {
+            a.schema_name
+                .cmp(&b.schema_name)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Ok(out)
     }
 

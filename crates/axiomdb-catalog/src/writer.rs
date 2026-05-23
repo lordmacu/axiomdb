@@ -56,6 +56,7 @@ use crate::{
     schema_foreign_server::ForeignServerDef,
     schema_foreign_table::ForeignTableDef,
     schema_holiday_calendar::HolidayCalendarDef,
+    schema_procedure::ProcedureDef,
 };
 
 // ── WAL table_id constants for system tables ──────────────────────────────────
@@ -96,6 +97,8 @@ pub const SYSTEM_TABLE_HOLIDAY_CALENDARS: u32 = u32::MAX - 15;
 pub const SYSTEM_TABLE_EXCHANGE_RATES: u32 = u32::MAX - 16;
 /// WAL `table_id` used for inserts/deletes into `axiom_composite_types` (Phase 20.18).
 pub const SYSTEM_TABLE_COMPOSITE_TYPES: u32 = u32::MAX - 17;
+/// WAL `table_id` used for inserts/deletes into `axiom_procedures` (Phase 16.7).
+pub const SYSTEM_TABLE_PROCEDURES: u32 = u32::MAX - 18;
 
 fn validate_enum_type_def(def: &EnumTypeDef) -> Result<(), DbError> {
     if def.labels.is_empty() {
@@ -2157,6 +2160,83 @@ impl<'a> CatalogWriter<'a> {
                     self.conn,
                     SYSTEM_TABLE_HOLIDAY_CALENDARS,
                     def.country_code.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // ── Stored procedure operations (Phase 16.7) ──────────────────────────────
+
+    /// Inserts or replaces a stored procedure in `axiom_procedures`.
+    ///
+    /// Keyed by `(schema_name, name)` (exact match). If a procedure with the
+    /// same key already exists, the old row is deleted first (upsert / `OR
+    /// REPLACE` semantics).
+    pub fn upsert_procedure(&mut self, def: ProcedureDef) -> Result<(), DbError> {
+        let root = CatalogBootstrap::ensure_procedures_root(self.storage)?;
+        self.page_ids.procedures = root;
+
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (existing, _) = ProcedureDef::from_bytes(&data)?;
+            if existing.schema_name == def.schema_name && existing.name == def.name {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", existing.schema_name, existing.name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_PROCEDURES,
+                    key.as_bytes(),
+                    &data,
+                    page_id,
+                    slot_id,
+                )?;
+                break;
+            }
+        }
+
+        let data = def.to_bytes();
+        let key = format!("{}.{}", def.schema_name, def.name);
+        let (page_id, slot_id) = HeapChain::insert(self.storage, root, &data, txn_id, None)?;
+        self.txn.record_insert(
+            self.conn,
+            SYSTEM_TABLE_PROCEDURES,
+            key.as_bytes(),
+            &data,
+            page_id,
+            slot_id,
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a stored procedure by `(schema, name)` (exact match).
+    ///
+    /// Returns `true` if found and deleted, `false` if not found.
+    pub fn delete_procedure(&mut self, schema: &str, name: &str) -> Result<bool, DbError> {
+        let root = self.page_ids.procedures;
+        if root == 0 {
+            return Ok(false);
+        }
+        let txn_id = self.conn.txn_id;
+        let snap = self.txn.active_snapshot(self.conn);
+        let rows = HeapChain::scan_visible(self.storage, root, snap)?;
+
+        for (page_id, slot_id, data) in rows {
+            let (def, _) = ProcedureDef::from_bytes(&data)?;
+            if def.schema_name == schema && def.name == name {
+                HeapChain::delete(self.storage, page_id, slot_id, txn_id)?;
+                let key = format!("{}.{}", def.schema_name, def.name);
+                self.txn.record_delete(
+                    self.conn,
+                    SYSTEM_TABLE_PROCEDURES,
+                    key.as_bytes(),
                     &data,
                     page_id,
                     slot_id,

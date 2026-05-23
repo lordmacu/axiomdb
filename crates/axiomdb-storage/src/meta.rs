@@ -188,6 +188,16 @@ pub const CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET: usize = 192;
 /// initialized on first `CREATE TYPE … AS (…)` statement).
 pub const CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET: usize = 200;
 
+/// body offset of `catalog_procedures_root: u64` — root heap page for
+/// `axiom_procedures` (Phase 16.7). Value 0 = not yet allocated (lazily
+/// initialized on first `CREATE PROCEDURE` statement).
+pub const CATALOG_PROCEDURES_ROOT_BODY_OFFSET: usize = 208;
+
+const _: () = assert!(
+    HEADER_SIZE + CATALOG_PROCEDURES_ROOT_BODY_OFFSET + 8 <= crate::page::PAGE_SIZE,
+    "procedures catalog root must fit within page 0"
+);
+
 const _: () = assert!(
     HEADER_SIZE + CATALOG_SCHEMA_VER_BODY_OFFSET + 4 <= crate::page::PAGE_SIZE,
     "catalog header must fit within page 0"

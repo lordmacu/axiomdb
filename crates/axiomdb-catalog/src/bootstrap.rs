@@ -22,10 +22,11 @@ use axiomdb_storage::{
     CATALOG_ENUM_TYPES_ROOT_BODY_OFFSET, CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_KEYS_ROOT_BODY_OFFSET, CATALOG_FOREIGN_SERVERS_ROOT_BODY_OFFSET,
     CATALOG_FOREIGN_TABLES_ROOT_BODY_OFFSET, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET,
-    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_SCHEMAS_ROOT_BODY_OFFSET,
-    CATALOG_SCHEMA_VER_BODY_OFFSET, CATALOG_SEQUENCES_ROOT_BODY_OFFSET,
-    CATALOG_STATS_ROOT_BODY_OFFSET, CATALOG_TABLES_ROOT_BODY_OFFSET,
-    CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET, NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
+    CATALOG_INDEXES_ROOT_BODY_OFFSET, CATALOG_PROCEDURES_ROOT_BODY_OFFSET,
+    CATALOG_SCHEMAS_ROOT_BODY_OFFSET, CATALOG_SCHEMA_VER_BODY_OFFSET,
+    CATALOG_SEQUENCES_ROOT_BODY_OFFSET, CATALOG_STATS_ROOT_BODY_OFFSET,
+    CATALOG_TABLES_ROOT_BODY_OFFSET, CATALOG_TABLE_DATABASES_ROOT_BODY_OFFSET,
+    NEXT_INDEX_ID_BODY_OFFSET, NEXT_TABLE_ID_BODY_OFFSET,
 };
 
 use crate::schema::{DatabaseDef, SchemaDef, DEFAULT_DATABASE_NAME};
@@ -93,6 +94,9 @@ pub struct CatalogPageIds {
     /// Root page of the `axiom_composite_types` heap (Phase 20.18).
     /// Zero on legacy databases; lazily initialized on first `CREATE TYPE … AS (…)`.
     pub composite_types: u64,
+    /// Root page of the `axiom_procedures` heap (Phase 16.7).
+    /// Zero on legacy databases; lazily initialized on first `CREATE PROCEDURE`.
+    pub procedures: u64,
 }
 
 // ── CatalogBootstrap ─────────────────────────────────────────────────────────
@@ -283,6 +287,7 @@ impl CatalogBootstrap {
             holiday_calendars: 0,
             exchange_rates: 0,
             composite_types: composite_types_root,
+            procedures: 0,
         })
     }
 
@@ -317,6 +322,7 @@ impl CatalogBootstrap {
         let holiday_calendars = read_meta_u64(storage, CATALOG_HOLIDAY_CALENDARS_ROOT_BODY_OFFSET)?;
         let exchange_rates = read_meta_u64(storage, CATALOG_EXCHANGE_RATES_ROOT_BODY_OFFSET)?;
         let composite_types = read_meta_u64(storage, CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET)?;
+        let procedures = read_meta_u64(storage, CATALOG_PROCEDURES_ROOT_BODY_OFFSET)?;
         Ok(CatalogPageIds {
             tables,
             columns,
@@ -336,6 +342,7 @@ impl CatalogBootstrap {
             holiday_calendars,
             exchange_rates,
             composite_types,
+            procedures,
         })
     }
 
@@ -607,6 +614,22 @@ impl CatalogBootstrap {
         let page = Page::new(PageType::Data, new_root);
         storage.write_page(new_root, &page)?;
         write_meta_u64(storage, CATALOG_COMPOSITE_TYPES_ROOT_BODY_OFFSET, new_root)?;
+        storage.flush()?;
+        Ok(new_root)
+    }
+
+    /// Ensures the `axiom_procedures` root page exists (Phase 16.7).
+    ///
+    /// Lazily initialized on first `CREATE PROCEDURE` statement.
+    pub fn ensure_procedures_root(storage: &dyn StorageEngine) -> Result<u64, DbError> {
+        let root = read_meta_u64(storage, CATALOG_PROCEDURES_ROOT_BODY_OFFSET)?;
+        if root != 0 {
+            return Ok(root);
+        }
+        let new_root = storage.alloc_page(PageType::Data)?;
+        let page = Page::new(PageType::Data, new_root);
+        storage.write_page(new_root, &page)?;
+        write_meta_u64(storage, CATALOG_PROCEDURES_ROOT_BODY_OFFSET, new_root)?;
         storage.flush()?;
         Ok(new_root)
     }
