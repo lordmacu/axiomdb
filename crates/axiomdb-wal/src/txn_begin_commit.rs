@@ -112,7 +112,13 @@ impl TxnManager {
         if effective_policy == WalDurabilityPolicy::Strict {
             storage.sync_frame_log()?;
         }
-        let result = self.commit(conn_txn)?;
+        // Single-fsync commit: under frame-only the frame fsync above already made the
+        // commit durable (data frames + commit marker), so the logical WAL is NOT fsync'd
+        // here (best-effort flush only) — one fsync per commit instead of two. redo=off
+        // keeps fsyncing the logical WAL (its durability source). `force_double_fsync` is a
+        // diagnostic toggle that reinstates the 2nd fsync for the A/B bench.
+        let sync_logical = !storage.frame_log_active() || crate::force_double_fsync();
+        let result = self.commit_inner(conn_txn, sync_logical)?;
         // 6f synchronous back-pressure: keep the frame log bounded even with no
         // background checkpointer (or if it falls behind / dies). No-op unless redo
         // is on AND the log has reached the hard cap — maybe_checkpoint_frames
@@ -126,7 +132,10 @@ impl TxnManager {
     }
 
     /// Commits the transaction: writes the Commit WAL entry, fsyncs (or defers),
-    /// advances `max_committed`, and removes the txn from the active set.
+    /// advances `max_committed`, and removes the txn from the active set. Always fsyncs the
+    /// logical WAL at Strict (it is the durability source when there is no frame log).
+    /// Frame-only callers use [`commit_durable`](Self::commit_durable), which routes through
+    /// [`commit_inner`](Self::commit_inner) with `sync_logical = false`.
     ///
     /// Returns `Some(txn_id)` when the commit is deferred (pipeline mode) and
     /// the caller must drive the fsync pipeline. Returns `None` for immediate
@@ -134,7 +143,20 @@ impl TxnManager {
     ///
     /// # Errors
     /// - I/O errors from WAL write or fsync.
-    pub fn commit(&self, mut conn_txn: ConnectionTxn) -> Result<Option<TxnId>, DbError> {
+    pub fn commit(&self, conn_txn: ConnectionTxn) -> Result<Option<TxnId>, DbError> {
+        self.commit_inner(conn_txn, true)
+    }
+
+    /// `commit` with control over whether the logical WAL is fsync'd at Strict.
+    /// `sync_logical = false` (frame-only single-fsync commit): the frame log's commit
+    /// marker + frame fsync (already done in `commit_durable` BEFORE this) made the commit
+    /// durable, so the logical WAL is only `flush_no_sync`'d. `sync_logical = true`
+    /// (redo=off): the logical WAL IS the durability source → `commit_data_sync` as before.
+    fn commit_inner(
+        &self,
+        mut conn_txn: ConnectionTxn,
+        sync_logical: bool,
+    ) -> Result<Option<TxnId>, DbError> {
         let txn_id = conn_txn.txn_id;
 
         {
@@ -167,8 +189,15 @@ impl TxnManager {
                         // Pipeline mode: Commit entry buffered but not fsynced yet.
                         // max_committed advances only after the pipeline confirms fsync.
                         (false, Some(txn_id))
-                    } else {
+                    } else if sync_logical {
+                        // redo=off: the logical WAL is the durability source → fsync it.
                         self.wal.commit_data_sync()?;
+                        (true, None)
+                    } else {
+                        // Single-fsync commit (frame-only): the frame log's marker + frame
+                        // fsync (done in commit_durable BEFORE this) already made the commit
+                        // durable. The logical WAL is best-effort (recovery uses markers).
+                        self.wal.flush_no_sync()?;
                         (true, None)
                     }
                 }

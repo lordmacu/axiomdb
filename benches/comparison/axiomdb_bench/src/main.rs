@@ -1697,9 +1697,94 @@ fn main() {
         diagnose_parse(&data_dir, n_rows);
     } else if args.contains(&"--diagnose-wrapper".to_string()) {
         diagnose_wrapper(&data_dir, n_rows);
+    } else if args.contains(&"--diagnose-1fsync".to_string()) {
+        diagnose_1fsync(&data_dir, n_rows);
     } else {
         run_scenario(&scenario, n_rows, &data_dir);
     }
+}
+
+// ── Single-fsync commit: FULL autocommit ms/commit (run with AXIOMDB_BENCH_REDO=1) ──
+// At synchronous=FULL each commit fsyncs; ms/commit ≈ fsync_count × the device fsync
+// latency (deterministic on APFS, ~1.9ms), so it reads out the fsync COUNT directly.
+// Post single-fsync-commit a frame-only commit does ONE fsync (the frame log, covering
+// data frames + commit marker); the pre-change baseline did two (frame log + logical WAL).
+fn diagnose_1fsync(data_dir: &Path, n_rows: usize) {
+    let mut db = db_open(data_dir);
+    db.run("SET synchronous = 'FULL'")
+        .expect("set synchronous=FULL");
+    let n = n_rows.min(300);
+    let ins = gen_inserts(n);
+    let iters = 9;
+    let (mut t_double, mut t_single) = (Vec::new(), Vec::new());
+
+    // Warmup both modes.
+    for _ in 0..2 {
+        for d in [true, false] {
+            axiomdb_wal::set_force_double_fsync(d);
+            reset(&mut db);
+            for sql in &ins {
+                db_sql(&mut db, sql);
+            }
+        }
+    }
+    // Interleaved per-iter: 2-fsync (pre-single-fsync) vs 1-fsync (single-fsync commit).
+    for _ in 0..iters {
+        axiomdb_wal::set_force_double_fsync(true);
+        reset(&mut db);
+        let t = Instant::now();
+        for sql in &ins {
+            db_sql(&mut db, sql);
+        }
+        t_double.push(t.elapsed().as_secs_f64());
+
+        axiomdb_wal::set_force_double_fsync(false);
+        reset(&mut db);
+        let t = Instant::now();
+        for sql in &ins {
+            db_sql(&mut db, sql);
+        }
+        t_single.push(t.elapsed().as_secs_f64());
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (md, ms) = (med(&mut t_double), med(&mut t_single));
+
+    // fsync accounting per mode (one clean run each, resets excluded).
+    let count = |db: &mut Db, d: bool| -> (f64, f64) {
+        axiomdb_wal::set_force_double_fsync(d);
+        reset(db);
+        let f0 = axiomdb_storage::wal_frame::frame_fsyncs();
+        let w0 = axiomdb_wal::wal_fsyncs();
+        for sql in &ins {
+            db_sql(db, sql);
+        }
+        let frame = (axiomdb_storage::wal_frame::frame_fsyncs() - f0) as f64 / n as f64;
+        let wal = (axiomdb_wal::wal_fsyncs() - w0) as f64 / n as f64;
+        (frame, wal)
+    };
+    let (fd, wd) = count(&mut db, true);
+    let (fs, ws) = count(&mut db, false);
+    axiomdb_wal::set_force_double_fsync(false);
+
+    println!("── FULL autocommit A/B: 2-fsync (pre) vs 1-fsync (single-fsync commit) ──");
+    println!(
+        "2-fsync: {:>7.0} ops/s | {:.3} ms/commit | fsyncs/commit {fd:.2}+{wd:.2}",
+        n as f64 / md,
+        md * 1000.0 / n as f64,
+    );
+    println!(
+        "1-fsync: {:>7.0} ops/s | {:.3} ms/commit | fsyncs/commit {fs:.2}+{ws:.2}",
+        n as f64 / ms,
+        ms * 1000.0 / n as f64,
+    );
+    println!(
+        "→ single-fsync win: {:.2}× ({:+.1}%)",
+        md / ms,
+        (md / ms - 1.0) * 100.0
+    );
 }
 
 // ── Deep INSERT diagnostic (requires --features axiomdb-sql/bench-timings) ────

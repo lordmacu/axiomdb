@@ -3,7 +3,13 @@
 Phase: redo-recovery (project B)
 Task: 1 fsync per durable commit under frame-only redo
 Spec: specs/fase-redo-recovery/spec-single-fsync-commit.md
-Status: in-progress — Steps 1-4 + 5a DONE. Step 1-3 (commit 51ebfd57): marker +
+Status: in-progress — Steps 1-5 DONE (Step 6 docs remaining). **Step 5b (the flip):**
+commit_durable does ONE fsync under frame-only (drop commit_data_sync; logical WAL
+flush_no_sync). MEASURED (interleaved A/B, `--diagnose-1fsync`, force_double_fsync toggle):
+fsyncs/commit 1+0 (was 1+1); **Lima 1.21–1.44× FULL autocommit** (real virtio fsync ~50µs),
+**macOS APFS ~0** (it coalesces the 2nd fsync — confirmed 4.0ms both). Win grows with fsync
+cost → ~2× on real-disk Linux/cloud. = fsync-parity with SQLite at FULL + PG single-WAL.
+Earlier status (1-4+5a): Step 1-3 (commit 51ebfd57): marker +
 variable-stride scan + length-aware durable prefix. Step 4 + 5a: commit_durable appends the
 marker; recovery sources committed-ness from markers UNION logical (reconciles undo set +
 clustered roots); FrameLog version field (v1 fallback); FaultInjectionStorage wired; new T8

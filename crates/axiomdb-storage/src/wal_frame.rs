@@ -52,6 +52,15 @@ const FRAME_HDR_CRC_PREFIX: usize = 32;
 /// One frame on disk: header + a full page image.
 const FRAME_SIZE: u64 = FRAME_HDR_SIZE as u64 + PAGE_SIZE as u64;
 
+/// Diagnostic (single-fsync-commit A/B): process-global count of frame-log fsyncs
+/// (`sync_to_durable`). A relaxed counter — cheap; read via [`frame_fsyncs`].
+pub static FRAME_FSYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Total frame-log fsyncs since process start (diagnostic).
+pub fn frame_fsyncs() -> u64 {
+    FRAME_FSYNCS.load(Ordering::Relaxed)
+}
+
 fn le_u64(b: &[u8]) -> u64 {
     u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
 }
@@ -515,6 +524,7 @@ impl FrameLog {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contiguous_written;
+            FRAME_FSYNCS.fetch_add(1, Ordering::Relaxed);
             self.file
                 .sync_data()
                 .map_err(|e| classify_io(e, "frame log sync"))?;

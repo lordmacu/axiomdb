@@ -58,6 +58,15 @@ use crate::writer::{
 /// Entries arrive out of order when multiple transactions submit concurrently.
 /// The flush leader sorts by `base_lsn` before writing to ensure the on-disk
 /// file always contains entries in LSN order.
+/// Diagnostic (single-fsync-commit A/B): process-global count of logical-WAL fsyncs
+/// (`flush_and_sync`). Read via [`wal_fsyncs`]. Relaxed counter — cheap.
+pub static WAL_FSYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Total logical-WAL fsyncs since process start (diagnostic).
+pub fn wal_fsyncs() -> u64 {
+    WAL_FSYNCS.load(Ordering::Relaxed)
+}
+
 struct WriteQueue {
     /// `(base_lsn, serialized_bytes)` per submitted entry or batch.
     ///
@@ -443,6 +452,7 @@ impl ConcurrentWalWriter {
 
         // Durable sync — covers ALL entries accumulated since last flush
         // (InnoDB group commit: one fsync covers N concurrent transactions).
+        WAL_FSYNCS.fetch_add(1, Ordering::Relaxed);
         if metadata_sync {
             w.writer
                 .get_ref()
