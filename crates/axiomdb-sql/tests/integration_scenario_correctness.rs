@@ -934,3 +934,103 @@ fn update_subset_changes_only_targeted_rows() {
     );
     assert_eq!(count, N as i64, "UPDATE must not change row count");
 }
+
+/// Verifies the per-session COUNT(*) cache (Attack 17b, select_ctx.rs) returns
+/// the CORRECT count — both on a cache hit (repeated count, no writes) and after
+/// writes that must invalidate it. A stale cache here would be a real bug (the
+/// "count_star ~6× faster than SQLite" benchmark number is a cache hit).
+#[test]
+fn count_star_cache_reflects_writes_and_is_not_stale() {
+    let (mut s, mut txn, mut bloom, mut ctx) = setup_ctx();
+    ok(
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    for i in 1..=100i64 {
+        ok(
+            &format!("INSERT INTO c VALUES ({i}, {i})"),
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        );
+    }
+    assert_eq!(
+        scalar_int(
+            "SELECT COUNT(*) FROM c",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx
+        ),
+        100,
+        "fresh count"
+    );
+    // Repeated count → cache HIT (no writes since). Must still be correct.
+    assert_eq!(
+        scalar_int(
+            "SELECT COUNT(*) FROM c",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx
+        ),
+        100,
+        "cached count (no writes) must be correct"
+    );
+    // More inserts → cache MUST invalidate (must NOT return a stale 100).
+    for i in 101..=150i64 {
+        ok(
+            &format!("INSERT INTO c VALUES ({i}, {i})"),
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx,
+        );
+    }
+    assert_eq!(
+        scalar_int(
+            "SELECT COUNT(*) FROM c",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx
+        ),
+        150,
+        "count must reflect inserts (cache invalidated)"
+    );
+    // Delete → cache MUST invalidate.
+    ok(
+        "DELETE FROM c WHERE id <= 40",
+        &mut s,
+        &mut txn,
+        &mut bloom,
+        &mut ctx,
+    );
+    assert_eq!(
+        scalar_int(
+            "SELECT COUNT(*) FROM c",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx
+        ),
+        110,
+        "count must reflect delete (150-40)"
+    );
+    // Repeated after delete → cache HIT. Still correct.
+    assert_eq!(
+        scalar_int(
+            "SELECT COUNT(*) FROM c",
+            &mut s,
+            &mut txn,
+            &mut bloom,
+            &mut ctx
+        ),
+        110,
+        "cached count after delete must be correct"
+    );
+}
