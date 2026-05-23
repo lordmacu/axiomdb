@@ -241,6 +241,71 @@ fn t6_uncommitted_clustered_insert_is_undone_after_power_loss() {
     }
 }
 
+// ── T8 — single-fsync commit: recovery from the frame MARKER alone ───────────
+
+/// The single-fsync invariant: a committed clustered insert survives power loss even
+/// when the logical-WAL `Commit` record is GONE — recovery learns committed-ness from
+/// the frame-log commit marker, and reconciles the clustered root from the surviving
+/// `ClusteredInsert` entry. This is the post-drop world (logical WAL not fsync'd at
+/// commit); the frame log (markers + frames) is fsync'd and intact.
+#[test]
+fn t8_committed_insert_survives_on_the_marker_when_logical_commit_is_lost() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("t8.wal");
+
+    let mut storage = FaultInjectionStorage::new();
+    storage.enable_redo_log(&dir.path().join("t8.wf")).unwrap();
+
+    let key = b"k-marker-only";
+    let data = b"survives-on-the-marker-alone".to_vec();
+    {
+        let txn = TxnManager::create(&wal_path).unwrap();
+        let mut conn = txn.begin().unwrap();
+        let txn_id = conn.txn_id;
+        storage.set_current_txn(txn_id);
+        let root = clustered_tree::insert(&storage, None, key, &row_header(txn_id), &data).unwrap();
+        let image = ClusteredRowImage::new(root, row_header(txn_id), &data);
+        txn.record_clustered_insert(&mut conn, TABLE_ID, key, &image)
+            .unwrap();
+        txn.commit_durable(conn, &storage).unwrap();
+        storage.set_current_txn(0);
+    }
+
+    // Drop the trailing logical-WAL entry (the `Commit` record) by its backward length
+    // (`entry_len_2`, the last 4 bytes) — robust to the entry's exact size. This models
+    // a power loss where the non-fsync'd logical `Commit` never reached disk; the
+    // fsync'd frame log (with the commit marker) is untouched.
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        let len = f.metadata().unwrap().len();
+        let mut last4 = [0u8; 4];
+        f.read_exact_at(&mut last4, len - 4).unwrap();
+        let last_entry_len = u32::from_le_bytes(last4) as u64;
+        f.set_len(len - last_entry_len).unwrap();
+    }
+
+    storage.simulate_power_loss();
+
+    let (mgr, result) = TxnManager::open_with_recovery(&mut storage, &wal_path).unwrap();
+    assert!(
+        result.redone_pages >= 1,
+        "the committed frame must be redone via its commit marker (logical Commit is gone)"
+    );
+    let root = mgr
+        .clustered_root(TABLE_ID)
+        .expect("clustered root must be reconciled from the surviving ClusteredInsert entry");
+    let row = clustered_tree::lookup_physical(&storage, Some(root), key)
+        .unwrap()
+        .expect("committed row must survive on the marker alone");
+    assert_eq!(row.row_data, data);
+}
+
 // ── T2 — recovery is re-runnable (crash again after recovery → no-op) ────────
 
 /// After recovery flushes the redone state durable, a second power loss + a

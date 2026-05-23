@@ -1047,6 +1047,33 @@ impl StorageEngine for MmapStorage {
         self.frame_log.is_some()
     }
 
+    fn append_commit_marker(&self, txn_id: u64) -> Result<(), DbError> {
+        if let Some(fl) = &self.frame_log {
+            // Same checkpoint read-guard as a frame append, so a concurrent recycle can't
+            // race the marker write (mirrors write_page_inner / sync_frame_log).
+            let _ck = self
+                .checkpoint_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
+            fl.append_commit_marker(txn_id, lsn)?;
+        }
+        Ok(())
+    }
+
+    fn committed_txns_from_frames(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<u64>>, DbError> {
+        match &self.frame_log {
+            // v2+ logs carry commit markers ⇒ they are the durable committed truth.
+            Some(fl) if fl.format_version() >= 2 => Ok(Some(
+                fl.committed_txns_from_markers()?.into_iter().collect(),
+            )),
+            // redo=off, or a v1 log (no markers) ⇒ recovery uses the logical-WAL predicate.
+            _ => Ok(None),
+        }
+    }
+
     fn frame_log_durable_len(&self) -> u64 {
         // Gap-free written prefix (bytes); resets to FILE_HDR_SIZE on recycle.
         self.frame_log

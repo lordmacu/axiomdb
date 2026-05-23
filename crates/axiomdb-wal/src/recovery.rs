@@ -415,6 +415,26 @@ impl CrashRecovery {
             }
         }
 
+        // ── Single-fsync commit: marker-derived committed predicate ───────────
+        // Under frame-only with commit markers (v2), the DURABLE committed truth is the
+        // frame markers, not the logical-WAL `Commit` records (which are not fsync'd at
+        // commit once the 2nd fsync is dropped). Source the committed set from the markers
+        // and reconcile: a marker'd txn IS committed — it must NOT be undone, its clustered
+        // root belongs in `committed_clustered_roots`, and it advances `max_committed`.
+        // `None` (redo=off / pre-marker v1 log) keeps the logical-WAL `committed` set.
+        let marker_committed: Option<HashSet<u64>> = storage.committed_txns_from_frames()?;
+        if let Some(mc) = &marker_committed {
+            for t in mc {
+                active_txns.remove(t);
+                if let Some(roots) = active_clustered_roots.remove(t) {
+                    for (table_id, root_pid) in roots {
+                        committed_clustered_roots.insert(table_id, root_pid);
+                    }
+                }
+                max_committed = max_committed.max(*t);
+            }
+        }
+
         // ── Phase: UndoingInProgress ──────────────────────────────────────────
 
         let undone_txns = active_txns.len() as u32;
@@ -562,7 +582,19 @@ impl CrashRecovery {
         // Hybrid recovery: UNDO logical (uncommitted) above, then REDO physical
         // (committed) here — restores committed pages whose data never reached the
         // main file. No-op on a backend without a redo log (returns 0).
-        let redone_pages = storage.redo_committed_frames(&|t| committed.contains(&t))?;
+        let redone_pages = match &marker_committed {
+            // Frame-only v2: a txn is committed if it has a durable commit marker OR a
+            // logical `Commit`. UNION (not markers-only) is the safe choice: the marker is
+            // fsync'd BEFORE the logical `Commit` is written, so "logical Commit durable ⟹
+            // marker durable" — the union equals the marker set once the 2nd fsync is
+            // dropped, yet in the dual-durable interim it also covers any txn a commit path
+            // failed to mark (caught by the crash suite before the drop).
+            Some(mc) => {
+                storage.redo_committed_frames(&|t| committed.contains(&t) || mc.contains(&t))?
+            }
+            // redo=off / v1: replay per the logical-WAL committed set (unchanged path).
+            None => storage.redo_committed_frames(&|t| committed.contains(&t))?,
+        };
 
         // Flush all corrected pages to disk — makes recovery durable.
         storage.flush()?;

@@ -307,6 +307,33 @@ impl StorageEngine for FaultInjectionStorage {
         }
     }
 
+    fn frame_log_active(&self) -> bool {
+        self.frame_log.is_some()
+    }
+
+    fn append_commit_marker(&self, txn_id: u64) -> Result<(), DbError> {
+        if let Some(fl) = &self.frame_log {
+            let _ck = self
+                .checkpoint_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let lsn = self.frame_lsn.fetch_add(1, Ordering::Relaxed);
+            fl.append_commit_marker(txn_id, lsn)?;
+        }
+        Ok(())
+    }
+
+    fn committed_txns_from_frames(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<u64>>, DbError> {
+        match &self.frame_log {
+            Some(fl) if fl.format_version() >= 2 => Ok(Some(
+                fl.committed_txns_from_markers()?.into_iter().collect(),
+            )),
+            _ => Ok(None),
+        }
+    }
+
     fn redo_committed_frames(&self, is_committed: &dyn Fn(u64) -> bool) -> Result<usize, DbError> {
         self.apply_committed_frames(is_committed)
     }

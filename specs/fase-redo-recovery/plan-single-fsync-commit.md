@@ -3,10 +3,14 @@
 Phase: redo-recovery (project B)
 Task: 1 fsync per durable commit under frame-only redo
 Spec: specs/fase-redo-recovery/spec-single-fsync-commit.md
-Status: in-progress — Steps 1-3 DONE (commit 51ebfd57: marker + variable-stride scan +
-length-aware durable prefix + committed_txns_from_markers; storage 385/385). Next: Step 4
-(recovery sources committed-ness from markers). Steps 1-3 were one inseparable correctness
-unit so they landed together.
+Status: in-progress — Steps 1-4 + 5a DONE. Step 1-3 (commit 51ebfd57): marker +
+variable-stride scan + length-aware durable prefix. Step 4 + 5a: commit_durable appends the
+marker; recovery sources committed-ness from markers UNION logical (reconciles undo set +
+clustered roots); FrameLog version field (v1 fallback); FaultInjectionStorage wired; new T8
+proves recovery from the marker ALONE (logical Commit truncated). wal 224/224, storage
+385/385, crash suite 8/8. **Both fsyncs still on — NO throughput change yet.** NEXT = Step 5b
+(drop commit_data_sync + logical WAL flush_no_sync under frame-only = the ~2× FULL win) +
+Step 6 (bench + docs).
 
 ## Summary
 

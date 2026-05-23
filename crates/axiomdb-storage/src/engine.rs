@@ -126,6 +126,26 @@ pub trait StorageEngine: Send + Sync {
         false
     }
 
+    /// Appends a durable **commit marker** for `txn_id` to the page-frame log (single-fsync
+    /// commit). Must be called AFTER the txn's data frames and BEFORE [`Self::sync_frame_log`]
+    /// so one frame-log fsync makes data + commit durable in write-ahead order — AxiomDB's
+    /// version of PostgreSQL's single-WAL commit record. Default no-op (no redo log). See
+    /// `specs/fase-redo-recovery/spec-single-fsync-commit.md`.
+    fn append_commit_marker(&self, txn_id: u64) -> Result<(), DbError> {
+        let _ = txn_id;
+        Ok(())
+    }
+
+    /// The committed-txn set derived from the frame log's commit markers, or `None` when the
+    /// marker predicate does not apply (no redo log, or a pre-marker v1 log) — recovery then
+    /// falls back to the logical-WAL `Commit` scan. `Some(set)` means recovery MUST use it as
+    /// the durable committed truth (the logical WAL's `Commit` may not be fsync'd).
+    fn committed_txns_from_frames(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<u64>>, DbError> {
+        Ok(None)
+    }
+
     /// REDO: apply every committed frame to its page so committed data survives a
     /// crash (project B subphase 5). For each page with a committed frame (latest
     /// wins), if `frame.lsn > page.lsn` the frame's bytes are written to the page

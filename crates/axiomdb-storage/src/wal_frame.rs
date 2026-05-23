@@ -223,6 +223,10 @@ pub struct FrameLog {
     /// Serializes/coalesces fsyncs so a multi-ms `sync_data` never blocks append
     /// bookkeeping (the `sync_state` mutex is dropped before the fsync runs under this).
     fsync_leader: Mutex<()>,
+    /// On-disk format version of THIS log file (`VERSION` for a freshly created log; the
+    /// header's version for an opened one). v1 has no commit markers ⇒ recovery falls back
+    /// to the logical-WAL committed predicate; v2+ uses the markers (single-fsync commit).
+    version: u32,
 }
 
 /// Bookkeeping for the gap-free written prefix under concurrent lock-free appends.
@@ -281,6 +285,7 @@ impl FrameLog {
             advanced: Condvar::new(),
             durable: AtomicU64::new(FILE_HDR_SIZE),
             fsync_leader: Mutex::new(()),
+            version: VERSION,
         })
     }
 
@@ -327,6 +332,7 @@ impl FrameLog {
             advanced: Condvar::new(),
             durable: AtomicU64::new(FILE_HDR_SIZE),
             fsync_leader: Mutex::new(()),
+            version: file_version,
         };
         // The valid prefix on disk is already durable: set every watermark to its end.
         // Use the variable-stride walker's end offset (page frames + compact markers), not
@@ -716,6 +722,13 @@ impl FrameLog {
     /// The run salt (test/diagnostic).
     pub fn salt(&self) -> u64 {
         self.salt.load(Ordering::Relaxed)
+    }
+
+    /// On-disk format version of this log (1 = page frames only, 2 = adds compact commit
+    /// markers). Recovery uses this to pick the committed predicate: v2 → frame markers,
+    /// v1 → the logical-WAL `Commit` scan (no markers exist to read).
+    pub fn format_version(&self) -> u32 {
+        self.version
     }
 }
 

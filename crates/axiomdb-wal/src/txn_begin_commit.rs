@@ -99,6 +99,16 @@ impl TxnManager {
         let effective_policy = conn_txn
             .durability_override
             .unwrap_or(self.durability_policy);
+        // Single-fsync commit: record the commit decision IN the frame log (a compact
+        // marker) so recovery learns committed-ness from the frame log alone. Appended
+        // AFTER the txn's data frames (written during the txn) and BEFORE the frame-log
+        // fsync below, preserving write-ahead order (data durable before the commit
+        // marker). Skipped for read-only txns and when redo is off. NOTE: both fsyncs
+        // remain for now — dropping the logical-WAL fsync (commit_data_sync) is the
+        // separate final flip that yields the throughput win.
+        if !conn_txn.undo_ops.is_empty() && storage.frame_log_active() {
+            storage.append_commit_marker(conn_txn.txn_id)?;
+        }
         if effective_policy == WalDurabilityPolicy::Strict {
             storage.sync_frame_log()?;
         }
