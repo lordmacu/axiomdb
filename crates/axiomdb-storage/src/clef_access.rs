@@ -112,6 +112,27 @@ fn cell_content_start(page: &Page) -> u16 {
     u16::from_le_bytes([b[HEADER_SIZE + 4], b[HEADER_SIZE + 5]])
 }
 
+/// Absolute byte range `[offset, offset + len)` of the contiguous free hole
+/// between the cell-pointer array and the cell content — exactly the gap a redo
+/// frame may elide (PostgreSQL's `REGBUF_STANDARD` `pd_lower..pd_upper`,
+/// `research/postgres/src/backend/access/transam/xloginsert.c:729`).
+///
+/// Zeroing this range never touches a live cell, pointer, the page header, or a
+/// freeblock-with-data: pointers grow up from `CELL_PTR_START`, cell content
+/// (including any freeblock chain) grows down from `cell_content_start`, and the
+/// hole is the gap strictly between them. `len == 0` for a full page (no gap);
+/// `offset` is always `>= HEADER_SIZE` so the header (magic/type/checksum/LSN)
+/// is never elided. See `specs/fase-redo-recovery/spec-frame-hole-skipping.md`.
+pub fn free_hole(page: &Page) -> (usize, usize) {
+    let lower = HEADER_SIZE + CELL_PTR_START + num_cells(page) as usize * CELL_PTR_SIZE;
+    let upper = HEADER_SIZE + cell_content_start(page) as usize;
+    if upper > lower {
+        (lower, upper - lower)
+    } else {
+        (lower, 0)
+    }
+}
+
 #[inline]
 fn set_cell_content_start(page: &mut Page, v: u16) {
     let bytes = v.to_le_bytes();
@@ -238,10 +259,7 @@ struct OwnedCell {
 /// in logical order. Returns early on bounds errors so callers can
 /// surface them via `?`.
 #[inline]
-pub fn for_each_row_header<F: FnMut(&RowHeader)>(
-    page: &Page,
-    mut f: F,
-) -> Result<(), DbError> {
+pub fn for_each_row_header<F: FnMut(&RowHeader)>(page: &Page, mut f: F) -> Result<(), DbError> {
     let n = num_cells(page);
     let b = page.as_bytes();
     for i in 0..n {

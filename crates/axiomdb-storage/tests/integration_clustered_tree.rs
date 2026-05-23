@@ -2,8 +2,8 @@ use std::ops::Bound;
 
 use axiomdb_core::{error::DbError, TransactionSnapshot};
 use axiomdb_storage::{
-    clustered_internal, clustered_leaf, clustered_tree, MemoryStorage, PageType, RowHeader,
-    StorageEngine,
+    clustered_internal, clustered_leaf, clustered_tree, MemoryStorage, Page, PageType, RowHeader,
+    StorageEngine, HEADER_SIZE, PAGE_SIZE,
 };
 
 fn row_header(txn_id: u64) -> RowHeader {
@@ -891,4 +891,106 @@ fn clustered_append_split_overflow_rows_round_trip_across_boundaries() {
     for (idx, key) in keys.iter().enumerate() {
         assert_eq!(key.as_slice(), &(idx as u32).to_be_bytes());
     }
+}
+
+// ── Frame hole-skipping foundation (spec-frame-hole-skipping) ────────────────
+
+/// The redo-frame free hole (`clustered_leaf::free_hole`) must cover ONLY free
+/// space: zeroing it (the elision a hole-skipped frame performs on reconstruct)
+/// preserves every cell byte-for-byte. A wrong range would zero live data, so
+/// this is the safety crux of frame hole-skipping.
+#[test]
+fn clustered_leaf_free_hole_is_entirely_free_space() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root: Option<u64> = None;
+
+    // 30 small rows → a single, partially-full leaf (so a real hole exists).
+    for key in 0u32..30 {
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, 80),
+            )
+            .unwrap(),
+        );
+    }
+    let root = root.unwrap();
+    let leaf = storage.read_page(root).unwrap().into_page();
+    assert_eq!(
+        clustered_page_type(leaf.header().page_type).unwrap(),
+        PageType::ClusteredLeaf,
+        "30 small rows must still be a single leaf root"
+    );
+
+    let n = clustered_leaf::num_cells(&leaf);
+    let (off, len) = clustered_leaf::free_hole(&leaf);
+    assert!(off >= HEADER_SIZE, "hole must not touch the header");
+    assert!(off + len <= PAGE_SIZE, "hole must stay within the page");
+    assert!(len > 0, "a partially-full leaf must have a contiguous hole");
+
+    // Snapshot every cell from the original.
+    let original: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+        .map(|i| {
+            let c = clustered_leaf::read_cell(&leaf, i).unwrap();
+            (c.key.to_vec(), c.row_data.to_vec())
+        })
+        .collect();
+
+    // Zero the hole (what a reconstructed hole-skipped frame yields) + recompute.
+    let mut bytes = [0u8; PAGE_SIZE];
+    bytes.copy_from_slice(leaf.as_bytes());
+    for b in &mut bytes[off..off + len] {
+        *b = 0;
+    }
+    let mut zeroed = Page::from_bytes(bytes).unwrap();
+    zeroed.update_checksum();
+
+    // Every cell + the cell count must be intact after zeroing the hole.
+    assert_eq!(
+        clustered_leaf::num_cells(&zeroed),
+        n,
+        "zeroing the hole must not change the cell count"
+    );
+    for i in 0..n {
+        let c = clustered_leaf::read_cell(&zeroed, i).unwrap();
+        assert_eq!(
+            (c.key.to_vec(), c.row_data.to_vec()),
+            original[i as usize],
+            "cell {i} changed after zeroing the free hole"
+        );
+    }
+}
+
+/// A full (just-split) leaf has no usable hole (`len == 0`), so a hole-skipped
+/// frame falls back to the full-page format — no elision, no risk.
+#[test]
+fn clustered_leaf_free_hole_is_zero_when_full() {
+    let mut storage: Box<dyn StorageEngine> = Box::new(MemoryStorage::new());
+    let mut root: Option<u64> = None;
+    // Fill past one leaf so the first (left) leaf is packed ~full by append-split.
+    for key in 0u32..2_000 {
+        root = Some(
+            clustered_tree::insert(
+                storage.as_mut(),
+                root,
+                &key.to_be_bytes(),
+                &row_header(1),
+                &row_bytes(key, 80),
+            )
+            .unwrap(),
+        );
+    }
+    let root = root.unwrap();
+    let left = leftmost_leaf_pid(storage.as_ref(), root).unwrap();
+    let leaf = storage.read_page(left).unwrap().into_page();
+    let (_off, len) = clustered_leaf::free_hole(&leaf);
+    // A balance_quick-packed left leaf has little/no contiguous gap.
+    let cap = clustered_leaf::page_capacity_bytes();
+    assert!(
+        len * 10 < cap,
+        "a packed leaf should have a tiny hole (got {len} of capacity {cap})"
+    );
 }
