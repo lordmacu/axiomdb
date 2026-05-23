@@ -482,6 +482,9 @@ pub enum Token<'src> {
     /// `DO` — used in `DO expr` (MySQL expression discard → Noop).
     #[token("DO", ignore(ascii_case))]
     Do,
+    /// `PROCEDURE` — used in `CREATE/DROP PROCEDURE` (Phase 16.7).
+    #[token("PROCEDURE", ignore(ascii_case))]
+    Procedure,
     /// `IGNORE` — used in `INSERT IGNORE INTO ...`.
     #[token("IGNORE", ignore(ascii_case))]
     Ignore,
@@ -572,6 +575,13 @@ pub enum Token<'src> {
 
     /// Double-quote-quoted identifier after `ANSI_QUOTES` decoding.
     DqIdent(String),
+
+    /// PostgreSQL dollar-quoted string: `$$ … $$` or `$tag$ … $tag$` (Phase 16.7).
+    /// Used for PL/pgSQL procedure bodies. The inner content is returned verbatim
+    /// (dollar-quoting performs no escape processing — that is its purpose). A bare
+    /// `$` not opening a valid dollar-quote, or an unterminated one, is a lex error.
+    #[token("$", lex_dollar_quoted)]
+    DollarString(String),
 
     // ── MySQL expression keywords ─────────────────────────────────────────────
     /// `REGEXP` — regular-expression match operator.
@@ -752,6 +762,45 @@ pub(crate) fn decode_hex_bytes_literal(raw: &str) -> Option<Vec<u8>> {
 /// Recognized escapes: `\\` `\'` `\"` `\n` `\r` `\t` `\0` `\b` `\Z`.
 /// Unknown escapes `\x` → returns `x` literally (MySQL lenient behavior).
 /// SQL standard `''` doubling → returns `'`.
+/// logos callback for a PostgreSQL dollar-quoted string (Phase 16.7).
+///
+/// On entry the opening `$` has already been consumed by the `#[token("$", …)]`
+/// match, so `lex.remainder()` begins right after it. Accepts `$$ … $$` and
+/// `$tag$ … $tag$` where `tag` is `[A-Za-z_][A-Za-z0-9_]*`. Returns the inner
+/// content verbatim (no escape processing) and bumps the lexer past the closing
+/// delimiter. Returns `None` (→ lex error) for a bare `$`, an invalid tag, or an
+/// unterminated dollar-quote, preserving the prior "`$` is not valid" behavior.
+fn lex_dollar_quoted<'src>(lex: &mut logos::Lexer<'src, Token<'src>>) -> Option<String> {
+    let rem = lex.remainder();
+    let bytes = rem.as_bytes();
+
+    // Scan the tag: identifier chars up to the closing `$` of the opener.
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'$' {
+            break;
+        }
+        let is_tag_char = b == b'_' || b.is_ascii_alphanumeric();
+        // A tag must be a valid identifier — its first char is not a digit.
+        if !is_tag_char || (i == 0 && b.is_ascii_digit()) {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'$' {
+        return None; // no closing `$` for the opener (e.g. a bare `$`)
+    }
+    let tag = &rem[..i];
+    let opener_rest = i + 1; // tag bytes + the `$` that closes the opener
+    let close = format!("${tag}$");
+    let hay = &rem[opener_rest..];
+    let inner_len = hay.find(&close)?; // unterminated → None → lex error
+    let inner = hay[..inner_len].to_string();
+    lex.bump(opener_rest + inner_len + close.len());
+    Some(inner)
+}
+
 pub(crate) fn process_string_literal(raw: &str) -> Option<String> {
     // Strip surrounding single quotes.
     let inner = &raw[1..raw.len() - 1];
@@ -1090,6 +1139,61 @@ mod tests {
     #[test]
     fn test_keyword_uppercase() {
         assert_eq!(tok("SELECT"), vec![Token::Select, Token::Eof]);
+    }
+
+    // ── Stored procedures: PROCEDURE keyword + dollar-quoting (Phase 16.7) ─────
+
+    #[test]
+    fn lex_procedure_keyword() {
+        assert_eq!(tok("PROCEDURE"), vec![Token::Procedure, Token::Eof]);
+        assert_eq!(tok("procedure"), vec![Token::Procedure, Token::Eof]);
+    }
+
+    #[test]
+    fn lex_dollar_quoted_simple() {
+        assert_eq!(
+            tok("$$ a; b; $$"),
+            vec![Token::DollarString(" a; b; ".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_dollar_quoted_empty() {
+        assert_eq!(
+            tok("$$$$"),
+            vec![Token::DollarString(String::new()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_dollar_quoted_tagged_allows_inner_dollars() {
+        // Inner `$$` is content, not the close (close is `$body$`).
+        assert_eq!(
+            tok("$body$ x $$ y $body$"),
+            vec![Token::DollarString(" x $$ y ".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_bare_dollar_is_error() {
+        assert!(tokenize("$", None).is_err());
+        assert!(tokenize("$ ", None).is_err());
+        assert!(tokenize("$1", None).is_err()); // not a tag-then-$ → error (no $N params)
+    }
+
+    #[test]
+    fn lex_unterminated_dollar_is_error() {
+        assert!(tokenize("$$ abc", None).is_err());
+        assert!(tokenize("$tag$ abc $tag", None).is_err());
+    }
+
+    #[test]
+    fn lex_create_procedure_with_body() {
+        let toks = tok("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$");
+        assert!(toks.contains(&Token::Procedure));
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t, Token::DollarString(s) if s == " BEGIN END ")));
     }
 
     #[test]

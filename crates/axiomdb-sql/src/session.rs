@@ -531,6 +531,8 @@ pub fn is_ignorable_on_error(err: &DbError) -> bool {
         // ── SQL / user-facing ─────────────────────────────────────────────────
         DbError::ParseError { .. }
         | DbError::TableNotFound { .. }
+        | DbError::ProcedureNotFound { .. }
+        | DbError::ProcedureAlreadyExists { .. }
         | DbError::DatabaseNotFound { .. }
         | DbError::ColumnNotFound { .. }
         | DbError::IndexNotFound { .. }
