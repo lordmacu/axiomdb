@@ -18,7 +18,7 @@
 //!   partially-written frame fails the crc → marks the end of the valid prefix
 //!   (append-only ⇒ damage is always at the tail).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -30,7 +30,18 @@ use axiomdb_core::error::{classify_io, DbError};
 use crate::page::PAGE_SIZE;
 
 const MAGIC: u64 = 0x4158_494f_4d5f_5746; // "AXIOM_WF"
-const VERSION: u32 = 1;
+
+// v2 added the variable-stride commit-marker record (single-fsync commit). A v1 log has
+// only full page frames; recovery of a v1 log falls back to the logical-WAL committed
+// predicate (see recovery.rs). See specs/fase-redo-recovery/spec-single-fsync-commit.md.
+const VERSION: u32 = 2;
+
+/// Sentinel `page_id` marking a **compact commit-marker record** (PostgreSQL's commit
+/// record lives in the one WAL; ours lives in the one frame log). A marker is just the
+/// 36-byte frame header — no page payload — so its on-disk length is `FRAME_HDR_SIZE`,
+/// not `FRAME_SIZE`. Recovery reads markers to learn which `txn_id`s committed without a
+/// second (logical-WAL) fsync. `u64::MAX` is never a real page id.
+const COMMIT_MARKER: u64 = u64::MAX;
 
 /// File header: magic(8) version(4) page_size(4) salt(8) header_crc(4) _pad(4).
 const FILE_HDR_SIZE: u64 = 32;
@@ -61,6 +72,17 @@ pub struct FrameRef {
     pub txn_id: u64,
     /// Byte offset of the frame header in the log file.
     pub offset: u64,
+}
+
+/// Result of a variable-stride scan of the frame log's valid prefix
+/// ([`FrameLog::scan_records`]).
+struct ScannedRecords {
+    /// Page frames (salt-matching, crc-verified), in log order.
+    pages: Vec<FrameRef>,
+    /// Commit markers as `(txn_id, lsn)`, in log order.
+    markers: Vec<(u64, u64)>,
+    /// Byte offset just past the last valid record (the end of the valid prefix).
+    end: u64,
 }
 
 /// How [`FrameLog::recycle`] treats the file's already-allocated blocks after a
@@ -207,9 +229,12 @@ pub struct FrameLog {
 /// Offsets are frame START boundaries; "prefix ends at X" ⇔ every frame with START < X
 /// has finished its `pwrite`.
 struct SyncState {
-    /// Completed frame START offsets not yet folded into `contiguous_written` (i.e. a
-    /// higher frame finished before a lower one — the out-of-order reorder buffer).
-    completed: BTreeSet<u64>,
+    /// Completed records not yet folded into `contiguous_written` (a higher record
+    /// finished before a lower one — the out-of-order reorder buffer). Maps each
+    /// record's START offset → its on-disk length (`FRAME_SIZE` for a page frame,
+    /// `FRAME_HDR_SIZE` for a commit marker) so the gap-free fold advances by the
+    /// actual length under the variable-stride layout.
+    completed: BTreeMap<u64, u64>,
     /// Gap-free written prefix == the next expected (lowest un-written) START offset.
     contiguous_written: u64,
     /// Lowest START offset whose append `pwrite` failed (a permanent gap), if any.
@@ -219,7 +244,7 @@ struct SyncState {
 impl SyncState {
     fn new(start: u64) -> Self {
         SyncState {
-            completed: BTreeSet::new(),
+            completed: BTreeMap::new(),
             contiguous_written: start,
             poison: None,
         }
@@ -274,10 +299,14 @@ impl FrameLog {
         if le_u64(&hdr[0..8]) != MAGIC {
             return Err(DbError::Other("frame log: bad magic".into()));
         }
-        if le_u32(&hdr[8..12]) != VERSION {
+        // Accept v1 (page frames only) and v2 (adds compact commit markers): the
+        // variable-stride reader handles both — a v1 log simply has no markers, so
+        // recovery falls back to the logical-WAL committed predicate for it (no
+        // regression opening a pre-marker log). Reject only unknown/newer versions.
+        let file_version = le_u32(&hdr[8..12]);
+        if file_version == 0 || file_version > VERSION {
             return Err(DbError::Other(format!(
-                "frame log: unsupported version {}",
-                le_u32(&hdr[8..12])
+                "frame log: unsupported version {file_version}"
             )));
         }
         if le_u32(&hdr[12..16]) as usize != PAGE_SIZE {
@@ -300,11 +329,9 @@ impl FrameLog {
             fsync_leader: Mutex::new(()),
         };
         // The valid prefix on disk is already durable: set every watermark to its end.
-        let frames = log.scan()?;
-        let end = frames
-            .last()
-            .map(|f| f.offset + FRAME_SIZE)
-            .unwrap_or(FILE_HDR_SIZE);
+        // Use the variable-stride walker's end offset (page frames + compact markers), not
+        // `last_frame + FRAME_SIZE` (which would over-count a trailing commit marker).
+        let end = log.scan_records()?.end;
         log.write_offset.store(end, Ordering::Relaxed);
         log.sync_state
             .lock()
@@ -341,13 +368,47 @@ impl FrameLog {
         match write {
             Ok(()) => {
                 // Publish completion so the contiguous-written prefix can advance.
-                self.mark_written(offset);
+                self.mark_written(offset, FRAME_SIZE);
                 Ok(offset)
             }
             Err(e) => {
                 // Poison the slot: a committer waiting past it must error, not deadlock.
                 self.mark_poison(offset);
                 Err(classify_io(e, "frame log write"))
+            }
+        }
+    }
+
+    /// Appends a **compact commit marker** for `txn_id` (single-fsync commit). The marker
+    /// is just the 36-byte frame header (`page_id == COMMIT_MARKER`, the txn, the run salt,
+    /// a crc over the header) — no page payload. It MUST be appended AFTER the txn's data
+    /// frames so a single [`sync_to_durable`](Self::sync_to_durable) makes data+commit
+    /// durable in write-ahead order. Recovery reads markers via
+    /// [`committed_txns_from_markers`](Self::committed_txns_from_markers) to learn which
+    /// transactions committed, with no second (logical-WAL) fsync. Lock-free like
+    /// [`append`](Self::append): reserves a compact slot with `fetch_add(FRAME_HDR_SIZE)`.
+    pub fn append_commit_marker(&self, txn_id: u64, lsn: u64) -> Result<u64, DbError> {
+        let mut hdr = [0u8; FRAME_HDR_SIZE];
+        hdr[0..8].copy_from_slice(&COMMIT_MARKER.to_le_bytes());
+        hdr[8..16].copy_from_slice(&lsn.to_le_bytes());
+        hdr[16..24].copy_from_slice(&txn_id.to_le_bytes());
+        hdr[24..32].copy_from_slice(&self.salt.load(Ordering::Relaxed).to_le_bytes());
+        // crc over the header prefix only (no page) — equals frame_crc(prefix, &[]).
+        let crc = crc32c::crc32c(&hdr[0..FRAME_HDR_CRC_PREFIX]);
+        hdr[32..36].copy_from_slice(&crc.to_le_bytes());
+
+        // Reserve a COMPACT slot (FRAME_HDR_SIZE, not FRAME_SIZE) — variable stride.
+        let offset = self
+            .write_offset
+            .fetch_add(FRAME_HDR_SIZE as u64, Ordering::Relaxed);
+        match self.file.write_all_at(&hdr, offset) {
+            Ok(()) => {
+                self.mark_written(offset, FRAME_HDR_SIZE as u64);
+                Ok(offset)
+            }
+            Err(e) => {
+                self.mark_poison(offset);
+                Err(classify_io(e, "frame log commit marker write"))
             }
         }
     }
@@ -361,15 +422,18 @@ impl FrameLog {
             .map_err(|e| classify_io(e, "frame log sync"))
     }
 
-    /// Records that the frame at START `offset` finished its `pwrite`, folding it into the
-    /// contiguous-written prefix (advancing over any now-contiguous earlier completions).
-    fn mark_written(&self, offset: u64) {
+    /// Records that the record at START `offset` with on-disk length `len` finished its
+    /// `pwrite`, folding it into the contiguous-written prefix (advancing over any
+    /// now-contiguous earlier completions). `len` is `FRAME_SIZE` for a page frame or
+    /// `FRAME_HDR_SIZE` for a commit marker — the fold advances by the stored length so
+    /// variable-stride records leave no phantom gap.
+    fn mark_written(&self, offset: u64, len: u64) {
         {
             let mut s = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
-            s.completed.insert(offset);
+            s.completed.insert(offset, len);
             let mut cw = s.contiguous_written;
-            while s.completed.remove(&cw) {
-                cw += FRAME_SIZE;
+            while let Some(l) = s.completed.remove(&cw) {
+                cw += l;
             }
             s.contiguous_written = cw;
         }
@@ -550,39 +614,85 @@ impl FrameLog {
         Ok(Some(out))
     }
 
-    /// Scans the valid prefix: every frame whose salt matches the run AND whose crc
-    /// verifies. Stops at the first invalid/partial frame (the torn tail).
-    pub fn scan(&self) -> Result<Vec<FrameRef>, DbError> {
+    /// Variable-stride walk of the valid prefix. Returns `(page_frames, commit_markers,
+    /// end_offset)` where `commit_markers` is `(txn_id, lsn)` per marker and `end_offset`
+    /// is the byte offset just past the last valid record. A record is a full **page
+    /// frame** (`page_id != COMMIT_MARKER`, length `FRAME_SIZE`) or a compact **commit
+    /// marker** (`page_id == COMMIT_MARKER`, length `FRAME_HDR_SIZE`). Stops at the first
+    /// stale salt, torn crc, or partial tail (append-only ⇒ damage is at the tail).
+    fn scan_records(&self) -> Result<ScannedRecords, DbError> {
         let file_len = self
             .file
             .metadata()
             .map_err(|e| classify_io(e, "frame log metadata"))?
             .len();
+        let salt_now = self.salt.load(Ordering::Relaxed);
         let mut frames = Vec::new();
+        let mut markers = Vec::new();
         let mut offset = FILE_HDR_SIZE;
-        let mut buf = vec![0u8; FRAME_SIZE as usize];
-        while offset + FRAME_SIZE <= file_len {
+        let mut hdr = [0u8; FRAME_HDR_SIZE];
+        let mut page = vec![0u8; PAGE_SIZE];
+        // Need at least a header to read any record.
+        while offset + FRAME_HDR_SIZE as u64 <= file_len {
             self.file
-                .read_exact_at(&mut buf, offset)
+                .read_exact_at(&mut hdr, offset)
                 .map_err(|e| classify_io(e, "frame log scan read"))?;
-            let (hdr, page) = buf.split_at(FRAME_HDR_SIZE);
-            let salt = le_u64(&hdr[24..32]);
-            if salt != self.salt.load(Ordering::Relaxed) {
-                break; // stale frame from a previous run
+            if le_u64(&hdr[24..32]) != salt_now {
+                break; // stale record from a previous run
             }
+            let page_id = le_u64(&hdr[0..8]);
             let stored_crc = le_u32(&hdr[32..36]);
-            if frame_crc(&hdr[0..FRAME_HDR_CRC_PREFIX], page) != stored_crc {
-                break; // torn / corrupt frame — end of valid prefix
+            if page_id == COMMIT_MARKER {
+                // Compact commit marker: crc covers the header only (no page payload).
+                if crc32c::crc32c(&hdr[0..FRAME_HDR_CRC_PREFIX]) != stored_crc {
+                    break; // torn marker — end of valid prefix
+                }
+                markers.push((le_u64(&hdr[16..24]), le_u64(&hdr[8..16]))); // (txn_id, lsn)
+                offset += FRAME_HDR_SIZE as u64;
+            } else {
+                // Full page frame: the page bytes must also be present (else torn tail).
+                if offset + FRAME_SIZE > file_len {
+                    break;
+                }
+                self.file
+                    .read_exact_at(&mut page, offset + FRAME_HDR_SIZE as u64)
+                    .map_err(|e| classify_io(e, "frame log scan read"))?;
+                if frame_crc(&hdr[0..FRAME_HDR_CRC_PREFIX], &page) != stored_crc {
+                    break; // torn / corrupt frame — end of valid prefix
+                }
+                frames.push(FrameRef {
+                    page_id,
+                    lsn: le_u64(&hdr[8..16]),
+                    txn_id: le_u64(&hdr[16..24]),
+                    offset,
+                });
+                offset += FRAME_SIZE;
             }
-            frames.push(FrameRef {
-                page_id: le_u64(&hdr[0..8]),
-                lsn: le_u64(&hdr[8..16]),
-                txn_id: le_u64(&hdr[16..24]),
-                offset,
-            });
-            offset += FRAME_SIZE;
         }
-        Ok(frames)
+        Ok(ScannedRecords {
+            pages: frames,
+            markers,
+            end: offset,
+        })
+    }
+
+    /// Scans the valid prefix for **page frames** (salt-matching, crc-verified, stopping at
+    /// the torn tail). Commit markers are skipped here — see
+    /// [`committed_txns_from_markers`](Self::committed_txns_from_markers).
+    pub fn scan(&self) -> Result<Vec<FrameRef>, DbError> {
+        Ok(self.scan_records()?.pages)
+    }
+
+    /// The set of `txn_id`s with a durable **commit marker** in the valid prefix — the
+    /// single-fsync recovery committed-predicate (frame-only). Empty for a v1 log (no
+    /// markers): recovery then falls back to the logical-WAL predicate.
+    pub fn committed_txns_from_markers(&self) -> Result<BTreeSet<u64>, DbError> {
+        Ok(self
+            .scan_records()?
+            .markers
+            .into_iter()
+            .map(|(txn_id, _lsn)| txn_id)
+            .collect())
     }
 
     /// Builds the page → latest-committed-frame index. A frame counts only if
@@ -690,6 +800,93 @@ mod tests {
         assert_eq!(got, vec![(2, 3), (3, 2)]);
     }
 
+    // ── single-fsync commit: compact marker + variable-stride frame log ──────────
+
+    #[test]
+    fn commit_marker_round_trips_between_page_frames() {
+        let (_d, path) = tmp("marker.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.append(7, 1, 100, &page(0xA1)).unwrap();
+        log.append_commit_marker(100, 2).unwrap();
+        log.append(8, 3, 101, &page(0xB2)).unwrap();
+        // scan() yields only the two PAGE frames, in order (the marker is variable-stride).
+        let frames = log.scan().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].page_id, 7);
+        assert_eq!(frames[1].page_id, 8);
+        assert_eq!(frames[1].txn_id, 101);
+        // the marker is read back as a committed txn.
+        assert_eq!(
+            log.committed_txns_from_markers().unwrap(),
+            BTreeSet::from([100u64])
+        );
+        // survives a reopen (variable-stride walk from disk).
+        drop(log);
+        let log2 = FrameLog::open(&path).unwrap();
+        assert_eq!(log2.scan().unwrap().len(), 2);
+        assert_eq!(
+            log2.committed_txns_from_markers().unwrap(),
+            BTreeSet::from([100u64])
+        );
+    }
+
+    #[test]
+    fn torn_commit_marker_ends_valid_prefix() {
+        let (_d, path) = tmp("torn_marker.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.append(7, 1, 100, &page(0xA1)).unwrap();
+        let marker_off = log.append_commit_marker(100, 2).unwrap();
+        log.append(8, 3, 101, &page(0xB2)).unwrap(); // a frame AFTER the marker
+        drop(log);
+        // Corrupt the marker's crc on disk (header bytes [marker_off+32 .. +36]).
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&[0xFF; 4], marker_off + 32).unwrap();
+        drop(f);
+        let log = FrameLog::open(&path).unwrap();
+        // scan stops at the torn marker → only the FIRST page frame survives; the frame
+        // written after the marker is unreachable.
+        let frames = log.scan().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].page_id, 7);
+        assert!(log.committed_txns_from_markers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_prefix_handles_mixed_record_sizes() {
+        // The subtle correctness point: the gap-free fold must advance by each record's
+        // ACTUAL length, not a fixed FRAME_SIZE. Layout: page @A, marker @B, page @C.
+        let (_d, path) = tmp("mixed.wf");
+        let log = FrameLog::create(&path).unwrap();
+        let a = FILE_HDR_SIZE;
+        let b = a + FRAME_SIZE; // after the page frame
+        let c = b + FRAME_HDR_SIZE as u64; // after the compact marker
+        log.set_write_offset_for_test(c + FRAME_SIZE);
+        // complete OUT OF ORDER: C first → prefix stuck at A (gaps at A,B).
+        log.mark_written(c, FRAME_SIZE);
+        assert_eq!(log.contiguous_written_offset(), a);
+        // A done (page len) → prefix advances to B.
+        log.mark_written(a, FRAME_SIZE);
+        assert_eq!(log.contiguous_written_offset(), b);
+        // B done (marker len) → folds B (FRAME_HDR_SIZE) then C (FRAME_SIZE) → end.
+        log.mark_written(b, FRAME_HDR_SIZE as u64);
+        assert_eq!(log.contiguous_written_offset(), c + FRAME_SIZE);
+    }
+
+    #[test]
+    fn open_end_offset_is_past_a_trailing_marker() {
+        // Regression for the variable-stride open(): a trailing marker advances the write
+        // offset by FRAME_HDR_SIZE, not FRAME_SIZE (else the next append leaves a hole).
+        let (_d, path) = tmp("trailing_marker.wf");
+        let log = FrameLog::create(&path).unwrap();
+        log.append(7, 1, 100, &page(0xA1)).unwrap();
+        let marker_off = log.append_commit_marker(100, 2).unwrap();
+        log.sync_to_durable().unwrap();
+        drop(log);
+        let log2 = FrameLog::open(&path).unwrap();
+        let off = log2.append(8, 3, 101, &page(0xB2)).unwrap();
+        assert_eq!(off, marker_off + FRAME_HDR_SIZE as u64);
+    }
+
     #[test]
     fn build_index_excludes_uncommitted_txns() {
         let (_d, path) = tmp("uncommitted.wf");
@@ -745,14 +942,14 @@ mod tests {
         assert_eq!(log.contiguous_written_offset(), h);
         assert_eq!(log.durable_offset(), h);
         // A higher frame completes before a lower one → the prefix must NOT skip the gap.
-        log.mark_written(h + FRAME_SIZE);
+        log.mark_written(h + FRAME_SIZE, FRAME_SIZE);
         assert_eq!(
             log.contiguous_written_offset(),
             h,
             "gap must not be skipped"
         );
         // Filling the gap folds both in one step.
-        log.mark_written(h);
+        log.mark_written(h, FRAME_SIZE);
         assert_eq!(log.contiguous_written_offset(), h + 2 * FRAME_SIZE);
     }
 
@@ -789,7 +986,7 @@ mod tests {
         let h = FILE_HDR_SIZE;
         // Two frames reserved; only the higher one completed → a gap at h.
         log.set_write_offset_for_test(h + 2 * FRAME_SIZE);
-        log.mark_written(h + FRAME_SIZE);
+        log.mark_written(h + FRAME_SIZE, FRAME_SIZE);
 
         let done = Arc::new(AtomicBool::new(false));
         let (l2, d2) = (Arc::clone(&log), Arc::clone(&done));
@@ -802,7 +999,7 @@ mod tests {
             !done.load(Ordering::SeqCst),
             "sync_to_durable must block while a gap exists below the target"
         );
-        log.mark_written(h); // fill the gap → the waiter proceeds
+        log.mark_written(h, FRAME_SIZE); // fill the gap → the waiter proceeds
         t.join().unwrap();
         assert!(done.load(Ordering::SeqCst));
         assert_eq!(log.durable_offset(), h + 2 * FRAME_SIZE);
