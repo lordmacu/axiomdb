@@ -3,7 +3,52 @@
 Phase: redo-recovery (project B) — WAL-volume optimization
 Task: Borrow PostgreSQL's full-page-image hole elision for AxiomDB's page-frame
 redo log, to cut WAL volume (most impactful for autocommit, our worst write gap).
-Status: draft
+Status: in-progress — Step 1 (foundation) DONE + pushed; the format/write-path
+change remains. Picked up by another agent.
+
+## Progress / Handoff (2026-05-22)
+
+### ✅ DONE — Step 1: hole computation + safety validation (read-only, no risk)
+
+The safety crux (are the hole bounds correct?) is implemented and **proven**, with
+**no on-disk format or write-path change yet** — so nothing here can corrupt data.
+
+- **`clustered_leaf::free_hole(page) -> (offset, len)`** in
+  `crates/axiomdb-storage/src/clef_access.rs` — returns the absolute byte range of
+  the contiguous free hole `[ptr_array_end .. cell_content_start]` (PG's
+  `pd_lower..pd_upper`). `len == 0` for a full page; `offset >= HEADER_SIZE`.
+- **Property tests** in `crates/axiomdb-storage/tests/integration_clustered_tree.rs`:
+  - `clustered_leaf_free_hole_is_entirely_free_space` — zeroing the computed hole
+    + recomputing the checksum preserves **every cell byte-for-byte** (a wrong
+    range would zero live data → this is the corruption guard).
+  - `clustered_leaf_free_hole_is_zero_when_full` — a balance_quick-packed leaf has
+    ~no hole (→ full-frame fallback, no elision).
+- Commits: spec `db03464f`, foundation `21a945b8` (both pushed to
+  `origin/fase-redo-recovery`). Storage clustered-tree suite 16/16 green.
+
+### ⏳ REMAINING — the format/write-path change (safety-critical, gated)
+
+1. **Per-type hole dispatch** — extend beyond ClusteredLeaf: a
+   `Page::redo_free_hole() -> Option<(offset,len)>` dispatching by `page_type`
+   (ClusteredInternal + heap/Data slotted layouts; `None` for Meta/Overflow/Free/
+   Index). Each new type needs its own `free_hole` + the same property test.
+2. **`zero-the-hole-on-write`** in `write_page` (before `update_checksum`) — the
+   **ONLY read-safe design** (see the table below): zero the hole so the in-memory
+   page, the main file, and the frame all agree, and reconstruction is
+   byte-identical with **no checksum recompute** (no read regression). Do NOT use
+   recompute-on-reconstruct (it regresses wal-index reads).
+3. **Frame format** (`wal_frame.rs`) — add `hole_offset:u16 + hole_len:u16` to the
+   frame header (`FRAME_HDR_SIZE` 36→40); payload = `page[0..off] + page[off+len..]`;
+   `hole_len==0` sentinel keeps old `.wf` readable. `frame_crc` over the logged
+   segments only.
+4. **Reconstruct** (recovery REDO + wal-index read) — segment1 + zeros + segment2;
+   no recompute (the source page's hole is already zero from step 2).
+5. **Crash/integrity gate** — the crash suite `integration_redo_crash_suite.rs`
+   (T1–T7) green WITH hole-skipping + `IntegrityChecker` clean after
+   autocommit/batch/random/delete; round-trip property test
+   (`write → frame → reconstruct == original`). `redo=Off` must stay unaffected.
+6. **Measure-first** — confirm the autocommit win (~10-30% est.) before/after; abort
+   if < ~10%. The hole fraction is ~56% for autocommit, ~12% for the append-batch.
 
 ## Context
 
