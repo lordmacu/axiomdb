@@ -188,6 +188,8 @@ impl<'r, 'db> DepCollector<'r, 'db> {
             | Stmt::CreateSchema(_)
             | Stmt::CreateIndex(_)
             | Stmt::CreateTrigger(_)
+            | Stmt::CreateProcedure(_)
+            | Stmt::DropProcedure(_)
             | Stmt::CreateAggregate(_)
             | Stmt::CreateSequence(_)
             | Stmt::CreateEnumType(_)

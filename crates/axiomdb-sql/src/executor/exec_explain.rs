@@ -65,6 +65,9 @@ fn dispatch(
         Stmt::CreateTrigger(_) => Err(DbError::NotImplemented {
             feature: "CREATE TRIGGER requires session context — use execute_with_ctx".into(),
         }),
+        Stmt::CreateProcedure(_) | Stmt::DropProcedure(_) => Err(DbError::NotImplemented {
+            feature: "stored procedures require session context — use execute_with_ctx".into(),
+        }),
         Stmt::CreateAggregate(_) => Err(DbError::NotImplemented {
             feature: "CREATE AGGREGATE requires session context — use execute_with_ctx".into(),
         }),
@@ -74,9 +77,7 @@ fn dispatch(
         Stmt::CreateEnumType(_) => Err(DbError::NotImplemented {
             feature: "CREATE TYPE requires session context — use execute_with_ctx".into(),
         }),
-        Stmt::DropEnumType(s) => {
-            execute_drop_enum_type(s, storage, txn, conn_txn, "public")
-        }
+        Stmt::DropEnumType(s) => execute_drop_enum_type(s, storage, txn, conn_txn, "public"),
         Stmt::DropTable(s) => {
             execute_drop_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
@@ -158,18 +159,15 @@ fn dispatch(
         Stmt::ShowIndex(s) => {
             execute_show_index(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
         }
-        Stmt::ShowCreateTable(s) => execute_show_create_table(
-            s,
-            storage,
-            txn,
-            conn_txn,
-            None,
-            DEFAULT_DATABASE_NAME,
-        ),
+        Stmt::ShowCreateTable(s) => {
+            execute_show_create_table(s, storage, txn, conn_txn, None, DEFAULT_DATABASE_NAME)
+        }
         Stmt::ShowCreateTrigger(_) => Err(DbError::NotImplemented {
             feature: "SHOW CREATE TRIGGER requires session context — use execute_with_ctx".into(),
         }),
-        Stmt::RenameTable(s) => execute_rename_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME),
+        Stmt::RenameTable(s) => {
+            execute_rename_table(s, storage, txn, conn_txn, DEFAULT_DATABASE_NAME)
+        }
         Stmt::Analyze(_) => Err(DbError::NotImplemented {
             feature: "ANALYZE requires session context — use execute_with_ctx".into(),
         }),
@@ -193,12 +191,10 @@ fn dispatch(
         | Stmt::Notify(_)
         | Stmt::DeclareCursor(_)
         | Stmt::FetchCursor(_)
-        | Stmt::CloseCursor(_) => {
-            Err(DbError::NotImplemented {
-                feature: "session-scoped statements require session context — use execute_with_ctx"
-                    .into(),
-            })
-        }
+        | Stmt::CloseCursor(_) => Err(DbError::NotImplemented {
+            feature: "session-scoped statements require session context — use execute_with_ctx"
+                .into(),
+        }),
         Stmt::Noop => Ok(QueryResult::Empty),
         // G5.1: CALL / DO — execute as Noop (no session context needed)
         Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
@@ -208,7 +204,9 @@ fn dispatch(
         }),
         // Phase 20.7: BACKUP/RESTORE run outside any transaction — cannot be dispatched here.
         Stmt::Backup(_) | Stmt::Restore(_) => Err(DbError::NotImplemented {
-            feature: "BACKUP/RESTORE must not be called inside a transaction — use execute_with_ctx".into(),
+            feature:
+                "BACKUP/RESTORE must not be called inside a transaction — use execute_with_ctx"
+                    .into(),
         }),
         // G5.5: CREATE TABLE LIKE
         Stmt::CreateTableLike(s) => {
@@ -216,7 +214,8 @@ fn dispatch(
         }
         // G5.6: CREATE TABLE AS SELECT — requires session context (cannot run via dispatch)
         Stmt::CreateTableAsSelect(_) => Err(DbError::NotImplemented {
-            feature: "CREATE TABLE AS SELECT requires session context — use execute_with_ctx".into(),
+            feature: "CREATE TABLE AS SELECT requires session context — use execute_with_ctx"
+                .into(),
         }),
         // 5.9f: SHOW TABLE STATUS
         Stmt::ShowTableStatus(s) => {
@@ -250,16 +249,12 @@ fn dispatch(
                 feature: "holiday calendar DDL — use session-aware path".into(),
             })
         }
-        Stmt::CreateExchangeRate(_) | Stmt::DropExchangeRate(_) => {
-            Err(DbError::NotImplemented {
-                feature: "exchange rate DDL — use session-aware path".into(),
-            })
-        }
-        Stmt::CreateCompositeType(_) | Stmt::DropCompositeType(_) => {
-            Err(DbError::NotImplemented {
-                feature: "composite type DDL — use session-aware path".into(),
-            })
-        }
+        Stmt::CreateExchangeRate(_) | Stmt::DropExchangeRate(_) => Err(DbError::NotImplemented {
+            feature: "exchange rate DDL — use session-aware path".into(),
+        }),
+        Stmt::CreateCompositeType(_) | Stmt::DropCompositeType(_) => Err(DbError::NotImplemented {
+            feature: "composite type DDL — use session-aware path".into(),
+        }),
     }
 }
 
@@ -281,18 +276,42 @@ fn execute_explain(
             rows.push(vec![
                 Value::Text("SET OP branch 1 (first)".into()),
                 Value::Text(format!("{:?}", first.from)),
-                Value::Null, Value::Null, Value::Null, Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
             ]);
             for (i, tail) in rest.into_iter().enumerate() {
                 let op = match tail.kind {
-                    SetOpKind::Union => if tail.all { "UNION ALL" } else { "UNION" },
-                    SetOpKind::Intersect => if tail.all { "INTERSECT ALL" } else { "INTERSECT" },
-                    SetOpKind::Except => if tail.all { "EXCEPT ALL" } else { "EXCEPT" },
+                    SetOpKind::Union => {
+                        if tail.all {
+                            "UNION ALL"
+                        } else {
+                            "UNION"
+                        }
+                    }
+                    SetOpKind::Intersect => {
+                        if tail.all {
+                            "INTERSECT ALL"
+                        } else {
+                            "INTERSECT"
+                        }
+                    }
+                    SetOpKind::Except => {
+                        if tail.all {
+                            "EXCEPT ALL"
+                        } else {
+                            "EXCEPT"
+                        }
+                    }
                 };
                 rows.push(vec![
                     Value::Text(format!("{op} branch {}", i + 2)),
                     Value::Text(format!("{:?}", tail.select.from)),
-                    Value::Null, Value::Null, Value::Null, Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
                 ]);
             }
             Ok(QueryResult::Rows { columns, rows })
@@ -558,7 +577,10 @@ fn explain_select(
                 "Using index",
             )
         }
-        crate::planner::AccessMethod::GinScan { index_def, query_terms } => {
+        crate::planner::AccessMethod::GinScan {
+            index_def,
+            query_terms,
+        } => {
             // GIN scan: estimate ~10% of rows pass the containment filter.
             let est = (row_count / 10).max(1);
             (

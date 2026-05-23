@@ -1516,6 +1516,67 @@ pub struct CreateTriggerStmt {
     pub body_sql: String,
 }
 
+// ── Stored procedures (Phase 16.7) ──────────────────────────────────────────────
+
+/// One formal parameter in `CREATE PROCEDURE` (parsed form). The type is the SQL
+/// `DataType`; it is converted to the catalog `ColumnType` at execution time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcParamAst {
+    pub mode: axiomdb_catalog::ProcParamMode,
+    pub name: String,
+    pub ty: DataType,
+}
+
+/// `CREATE [OR REPLACE] PROCEDURE [schema.]name(params) …`
+///
+/// PL/pgSQL: `… LANGUAGE plpgsql AS $$ [DECLARE …] BEGIN … END $$`.
+/// MySQL: `… BEGIN [DECLARE …] … END`.
+/// `body_sql` holds the raw body source (re-parsed on CALL).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateProcedureStmt {
+    pub or_replace: bool,
+    pub name: TableRef,
+    pub params: Vec<ProcParamAst>,
+    pub language: axiomdb_catalog::ProcLanguage,
+    pub body_sql: String,
+}
+
+/// `DROP PROCEDURE [IF EXISTS] [schema.]name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropProcedureStmt {
+    pub if_exists: bool,
+    pub name: TableRef,
+}
+
+/// A `DECLARE`d local variable inside a procedure body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcVarDecl {
+    pub name: String,
+    pub ty: DataType,
+    pub init: Option<Expr>,
+}
+
+/// A single statement inside a procedure body (v1 subset — no control flow yet).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcStmt {
+    /// A regular SQL DML statement (INSERT / UPDATE / DELETE).
+    Sql(Box<Stmt>),
+    /// `var := expr` (PL/pgSQL) or `SET var = expr` (MySQL).
+    Assign { target: String, value: Expr },
+    /// `SELECT <exprs> INTO <vars> FROM …` — assigns result columns to variables.
+    SelectInto {
+        vars: Vec<String>,
+        query: Box<SelectStmt>,
+    },
+}
+
+/// Parsed procedure body: `DECLARE`d locals followed by ordered statements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcBody {
+    pub declares: Vec<ProcVarDecl>,
+    pub statements: Vec<ProcStmt>,
+}
+
 /// `CREATE AGGREGATE name(type[, ...]) (SFUNC=..., STYPE=..., FINALFUNC=...)`
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateAggregateStmt {
@@ -1708,6 +1769,8 @@ pub enum Stmt {
     /// `CREATE [OR REPLACE] VIEW name AS SELECT ...`.
     CreateView(CreateViewStmt),
     CreateTrigger(CreateTriggerStmt),
+    /// `CREATE [OR REPLACE] PROCEDURE …` (Phase 16.7).
+    CreateProcedure(CreateProcedureStmt),
     CreateAggregate(CreateAggregateStmt),
     CreateSequence(CreateSequenceStmt),
     CreateEnumType(CreateEnumTypeStmt),
@@ -1721,6 +1784,8 @@ pub enum Stmt {
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     DropTrigger(DropTriggerStmt),
+    /// `DROP PROCEDURE [IF EXISTS] …` (Phase 16.7).
+    DropProcedure(DropProcedureStmt),
     DropEnumType(DropEnumTypeStmt),
     DropAggregate(DropAggregateStmt),
     DropSequence(DropSequenceStmt),
