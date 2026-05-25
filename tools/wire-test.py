@@ -2980,14 +2980,19 @@ except Exception as e:
 
 conn_422e.close()
 
-# ── G5.1 — CALL / DO as no-ops ───────────────────────────────────────────────
+# ── G5.1 — DO no-op; CALL executes a procedure (Phase 16.7) ──────────────────
 
 print("\n[G5 — DML extensions]")
 conn_g5 = connect()
 c_g5 = conn_g5.cursor()
-c_g5.execute("CALL some_procedure(1, 2)")
-c_g5.fetchall()
-ok("G5.1 CALL noop", True)
+# CALL is no longer a no-op: an unknown procedure errors (see [16.7] section).
+_g5_call_err = False
+try:
+    c_g5.execute("CALL some_procedure(1, 2)")
+    c_g5.fetchall()
+except Exception:
+    _g5_call_err = True
+ok("G5.1 CALL of unknown procedure errors (not a no-op)", _g5_call_err)
 c_g5.execute("DO SLEEP(0)")
 c_g5.fetchall()
 ok("G5.1 DO noop", True)
@@ -6106,6 +6111,47 @@ ok("[range-bounds] residual predicate still filters within a covering range",
    [r[0] for r in cur.fetchall()] == [4, 6])
 
 cur.execute("DROP TABLE IF EXISTS wire_range")
+conn.commit()
+
+
+# ── [16.7] Stored procedures (CREATE PROCEDURE / CALL) over the wire ──────────
+print("\n[16.7] stored procedures")
+
+cur.execute("DROP PROCEDURE IF EXISTS wp_add")
+cur.execute("DROP PROCEDURE IF EXISTS wp_dbl")
+cur.execute("DROP TABLE IF EXISTS wire_proc")
+cur.execute("CREATE TABLE wire_proc (id INT PRIMARY KEY, v INT)")
+conn.commit()
+
+# CREATE PROCEDURE (MySQL BEGIN..END, sent whole in one COM_QUERY) + CALL runs body.
+cur.execute(
+    "CREATE PROCEDURE wp_add(IN k INT, IN val INT) "
+    "BEGIN INSERT INTO wire_proc VALUES (k, val); END"
+)
+cur.execute("CALL wp_add(1, 100)")
+conn.commit()
+cur.execute("SELECT v FROM wire_proc WHERE id = 1")
+ok("[16.7] CALL runs the procedure body (insert visible)",
+   [r[0] for r in cur.fetchall()] == [100])
+
+# OUT parameter is returned to the client as a one-row result set.
+cur.execute("CREATE PROCEDURE wp_dbl(IN x INT, OUT y INT) BEGIN SET y = x * 2; END")
+cur.execute("CALL wp_dbl(21, NULL)")
+ok("[16.7] OUT parameter returned over the wire",
+   [r[0] for r in cur.fetchall()] == [42])
+
+# Unknown procedure → real error, not a silent success (the safety fix).
+_proc_err = False
+try:
+    cur.execute("CALL wp_definitely_missing()")
+    cur.fetchall()
+except Exception:
+    _proc_err = True
+ok("[16.7] CALL of an unknown procedure errors (not silent)", _proc_err)
+
+cur.execute("DROP PROCEDURE wp_add")
+cur.execute("DROP PROCEDURE wp_dbl")
+cur.execute("DROP TABLE IF EXISTS wire_proc")
 conn.commit()
 
 

@@ -223,11 +223,70 @@ where
     Ok(result)
 }
 
+/// True if `kw` (ASCII) appears at `bytes[i]` case-insensitively with identifier
+/// word boundaries on both sides (so `END` matches but `ENDING` / `xEND` do not).
+fn is_keyword_at(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    if i + kw.len() > bytes.len() {
+        return false;
+    }
+    if !bytes[i..i + kw.len()].eq_ignore_ascii_case(kw) {
+        return false;
+    }
+    let is_ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+    let after_ok = i + kw.len() >= bytes.len() || !is_ident(bytes[i + kw.len()]);
+    before_ok && after_ok
+}
+
+/// If a PostgreSQL dollar-quote opener (`$$` or `$tag$`) begins at `bytes[i]`,
+/// returns the byte index just past the matching close; otherwise `None`.
+fn dollar_quote_skip(sql: &str, i: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    debug_assert_eq!(bytes[i], b'$');
+    let mut j = i + 1;
+    while j < bytes.len() && bytes[j] != b'$' {
+        let b = bytes[j];
+        if !(b == b'_' || b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        j += 1;
+    }
+    if j >= bytes.len() {
+        return None; // no closing `$` of the opener
+    }
+    let close = &sql[i..j + 1]; // `$tag$` (or `$$`)
+    let body_start = j + 1;
+    sql[body_start..]
+        .find(close)
+        .map(|rel| body_start + rel + close.len())
+}
+
+/// True if `s` (a statement, possibly leading-trimmed) begins a routine
+/// definition (`CREATE [OR REPLACE] PROCEDURE|FUNCTION …`), whose `BEGIN … END`
+/// body or `$$ … $$` block must not be split on inner `;`.
+fn stmt_starts_routine(s: &str) -> bool {
+    let t = s.trim_start().to_ascii_lowercase();
+    let rest = t.strip_prefix("create ").map(str::trim_start);
+    let rest = rest.map(|r| {
+        r.strip_prefix("or replace ")
+            .map(str::trim_start)
+            .unwrap_or(r)
+    });
+    matches!(rest, Some(r) if r.starts_with("procedure") || r.starts_with("function"))
+}
+
 pub(crate) fn split_sql_statements(sql: &str, ansi_quotes: bool) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut stmts: Vec<&str> = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
+
+    // Routine-body awareness: inside a `CREATE PROCEDURE/FUNCTION` definition,
+    // `;` within the `BEGIN … END` block (or a `$$ … $$` body) is part of the
+    // body, not a statement separator. `CASE` also closes with `END`, so it is
+    // counted as a block opener too.
+    let mut in_routine = stmt_starts_routine(&sql[start..]);
+    let mut body_depth: usize = 0;
 
     while i < bytes.len() {
         match bytes[i] {
@@ -235,16 +294,30 @@ pub(crate) fn split_sql_statements(sql: &str, ansi_quotes: bool) -> Vec<&str> {
             b'"' if ansi_quotes => i = skip_delimited_identifier(sql, i, b'"'),
             b'"' => i = decode_double_quoted_string(sql, i).0,
             b'`' => i = skip_delimited_identifier(sql, i, b'`'),
-            b';' => {
+            b'$' if dollar_quote_skip(sql, i).is_some() => {
+                i = dollar_quote_skip(sql, i).unwrap();
+            }
+            b';' if body_depth == 0 => {
                 let stmt = sql[start..i].trim();
                 if !stmt.is_empty() {
                     stmts.push(stmt);
                 }
                 start = i + 1;
                 i += 1;
+                in_routine = stmt_starts_routine(&sql[start..]);
             }
             _ if is_line_comment_start(bytes, i) => i = skip_line_comment(sql, i),
             _ if is_block_comment_start(bytes, i) => i = skip_block_comment(sql, i),
+            _ if in_routine
+                && (is_keyword_at(bytes, i, b"BEGIN") || is_keyword_at(bytes, i, b"CASE")) =>
+            {
+                body_depth += 1;
+                i += if bytes[i] | 0x20 == b'b' { 5 } else { 4 };
+            }
+            _ if in_routine && body_depth > 0 && is_keyword_at(bytes, i, b"END") => {
+                body_depth -= 1;
+                i += 3;
+            }
             _ => i += next_char_len(sql, i),
         }
     }
@@ -375,4 +448,49 @@ pub(crate) fn normalize_sql(sql: &str, ansi_quotes: bool) -> (String, Vec<Value>
     }
 
     (result, params)
+}
+
+#[cfg(test)]
+mod proc_split_tests {
+    use super::split_sql_statements;
+
+    #[test]
+    fn does_not_split_inside_mysql_begin_end_body() {
+        let sql =
+            "CREATE PROCEDURE p(IN x INT) BEGIN INSERT INTO t VALUES (x); UPDATE t SET v = 1; END";
+        let stmts = split_sql_statements(sql, false);
+        assert_eq!(
+            stmts.len(),
+            1,
+            "procedure body must stay one statement: {stmts:?}"
+        );
+        assert!(stmts[0].trim_end().ends_with("END"));
+    }
+
+    #[test]
+    fn does_not_split_inside_nested_begin_or_case() {
+        let sql = "CREATE PROCEDURE p() BEGIN UPDATE t SET x = CASE WHEN x>0 THEN 1 ELSE 0 END; INSERT INTO t VALUES (9); END";
+        assert_eq!(split_sql_statements(sql, false).len(), 1);
+    }
+
+    #[test]
+    fn does_not_split_inside_dollar_quoted_body() {
+        let sql = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); END $$";
+        assert_eq!(split_sql_statements(sql, false).len(), 1);
+    }
+
+    #[test]
+    fn still_splits_ordinary_multi_statements() {
+        let sql = "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); SELECT * FROM t";
+        assert_eq!(split_sql_statements(sql, false).len(), 3);
+    }
+
+    #[test]
+    fn splits_call_then_select_after_a_procedure() {
+        let sql =
+            "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); END; CALL p(); SELECT * FROM t";
+        let stmts = split_sql_statements(sql, false);
+        assert_eq!(stmts.len(), 3, "{stmts:?}");
+        assert!(stmts[1].eq_ignore_ascii_case("CALL p()"));
+    }
 }
