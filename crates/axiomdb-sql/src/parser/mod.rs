@@ -12,6 +12,7 @@ pub(crate) mod ddl;
 pub(crate) mod dml;
 pub(crate) mod expr;
 pub(crate) mod json_table;
+pub(crate) mod proc_body;
 pub(crate) mod sql_json_common;
 pub(crate) mod xml_table;
 
