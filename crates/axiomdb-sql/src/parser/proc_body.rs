@@ -20,8 +20,6 @@ use crate::session::SqlModeFlags;
 use super::{ddl::parse_data_type, expr::parse_expr, Parser};
 
 /// Parses a procedure body into a [`ProcBody`].
-// Wired into the procedure interpreter in Step 10; until then only the tests use it.
-#[allow(dead_code)]
 pub(crate) fn parse_proc_body(
     body_sql: &str,
     language: ProcLanguage,

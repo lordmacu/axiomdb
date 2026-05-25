@@ -10,7 +10,8 @@ use axiomdb_core::error::DbError;
 use axiomdb_sql::ast::Stmt;
 use axiomdb_sql::parse;
 use axiomdb_types::DataType;
-use common::{run_ctx, setup_ctx};
+use axiomdb_types::Value;
+use common::{rows, run_ctx, setup_ctx};
 
 fn parse_stmt(sql: &str) -> Stmt {
     parse(sql, None).unwrap_or_else(|e| panic!("parse failed for {sql}\n  error: {e:?}"))
@@ -247,5 +248,199 @@ fn call_existing_procedure_resolves_not_procedure_not_found() {
     assert!(
         !matches!(r, Err(DbError::ProcedureNotFound { .. })),
         "CALL of an existing procedure must resolve it, got {r:?}"
+    );
+}
+
+// ── Execution: tree-walking interpreter (Step 10) ────────────────────────────────
+
+/// Convenience: run SQL and return its result rows (`Vec<Vec<Value>>`).
+fn query(
+    sql: &str,
+    s: &mut axiomdb_storage::MemoryStorage,
+    t: &mut axiomdb_wal::TxnManager,
+    b: &mut axiomdb_sql::BloomRegistry,
+    ctx: &mut axiomdb_sql::SessionContext,
+) -> Vec<Vec<Value>> {
+    rows(run_ctx(sql, s, t, b, ctx).unwrap_or_else(|e| panic!("query failed: {sql}\n  {e:?}")))
+}
+
+fn create_t(
+    s: &mut axiomdb_storage::MemoryStorage,
+    t: &mut axiomdb_wal::TxnManager,
+    b: &mut axiomdb_sql::BloomRegistry,
+    ctx: &mut axiomdb_sql::SessionContext,
+) {
+    run_ctx("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)", s, t, b, ctx).unwrap();
+}
+
+#[test]
+fn proc_in_param_drives_insert() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE add_row(IN x INT) BEGIN INSERT INTO t VALUES (x); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("CALL add_row(5)", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    let r = query("SELECT id FROM t", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(5)]]);
+}
+
+#[test]
+fn proc_declare_assign_and_use_variable() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE p(IN x INT) BEGIN DECLARE v INT; SET v = x + 10; INSERT INTO t VALUES (v); END",
+        &mut s, &mut t, &mut b, &mut ctx,
+    ).unwrap();
+    run_ctx("CALL p(5)", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    let r = query("SELECT id FROM t", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(15)]]);
+}
+
+#[test]
+fn proc_declare_init_and_multiple_statements() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN DECLARE a INT DEFAULT 1; DECLARE bb INT := a + 1; INSERT INTO t VALUES (a); INSERT INTO t VALUES (bb); END",
+        &mut s, &mut t, &mut b, &mut ctx,
+    ).unwrap();
+    run_ctx("CALL p()", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    let r = query(
+        "SELECT id FROM t ORDER BY id",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    );
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn proc_out_param_returned_as_row() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE dbl(IN x INT, OUT y INT) BEGIN SET y = x * 2; END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    // OUT placeholder argument is ignored.
+    let r = query("CALL dbl(3, NULL)", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(6)]]);
+}
+
+#[test]
+fn proc_inout_bound_and_returned() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE inc(INOUT x INT) BEGIN SET x = x + 1; END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = query("CALL inc(10)", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(11)]]);
+}
+
+#[test]
+fn proc_assign_from_scalar_subquery_into_out() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "INSERT INTO t VALUES (1), (2), (3)",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "CREATE PROCEDURE cnt(OUT n INT) BEGIN SET n = (SELECT COUNT(*) FROM t); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = query("CALL cnt(NULL)", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(3)]]);
+}
+
+#[test]
+fn proc_no_out_params_returns_empty() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (7); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let res = run_ctx("CALL p()", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    assert!(matches!(res, axiomdb_sql::QueryResult::Empty));
+}
+
+#[test]
+fn proc_assign_to_in_param_errors() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE p(IN x INT) BEGIN SET x = 1; END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let e = run_ctx("CALL p(5)", &mut s, &mut t, &mut b, &mut ctx)
+        .expect_err("assigning to an IN parameter must error");
+    assert!(matches!(e, DbError::InvalidValue { .. }), "got {e:?}");
+}
+
+#[test]
+fn proc_arity_mismatch_errors() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE p(IN a INT, IN b INT) BEGIN END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let e = run_ctx("CALL p(1)", &mut s, &mut t, &mut b, &mut ctx)
+        .expect_err("arity mismatch must error");
+    assert!(matches!(e, DbError::InvalidValue { .. }), "got {e:?}");
+}
+
+#[test]
+fn proc_error_midbody_propagates() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    // Second insert duplicates the PK → the CALL must surface the error.
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let e = run_ctx("CALL p()", &mut s, &mut t, &mut b, &mut ctx);
+    assert!(
+        e.is_err(),
+        "duplicate-PK mid-body must propagate, got {e:?}"
     );
 }

@@ -573,7 +573,7 @@ fn dispatch_ctx(
         // stored procedure (Phase 16.7); an unknown procedure now errors instead
         // of silently succeeding.
         Stmt::Do { .. } => Ok(QueryResult::Empty),
-        Stmt::Call { name, args } => execute_call_ctx(&name, &args, storage, txn, ctx),
+        Stmt::Call { name, args } => execute_call_ctx(&name, &args, exec_ctx, ctx),
         Stmt::CreateProcedure(s) => {
             ctx.invalidate_all();
             let default_schema = ctx.default_create_schema().to_string();
