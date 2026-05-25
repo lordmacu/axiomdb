@@ -29,14 +29,9 @@ fn affected(r: axiomdb_sql::QueryResult) -> u64 {
     common::affected_count(r)
 }
 
-// ─── G5.1 — CALL / DO as no-ops ──────────────────────────────────────────────
-
-#[test]
-fn test_call_noop() {
-    let (mut s, mut t) = common::setup();
-    let res = ok("CALL some_procedure(1, 2)", &mut s, &mut t);
-    assert!(matches!(res, axiomdb_sql::QueryResult::Empty));
-}
+// ─── G5.1 — DO as no-op ──────────────────────────────────────────────────────
+// (CALL is no longer a no-op: it executes a stored procedure as of Phase 16.7;
+//  an unknown procedure errors. See integration_stored_procedures.rs.)
 
 #[test]
 fn test_do_noop() {

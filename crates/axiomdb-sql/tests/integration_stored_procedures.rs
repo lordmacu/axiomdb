@@ -3,10 +3,14 @@
 //! Execution/end-to-end tests are added in later steps. Here we only assert that
 //! `CREATE/DROP PROCEDURE` parse correctly in both dialects and capture the body.
 
+mod common;
+
 use axiomdb_catalog::{ProcLanguage, ProcParamMode};
+use axiomdb_core::error::DbError;
 use axiomdb_sql::ast::Stmt;
 use axiomdb_sql::parse;
 use axiomdb_types::DataType;
+use common::{run_ctx, setup_ctx};
 
 fn parse_stmt(sql: &str) -> Stmt {
     parse(sql, None).unwrap_or_else(|e| panic!("parse failed for {sql}\n  error: {e:?}"))
@@ -140,4 +144,108 @@ fn parse_drop_procedure_if_exists() {
 #[test]
 fn parse_unterminated_begin_end_errors() {
     assert!(parse("CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1);", None).is_err());
+}
+
+// ── Execution: CREATE / DROP + CALL safety fix (Step 9) ──────────────────────────
+
+#[test]
+fn create_procedure_then_duplicate_errors_then_drop() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .expect("create should succeed");
+
+    // Re-creating without OR REPLACE errors → proves it persisted.
+    let dup = run_ctx(
+        "CREATE PROCEDURE p() BEGIN END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .expect_err("duplicate create should error");
+    assert!(
+        matches!(dup, DbError::ProcedureAlreadyExists { .. }),
+        "expected ProcedureAlreadyExists, got {dup:?}"
+    );
+
+    // DROP removes it.
+    run_ctx("DROP PROCEDURE p", &mut s, &mut t, &mut b, &mut ctx).expect("drop should succeed");
+
+    // Dropping again errors (gone).
+    let gone = run_ctx("DROP PROCEDURE p", &mut s, &mut t, &mut b, &mut ctx)
+        .expect_err("drop of missing should error");
+    assert!(matches!(gone, DbError::ProcedureNotFound { .. }));
+}
+
+#[test]
+fn create_or_replace_succeeds_over_existing() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "CREATE OR REPLACE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .expect("OR REPLACE should succeed over an existing procedure");
+}
+
+#[test]
+fn drop_if_exists_missing_is_ok() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "DROP PROCEDURE IF EXISTS nope",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .expect("DROP IF EXISTS on a missing procedure is a no-op success");
+}
+
+#[test]
+fn call_unknown_procedure_errors_not_silent() {
+    // The safety fix: CALL to an unknown procedure must error, not silently succeed.
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    let e = run_ctx("CALL nope()", &mut s, &mut t, &mut b, &mut ctx)
+        .expect_err("CALL of an unknown procedure must error");
+    assert!(
+        matches!(e, DbError::ProcedureNotFound { .. }),
+        "expected ProcedureNotFound, got {e:?}"
+    );
+}
+
+#[test]
+fn call_existing_procedure_resolves_not_procedure_not_found() {
+    // After CREATE, CALL must resolve the procedure (it does not error with
+    // ProcedureNotFound). Body execution lands in Step 10.
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = run_ctx("CALL p()", &mut s, &mut t, &mut b, &mut ctx);
+    assert!(
+        !matches!(r, Err(DbError::ProcedureNotFound { .. })),
+        "CALL of an existing procedure must resolve it, got {r:?}"
+    );
 }

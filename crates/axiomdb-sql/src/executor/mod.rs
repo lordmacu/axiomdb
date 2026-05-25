@@ -139,6 +139,8 @@ include!("ddl_analyze.rs");
 include!("ddl_fdw.rs");
 include!("ddl_holiday_calendar.rs");
 include!("ddl_exchange_rate.rs");
+include!("ddl_procedure.rs");
+include!("procedure.rs");
 include!("fdw_http.rs");
 #[cfg(feature = "import-export")]
 include!("copy_from.rs");

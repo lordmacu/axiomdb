@@ -196,8 +196,12 @@ fn dispatch(
                 .into(),
         }),
         Stmt::Noop => Ok(QueryResult::Empty),
-        // G5.1: CALL / DO — execute as Noop (no session context needed)
-        Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
+        // DO is a harmless no-op. CALL needs session context to resolve and run
+        // a stored procedure (Phase 16.7) — route through execute_with_ctx.
+        Stmt::Do { .. } => Ok(QueryResult::Empty),
+        Stmt::Call { .. } => Err(DbError::NotImplemented {
+            feature: "CALL requires session context — use execute_with_ctx".into(),
+        }),
         // Phase 20.5: COPY FROM/TO requires session context
         Stmt::CopyFrom(_) | Stmt::CopyTo(_) => Err(DbError::NotImplemented {
             feature: "COPY requires session context — use execute_with_ctx".into(),
