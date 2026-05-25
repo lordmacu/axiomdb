@@ -84,6 +84,7 @@ fn dispatch_ctx(
             let result = run_statement_triggers_for_result(
                 TriggerEvent::Insert,
                 &table_ref,
+                None,
                 result,
                 exec_ctx,
                 ctx,
@@ -114,6 +115,7 @@ fn dispatch_ctx(
             let result = run_statement_triggers_for_result(
                 TriggerEvent::Update,
                 &table_ref,
+                None,
                 result,
                 exec_ctx,
                 ctx,
@@ -130,6 +132,7 @@ fn dispatch_ctx(
             let result = run_statement_triggers_for_result(
                 TriggerEvent::Delete,
                 &table_ref,
+                None,
                 result,
                 exec_ctx,
                 ctx,
@@ -566,8 +569,37 @@ fn dispatch_ctx(
                 &db,
             )
         }
-        // G5.1: CALL / DO — execute as Noop
-        Stmt::Call { .. } | Stmt::Do { .. } => Ok(QueryResult::Empty),
+        // DO stays a no-op (harmless expression discard). CALL executes a real
+        // stored procedure (Phase 16.7); an unknown procedure now errors instead
+        // of silently succeeding.
+        Stmt::Do { .. } => Ok(QueryResult::Empty),
+        Stmt::Call { name, args } => execute_call_ctx(&name, &args, storage, txn, ctx),
+        Stmt::CreateProcedure(s) => {
+            ctx.invalidate_all();
+            let default_schema = ctx.default_create_schema().to_string();
+            execute_create_procedure(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &default_schema,
+            )
+        }
+        Stmt::DropProcedure(s) => {
+            ctx.invalidate_all();
+            let default_schema = ctx.default_create_schema().to_string();
+            execute_drop_procedure(
+                s,
+                storage,
+                txn,
+                ctx.conn_txn
+                    .as_mut()
+                    .expect("conn_txn must be set before dispatch_ctx"),
+                &default_schema,
+            )
+        }
         // G5.5: CREATE TABLE ... LIKE
         Stmt::CreateTableLike(mut s) => {
             ctx.invalidate_all();
@@ -995,9 +1027,7 @@ fn execute_set_ctx(stmt: SetStmt, ctx: &mut SessionContext) -> Result<QueryResul
                         Value::BigInt(n) => n.to_string(),
                         other => {
                             return Err(DbError::InvalidValue {
-                                reason: format!(
-                                    "synchronous: unsupported value type {other:?}"
-                                ),
+                                reason: format!("synchronous: unsupported value type {other:?}"),
                             });
                         }
                     };

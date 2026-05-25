@@ -1214,6 +1214,78 @@ mod db {
             let rows = db.query("SELECT id, v, w FROM t ORDER BY id").unwrap();
             assert_eq!(rows.len(), 2, "both rows present across the schema change");
         }
+
+        /// [skip-trigger-lookup] Correctness gate: passing the resolved table to the
+        /// statement-trigger pass must NOT skip firing. The prepared fast path now reads the
+        /// trigger list from the carried `resolved.def.triggers` instead of a per-row
+        /// `get_table`; this proves it still fires AFTER INSERT statement triggers. The trigger
+        /// body always returns a row (reads an always-populated `guard` table, independent of
+        /// the staged rows), so it must reject the prepared INSERT.
+        #[test]
+        fn prepared_insert_fires_statement_trigger() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("trg.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+                .unwrap();
+            db.execute("CREATE TABLE guard (x INT NOT NULL PRIMARY KEY)")
+                .unwrap();
+            db.execute("INSERT INTO guard VALUES (1)").unwrap(); // guard always has a row
+            db.execute(
+                "CREATE TRIGGER t_guard AFTER INSERT ON t FOR EACH STATEMENT AS SELECT x FROM guard",
+            )
+            .unwrap();
+
+            let stmt = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+            assert!(
+                stmt.insert_plan.is_some(),
+                "eligible for the prepared fast path"
+            );
+            db.execute("BEGIN").unwrap();
+            let res = stmt.execute(&mut db, &[Value::Int(1), Value::Int(10)]);
+            let dbg = format!("{res:?}");
+            assert!(
+                dbg.contains("TriggerValidationFailed"),
+                "prepared INSERT fast path must fire the AFTER INSERT statement trigger; got {dbg}"
+            );
+            db.execute("ROLLBACK").unwrap();
+        }
+
+        /// [skip-trigger-lookup] A trigger CREATEd between prepared executes must fire on the
+        /// next execute: the DDL bumps `catalog_epoch`, invalidating the carry plan, so the
+        /// execute leaves the fast path and re-resolves — it can never serve a stale
+        /// "no triggers" view.
+        #[test]
+        fn trigger_added_between_prepared_executes_fires() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open(dir.path().join("trg2.db")).unwrap();
+            db.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+                .unwrap();
+            db.execute("CREATE TABLE guard (x INT NOT NULL PRIMARY KEY)")
+                .unwrap();
+            db.execute("INSERT INTO guard VALUES (1)").unwrap();
+
+            let stmt = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+            // No trigger yet: the prepared insert succeeds.
+            db.execute("BEGIN").unwrap();
+            stmt.execute(&mut db, &[Value::Int(1), Value::Int(10)])
+                .unwrap();
+            db.execute("COMMIT").unwrap();
+
+            // Add an always-failing trigger — the DDL bumps catalog_epoch.
+            db.execute(
+                "CREATE TRIGGER t_guard AFTER INSERT ON t FOR EACH STATEMENT AS SELECT x FROM guard",
+            )
+            .unwrap();
+
+            db.execute("BEGIN").unwrap();
+            let res = stmt.execute(&mut db, &[Value::Int(2), Value::Int(20)]);
+            let dbg = format!("{res:?}");
+            assert!(
+                dbg.contains("TriggerValidationFailed"),
+                "a trigger added between executes must fire (catalog_epoch re-resolve); got {dbg}"
+            );
+            db.execute("ROLLBACK").unwrap();
+        }
     }
 
     #[cfg(test)]

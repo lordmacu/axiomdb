@@ -1063,3 +1063,37 @@ is OTHER per-row work (`encode_row` `Vec`, `DataType::clone`, `materialize_inser
 record) — the next levers. Reads are untouched (full_scan/select_where/range_scan still beat SQLite;
 point_lookup ~1.2×). Knob `AXIOMDB_NO_CARRY_RESOLVE` (read once at prepare) isolates this lever.
 </div>
+
+## Skip the per-row statement-trigger lookup — prepared INSERT (2026-05-25)
+
+A `perf` re-profile **after** carry-resolved (Lima, symbols) found the prepared INSERT still paid a
+SECOND per-row table lookup: `execute_prepared_insert` → `run_statement_triggers_for_result` →
+`ctx.get_table` (a `db\0schema\0table` String key + **SipHash** probe + a `search_path` clone) —
+**only to read `rt.def.triggers`** (≈2.3% self-time). But `execute_prepared_insert` already holds
+the resolved `Arc<ResolvedTable>`.
+
+**The lever:** pass the carried `Arc<ResolvedTable>` to `run_statement_triggers_for_result`; it
+reads `resolved.def.triggers` directly and skips the per-row `get_table`. Same "carry resolved
+metadata, validate on DDL" idea as carry-resolved (and as PostgreSQL's `plancache.c`). On a DDL the
+`catalog_epoch` bump invalidates the carry plan → the execute leaves the fast path and re-resolves,
+so it can never serve a stale "no triggers" view. The 3 generic-dispatch call sites pass `None`
+(bit-identical to before).
+
+| insert_batch (macOS native, A/B vs carry-only baseline, 50K) | ops/s |
+|---|---|
+| carry-resolved only (baseline) | 495,179 (median, 14 pairs) |
+| + skip-trigger-lookup | 537,633 (median) |
+| **win** | **+8.6% median / +7.4% mean** (two runs converge at ~+8%) |
+
+<div class="callout-advantage">
+<span class="callout-label">Bigger than the 2.3% self-time — why</span>
+The profile's 2.3% was only `get_table`'s own CPU; the lookup also did **2 String allocations per
+row** (the key + the `search_path` clone) charged to the ~36% allocator block. Removing it cuts
+both, so the measured win is **~+8%**, not 2.3%. Re-profile confirms it:
+`run_statement_triggers_for_result` fell from 2.54% → 0.86% and `get_table`/`SessionContext::key`
+vanished from the trigger path. Correctness gates: a statement trigger still fires via the prepared
+fast path, and a trigger added between executes fires (catalog_epoch re-resolve). The allocator is
+now ~46% of `insert_batch` (a larger fraction because the total dropped) — `encode_row` Vec,
+`DataType::clone`+drop (~3%), and the residual SipHash (~3.7%, the intra-batch `staged_pks`
+HashSet) are the next targets.
+</div>

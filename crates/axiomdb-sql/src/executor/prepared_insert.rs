@@ -170,6 +170,9 @@ pub fn execute_prepared_insert(
         Some(rt) => Ok(rt),
         None => resolve_insert_target(&stmt, &exec_ctx, &mut conn, ctx),
     };
+    // Carry the resolved table into the statement-trigger pass too, so it skips the per-row
+    // get_table (String key + SipHash). Arc::clone is a refcount bump, not an allocation.
+    let resolved_for_triggers = resolved_res.as_ref().ok().map(std::sync::Arc::clone);
     let r = match resolved_res {
         Ok(resolved) => {
             let table_id = resolved.def.id;
@@ -184,6 +187,7 @@ pub fn execute_prepared_insert(
     let result = run_statement_triggers_for_result(
         TriggerEvent::Insert,
         &table_ref,
+        resolved_for_triggers.as_deref(),
         result,
         &exec_ctx,
         ctx,

@@ -116,6 +116,7 @@ fn execute_show_create_trigger(
 fn run_statement_triggers_for_result(
     event: TriggerEvent,
     table: &TableRef,
+    resolved: Option<&ResolvedTable>,
     result: QueryResult,
     exec_ctx: &ExecutionContext,
     ctx: &mut SessionContext,
@@ -125,22 +126,8 @@ fn run_statement_triggers_for_result(
     };
     let count = *count;
 
-    // Fast path: read triggers from the session cache — no catalog HeapChain
-    // scan needed. Trigger definitions only change via DDL, which always
-    // invalidates the session cache (SchemaCache::invalidate). The table was
-    // just resolved in execute_insert_ctx so the cache entry is current.
-    //
-    // The cache probe is also what keeps the resolve cache warm after an
-    // autocommit write that bumped schema_version (the immediate write evicts
-    // the entry; the miss fallback below re-resolves it). Clone the table name +
-    // trigger list ONLY when the table actually has triggers — the common
-    // no-trigger DML path then pays just the probe, not two allocations.
-    let database: &str = table
-        .database
-        .as_deref()
-        .unwrap_or_else(|| ctx.effective_database());
-    // `pick` returns None when the cached table has no triggers (skip the clone),
-    // Some(name, triggers) otherwise. Outer Option = was the table cached at all.
+    // `pick` returns None when the table has no triggers (skip the clone),
+    // Some(name, triggers) otherwise. Outer Option = was the table known at all.
     let pick = |rt: &ResolvedTable| -> Option<(String, Vec<axiomdb_catalog::TriggerDef>)> {
         if rt.def.triggers.is_empty() {
             None
@@ -148,20 +135,35 @@ fn run_statement_triggers_for_result(
             Some((rt.def.table_name.clone(), rt.def.triggers.clone()))
         }
     };
+
+    // Carry-resolved-table: if the caller already holds the resolved table (the prepared INSERT
+    // fast path), read its trigger list directly — NO per-row `get_table` (a `db\0schema\0table`
+    // String key + SipHash probe + a `search_path` clone). The resolve is DDL-current (any DDL
+    // bumps `catalog_epoch`, invalidating the carry plan → re-resolve), so `.def.triggers` is
+    // never stale. Otherwise fall back to the session-cache probe — which also keeps the resolve
+    // cache warm after an autocommit write that bumped schema_version.
     let cached_info: Option<Option<(String, Vec<axiomdb_catalog::TriggerDef>)>> =
-        if let Some(schema) = table.schema.as_deref() {
-            ctx.get_table(database, schema, &table.name).map(pick)
+        if let Some(rt) = resolved {
+            Some(pick(rt))
         } else {
-            let n = ctx.search_path.len();
-            let mut found = None;
-            for i in 0..n {
-                let schema = ctx.search_path[i].clone();
-                if let Some(rt) = ctx.get_table(database, &schema, &table.name) {
-                    found = Some(pick(rt));
-                    break;
+            let database: &str = table
+                .database
+                .as_deref()
+                .unwrap_or_else(|| ctx.effective_database());
+            if let Some(schema) = table.schema.as_deref() {
+                ctx.get_table(database, schema, &table.name).map(pick)
+            } else {
+                let n = ctx.search_path.len();
+                let mut found = None;
+                for i in 0..n {
+                    let schema = ctx.search_path[i].clone();
+                    if let Some(rt) = ctx.get_table(database, &schema, &table.name) {
+                        found = Some(pick(rt));
+                        break;
+                    }
                 }
+                found
             }
-            found
         };
 
     let (table_name, all_triggers) = match cached_info {
@@ -184,7 +186,10 @@ fn run_statement_triggers_for_result(
             if resolved.def.triggers.is_empty() {
                 return Ok(result);
             }
-            (resolved.def.table_name.clone(), resolved.def.triggers.clone())
+            (
+                resolved.def.table_name.clone(),
+                resolved.def.triggers.clone(),
+            )
         }
     };
 
@@ -219,8 +224,14 @@ fn run_one_statement_trigger(
     };
     let sql = trigger
         .body_sql
-        .replace("@@trigger_name", &format!("'{}'", trigger.name.replace('\'', "''")))
-        .replace("@@trigger_table", &format!("'{}'", table_name.replace('\'', "''")))
+        .replace(
+            "@@trigger_name",
+            &format!("'{}'", trigger.name.replace('\'', "''")),
+        )
+        .replace(
+            "@@trigger_table",
+            &format!("'{}'", table_name.replace('\'', "''")),
+        )
         .replace("@@trigger_event", &format!("'{}'", event_name))
         .replace("@@trigger_row_count", &row_count.to_string());
     let parsed = crate::parser::parse_with_sql_mode(
@@ -246,7 +257,10 @@ fn run_one_statement_trigger(
             reason: format!("trigger '{}' body must be a SELECT", trigger.name),
         });
     };
-    let conn = ctx.conn_txn.take().expect("conn_txn set during trigger execution");
+    let conn = ctx
+        .conn_txn
+        .take()
+        .expect("conn_txn set during trigger execution");
     let result = execute_select_ctx(select, exec_ctx, Some(&conn), ctx);
     ctx.conn_txn = Some(conn);
     let result = result?;
