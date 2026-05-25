@@ -178,6 +178,20 @@ pub static IS_FOREIGN_TABLES_COLS: &[(&str, ColumnType)] = &[
     ("OPTIONS", ColumnType::Text),
 ];
 
+/// Column names and types for `information_schema.ROUTINES` (Phase 16.7 — stored
+/// procedures). A minimal, MySQL/SQL-standard-compatible subset.
+pub static IS_ROUTINES_COLS: &[(&str, ColumnType)] = &[
+    ("SPECIFIC_NAME", ColumnType::Text),
+    ("ROUTINE_CATALOG", ColumnType::Text),
+    ("ROUTINE_SCHEMA", ColumnType::Text),
+    ("ROUTINE_NAME", ColumnType::Text),
+    ("ROUTINE_TYPE", ColumnType::Text),
+    ("DATA_TYPE", ColumnType::Text),
+    ("ROUTINE_BODY", ColumnType::Text),
+    ("ROUTINE_DEFINITION", ColumnType::Text),
+    ("EXTERNAL_LANGUAGE", ColumnType::Text),
+];
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Returns the column schema for the given IS virtual table name
@@ -195,6 +209,7 @@ pub fn is_table_cols(table_name: &str) -> Option<&'static [(&'static str, Column
         "scheduled_jobs" => Some(IS_SCHEDULED_JOBS_COLS),
         "foreign_servers" => Some(IS_FOREIGN_SERVERS_COLS),
         "foreign_tables" => Some(IS_FOREIGN_TABLES_COLS),
+        "routines" => Some(IS_ROUTINES_COLS),
         _ => None,
     }
 }

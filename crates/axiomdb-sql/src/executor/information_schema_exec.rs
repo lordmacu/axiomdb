@@ -22,15 +22,14 @@ fn execute_information_schema_select(
     let table_name_lower = from_table_ref.name.to_ascii_lowercase();
 
     // Generate virtual rows from the catalog.
-    let (derived_cols, derived_rows) =
-        generate_is_rows(
-            &table_name_lower,
-            storage,
-            txn,
-            conn_txn,
-            default_database,
-            temp_schema,
-        )?;
+    let (derived_cols, derived_rows) = generate_is_rows(
+        &table_name_lower,
+        storage,
+        txn,
+        conn_txn,
+        default_database,
+        temp_schema,
+    )?;
 
     // Apply WHERE filter.
     let mut combined_rows: Vec<Row> = Vec::new();
@@ -134,6 +133,7 @@ fn generate_is_rows(
         "scheduled_jobs" => generate_is_scheduled_jobs_rows(&mut reader)?,
         "foreign_servers" => generate_is_foreign_servers_rows(&mut reader)?,
         "foreign_tables" => generate_is_foreign_tables_rows(&mut reader)?,
+        "routines" => generate_is_routines_rows(&mut reader)?,
         _ => {
             return Err(DbError::TableNotFound {
                 name: format!("information_schema.{table_name}"),
@@ -213,29 +213,29 @@ fn generate_is_tables_rows(
         let tables = visible_is_tables_for_session(reader, &db.name, temp_schema)?;
         for t in tables {
             rows.push(vec![
-                Value::Text("def".into()),                // TABLE_CATALOG
-                Value::Text(db.name.clone()),             // TABLE_SCHEMA
-                Value::Text(t.table_name.clone()),        // TABLE_NAME
+                Value::Text("def".into()),                    // TABLE_CATALOG
+                Value::Text(db.name.clone()),                 // TABLE_SCHEMA
+                Value::Text(t.table_name.clone()),            // TABLE_NAME
                 Value::Text(show_table_type_name(&t).into()), // TABLE_TYPE
-                Value::Text("InnoDB".into()),             // ENGINE
-                Value::BigInt(10),                        // VERSION
-                Value::Text("Dynamic".into()),            // ROW_FORMAT
-                Value::Null,                              // TABLE_ROWS
-                Value::BigInt(0),                         // AVG_ROW_LENGTH
-                Value::BigInt(0),                         // DATA_LENGTH
-                Value::BigInt(0),                         // MAX_DATA_LENGTH
-                Value::BigInt(0),                         // INDEX_LENGTH
-                Value::BigInt(0),                         // DATA_FREE
-                Value::Null,                              // AUTO_INCREMENT
-                Value::Null,                              // CREATE_TIME
-                Value::Null,                              // UPDATE_TIME
-                Value::Null,                              // CHECK_TIME
+                Value::Text("InnoDB".into()),                 // ENGINE
+                Value::BigInt(10),                            // VERSION
+                Value::Text("Dynamic".into()),                // ROW_FORMAT
+                Value::Null,                                  // TABLE_ROWS
+                Value::BigInt(0),                             // AVG_ROW_LENGTH
+                Value::BigInt(0),                             // DATA_LENGTH
+                Value::BigInt(0),                             // MAX_DATA_LENGTH
+                Value::BigInt(0),                             // INDEX_LENGTH
+                Value::BigInt(0),                             // DATA_FREE
+                Value::Null,                                  // AUTO_INCREMENT
+                Value::Null,                                  // CREATE_TIME
+                Value::Null,                                  // UPDATE_TIME
+                Value::Null,                                  // CHECK_TIME
                 Value::Text(
                     is_effective_table_collation(&t, db.default_collation.as_deref()).into(),
                 ), // TABLE_COLLATION
-                Value::Null,                              // CHECKSUM
-                Value::Text("".into()),                   // CREATE_OPTIONS
-                Value::Text("".into()),                   // TABLE_COMMENT
+                Value::Null,                                  // CHECKSUM
+                Value::Text("".into()),                       // CREATE_OPTIONS
+                Value::Text("".into()),                       // TABLE_COMMENT
             ]);
         }
     }
@@ -278,8 +278,16 @@ fn generate_is_columns_rows(
                     _ => Value::Null,
                 };
                 let (decimal_prec, decimal_scale) = if col.col_type == ColumnType::Decimal {
-                    let p = if col.type_len != 0 { (col.type_len >> 8) as i64 } else { 10 };
-                    let s = if col.type_len != 0 { (col.type_len & 0xFF) as i64 } else { 0 };
+                    let p = if col.type_len != 0 {
+                        (col.type_len >> 8) as i64
+                    } else {
+                        10
+                    };
+                    let s = if col.type_len != 0 {
+                        (col.type_len & 0xFF) as i64
+                    } else {
+                        0
+                    };
                     (p, s)
                 } else {
                     (0, 0)
@@ -293,36 +301,36 @@ fn generate_is_columns_rows(
                     _ => Value::Null,
                 };
                 rows.push(vec![
-                    Value::Text("def".into()),                             // TABLE_CATALOG
-                    Value::Text(db.name.clone()),                          // TABLE_SCHEMA
-                    Value::Text(t.table_name.clone()),                     // TABLE_NAME
-                    Value::Text(col.name.clone()),                         // COLUMN_NAME
-                    Value::BigInt((col.col_idx as i64) + 1),               // ORDINAL_POSITION
-                    Value::Null,                                           // COLUMN_DEFAULT
-                    Value::Text(is_nullable.into()),                       // IS_NULLABLE
-                    Value::Text(data_type_str),                            // DATA_TYPE
-                    char_max_len,                     // CHARACTER_MAXIMUM_LENGTH
-                    Value::Null,                      // CHARACTER_OCTET_LENGTH
-                    num_prec,                         // NUMERIC_PRECISION
+                    Value::Text("def".into()),               // TABLE_CATALOG
+                    Value::Text(db.name.clone()),            // TABLE_SCHEMA
+                    Value::Text(t.table_name.clone()),       // TABLE_NAME
+                    Value::Text(col.name.clone()),           // COLUMN_NAME
+                    Value::BigInt((col.col_idx as i64) + 1), // ORDINAL_POSITION
+                    Value::Null,                             // COLUMN_DEFAULT
+                    Value::Text(is_nullable.into()),         // IS_NULLABLE
+                    Value::Text(data_type_str),              // DATA_TYPE
+                    char_max_len,                            // CHARACTER_MAXIMUM_LENGTH
+                    Value::Null,                             // CHARACTER_OCTET_LENGTH
+                    num_prec,                                // NUMERIC_PRECISION
                     if col.col_type == ColumnType::Decimal {
                         Value::BigInt(decimal_scale)
                     } else {
                         Value::Null
-                    },                                // NUMERIC_SCALE
-                    Value::Null,                      // DATETIME_PRECISION
+                    }, // NUMERIC_SCALE
+                    Value::Null,                             // DATETIME_PRECISION
                     is_effective_column_collation(col, &t, db.default_collation.as_deref())
                         .map(|_| Value::Text("utf8mb4".into()))
                         .unwrap_or(Value::Null), // CHARACTER_SET_NAME
                     is_effective_column_collation(col, &t, db.default_collation.as_deref())
                         .map(|name| Value::Text(name.into()))
                         .unwrap_or(Value::Null), // COLLATION_NAME
-                    Value::Text(col_type_str), // COLUMN_TYPE
-                    Value::Text("".into()),           // COLUMN_KEY
-                    Value::Text(extra.into()),        // EXTRA
+                    Value::Text(col_type_str),               // COLUMN_TYPE
+                    Value::Text("".into()),                  // COLUMN_KEY
+                    Value::Text(extra.into()),               // EXTRA
                     Value::Text("select,insert,update,references".into()), // PRIVILEGES
-                    Value::Text("".into()),           // COLUMN_COMMENT
-                    Value::Text("".into()),           // GENERATION_EXPRESSION
-                    Value::Null,                      // SRS_ID
+                    Value::Text("".into()),                  // COLUMN_COMMENT
+                    Value::Text("".into()),                  // GENERATION_EXPRESSION
+                    Value::Null,                             // SRS_ID
                 ]);
             }
         }
@@ -349,15 +357,16 @@ fn generate_is_key_column_usage_rows(
             let columns = reader.list_columns(t.id)?;
             let indexes = reader.list_indexes(t.id)?;
             let constraints = reader.list_constraints(t.id)?;
-            let exclusion_by_index: std::collections::HashMap<u32, &axiomdb_catalog::ConstraintDef> =
-                constraints
-                    .iter()
-                    .filter(|c| {
-                        c.kind == axiomdb_catalog::ConstraintKind::Exclusion
-                            && c.owned_index_id != 0
-                    })
-                    .map(|c| (c.owned_index_id, c))
-                    .collect();
+            let exclusion_by_index: std::collections::HashMap<
+                u32,
+                &axiomdb_catalog::ConstraintDef,
+            > = constraints
+                .iter()
+                .filter(|c| {
+                    c.kind == axiomdb_catalog::ConstraintKind::Exclusion && c.owned_index_id != 0
+                })
+                .map(|c| (c.owned_index_id, c))
+                .collect();
             for idx in &indexes {
                 if exclusion_by_index.contains_key(&idx.index_id) {
                     continue;
@@ -403,18 +412,18 @@ fn generate_is_key_column_usage_rows(
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
                     rows.push(vec![
-                        Value::Text("def".into()),              // CONSTRAINT_CATALOG
-                        Value::Text(db.name.clone()),           // CONSTRAINT_SCHEMA
-                        Value::Text(constraint.name.clone()),   // CONSTRAINT_NAME
-                        Value::Text("def".into()),              // TABLE_CATALOG
-                        Value::Text(db.name.clone()),           // TABLE_SCHEMA
-                        Value::Text(t.table_name.clone()),      // TABLE_NAME
-                        Value::Text(col_name),                  // COLUMN_NAME
-                        Value::BigInt((seq + 1) as i64),        // ORDINAL_POSITION
-                        Value::Null,                            // POSITION_IN_UNIQUE_CONSTRAINT
-                        Value::Null,                            // REFERENCED_TABLE_SCHEMA
-                        Value::Null,                            // REFERENCED_TABLE_NAME
-                        Value::Null,                            // REFERENCED_COLUMN_NAME
+                        Value::Text("def".into()),            // CONSTRAINT_CATALOG
+                        Value::Text(db.name.clone()),         // CONSTRAINT_SCHEMA
+                        Value::Text(constraint.name.clone()), // CONSTRAINT_NAME
+                        Value::Text("def".into()),            // TABLE_CATALOG
+                        Value::Text(db.name.clone()),         // TABLE_SCHEMA
+                        Value::Text(t.table_name.clone()),    // TABLE_NAME
+                        Value::Text(col_name),                // COLUMN_NAME
+                        Value::BigInt((seq + 1) as i64),      // ORDINAL_POSITION
+                        Value::Null,                          // POSITION_IN_UNIQUE_CONSTRAINT
+                        Value::Null,                          // REFERENCED_TABLE_SCHEMA
+                        Value::Null,                          // REFERENCED_TABLE_NAME
+                        Value::Null,                          // REFERENCED_COLUMN_NAME
                     ]);
                 }
             }
@@ -443,8 +452,7 @@ fn generate_is_table_constraints_rows(
             let owned_exclusion_index_ids: std::collections::HashSet<u32> = constraints
                 .iter()
                 .filter(|c| {
-                    c.kind == axiomdb_catalog::ConstraintKind::Exclusion
-                        && c.owned_index_id != 0
+                    c.kind == axiomdb_catalog::ConstraintKind::Exclusion && c.owned_index_id != 0
                 })
                 .map(|c| c.owned_index_id)
                 .collect();
@@ -474,13 +482,13 @@ fn generate_is_table_constraints_rows(
                 .filter(|c| c.kind == axiomdb_catalog::ConstraintKind::Exclusion)
             {
                 rows.push(vec![
-                    Value::Text("def".into()),                 // CONSTRAINT_CATALOG
-                    Value::Text(db.name.clone()),              // CONSTRAINT_SCHEMA
-                    Value::Text(constraint.name.clone()),      // CONSTRAINT_NAME
-                    Value::Text(db.name.clone()),              // TABLE_SCHEMA
-                    Value::Text(t.table_name.clone()),         // TABLE_NAME
-                    Value::Text("EXCLUSION".into()),           // CONSTRAINT_TYPE
-                    Value::Text("YES".into()),                 // ENFORCED
+                    Value::Text("def".into()),            // CONSTRAINT_CATALOG
+                    Value::Text(db.name.clone()),         // CONSTRAINT_SCHEMA
+                    Value::Text(constraint.name.clone()), // CONSTRAINT_NAME
+                    Value::Text(db.name.clone()),         // TABLE_SCHEMA
+                    Value::Text(t.table_name.clone()),    // TABLE_NAME
+                    Value::Text("EXCLUSION".into()),      // CONSTRAINT_TYPE
+                    Value::Text("YES".into()),            // ENFORCED
                 ]);
             }
         }
@@ -621,12 +629,12 @@ fn generate_is_views_rows(
             }
             let definition = t.defining_query.clone().unwrap_or_default();
             rows.push(vec![
-                Value::Text("def".into()),          // TABLE_CATALOG
-                Value::Text(db.name.clone()),        // TABLE_SCHEMA
-                Value::Text(t.table_name.clone()),   // TABLE_NAME
-                Value::Text(definition),             // VIEW_DEFINITION
-                Value::Text("NONE".into()),          // CHECK_OPTION
-                Value::Text("NO".into()),            // IS_UPDATABLE
+                Value::Text("def".into()),         // TABLE_CATALOG
+                Value::Text(db.name.clone()),      // TABLE_SCHEMA
+                Value::Text(t.table_name.clone()), // TABLE_NAME
+                Value::Text(definition),           // VIEW_DEFINITION
+                Value::Text("NONE".into()),        // CHECK_OPTION
+                Value::Text("NO".into()),          // IS_UPDATABLE
             ]);
         }
     }
@@ -654,11 +662,11 @@ fn generate_is_schemata_rows(
         .into_iter()
         .map(|s| {
             vec![
-                Value::Text("def".into()),                       // CATALOG_NAME
-                Value::Text(s.name),                             // SCHEMA_NAME
-                Value::Text("utf8mb4".into()),                   // DEFAULT_CHARACTER_SET_NAME
-                Value::Text("utf8mb4_general_ci".into()),        // DEFAULT_COLLATION_NAME
-                Value::Null,                                     // SQL_PATH
+                Value::Text("def".into()),                // CATALOG_NAME
+                Value::Text(s.name),                      // SCHEMA_NAME
+                Value::Text("utf8mb4".into()),            // DEFAULT_CHARACTER_SET_NAME
+                Value::Text("utf8mb4_general_ci".into()), // DEFAULT_COLLATION_NAME
+                Value::Null,                              // SQL_PATH
             ]
         })
         .collect())
@@ -772,10 +780,7 @@ fn format_ms_as_datetime(ms: i64) -> String {
     let nanos = ((ms % 1000) * 1_000_000) as u32;
     let t = UNIX_EPOCH + Duration::new(secs as u64, nanos);
     // Format as RFC3339-like string without extra deps.
-    let elapsed = t
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let elapsed = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     // Simple manual UTC formatting (avoids chrono dep in this file).
     let secs_in_day = elapsed % 86400;
     let days = elapsed / 86400;
@@ -784,7 +789,10 @@ fn format_ms_as_datetime(ms: i64) -> String {
     let s = secs_in_day % 60;
     // Days since 1970-01-01 to year/month/day.
     let (year, month, day) = days_to_ymd(days as u32);
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, h, m, s)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, h, m, s
+    )
 }
 
 fn days_to_ymd(mut days: u32) -> (u32, u32, u32) {
@@ -816,6 +824,32 @@ fn days_to_ymd(mut days: u32) -> (u32, u32, u32) {
 
 fn is_leap(y: u32) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+/// `information_schema.ROUTINES` — one row per stored procedure (Phase 16.7).
+fn generate_is_routines_rows(
+    reader: &mut axiomdb_catalog::CatalogReader,
+) -> Result<Vec<Row>, DbError> {
+    let procs = reader.list_procedures(None)?;
+    let mut rows = Vec::with_capacity(procs.len());
+    for p in procs {
+        let lang = match p.language {
+            axiomdb_catalog::ProcLanguage::PlPgSql => "PLPGSQL",
+            axiomdb_catalog::ProcLanguage::MySql => "SQL",
+        };
+        rows.push(vec![
+            Value::Text(p.name.clone()),          // SPECIFIC_NAME
+            Value::Text("def".to_string()),       // ROUTINE_CATALOG
+            Value::Text(p.schema_name),           // ROUTINE_SCHEMA
+            Value::Text(p.name),                  // ROUTINE_NAME
+            Value::Text("PROCEDURE".to_string()), // ROUTINE_TYPE
+            Value::Text(String::new()),           // DATA_TYPE (procedures have no return type)
+            Value::Text("SQL".to_string()),       // ROUTINE_BODY
+            Value::Text(p.body_sql),              // ROUTINE_DEFINITION
+            Value::Text(lang.to_string()),        // EXTERNAL_LANGUAGE
+        ]);
+    }
+    Ok(rows)
 }
 
 /// `information_schema.FOREIGN_SERVERS` — one row per foreign server (Phase 22b.2).

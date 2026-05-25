@@ -527,3 +527,30 @@ fn proc_call_inside_explicit_txn_rolls_back() {
         "procedure body effects must roll back with the outer transaction, got {r:?}"
     );
 }
+
+#[test]
+fn information_schema_routines_lists_procedure() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    run_ctx(
+        "CREATE PROCEDURE myproc(IN x INT) BEGIN INSERT INTO t VALUES (x); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let r = query(
+        "SELECT routine_name, routine_type FROM information_schema.routines",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    );
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("myproc".into()),
+            Value::Text("PROCEDURE".into())
+        ]]
+    );
+}
