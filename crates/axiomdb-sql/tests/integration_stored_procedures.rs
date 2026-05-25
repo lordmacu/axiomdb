@@ -444,3 +444,86 @@ fn proc_error_midbody_propagates() {
         "duplicate-PK mid-body must propagate, got {e:?}"
     );
 }
+
+// ── Wiring: nested CALL, recursion limit, txn, resolution (Step 11) ───────────────
+
+#[test]
+fn proc_nested_call() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE inner_p(IN x INT) BEGIN INSERT INTO t VALUES (x); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx(
+        "CREATE PROCEDURE outer_p() BEGIN CALL inner_p(42); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("CALL outer_p()", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    let r = query("SELECT id FROM t", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(42)]]);
+}
+
+#[test]
+fn proc_recursion_depth_limit() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    // Unbounded self-recursion must hit the depth limit, not overflow the stack.
+    run_ctx(
+        "CREATE PROCEDURE r() BEGIN CALL r(); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    let e = run_ctx("CALL r()", &mut s, &mut t, &mut b, &mut ctx)
+        .expect_err("infinite recursion must error at the depth limit");
+    assert!(matches!(e, DbError::InvalidValue { .. }), "got {e:?}");
+}
+
+#[test]
+fn proc_qualified_call_resolves() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE public.p() BEGIN INSERT INTO t VALUES (1); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("CALL public.p()", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    let r = query("SELECT id FROM t", &mut s, &mut t, &mut b, &mut ctx);
+    assert_eq!(r, vec![vec![Value::Int(1)]]);
+}
+
+#[test]
+fn proc_call_inside_explicit_txn_rolls_back() {
+    let (mut s, mut t, mut b, mut ctx) = setup_ctx();
+    create_t(&mut s, &mut t, &mut b, &mut ctx);
+    run_ctx(
+        "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (99); END",
+        &mut s,
+        &mut t,
+        &mut b,
+        &mut ctx,
+    )
+    .unwrap();
+    run_ctx("BEGIN", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    run_ctx("CALL p()", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    run_ctx("ROLLBACK", &mut s, &mut t, &mut b, &mut ctx).unwrap();
+    let r = query("SELECT id FROM t", &mut s, &mut t, &mut b, &mut ctx);
+    assert!(
+        r.is_empty(),
+        "procedure body effects must roll back with the outer transaction, got {r:?}"
+    );
+}

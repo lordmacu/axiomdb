@@ -242,10 +242,32 @@ fn eval_proc_expr(
     crate::eval::eval_with(expr, &[], &mut runner)
 }
 
-/// Executes `CALL name(args)` by running the procedure body in the caller's
-/// transaction. Returns a one-row result set of OUT/INOUT parameter values, or
-/// `Empty` when the procedure has no OUT/INOUT parameters.
+/// Executes `CALL name(args)` with a recursion-depth guard around the body
+/// interpreter, so mutual/self recursion cannot overflow the stack.
 fn execute_call_ctx(
+    name: &str,
+    args: &[Expr],
+    exec_ctx: &ExecutionContext,
+    ctx: &mut SessionContext,
+) -> Result<QueryResult, DbError> {
+    ctx.proc_call_depth += 1;
+    if ctx.proc_call_depth > crate::session::MAX_PROC_CALL_DEPTH {
+        ctx.proc_call_depth -= 1;
+        return Err(DbError::InvalidValue {
+            reason: format!(
+                "stored procedure recursion depth limit ({}) exceeded",
+                crate::session::MAX_PROC_CALL_DEPTH
+            ),
+        });
+    }
+    let result = execute_call_inner(name, args, exec_ctx, ctx);
+    ctx.proc_call_depth -= 1;
+    result
+}
+
+/// Runs the procedure body in the caller's transaction. Returns a one-row result
+/// set of OUT/INOUT parameter values, or `Empty` when there are none.
+fn execute_call_inner(
     name: &str,
     args: &[Expr],
     exec_ctx: &ExecutionContext,

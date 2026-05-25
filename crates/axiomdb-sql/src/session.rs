@@ -1150,7 +1150,21 @@ pub struct SessionContext {
     /// `write_commit_seq`; a stale tag forces a catalog reload so session A never
     /// serves a rate that session B changed.
     pub exchange_rate_cache: HashMap<(String, String), (u64, (i128, u8))>,
+    /// Current stored-procedure call-nesting depth (Phase 16.7). Incremented on
+    /// entry to `CALL` execution and decremented on exit; a CALL that would push
+    /// it past [`MAX_PROC_CALL_DEPTH`] errors instead of risking a stack overflow
+    /// via unbounded (mutual) recursion.
+    pub proc_call_depth: usize,
 }
+
+/// Maximum stored-procedure call-nesting depth before `CALL` errors (Phase 16.7).
+///
+/// Kept conservative because each nested `CALL` re-enters the full dispatcher +
+/// body parser + evaluator, so deep recursion uses substantial stack per level.
+/// MySQL's `max_sp_recursion_depth` is likewise capped low (≤ 255, default 0).
+/// Each level re-enters the (large) `dispatch_ctx` + body parser + evaluator, so
+/// the cap is intentionally small to stay well under a typical 2 MB thread stack.
+pub const MAX_PROC_CALL_DEPTH: usize = 16;
 
 impl Default for SessionContext {
     fn default() -> Self {
@@ -1209,6 +1223,7 @@ impl SessionContext {
             sequence_currvals: HashMap::new(),
             holiday_cache: HashMap::new(),
             exchange_rate_cache: HashMap::new(),
+            proc_call_depth: 0,
         }
     }
 
