@@ -64,6 +64,8 @@ fn analyze_stmt(
         Stmt::CreateTrigger(_)
         | Stmt::DropTrigger(_)
         | Stmt::ShowCreateTrigger(_)
+        | Stmt::CreateProcedure(_)
+        | Stmt::DropProcedure(_)
         | Stmt::CreateAggregate(_)
         | Stmt::CreateSequence(_)
         | Stmt::CreateEnumType(_)
@@ -81,14 +83,20 @@ fn analyze_stmt(
                 tables: s.views,
                 cascade: s.cascade,
             };
-            analyze_drop_table(drop_stmt, storage, snapshot, default_database, default_schema)
-                .map(|drop_stmt| {
-                    Stmt::DropMaterializedView(crate::ast::DropMaterializedViewStmt {
-                        if_exists: drop_stmt.if_exists,
-                        views: drop_stmt.tables,
-                        cascade: drop_stmt.cascade,
-                    })
+            analyze_drop_table(
+                drop_stmt,
+                storage,
+                snapshot,
+                default_database,
+                default_schema,
+            )
+            .map(|drop_stmt| {
+                Stmt::DropMaterializedView(crate::ast::DropMaterializedViewStmt {
+                    if_exists: drop_stmt.if_exists,
+                    views: drop_stmt.tables,
+                    cascade: drop_stmt.cascade,
                 })
+            })
         }
         Stmt::CreateIndex(s) => {
             analyze_create_index(s, storage, snapshot, default_database, default_schema)
@@ -169,6 +177,8 @@ fn analyze_stmt_cached(
         | Stmt::CreateMaterializedView(_)
         | Stmt::CreateView(_)
         | Stmt::CreateTrigger(_)
+        | Stmt::CreateProcedure(_)
+        | Stmt::DropProcedure(_)
         | Stmt::CreateAggregate(_)
         | Stmt::CreateSequence(_)
         | Stmt::CreateEnumType(_)
@@ -492,12 +502,14 @@ fn analyze_select_with_outer(
                     let mut scopes = outer_scopes.to_vec();
                     scopes.push(&ctx);
                     for expr in &mut un.exprs {
-                        let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                        let taken =
+                            std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
                         *expr = resolve_expr_full(taken, &empty_ctx, &scopes, Some(&state))?;
                     }
                 } else {
                     for expr in &mut un.exprs {
-                        let taken = std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
+                        let taken =
+                            std::mem::replace(expr, Expr::Literal(axiomdb_types::Value::Null));
                         *expr = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
                     }
                 }
@@ -505,9 +517,11 @@ fn analyze_select_with_outer(
             }
             // Phase 20.10 — GENERATE_SERIES: resolve start/stop/step expressions.
             FromClause::GenerateSeries(mut gs) => {
-                let taken = std::mem::replace(&mut gs.start, Expr::Literal(axiomdb_types::Value::Null));
+                let taken =
+                    std::mem::replace(&mut gs.start, Expr::Literal(axiomdb_types::Value::Null));
                 gs.start = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
-                let taken = std::mem::replace(&mut gs.stop, Expr::Literal(axiomdb_types::Value::Null));
+                let taken =
+                    std::mem::replace(&mut gs.stop, Expr::Literal(axiomdb_types::Value::Null));
                 gs.stop = resolve_expr_full(taken, &ctx, outer_scopes, Some(&state))?;
                 if let Some(step) = gs.step.take() {
                     let resolved = resolve_expr_full(step, &ctx, outer_scopes, Some(&state))?;
@@ -588,14 +602,20 @@ fn analyze_select_with_outer(
     // Resolve WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
     s.where_clause = resolve_opt_expr_full(s.where_clause, &ctx, outer_scopes, Some(&state))?;
     {
-        let resolved_exprs = s.group_by.exprs().to_owned()
+        let resolved_exprs = s
+            .group_by
+            .exprs()
+            .to_owned()
             .into_iter()
             .map(|e| resolve_expr_full(e, &ctx, outer_scopes, Some(&state)))
             .collect::<Result<Vec<_>, _>>()?;
         s.group_by = match s.group_by {
             GroupByClause::Simple(_) => GroupByClause::Simple(resolved_exprs),
             GroupByClause::WithRollup(_) => GroupByClause::WithRollup(resolved_exprs),
-            GroupByClause::Sets { sets, .. } => GroupByClause::Sets { universe: resolved_exprs, sets },
+            GroupByClause::Sets { sets, .. } => GroupByClause::Sets {
+                universe: resolved_exprs,
+                sets,
+            },
             GroupByClause::None => GroupByClause::None,
         };
     }
@@ -740,7 +760,10 @@ fn validate_window_usage(stmt: &SelectStmt) -> Result<(), DbError> {
             .as_ref()
             .map(expr_contains_window)
             .unwrap_or(false)
-        || stmt.order_by.iter().any(|item| expr_contains_window(&item.expr))
+        || stmt
+            .order_by
+            .iter()
+            .any(|item| expr_contains_window(&item.expr))
         || stmt.distinct_on.iter().any(expr_contains_window)
         || stmt.joins.iter().any(|join| match &join.condition {
             JoinCondition::On(expr) => expr_contains_window(expr),
@@ -871,11 +894,9 @@ fn expr_contains_window(expr: &Expr) -> bool {
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_window(left) || expr_contains_window(right)
         }
-        Expr::Between { expr, low, high, .. } => {
-            expr_contains_window(expr)
-                || expr_contains_window(low)
-                || expr_contains_window(high)
-        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_contains_window(expr) || expr_contains_window(low) || expr_contains_window(high),
         Expr::Like {
             expr,
             pattern,
@@ -884,10 +905,7 @@ fn expr_contains_window(expr: &Expr) -> bool {
         } => {
             expr_contains_window(expr)
                 || expr_contains_window(pattern)
-                || escape
-                    .as_deref()
-                    .map(expr_contains_window)
-                    .unwrap_or(false)
+                || escape.as_deref().map(expr_contains_window).unwrap_or(false)
         }
         Expr::In { expr, list, .. } => {
             expr_contains_window(expr) || list.iter().any(expr_contains_window)
@@ -1076,18 +1094,29 @@ fn select_has_function_call(stmt: &SelectStmt) -> bool {
             | Expr::IsNull { expr: operand, .. }
             | Expr::IsBoolean { expr: operand, .. }
             | Expr::Cast { expr: operand, .. } => expr_has_fn(operand),
-            Expr::Between { expr, low, high, .. } => {
-                expr_has_fn(expr) || expr_has_fn(low) || expr_has_fn(high)
-            }
-            Expr::Like { expr, pattern, escape, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => expr_has_fn(expr) || expr_has_fn(low) || expr_has_fn(high),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
                 expr_has_fn(expr)
                     || expr_has_fn(pattern)
                     || escape.as_ref().is_some_and(|esc| expr_has_fn(esc))
             }
             Expr::In { expr, list, .. } => expr_has_fn(expr) || list.iter().any(expr_has_fn),
-            Expr::Case { operand, when_thens, else_result } => {
+            Expr::Case {
+                operand,
+                when_thens,
+                else_result,
+            } => {
                 operand.as_ref().is_some_and(|o| expr_has_fn(o))
-                    || when_thens.iter().any(|(w, t)| expr_has_fn(w) || expr_has_fn(t))
+                    || when_thens
+                        .iter()
+                        .any(|(w, t)| expr_has_fn(w) || expr_has_fn(t))
                     || else_result.as_ref().is_some_and(|er| expr_has_fn(er))
             }
             Expr::Row(elems) => elems.iter().any(expr_has_fn),
@@ -1334,7 +1363,10 @@ fn is_aggregate_name(name: &str) -> bool {
 /// (will be treated as never-rolled-up = returns 0 for that bit).
 fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
     match expr {
-        Expr::Grouping { args, universe_indices } => {
+        Expr::Grouping {
+            args,
+            universe_indices,
+        } => {
             let indices: Vec<usize> = args
                 .iter()
                 .map(|arg| universe.iter().position(|u| u == arg).unwrap_or(usize::MAX))
@@ -1354,22 +1386,35 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         Expr::Collate { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::IsNull { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::IsBoolean { expr, .. } => populate_grouping_indices(expr, universe),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             populate_grouping_indices(expr, universe);
             populate_grouping_indices(low, universe);
             populate_grouping_indices(high, universe);
         }
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             populate_grouping_indices(expr, universe);
             populate_grouping_indices(pattern, universe);
-            if let Some(e) = escape { populate_grouping_indices(e, universe); }
+            if let Some(e) = escape {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::In { expr, list, .. } => {
             populate_grouping_indices(expr, universe);
-            for e in list { populate_grouping_indices(e, universe); }
+            for e in list {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::Function { args, .. } => {
-            for a in args { populate_grouping_indices(a, universe); }
+            for a in args {
+                populate_grouping_indices(a, universe);
+            }
         }
         Expr::Window { spec, .. } => {
             for e in &mut spec.partition_by {
@@ -1379,22 +1424,34 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
                 populate_grouping_indices(&mut item.expr, universe);
             }
         }
-        Expr::Case { operand, when_thens, else_result } => {
-            if let Some(op) = operand { populate_grouping_indices(op, universe); }
+        Expr::Case {
+            operand,
+            when_thens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                populate_grouping_indices(op, universe);
+            }
             for (w, t) in when_thens {
                 populate_grouping_indices(w, universe);
                 populate_grouping_indices(t, universe);
             }
-            if let Some(e) = else_result { populate_grouping_indices(e, universe); }
+            if let Some(e) = else_result {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::Cast { expr, .. } => populate_grouping_indices(expr, universe),
         Expr::GroupConcat { expr, order_by, .. } => {
             populate_grouping_indices(expr, universe);
-            for (e, _) in order_by { populate_grouping_indices(e, universe); }
+            for (e, _) in order_by {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::ArrayAgg { expr, order_by, .. } => {
             populate_grouping_indices(expr, universe);
-            for (e, _) in order_by { populate_grouping_indices(e, universe); }
+            for (e, _) in order_by {
+                populate_grouping_indices(e, universe);
+            }
         }
         // Phase 20.4 — ARRAY[expr, ...]: recurse into elements.
         Expr::ArrayConstructor { elements } => {
@@ -1403,7 +1460,11 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
             }
         }
         // Phase 20.4, Step 5 — array subscript: recurse into array and index.
-        Expr::Subscript { array, index, slice } => {
+        Expr::Subscript {
+            array,
+            index,
+            slice,
+        } => {
             populate_grouping_indices(array, universe);
             populate_grouping_indices(index, universe);
             if let Some(s) = slice {
@@ -1435,15 +1496,23 @@ fn populate_grouping_indices(expr: &mut Expr, universe: &[Expr]) {
         Expr::FieldAccess { .. } => {}
         // Phase 20.20 — XML constructor forms: recurse into sub-expressions.
         Expr::XmlElement { attrs, content, .. } => {
-            for (e, _) in attrs { populate_grouping_indices(e, universe); }
-            for e in content { populate_grouping_indices(e, universe); }
+            for (e, _) in attrs {
+                populate_grouping_indices(e, universe);
+            }
+            for e in content {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::XmlForest { items } => {
-            for (e, _) in items { populate_grouping_indices(e, universe); }
+            for (e, _) in items {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::XmlRoot { doc, .. } => populate_grouping_indices(doc, universe),
         Expr::XmlConcat { args } => {
-            for e in args { populate_grouping_indices(e, universe); }
+            for e in args {
+                populate_grouping_indices(e, universe);
+            }
         }
         Expr::XmlQuery { doc, .. } => populate_grouping_indices(doc, universe),
     }
@@ -1559,14 +1628,8 @@ fn substitute_view_ref(
     match from {
         FromClause::Table(ref tref) => {
             // Only expand unqualified or public-schema references.
-            let schema = tref
-                .schema
-                .as_deref()
-                .unwrap_or(default_schema);
-            let database = tref
-                .database
-                .as_deref()
-                .unwrap_or(default_database);
+            let schema = tref.schema.as_deref().unwrap_or(default_schema);
+            let database = tref.database.as_deref().unwrap_or(default_database);
             let mut reader = CatalogReader::new(storage, snapshot.clone())?;
             let def = reader.get_table_in_database(database, schema, &tref.name)?;
             match def {
@@ -1618,7 +1681,11 @@ fn substitute_view_ref(
             }
         }
         // Recurse into subqueries to expand views inside them.
-        FromClause::Subquery { query, alias, lateral } => {
+        FromClause::Subquery {
+            query,
+            alias,
+            lateral,
+        } => {
             let mut body = *query;
             expand_views(
                 &mut body,
