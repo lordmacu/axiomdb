@@ -327,7 +327,10 @@ UDFs, triggers, stored procedures, pooler. Auth, RBAC, TLS, RLS, audit, TDE. pg_
 - [ ] 16.2 ⏳ Table SQL UDFs — return multiple rows
 - [ ] 16.3 ⏳ BEFORE/AFTER triggers — with `WHEN` condition and `SIGNAL`
 - [ ] 16.3b ⏳ INSTEAD OF triggers — INSERT/UPDATE/DELETE logic over views
-- [ ] 16.7 ⏳ Stored procedures — `CREATE PROCEDURE` with flow control (`IF`, `LOOP`, `WHILE`, `BEGIN/END`)
+- [ ] 16.7 🔄 Stored procedures — `CREATE PROCEDURE` with flow control (`IF`, `LOOP`, `WHILE`, `BEGIN/END`)
+  - [x] 16.7.1+.2 ✅ Foundations — `CREATE [OR REPLACE]/DROP PROCEDURE` (PL/pgSQL `$$` + MySQL `BEGIN…END`), `ProcedureDef` catalog object (crash-safe), `IN/OUT/INOUT` params, `DECLARE` locals + assignment (`:=`/`SET`), tree-walking `CALL` interpreter (runs body in caller txn, OUT/INOUT as result row, recursion-depth guard), `information_schema.routines`, and the CALL silent-noop → `ProcedureNotFound` safety fix
+  - [ ] 16.7.3 ⏳ Control flow in bodies — `IF`/`ELSIF`/`ELSE`, `WHILE`, `LOOP`, `FOR`, `EXIT`/`CONTINUE` (currently `NotImplemented`)
+  - [ ] ⚠️ DEFERRED — multi-target `SELECT … INTO`, frame vars inside subqueries, MySQL `CALL p(@uservar)` OUT write-back (needs user `@variables`); revisit in 16.7.x
 - [ ] 16.8 ⏳ Exception handling in procedures — `DECLARE ... HANDLER FOR SQLSTATE`, re-raise, cleanup handlers
 - [ ] 16.9 ⏳ UDF and trigger tests — correctness, error handling, WHEN conditions, INSTEAD OF over views
 - [ ] 16.10 ⏳ Built-in connection pooler

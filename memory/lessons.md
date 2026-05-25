@@ -1,5 +1,38 @@
 # Lessons Learned
 
+## 2026-05-23 — Stored procedures (Phase 16.7 foundations)
+
+- **A fixed recursion-depth cap must account for per-level STACK FRAME size, not
+  just "a big number".** The procedure `CALL` interpreter re-enters the whole
+  `dispatch_ctx` (a giant match) + body re-parser + evaluator at each nesting
+  level, so each level eats ~tens of KB of stack. A limit of 256 (and even 50)
+  still overflowed the test thread's ~2 MB stack BEFORE the guard fired. Settled
+  on `MAX_PROC_CALL_DEPTH = 16` (MySQL caps `max_sp_recursion_depth` low too).
+  Lesson: when guarding recursion through heavy code paths, pick the cap from the
+  measured frame size, or the guard is theater.
+- **Substitute procedure variables as literals into the statement AST before
+  execution — don't make the evaluator variable-aware.** Mirrors
+  `substitute_outer_columns`: a focused Expr walker replaces `Expr::Column{name}`
+  matching a frame var with `Expr::Literal(value)`, so embedded SQL never tries
+  to resolve a variable as a column. Assignment RHS goes through `eval_with` +
+  `ExecSubqueryRunner` for scalar-subquery support. Keeps the change isolated to
+  the interpreter; zero evaluator surgery.
+- **Reuse `dispatch_ctx` recursively for body statements** — the body runs in the
+  caller's `conn_txn`, so a `CALL` inside `BEGIN…COMMIT` participates and an outer
+  `ROLLBACK` undoes it, for free. No separate execution path.
+- **Two dialects = one AST + interpreter, branched only at the parser front-end.**
+  PL/pgSQL (`$$…$$`, `DECLARE` before `BEGIN`, `:=`) vs MySQL (`BEGIN…END`,
+  `DECLARE` inside, `SET`) differ only in lexing/parsing; everything downstream is
+  unified.
+- **MySQL `BEGIN…END` body capture must count `CASE` as an opener too** — both
+  `BEGIN` and `CASE` close with `END`, so a `CASE…END` inside a DML statement
+  would otherwise prematurely terminate the captured body. Depth-count
+  `{BEGIN, CASE}` up, `END` down.
+- **Adding an enum variant (DbError / Stmt / Token) breaks intentional exhaustive
+  matches** — `is_ignorable_on_error` (DbError), `plan_deps` + `exec_explain`
+  (Stmt). These are deliberately wildcard-free to force a conscious decision; the
+  compiler points you straight at them. Budget for it.
+
 ## 2026-05-22 — Cross-session cache invalidation
 
 - **`max_committed` advances on read-only SELECTs — it is NOT a write watermark.**

@@ -34,6 +34,7 @@
 - [SQL Parser](internals/sql-parser.md)
 - [Semantic Analyzer](internals/semantic-analyzer.md)
 - [Executor](internals/executor.md)
+- [Stored Procedures](internals/stored-procedures.md)
 
 ---
 

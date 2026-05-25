@@ -2829,3 +2829,18 @@ type — XML processing requires application-side libraries. AxiomDB's XMLTABLE 
 the SQL:2006 / PostgreSQL 10+ standard; the derived table supports full
 <code>WHERE</code>, <code>ORDER BY</code>, <code>JOIN</code>, and aggregation.
 </div>
+
+## CALL
+
+Invokes a stored procedure (Phase 16.7). The body runs in the caller's
+transaction.
+
+```sql
+CALL bump(42);            -- no OUT params → "OK"
+CALL bump(42, NULL);      -- OUT param → one-row result set: { n }
+```
+
+- Arguments are positional, one per parameter (an `OUT` parameter takes an
+  ignored placeholder argument).
+- Calling an unknown procedure raises an error (it does not silently succeed).
+- See `CREATE PROCEDURE` in the DDL reference and the Stored Procedures internals page.

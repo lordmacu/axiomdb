@@ -2,7 +2,7 @@
 
 Phase: 16 — Server features (16.7 Stored procedures)
 Task: 16.7.1 + 16.7.2 (combined first deliverable)
-Status: approved
+Status: implemented
 
 ## Context
 

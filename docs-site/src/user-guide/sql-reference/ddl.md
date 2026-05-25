@@ -1842,3 +1842,34 @@ DROP TYPE IF EXISTS address;   -- succeeds even if type does not exist
 - `IF EXISTS`: suppresses the error when the type is not found.
 - Works for both composite types (created with `AS (...)`) and ENUM types (created with `AS ENUM (...)`).
 - Dropping a type that is still referenced by a table column is currently permitted (no CASCADE check); behavior is undefined if columns of that type are then read.
+
+## CREATE PROCEDURE / DROP PROCEDURE
+
+Stored procedures (Phase 16.7) in both PL/pgSQL and MySQL dialects:
+
+```sql
+-- PL/pgSQL
+CREATE OR REPLACE PROCEDURE bump(IN id INT, OUT n INT)
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE t SET c = c + 1 WHERE pk = id;
+    SET n = (SELECT c FROM t WHERE pk = id);
+END
+$$;
+
+-- MySQL
+CREATE PROCEDURE bump(IN id INT)
+BEGIN
+    DECLARE step INT DEFAULT 1;
+    UPDATE t SET c = c + step WHERE pk = id;
+END
+
+DROP PROCEDURE IF EXISTS bump;
+```
+
+- Parameters: `IN` (default), `OUT`, `INOUT`. `OUT`/`INOUT` are returned by `CALL`
+  as a one-row result set.
+- Body: `DECLARE` locals, assignment (`:=` / `SET`), and `INSERT`/`UPDATE`/`DELETE`/
+  nested `CALL`. Read a value with a scalar subquery: `v := (SELECT … )`.
+- Control flow (`IF`/`LOOP`/`WHILE`), `RAISE`, and cursors are not yet supported.
+- Listed in `information_schema.routines`. See the internals page for details.
