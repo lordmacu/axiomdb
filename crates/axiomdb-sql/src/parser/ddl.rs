@@ -1,6 +1,6 @@
 //! DDL statement parsers — CREATE/DROP DATABASE, CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX.
 
-use axiomdb_catalog::TablePersistence;
+use axiomdb_catalog::{ProcLanguage, ProcParamMode, TablePersistence};
 use axiomdb_core::error::DbError;
 use axiomdb_types::DataType;
 
@@ -8,13 +8,14 @@ use crate::{
     ast::{
         AlterTableOp, AlterTableStmt, ColumnConstraint, ColumnDef, CompositeFieldDef,
         ConstraintDeferrability, ConstraintTiming, CreateAggregateStmt, CreateCompositeTypeStmt,
-        CreateEnumTypeStmt, CreateIndexStmt, CreateMaterializedViewStmt, CreateSequenceStmt,
-        CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt, CreateTriggerStmt,
-        CreateViewStmt, DropAggregateStmt, DropCompositeTypeStmt, DropIndexStmt,
-        DropMaterializedViewStmt, DropSequenceStmt, DropTableStmt, DropTriggerStmt, DropViewStmt,
-        ExclusionElement, ExclusionElementTarget, ExclusionOperator, ForeignKeyAction,
-        GeneratedColumnKind, IndexColumn, RefreshMaterializedViewStmt, ShowCreateViewStmt,
-        SortOrder, Stmt, TableConstraint, TriggerEvent,
+        CreateEnumTypeStmt, CreateIndexStmt, CreateMaterializedViewStmt, CreateProcedureStmt,
+        CreateSequenceStmt, CreateTableAsSelectStmt, CreateTableLikeStmt, CreateTableStmt,
+        CreateTriggerStmt, CreateViewStmt, DropAggregateStmt, DropCompositeTypeStmt, DropIndexStmt,
+        DropMaterializedViewStmt, DropProcedureStmt, DropSequenceStmt, DropTableStmt,
+        DropTriggerStmt, DropViewStmt, ExclusionElement, ExclusionElementTarget, ExclusionOperator,
+        ForeignKeyAction, GeneratedColumnKind, IndexColumn, ProcParamAst,
+        RefreshMaterializedViewStmt, ShowCreateViewStmt, SortOrder, Stmt, TableConstraint,
+        TriggerEvent,
     },
     expr::Expr,
     lexer::Token,
@@ -88,6 +89,157 @@ pub(crate) fn parse_create_trigger(p: &mut Parser) -> Result<Stmt, DbError> {
         table,
         body_sql,
     }))
+}
+
+// ── CREATE / DROP PROCEDURE (Phase 16.7) ────────────────────────────────────────
+
+/// Parses the optional `{IN | OUT | INOUT}` mode prefix of a procedure parameter.
+/// `IN` is a keyword token; `OUT` / `INOUT` are identifiers. No prefix ⇒ `IN`.
+fn parse_param_mode(p: &mut Parser) -> ProcParamMode {
+    match p.peek().clone() {
+        Token::In => {
+            p.advance();
+            ProcParamMode::In
+        }
+        Token::Ident(kw) if kw.eq_ignore_ascii_case("out") => {
+            p.advance();
+            ProcParamMode::Out
+        }
+        Token::Ident(kw) if kw.eq_ignore_ascii_case("inout") => {
+            p.advance();
+            ProcParamMode::InOut
+        }
+        _ => ProcParamMode::In,
+    }
+}
+
+/// Captures a MySQL-dialect `BEGIN … END` procedure body as raw text.
+///
+/// Depth-tracks `BEGIN` and `CASE` as openers (both close with `END`) so a
+/// `CASE … END` expression inside a body statement does not prematurely close
+/// the block. Returns the raw SQL slice from `BEGIN` through the matching `END`.
+fn capture_begin_end_body(p: &mut Parser) -> Result<String, DbError> {
+    let start = p.current_pos();
+    p.expect(&Token::Begin)?;
+    let mut depth = 1usize;
+    loop {
+        match p.peek() {
+            Token::Begin | Token::Case => {
+                depth += 1;
+                p.advance();
+            }
+            Token::End => {
+                depth -= 1;
+                p.advance();
+                if depth == 0 {
+                    break;
+                }
+            }
+            Token::Eof => {
+                return Err(DbError::ParseError {
+                    message: "unterminated BEGIN … END in procedure body".into(),
+                    position: Some(p.current_pos()),
+                });
+            }
+            _ => {
+                p.advance();
+            }
+        }
+    }
+    let end = p.previous_end();
+    Ok(p.slice_sql(start, end))
+}
+
+/// `CREATE [OR REPLACE] PROCEDURE [schema.]name(params) <body>`
+///
+/// MySQL dialect: body is `BEGIN … END`. PL/pgSQL dialect: `[LANGUAGE plpgsql]
+/// AS $$ … $$` (clauses order-independent). `body_sql` keeps the raw body text,
+/// re-parsed by the procedure-body sub-parser on CALL.
+pub(crate) fn parse_create_procedure(p: &mut Parser, or_replace: bool) -> Result<Stmt, DbError> {
+    let name = p.parse_table_ref()?;
+
+    // Parameter list: `( [ {IN|OUT|INOUT}? name type [, …] ] )`.
+    p.expect(&Token::LParen)?;
+    let mut params = Vec::new();
+    if !matches!(p.peek(), Token::RParen) {
+        loop {
+            let mode = parse_param_mode(p);
+            let pname = p.parse_identifier()?;
+            let ty = parse_data_type(p)?.data_type;
+            params.push(ProcParamAst {
+                mode,
+                name: pname,
+                ty,
+            });
+            if !p.eat(&Token::Comma) {
+                break;
+            }
+        }
+    }
+    p.expect(&Token::RParen)?;
+
+    // MySQL dialect: a bare `BEGIN … END` body.
+    if matches!(p.peek(), Token::Begin) {
+        let body_sql = capture_begin_end_body(p)?;
+        return Ok(Stmt::CreateProcedure(CreateProcedureStmt {
+            or_replace,
+            name,
+            params,
+            language: ProcLanguage::MySql,
+            body_sql,
+        }));
+    }
+
+    // PL/pgSQL dialect: `[LANGUAGE plpgsql] AS $$ … $$` (either order).
+    let mut body: Option<String> = None;
+    loop {
+        match p.peek().clone() {
+            Token::As => {
+                p.advance();
+                match p.peek().clone() {
+                    Token::DollarString(s) => {
+                        p.advance();
+                        body = Some(s);
+                    }
+                    other => {
+                        return Err(DbError::ParseError {
+                            message: format!(
+                                "expected a $$-quoted body after AS in CREATE PROCEDURE, found {other:?}"
+                            ),
+                            position: Some(p.current_pos()),
+                        });
+                    }
+                }
+            }
+            // `LANGUAGE <name>` — accept and ignore here; only `plpgsql` is
+            // supported, validated at analysis time.
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("language") => {
+                p.advance();
+                let _lang = p.parse_identifier()?;
+            }
+            _ => break,
+        }
+    }
+    let body_sql = body.ok_or_else(|| DbError::ParseError {
+        message:
+            "CREATE PROCEDURE requires a body: `BEGIN … END` (MySQL) or `AS $$ … $$` (PL/pgSQL)"
+                .into(),
+        position: Some(p.current_pos()),
+    })?;
+    Ok(Stmt::CreateProcedure(CreateProcedureStmt {
+        or_replace,
+        name,
+        params,
+        language: ProcLanguage::PlPgSql,
+        body_sql,
+    }))
+}
+
+/// `DROP PROCEDURE [IF EXISTS] [schema.]name`
+pub(crate) fn parse_drop_procedure(p: &mut Parser) -> Result<Stmt, DbError> {
+    let if_exists = eat_if_exists(p)?;
+    let name = p.parse_table_ref()?;
+    Ok(Stmt::DropProcedure(DropProcedureStmt { if_exists, name }))
 }
 
 pub(crate) fn parse_create_aggregate(p: &mut Parser) -> Result<Stmt, DbError> {

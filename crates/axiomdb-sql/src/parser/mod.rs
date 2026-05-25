@@ -1006,14 +1006,28 @@ impl<'src> Parser<'src> {
                 self.advance();
                 ddl::parse_create_view(self, false)
             }
-            // CREATE OR REPLACE VIEW
+            // CREATE OR REPLACE VIEW / PROCEDURE
             Token::Or => {
                 self.advance();
                 match self.peek().clone() {
                     Token::Ident(kw) if kw.eq_ignore_ascii_case("replace") => {
                         self.advance();
-                        self.expect(&Token::View)?;
-                        ddl::parse_create_view(self, true)
+                        match self.peek() {
+                            Token::View => {
+                                self.advance();
+                                ddl::parse_create_view(self, true)
+                            }
+                            Token::Procedure => {
+                                self.advance();
+                                ddl::parse_create_procedure(self, true)
+                            }
+                            other => Err(DbError::ParseError {
+                                message: format!(
+                                    "expected VIEW or PROCEDURE after OR REPLACE, found {other:?}"
+                                ),
+                                position: Some(self.current_pos()),
+                            }),
+                        }
                     }
                     other => Err(DbError::ParseError {
                         message: format!("expected REPLACE after OR in CREATE, found {other:?}"),
@@ -1024,6 +1038,10 @@ impl<'src> Parser<'src> {
             Token::Trigger => {
                 self.advance();
                 ddl::parse_create_trigger(self)
+            }
+            Token::Procedure => {
+                self.advance();
+                ddl::parse_create_procedure(self, false)
             }
             Token::Aggregate => {
                 self.advance();
@@ -1113,6 +1131,10 @@ impl<'src> Parser<'src> {
             Token::Trigger => {
                 self.advance();
                 ddl::parse_drop_trigger(self)
+            }
+            Token::Procedure => {
+                self.advance();
+                ddl::parse_drop_procedure(self)
             }
             Token::Aggregate => {
                 self.advance();
